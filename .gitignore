@@ -27,9 +27,21 @@ accounts_viewer.html
 
 # Cloudflare 域名邮箱池（运行时数据）
 用于注册的域名邮箱.json
+gmail_cdk_ledger.json
+paymesh_card_ledger.json
 
 # 旧版数据/历史迁移残留
 data/
+
+# CDK inventory SQLite runtime data
+cdk_inventory.sqlite3
+cdk_inventory.sqlite3-journal
+cdk_inventory.sqlite3-wal
+cdk_inventory.sqlite3-shm
+cdk_inventory.sqlite3.backup
+cdk_inventory.sqlite3.staging
+cdk_inventory.sqlite3.backup.*
+cdk_inventory-*.sqlite3.backup
 
 # ============================================================
 # 缓存 / 临时文件 / 诊断输出
