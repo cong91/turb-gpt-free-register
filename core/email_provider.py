@@ -18,7 +18,27 @@ from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
-_VALID_SOURCES = ("outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail")
+_VALID_SOURCES = (
+    "outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail",
+    "gmail_123452026", "paymesh",
+)
+
+_SOURCE_ALIASES = {
+    "sms_paymesh": "paymesh",
+    "sms.paymesh": "paymesh",
+    "sms.paymesh.cn": "paymesh",
+    "paymesh.cn": "paymesh",
+    "mail": "paymesh",
+}
+
+
+def normalize_email_source(value: str) -> str:
+    source = str(value or "").strip().strip('"\'')
+    return _SOURCE_ALIASES.get(source, source)
+
+
+def is_valid_email_source(value: str) -> bool:
+    return normalize_email_source(value) in _VALID_SOURCES
 
 
 def parse_email_sources(value=None) -> list[str]:
@@ -35,7 +55,7 @@ def parse_email_sources(value=None) -> list[str]:
 
     out: list[str] = []
     for item in raw:
-        s = str(item or "").strip().strip('"\'')
+        s = normalize_email_source(str(item or ""))
         if not s:
             continue
         if s not in _VALID_SOURCES:
@@ -46,7 +66,32 @@ def parse_email_sources(value=None) -> list[str]:
     return out or ["outlook"]
 
 
-def _pick_from_source(source: str) -> str:
+def _pick_from_source(
+    source: str,
+    job_id: int | str | None = None,
+    gmail_cdks: list[str] | None = None,
+    paymesh_cdks: list[str] | None = None,
+    gmail_inventory_ids: list[str] | None = None,
+    paymesh_inventory_ids: list[str] | None = None,
+) -> str:
+    if source == "gmail_123452026":
+        if gmail_inventory_ids:
+            from core.gmail_123452026_client import pick_account_by_inventory
+            return pick_account_by_inventory(
+                job_id=str(job_id or "standalone"),
+                inventory_ids=gmail_inventory_ids,
+            ).email
+        from core.gmail_123452026_client import pick_account
+        return pick_account(job_id=str(job_id or "standalone"), cdks=gmail_cdks or []).email
+    if source == "paymesh":
+        if paymesh_inventory_ids:
+            from core.paymesh_mail_client import pick_account_by_inventory
+            return pick_account_by_inventory(
+                job_id=str(job_id or "standalone"),
+                inventory_ids=paymesh_inventory_ids,
+            ).email
+        from core.paymesh_mail_client import pick_account
+        return pick_account(job_id=str(job_id or "standalone"), cdks=paymesh_cdks or []).email
     if source == "gptmail":
         from core.gptmail_client import pick_account
         return pick_account().email
@@ -69,13 +114,34 @@ def _pick_from_source(source: str) -> str:
     return pick_account().email
 
 
-def acquire_email() -> str:
-    """根据 EMAIL_SOURCE 领取一个用于注册的邮箱地址；多个来源时按顺序兜底。"""
-    sources = parse_email_sources()
+def acquire_email(
+    job_id: int | str | None = None,
+    gmail_cdks: list[str] | None = None,
+    paymesh_cdks: list[str] | None = None,
+    email_source: str | None = None,
+    gmail_inventory_ids: list[str] | None = None,
+    paymesh_inventory_ids: list[str] | None = None,
+) -> str:
+    """领取注册邮箱；显式 source 仅使用该 provider，否则按全局配置兜底。
+
+    Supports both raw CDK lists (backward-compatible) and managed inventory IDs.
+    """
+    if email_source is not None:
+        source = normalize_email_source(str(email_source or ""))
+        if not is_valid_email_source(source):
+            raise ValueError(f"未知邮箱来源: {source}")
+        sources = [source]
+    else:
+        sources = parse_email_sources()
     last_exc: Exception | None = None
     for source in sources:
         try:
-            email = _pick_from_source(source)
+            email = _pick_from_source(
+                source, job_id=job_id,
+                gmail_cdks=gmail_cdks, paymesh_cdks=paymesh_cdks,
+                gmail_inventory_ids=gmail_inventory_ids,
+                paymesh_inventory_ids=paymesh_inventory_ids,
+            )
             logger.info(f"[EmailProvider] 使用邮箱来源: {source}, email={email}")
             return email
         except Exception as exc:
@@ -87,6 +153,12 @@ def acquire_email() -> str:
 
 def resolve_email_source(email: str) -> str:
     """根据邮箱在各池中的归属判断实际来源。"""
+    from core.gmail_123452026_client import get_account_context as get_gmail_cdk_context
+    if get_gmail_cdk_context(email):
+        return "gmail_123452026"
+    from core.paymesh_mail_client import get_account_context as get_paymesh_context
+    if get_paymesh_context(email):
+        return "paymesh"
     from core.gptmail_client import get_account_context as get_gptmail_context
     if get_gptmail_context(email):
         return "gptmail"
@@ -157,6 +229,12 @@ def wait_for_otp(
         extra_kwargs["settle_seconds"] = settle_seconds
 
     source = resolve_email_source(email)
+    if source == "gmail_123452026":
+        from core.gmail_123452026_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "paymesh":
+        from core.paymesh_mail_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "gptmail":
         from core.gptmail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
@@ -182,7 +260,13 @@ def wait_for_otp(
 def release_email(email: str, status: str = "available", note: str | None = None) -> str:
     """按邮箱实际来源回收状态，返回来源名。"""
     source = resolve_email_source(email)
-    if source == "gptmail":
+    if source == "gmail_123452026":
+        from core.gmail_123452026_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "paymesh":
+        from core.paymesh_mail_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "gptmail":
         from core.gptmail_client import release_account
         release_account(email, status=status, note=note)
     elif source == "cloudflare":
@@ -214,7 +298,13 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
     source = resolve_email_source(email)
     from core import db
 
-    if source == "outlook":
+    if source == "gmail_123452026":
+        from core.gmail_123452026_client import release_account
+        changed = release_account(email, status="available", note=note)
+    elif source == "paymesh":
+        from core.paymesh_mail_client import release_account
+        changed = release_account(email, status="available", note=note)
+    elif source == "outlook":
         changed = db.release_unconsumed_outlook(email, note=note)
     elif source == "generic_api":
         changed = db.release_unconsumed_generic_api_email(email, note=note)
@@ -230,3 +320,17 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
     if changed:
         logger.info("[EmailProvider] 已回收未消耗邮箱: source=%s, email=%s", source, email)
     return changed
+
+
+def mark_email_consumed(email: str) -> bool:
+    """提交需要显式消费的 provider reservation；其他来源无需处理。"""
+    if not (email or "").strip():
+        return False
+    source = resolve_email_source(email)
+    if source == "gmail_123452026":
+        from core.gmail_123452026_client import mark_account_consumed
+        return mark_account_consumed(email)
+    if source == "paymesh":
+        from core.paymesh_mail_client import mark_account_consumed
+        return mark_account_consumed(email)
+    return False
