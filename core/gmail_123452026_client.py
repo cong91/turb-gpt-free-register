@@ -226,10 +226,7 @@ def pick_account_by_inventory(
     the full account context for OTP polling.
     """
     import uuid
-    from contextlib import closing
-    from pathlib import Path
 
-    from core.cdk_inventory_store import CdkInventoryStore
 
     owner = str(job_id or "").strip()
     if not owner:
