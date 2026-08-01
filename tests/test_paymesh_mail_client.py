@@ -319,7 +319,7 @@ class PaymeshMailClientTests(unittest.TestCase):
     @patch("core.paymesh_mail_client._config_values", return_value=("https://sms.paymesh.cn", 30, 6))
     def test_inventory_lease_prevents_second_concurrent_acquisition(self, _config, redeem):
         from core import paymesh_mail_client as client
-        from core.cdk_inventory_store import CdkInventoryStore, CdkInventoryConflict
+        from core.cdk_inventory_store import CdkInventoryStore
 
         card = "SECRET-CARD"
         redeem.return_value = PaymeshMailAccount("user@example.com", card, 6)
