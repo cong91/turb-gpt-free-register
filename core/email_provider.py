@@ -71,27 +71,55 @@ def _pick_from_source(
     job_id: int | str | None = None,
     gmail_cdks: list[str] | None = None,
     paymesh_cdks: list[str] | None = None,
+    gmail_routed_domains: list[str] | None = None,
+    gmail_batch_id: str | None = None,
     gmail_inventory_ids: list[str] | None = None,
+    paymesh_inventory_id: str | None = None,
     paymesh_inventory_ids: list[str] | None = None,
+    paymesh_routed_domains: list[str] | None = None,
 ) -> str:
     if source == "gmail_123452026":
+        if gmail_batch_id:
+            from core.gmail_123452026_client import pick_account_by_batch
+            return pick_account_by_batch(
+                job_id=str(job_id or "standalone"),
+                batch_id=gmail_batch_id,
+                routed_domains=gmail_routed_domains or [],
+            ).email
         if gmail_inventory_ids:
             from core.gmail_123452026_client import pick_account_by_inventory
             return pick_account_by_inventory(
                 job_id=str(job_id or "standalone"),
                 inventory_ids=gmail_inventory_ids,
+                routed_domains=gmail_routed_domains or [],
             ).email
         from core.gmail_123452026_client import pick_account
-        return pick_account(job_id=str(job_id or "standalone"), cdks=gmail_cdks or []).email
+        kwargs = {"job_id": str(job_id or "standalone"), "cdks": gmail_cdks or []}
+        if gmail_routed_domains:
+            kwargs["routed_domains"] = list(gmail_routed_domains)
+        return pick_account(**kwargs).email
     if source == "paymesh":
+        routed = paymesh_routed_domains
+        if paymesh_inventory_id:
+            from core.paymesh_mail_client import pick_account_for_inventory
+            return pick_account_for_inventory(
+                job_id=str(job_id or "standalone"),
+                inventory_id=paymesh_inventory_id,
+                routed_domains=routed or (),
+            ).email
         if paymesh_inventory_ids:
             from core.paymesh_mail_client import pick_account_by_inventory
             return pick_account_by_inventory(
                 job_id=str(job_id or "standalone"),
                 inventory_ids=paymesh_inventory_ids,
+                routed_domains=routed or (),
             ).email
         from core.paymesh_mail_client import pick_account
-        return pick_account(job_id=str(job_id or "standalone"), cdks=paymesh_cdks or []).email
+        return pick_account(
+            job_id=str(job_id or "standalone"),
+            cdks=paymesh_cdks or [],
+            routed_domains=routed or (),
+        ).email
     if source == "gptmail":
         from core.gptmail_client import pick_account
         return pick_account().email
@@ -118,9 +146,13 @@ def acquire_email(
     job_id: int | str | None = None,
     gmail_cdks: list[str] | None = None,
     paymesh_cdks: list[str] | None = None,
+    gmail_routed_domains: list[str] | None = None,
+    gmail_batch_id: str | None = None,
     email_source: str | None = None,
     gmail_inventory_ids: list[str] | None = None,
+    paymesh_inventory_id: str | None = None,
     paymesh_inventory_ids: list[str] | None = None,
+    paymesh_routed_domains: list[str] | None = None,
 ) -> str:
     """领取注册邮箱；显式 source 仅使用该 provider，否则按全局配置兜底。
 
@@ -133,14 +165,24 @@ def acquire_email(
         sources = [source]
     else:
         sources = parse_email_sources()
+    if paymesh_routed_domains is None:
+        try:
+            from config import email as _email_cfg
+            paymesh_routed_domains = list(getattr(_email_cfg, "PAYMESH_ROUTED_DOMAINS", []) or [])
+        except Exception:
+            paymesh_routed_domains = []
     last_exc: Exception | None = None
     for source in sources:
         try:
             email = _pick_from_source(
                 source, job_id=job_id,
                 gmail_cdks=gmail_cdks, paymesh_cdks=paymesh_cdks,
+                gmail_routed_domains=gmail_routed_domains,
+                gmail_batch_id=gmail_batch_id,
                 gmail_inventory_ids=gmail_inventory_ids,
+                paymesh_inventory_id=paymesh_inventory_id,
                 paymesh_inventory_ids=paymesh_inventory_ids,
+                paymesh_routed_domains=paymesh_routed_domains,
             )
             logger.info(f"[EmailProvider] 使用邮箱来源: {source}, email={email}")
             return email

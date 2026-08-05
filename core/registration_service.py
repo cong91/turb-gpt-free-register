@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from core import codex_retry_service, db
+from core.registration_maintenance_barrier import RegistrationMaintenanceBarrier
 
 logger = logging.getLogger(__name__)
 
@@ -34,27 +35,164 @@ _STOP_EVENTS: dict[int, threading.Event] = {}
 _ACTIVE_JOBS: set[int] = set()
 _STOP_LOCK = threading.Lock()
 _THREAD_CTX = threading.local()
+_JOB_EMAIL_INPUTS: dict[int, dict[str, Any]] = {}
+_JOB_EMAIL_INPUTS_LOCK = threading.Lock()
+
+_MAINTENANCE_BARRIER = RegistrationMaintenanceBarrier()
+_rotation_pending = False
+_ROTATION_LOCK = threading.Lock()
 
 
 class StopRequested(RuntimeError):
     """用户手动停止注册任务。"""
 
 
-def _activate_job(job_id: int) -> None:
+def _set_job_email_inputs(
+    job_id: int,
+    gmail_cdks: list[str] | None,
+    *,
+    paymesh_cdks: list[str] | None = None,
+    gmail_routed_domains: list[str] | None = None,
+    gmail_batch_id: str | None = None,
+    email_source: str | None = None,
+    paymesh_inventory_id: str | None = None,
+    paymesh_routed_domains: list[str] | None = None,
+) -> None:
+    with _JOB_EMAIL_INPUTS_LOCK:
+        _JOB_EMAIL_INPUTS[int(job_id)] = {
+            "email_source": str(email_source).strip() if email_source else None,
+            "gmail_cdks": list(gmail_cdks or []),
+            "gmail_routed_domains": list(gmail_routed_domains or []),
+            "gmail_batch_id": str(gmail_batch_id or "").strip() or None,
+            "paymesh_cdks": list(paymesh_cdks or []),
+            "paymesh_inventory_id": str(paymesh_inventory_id or "").strip() or None,
+            "paymesh_routed_domains": list(paymesh_routed_domains or []),
+        }
+
+
+def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
+    empty = {
+        "email_source": None,
+        "gmail_cdks": [],
+        "gmail_routed_domains": [],
+        "gmail_batch_id": None,
+        "paymesh_cdks": [],
+        "paymesh_routed_domains": [],
+    }
+    if job_id is None:
+        return empty
+    with _JOB_EMAIL_INPUTS_LOCK:
+        context = _JOB_EMAIL_INPUTS.get(int(job_id))
+        if context is not None:
+            result = {
+                "email_source": context.get("email_source"),
+                "gmail_cdks": list(context.get("gmail_cdks") or []),
+                "gmail_routed_domains": list(context.get("gmail_routed_domains") or []),
+                "gmail_batch_id": context.get("gmail_batch_id"),
+                "paymesh_cdks": list(context.get("paymesh_cdks") or []),
+                "paymesh_routed_domains": list(context.get("paymesh_routed_domains") or []),
+            }
+            if context.get("paymesh_inventory_id"):
+                result["paymesh_inventory_id"] = context["paymesh_inventory_id"]
+            return result
+    job = db.get_job(int(job_id))
+    persisted = job.get("provider_context") if job else {}
+    if not isinstance(persisted, dict):
+        persisted = {}
+    result = {
+        "email_source": job.get("email_source") if job else None,
+        "gmail_cdks": [],
+        "gmail_routed_domains": list(persisted.get("gmail_routed_domains") or []),
+        "gmail_batch_id": str(persisted.get("gmail_batch_id") or "").strip() or None,
+        "paymesh_cdks": [],
+        "paymesh_routed_domains": list(persisted.get("paymesh_routed_domains") or []),
+    }
+    paymesh_inventory_id = str(persisted.get("paymesh_inventory_id") or "").strip()
+    if paymesh_inventory_id:
+        result["paymesh_inventory_id"] = paymesh_inventory_id
+    return result
+
+
+def _clear_job_email_inputs(job_id: int) -> None:
+    with _JOB_EMAIL_INPUTS_LOCK:
+        _JOB_EMAIL_INPUTS.pop(int(job_id), None)
+
+
+def _activate_job(job_id: int) -> bool:
+    """Mark job as active, but check barrier first. Returns False if blocked."""
+    allowed = _MAINTENANCE_BARRIER.wait_before_start(
+        int(job_id),
+        lambda: is_stop_requested(int(job_id)),
+    )
+    if not allowed:
+        return False
     _THREAD_CTX.job_id = int(job_id)
     with _STOP_LOCK:
         _STOP_EVENTS.setdefault(int(job_id), threading.Event())
         _ACTIVE_JOBS.add(int(job_id))
+    return True
 
 
 def _deactivate_job(job_id: int) -> None:
+    _MAINTENANCE_BARRIER.notify_job_finished(int(job_id))
     with _STOP_LOCK:
         _STOP_EVENTS.pop(int(job_id), None)
         _ACTIVE_JOBS.discard(int(job_id))
+        remaining_active = len(_ACTIVE_JOBS)
+    _clear_job_email_inputs(job_id)
     try:
         delattr(_THREAD_CTX, "job_id")
     except Exception:
         pass
+    # Deferred NordVPN rotation: close the gate immediately when a
+    # rotation is pending so replacement workers cannot start.
+    # deferred_rotation drains remaining workers, rotates, and reopens.
+    global _rotation_pending
+    if _rotation_pending:
+        if not _ROTATION_LOCK.acquire(blocking=False):
+            return
+        try:
+            _append_job_log(job_id, "NordVPN auto-rotation started", level="INFO", marker="auto-rotation")
+            try:
+                from core.nordvpn_cli import execute_rotation
+                rotated = _MAINTENANCE_BARRIER.deferred_rotation(
+                    rotation_callback=execute_rotation,
+                    reason="NordVPN IP rotation (auto)",
+                )
+            except Exception:
+                rotated = False
+                _append_job_log(
+                    job_id,
+                    "NordVPN auto-rotation raised an exception; pending retry",
+                    marker="auto-rotation",
+                )
+                logger.exception("[Service] deferred NordVPN rotation 失败")
+            if rotated:
+                _rotation_pending = False
+                from core.nordvpn_cli import rotation_status_detail
+
+                rotation_detail = rotation_status_detail().get("detail")
+                _append_job_log(
+                    job_id,
+                    "NordVPN auto-rotation success"
+                    + (f": {rotation_detail}" if rotation_detail else ""),
+                    level="INFO",
+                    marker="auto-rotation",
+                )
+            else:
+                from core.nordvpn_cli import rotation_status_detail
+
+                rotation_error = (
+                    rotation_status_detail().get("error")
+                    or "rotation callback returned false without a diagnostic reason"
+                )
+                _append_job_log(
+                    job_id,
+                    f"NordVPN auto-rotation failed: {rotation_error}; start gate remains closed",
+                    marker="auto-rotation",
+                )
+        finally:
+            _ROTATION_LOCK.release()
 
 
 def is_stop_requested(job_id: int | None = None) -> bool:
@@ -76,7 +214,13 @@ def check_stop_requested() -> None:
         raise StopRequested(f"任务 #{job_id} 已被用户手动停止")
 
 
-def _append_job_log(job_id: int, message: str) -> None:
+def _append_job_log(
+    job_id: int,
+    message: str,
+    *,
+    level: str = "WARNING",
+    marker: str = "service",
+) -> None:
     try:
         job = db.get_job(job_id)
         log_file = job.get("log_file") if job else None
@@ -84,8 +228,10 @@ def _append_job_log(job_id: int, message: str) -> None:
             return
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%H:%M:%S")
+        normalized_level = str(level or "INFO").strip().upper()
+        normalized_marker = str(marker or "service").strip() or "service"
         with Path(log_file).open("a", encoding="utf-8") as f:
-            f.write(f"{ts} [WARNING] [manual-stop] {message}\n")
+            f.write(f"{ts} [{normalized_level}] [{normalized_marker}] {message}\n")
     except Exception:
         pass
 
@@ -104,7 +250,7 @@ def _random_display_name() -> str:
     return f"{first} {last}"
 
 
-def _prepare_registration_args() -> tuple[str, str, str]:
+def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
     from config import register as _r, email as _e
@@ -126,7 +272,37 @@ def _prepare_registration_args() -> tuple[str, str, str]:
     # 邮箱领取会把池状态置为 used，因此放在所有其他准备逻辑之后。
     if not email:
         if _e.USE_EMAIL_SERVICE:
-            email = acquire_email()
+            email_inputs = _get_job_email_inputs(job_id)
+            acquire_kwargs = {"job_id": job_id}
+            source = email_inputs["email_source"]
+            if source == "gmail_123452026":
+                if email_inputs["gmail_batch_id"]:
+                    acquire_kwargs["gmail_batch_id"] = email_inputs["gmail_batch_id"]
+                else:
+                    acquire_kwargs["gmail_cdks"] = email_inputs["gmail_cdks"]
+                if email_inputs["gmail_routed_domains"]:
+                    acquire_kwargs["gmail_routed_domains"] = email_inputs["gmail_routed_domains"]
+            elif source == "paymesh":
+                if email_inputs.get("paymesh_inventory_id"):
+                    acquire_kwargs["paymesh_inventory_id"] = email_inputs["paymesh_inventory_id"]
+                else:
+                    acquire_kwargs["paymesh_cdks"] = email_inputs["paymesh_cdks"]
+                if email_inputs["paymesh_routed_domains"]:
+                    acquire_kwargs["paymesh_routed_domains"] = email_inputs["paymesh_routed_domains"]
+            else:
+                if email_inputs["gmail_batch_id"]:
+                    acquire_kwargs["gmail_batch_id"] = email_inputs["gmail_batch_id"]
+                    if email_inputs["gmail_routed_domains"]:
+                        acquire_kwargs["gmail_routed_domains"] = email_inputs["gmail_routed_domains"]
+                else:
+                    acquire_kwargs["gmail_cdks"] = email_inputs["gmail_cdks"]
+                if email_inputs.get("paymesh_inventory_id"):
+                    acquire_kwargs["paymesh_inventory_id"] = email_inputs["paymesh_inventory_id"]
+                else:
+                    acquire_kwargs["paymesh_cdks"] = email_inputs["paymesh_cdks"]
+            if source is not None:
+                acquire_kwargs["email_source"] = source
+            email = acquire_email(**acquire_kwargs)
         else:
             raise RuntimeError(
                 "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
@@ -146,6 +322,8 @@ def _release_unconsumed_job_email(email: str | None, reason: str) -> None:
         release_email_if_unconsumed(email, note=f"任务未消耗，已自动回收: {reason[:180]}")
     except Exception:
         logger.exception("[Service] 回收未消耗邮箱失败: %s", email)
+
+
 
 
 def _is_final_session_access_token_timeout(error: object) -> bool:
@@ -201,6 +379,36 @@ def _normalize_workers(max_workers: int | None) -> int:
     return max(_MIN_MAX_WORKERS, min(_MAX_MAX_WORKERS, value))
 
 
+def effective_registration_workers(max_workers: int | None) -> int:
+    """Serialize registration when system-wide NordVPN rotation is enabled."""
+    requested = _normalize_workers(max_workers)
+    from config import nordvpn as _nordvpn_cfg
+
+    try:
+        rotate_interval = int(
+            getattr(_nordvpn_cfg, "NORDVPN_AUTO_ROTATE_INTERVAL", 0) or 0
+        )
+    except (TypeError, ValueError):
+        rotate_interval = 0
+    rotation_enabled = (
+        bool(getattr(_nordvpn_cfg, "NORDVPN_ENABLED", False))
+        and bool(getattr(_nordvpn_cfg, "NORDVPN_AUTO_ROTATE_ENABLED", False))
+        and rotate_interval > 0
+    )
+    from core.nordvpn_wireguard import is_per_profile_proxy_enabled
+
+    if rotation_enabled and is_per_profile_proxy_enabled():
+        rotation_enabled = False
+    if rotation_enabled:
+        if requested != 1:
+            logger.info(
+                "[Service] NordVPN auto-rotation 使用系统全局 IP，workers 从 %s 调整为 1",
+                requested,
+            )
+        return 1
+    return requested
+
+
 def get_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
     """返回注册线程池。
 
@@ -250,6 +458,59 @@ def shutdown_executor(wait: bool = True) -> None:
         ex.shutdown(wait=wait, cancel_futures=False)
 
 
+def nordvpn_rotation_status() -> dict:
+    """Return the current automatic-rotation and registration-gate state."""
+    from core.nordvpn_cli import rotation_status_detail
+
+    barrier = _MAINTENANCE_BARRIER.status()
+    detail = rotation_status_detail()
+    return {
+        "rotation_pending": bool(_rotation_pending),
+        "rotation_in_progress": _ROTATION_LOCK.locked(),
+        "rotation_error": detail.get("error"),
+        "rotation_detail": detail.get("detail"),
+        "gate_state": barrier["state"],
+        "waiting_jobs": barrier["waiting_count"],
+        "active_jobs": barrier["active_count"],
+        "last_outcome": barrier["last_outcome"],
+    }
+
+
+def retry_pending_nordvpn_rotation() -> dict:
+    """Retry a failed automatic rotation and reopen the registration gate on success."""
+    global _rotation_pending
+    if not _rotation_pending:
+        return {"ok": False, "error": "当前没有待重试的 NordVPN 自动轮换", "status": 409}
+    if not _ROTATION_LOCK.acquire(blocking=False):
+        return {"ok": False, "error": "NordVPN 自动轮换正在执行，请稍候", "status": 409}
+    try:
+        barrier_status = _MAINTENANCE_BARRIER.status()
+        if barrier_status["active_count"]:
+            return {"ok": False, "error": "仍有注册任务运行，暂不能重试 NordVPN 轮换", "status": 409}
+        from core.nordvpn_cli import execute_rotation, rotation_status_detail
+        if not _MAINTENANCE_BARRIER.retry_rotation(execute_rotation):
+            reason = (
+                rotation_status_detail().get("error")
+                or "rotation callback returned false without a diagnostic reason"
+            )
+            return {
+                "ok": False,
+                "error": f"NordVPN 轮换失败：{reason}；注册队列继续保持暂停",
+                "status": 503,
+            }
+        _rotation_pending = False
+        return {"ok": True, "message": "NordVPN 轮换成功，注册队列已恢复"}
+    except Exception as exc:
+        logger.exception("[Service] retry NordVPN rotation 失败")
+        return {
+            "ok": False,
+            "error": f"NordVPN 轮换重试异常：{type(exc).__name__}: {exc}",
+            "status": 500,
+        }
+    finally:
+        _ROTATION_LOCK.release()
+
+
 # ============================================================
 # 单任务执行：日志重定向到任务专属文件
 # ============================================================
@@ -281,10 +542,52 @@ class _JobLogContext:
             logging.getLogger().removeHandler(self.handler)
 
 
+def _run_local_test_job(job_id: int, log_file: str, email: str) -> None:
+    """Complete a persisted local dry-run without touching live registration paths."""
+    log_logger = logging.getLogger(__name__)
+    try:
+        if not email:
+            raise ValueError("Local test job thiếu alias đã persist")
+        with _JobLogContext(log_file):
+            check_stop_requested()
+            log_logger.info(
+                "[Job %s] Local test dry-run: alias=%s; external providers disabled",
+                job_id,
+                email,
+            )
+            check_stop_requested()
+            db.update_job(
+                job_id,
+                status="success",
+                email=email,
+                completed_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            log_logger.info("[Job %s] Local test dry-run completed", job_id)
+    except StopRequested as exc:
+        log_logger.warning("[Job %s] Local test stopped: %s", job_id, exc)
+        db.update_job(
+            job_id,
+            status="stopped",
+            error="用户手动停止",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+    except Exception as exc:
+        log_logger.exception("[Job %s] Local test failed", job_id)
+        db.update_job(
+            job_id,
+            status="failed",
+            error=f"{type(exc).__name__}: {exc}"[:500],
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+
+
 def _run_one_job(job_id: int, log_file: str) -> None:
     """单任务入口（线程池里跑这个）。"""
     log_logger = logging.getLogger(__name__)
-    _activate_job(job_id)
+    if not _activate_job(job_id):
+        log_logger.info(f"[Job {job_id}] 被维护屏障阻止，跳过执行")
+        return
+
 
     # 取消检查：用户可能在任务排队期间点了"取消排队"，把 status 改成了 cancelled。
     # 因为 Future 已经 submit 进线程池无法撤回，只能在真正执行前自检一下，跳过 cancelled 的。
@@ -300,12 +603,23 @@ def _run_one_job(job_id: int, log_file: str) -> None:
 
     db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
 
+    if str(current.get("job_type") or "registration") == "local_test":
+        try:
+            _run_local_test_job(
+                job_id,
+                log_file,
+                str(current.get("email") or "").strip(),
+            )
+        finally:
+            _deactivate_job(job_id)
+        return
+
     email: str | None = None
     try:
         with _JobLogContext(log_file):
             from main import run_registration
             log_logger.info(f"[Job {job_id}] 开始注册任务")
-            email, name, birthday = _prepare_registration_args()
+            email, name, birthday = _prepare_registration_args(job_id=job_id)
             db.update_job(job_id, email=email)
             check_stop_requested()
             result = run_registration(email=email, name=name, birthday=birthday)
@@ -328,6 +642,21 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
+                # NordVPN auto IP rotation counter
+                try:
+                    from core.nordvpn_cli import notify_registration_success
+                    if notify_registration_success():
+                        global _rotation_pending
+                        _rotation_pending = True
+                        log_logger.info(
+                            "[Job %d] 已标记 rotation pending；当前任务退出后关闭新任务 gate",
+                            job_id,
+                        )
+                except Exception:
+                    log_logger.debug(
+                        "[Job %d] NordVPN 轮换检查跳过",
+                        job_id, exc_info=True,
+                    )
             else:
                 # 注意：失败也可能伴随 account_id（如 Codex 失败但账号已注册成功）
                 err = (result or {}).get("error") if isinstance(result, dict) else "unknown"
@@ -383,7 +712,9 @@ def _run_one_job(job_id: int, log_file: str) -> None:
 
 def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int) -> None:
     """把 Codex 补跑作为标准任务执行，并复用任务状态、日志和停止入口。"""
-    _activate_job(job_id)
+    if not _activate_job(job_id):
+        codex_retry_service.release(email)
+        return
     current = db.get_job(job_id)
     if not current or current.get("status") == "cancelled":
         codex_retry_service.release(email)
@@ -434,7 +765,16 @@ def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int
 # 公共接口
 # ============================================================
 
-def submit_registration(count: int = 1, email_source: str | None = None, workers: int | None = None) -> list[dict]:
+def submit_registration(
+    count: int = 1,
+    email_source: str | None = None,
+    workers: int | None = None,
+    gmail_cdks: list[str] | None = None,
+    paymesh_cdks: list[str] | None = None,
+    gmail_routed_domains: list[str] | None = None,
+    gmail_batch_id: str | None = None,
+    paymesh_routed_domains: list[str] | None = None,
+) -> list[dict]:
     """
     创建 N 个注册任务并提交到线程池。
     email_source 仅记录到 DB；实际邮箱来源固定为 Outlook 账号池。
@@ -442,21 +782,70 @@ def submit_registration(count: int = 1, email_source: str | None = None, workers
     Returns:
         N 个新创建的 job dict
     """
+    requested_email_source = email_source
     if email_source is None:
         from config import email as _email_cfg
         email_source = _email_cfg.EMAIL_SOURCE
+    if gmail_cdks and not gmail_batch_id:
+        from core.gmail_123452026_client import create_registration_batch
 
+        gmail_batch_id = create_registration_batch(
+            gmail_cdks,
+            routed_domains=gmail_routed_domains or [],
+        )
+    paymesh_assignments: list[str] = []
+    if paymesh_cdks:
+        from config import email as _email_cfg
+        from core.paymesh_batch_assignment import create_paymesh_job_assignments
+
+        paymesh_assignments = create_paymesh_job_assignments(
+            paymesh_cdks,
+            count=count,
+            configured_limit=int(
+                getattr(_email_cfg, "PAYMESH_ACCOUNTS_PER_CDK", 6) or 6
+            ),
+        )
+    provider_context = {}
+    if gmail_batch_id:
+        provider_context = {
+            "gmail_batch_id": gmail_batch_id,
+            "gmail_routed_domains": list(gmail_routed_domains or []),
+        }
+    if paymesh_routed_domains:
+        provider_context["paymesh_routed_domains"] = list(paymesh_routed_domains)
+
+    effective_workers = effective_registration_workers(workers)
     # 创建/切换线程池和提交本批任务必须整体串行化：否则另一请求在本批提交中途
     # 切换 workers 并 shutdown 旧池，会导致后续 submit 报 cannot schedule new futures after shutdown。
     with _executor_lock:
-        executor = get_executor(max_workers=workers)
+        executor = get_executor(max_workers=effective_workers)
         effective_workers = get_executor_workers()
         jobs = []
-        for _ in range(count):
-            job = db.create_job(email_source=email_source)
+        for index in range(count):
+            job_provider_context = dict(provider_context)
+            paymesh_inventory_id = (
+                paymesh_assignments[index] if paymesh_assignments else None
+            )
+            if paymesh_inventory_id:
+                job_provider_context["paymesh_inventory_id"] = paymesh_inventory_id
+            job = db.create_job(
+                email_source=email_source,
+                provider_context=job_provider_context,
+            )
+            _set_job_email_inputs(
+                int(job["id"]),
+                gmail_cdks,
+                paymesh_cdks=(None if paymesh_inventory_id else paymesh_cdks),
+                gmail_routed_domains=gmail_routed_domains,
+                gmail_batch_id=gmail_batch_id,
+                email_source=requested_email_source,
+                paymesh_inventory_id=paymesh_inventory_id,
+                paymesh_routed_domains=paymesh_routed_domains,
+            )
             try:
                 executor.submit(_run_one_job, job["id"], job["log_file"])
             except Exception as exc:
+                _clear_job_email_inputs(int(job["id"]))
                 db.update_job(
                     int(job["id"]),
                     status="failed",
@@ -466,6 +855,44 @@ def submit_registration(count: int = 1, email_source: str | None = None, workers
                 logger.exception("[Service] 注册任务 #%s 提交线程池失败", job["id"])
             jobs.append(db.get_job(int(job["id"])) or job)
     logger.info(f"[Service] 已提交 {count} 个注册任务，源={email_source}，workers={effective_workers}")
+    return jobs
+
+
+def submit_local_test_registration(
+    aliases: list[str],
+    workers: int | None = None,
+) -> list[dict]:
+    """Create persisted local dry-run jobs without provider or registration context."""
+    values = [str(alias or "").strip().lower() for alias in aliases if str(alias or "").strip()]
+    if not values:
+        raise ValueError("Local test aliases không được để trống")
+
+    with _executor_lock:
+        executor = get_executor(max_workers=workers)
+        effective_workers = get_executor_workers()
+        jobs = []
+        for alias in values:
+            job = db.create_job(
+                email_source="reserved_test",
+                job_type="local_test",
+                email=alias,
+            )
+            try:
+                executor.submit(_run_one_job, job["id"], job["log_file"])
+            except Exception as exc:
+                db.update_job(
+                    int(job["id"]),
+                    status="failed",
+                    error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
+                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                )
+                logger.exception("[Service] Local test job #%s 提交线程池失败", job["id"])
+            jobs.append(db.get_job(int(job["id"])) or job)
+    logger.info(
+        "[Service] 已提交 %s 个 local test dry-run 任务，workers=%s",
+        len(jobs),
+        effective_workers,
+    )
     return jobs
 
 
@@ -493,6 +920,9 @@ def get_retry_info(job: dict) -> dict:
         "display_status": status,
     }
     if status not in ("failed", "stopped", "cancelled"):
+        return info
+    if str(job.get("job_type") or "registration") == "local_test":
+        info["retry_reason"] = "Local test dry-run không hỗ trợ retry"
         return info
 
     successful_retry = db.get_successful_retry_for_job(int(job.get("id") or 0))
@@ -584,8 +1014,11 @@ def retry_job(job_id: int, workers: int | None = None) -> dict:
     try:
         if action == "codex":
             db.update_account_codex_status(email, "retrying", None)
+        effective_workers = (
+            workers if action == "codex" else effective_registration_workers(workers)
+        )
         with _executor_lock:
-            executor = get_executor(max_workers=workers)
+            executor = get_executor(max_workers=effective_workers)
             if action == "codex":
                 executor.submit(_run_codex_retry_job, job["id"], job["log_file"], email, int(account_id))
             else:
@@ -647,7 +1080,11 @@ def request_stop_job(job_id: int) -> dict:
     now_iso = datetime.now().isoformat(timespec="seconds")
     if status == "pending":
         db.update_job(job_id, status="cancelled", completed_at=now_iso, error="用户手动停止/取消排队")
-        _append_job_log(job_id, "用户手动停止：任务尚未运行，已取消排队。")
+        _append_job_log(
+            job_id,
+            "用户手动停止：任务尚未运行，已取消排队。",
+            marker="manual-stop",
+        )
         return {"ok": True, "message": "排队任务已取消", "job_id": job_id, "state": "cancelled"}
     if status in ("success", "failed", "cancelled", "stopped"):
         return {"ok": True, "message": f"任务已结束：{status}", "job_id": job_id, "state": status}
@@ -669,15 +1106,24 @@ def request_stop_job(job_id: int) -> dict:
                 completed_at=now_iso,
                 error="用户手动停止（任务实例不存在）",
             )
-            _release_unconsumed_job_email(
-                str(job.get("email") or "").strip() or None,
-                "任务实例不存在，确认未继续执行",
+            if str(job.get("job_type") or "registration") != "local_test":
+                _release_unconsumed_job_email(
+                    str(job.get("email") or "").strip() or None,
+                    "任务实例不存在，确认未继续执行",
+                )
+            _append_job_log(
+                job_id,
+                "用户手动停止：未找到运行中的任务实例，已直接标记为已停止。",
+                marker="manual-stop",
             )
-            _append_job_log(job_id, "用户手动停止：未找到运行中的任务实例，已直接标记为已停止。")
             logger.warning("[Service] 用户停止任务 #%s：任务实例不存在，已直接标记 stopped", job_id)
             return {"ok": True, "message": "任务实例不存在，已直接标记为已停止", "job_id": job_id, "state": "stopped"}
         db.update_job(job_id, status="stopping", error="用户手动停止中")
-        _append_job_log(job_id, "用户手动停止：已发送停止信号，任务会在当前步骤检查点退出。")
+        _append_job_log(
+            job_id,
+            "用户手动停止：已发送停止信号，任务会在当前步骤检查点退出。",
+            marker="manual-stop",
+        )
         logger.warning("[Service] 用户请求停止任务 #%s", job_id)
         return {"ok": True, "message": "已发送停止信号", "job_id": job_id, "state": "stopping"}
     return {"ok": False, "error": f"当前状态不支持停止：{status}", "status": 409}

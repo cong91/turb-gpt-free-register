@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from urllib.parse import quote, urlparse
@@ -145,7 +146,7 @@ def _extract_codes(data: dict) -> list[tuple[str, str | None, int | None]]:
 def _code_identity(code: tuple[str, str | None, int | None]) -> str:
     value, received_at, message_id = code
     if message_id is not None:
-        return f"id:{message_id}"
+        return f"id:{message_id}:{value}"
     if received_at:
         return f"received:{received_at}:{value}"
     return f"code:{value}"
@@ -155,26 +156,24 @@ def _remember_codes(seen_codes: set[str], codes: list[tuple[str, str | None, int
     seen_codes.update(_code_identity(code) for code in codes)
 
 
-def _newest_unseen_code(
+def _code_candidates(
     seen_codes: set[str],
     codes: list[tuple[str, str | None, int | None]],
     after_ts: float | None = None,
-) -> str | None:
+) -> list[tuple[str, str | None, int | None]]:
     candidates = []
     for code in codes:
         received_at = _received_at_timestamp(code[1])
         if after_ts is not None and received_at is not None and received_at <= after_ts:
             continue
-        if _code_identity(code) in seen_codes and not (
-            after_ts is not None and received_at is not None and received_at > after_ts
-        ):
+        if _code_identity(code) in seen_codes:
             continue
         candidates.append(code)
-    if not candidates:
-        return None
-    code = max(candidates, key=lambda item: (item[1] or "", item[2] if item[2] is not None else -1))
-    seen_codes.add(_code_identity(code))
-    return code[0]
+    return sorted(
+        candidates,
+        key=lambda item: (item[1] or "", item[2] if item[2] is not None else -1),
+        reverse=True,
+    )
 
 
 def _received_at_timestamp(value: str | None) -> float | None:
@@ -206,11 +205,9 @@ def _alias_variants(email: str, limit: int) -> list[str]:
     count = max(0, min(MAX_ACCOUNTS_PER_CDK, int(limit)))
     if count == 0:
         return []
-    variants = []
-    for index in range(count):
-        suffix = hashlib.sha256(f"paymesh:{value}:{index}".encode("utf-8")).hexdigest()[:5]
-        variants.append(f"{local}+{suffix}@{domain}")
-    return variants
+    from core.paymesh_aliases import alias_suffix
+
+    return [f"{local}+{alias_suffix(value, index)}@{domain}" for index in range(count)]
 
 
 def _account_from_payload(cdk: str, data: dict) -> PaymeshMailAccount:
@@ -222,7 +219,9 @@ def _account_from_payload(cdk: str, data: dict) -> PaymeshMailAccount:
         expires_at=expires_at,
         status=status,
     )
-    _remember_codes(account.seen_codes, _extract_codes(data))
+    codes = _extract_codes(data)
+    _remember_codes(account.seen_codes, codes)
+    _remember_durable_codes(cdk, codes)
     return account
 
 
@@ -240,14 +239,21 @@ def redeem_cdk(
     url = _endpoint(api_base, "/api/v1/redeem")
     data = _request_json(client, "POST", url, json_payload={"code": value}, timeout=max(1, int(timeout)))
     code = _biz_code(data)
-    if code == 2004:
+    looked_up = False
+    if code in {2002, 2004}:
         data = lookup_order(value, session=client, api_base=api_base, timeout=timeout)
+        looked_up = True
     elif code != 0:
         raise _mapped_error(code, _biz_msg(data))
 
     parsed = _extract_email_info_if_present(data)
-    if parsed is None:
+    codes = _extract_codes(data)
+    if not looked_up and (parsed is None or not codes):
         data = lookup_order(value, session=client, api_base=api_base, timeout=timeout)
+        looked_up = True
+        parsed = _extract_email_info(data)
+        codes = _extract_codes(data)
+    elif parsed is None:
         parsed = _extract_email_info(data)
     email, expires_at, status = parsed
     account = PaymeshMailAccount(
@@ -257,7 +263,8 @@ def redeem_cdk(
         expires_at=expires_at,
         status=status,
     )
-    _remember_codes(account.seen_codes, _extract_codes(data))
+    _remember_codes(account.seen_codes, codes)
+    _remember_durable_codes(value, codes)
     return account
 
 
@@ -274,6 +281,8 @@ def lookup_order(
     url = _endpoint(api_base, f"/api/v1/order/lookup?code={quote(value, safe='')}&poll=true")
     data = _request_json(session or requests, "GET", url, timeout=max(1, int(timeout)))
     code = _biz_code(data)
+    if code == 2002 and _extract_email_info_if_present(data) is not None:
+        return data
     if code != 0:
         raise _mapped_error(code, _biz_msg(data))
     return data
@@ -298,9 +307,17 @@ def poll_verification_code(
             parsed = _extract_email_info_if_present(data)
             if parsed is not None:
                 _, account.expires_at, account.status = parsed
-            code = _newest_unseen_code(account.seen_codes, _extract_codes(data), after_ts=after_ts)
-            if code:
-                return code
+            codes = _extract_codes(data)
+            candidates = _code_candidates(account.seen_codes, codes, after_ts=after_ts)
+            if candidates:
+                candidate = candidates[0]
+                if _claim_durable_code(account.cdk, candidate, codes):
+                    _remember_codes(account.seen_codes, codes)
+                    return candidate[0]
+                _remember_codes(account.seen_codes, codes)
+            elif codes:
+                _remember_codes(account.seen_codes, codes)
+                _remember_durable_codes(account.cdk, codes)
         except PaymeshMailError as exc:
             last_error = exc
         if time.monotonic() >= deadline:
@@ -315,9 +332,61 @@ _CONTEXT_CACHE: dict[str, PaymeshMailAccount] = {}
 _SEEN_CODES_BY_CDK: dict[str, set[str]] = {}
 _LEDGER: object | None = None
 _INVENTORY_STORE: object | None = None
+_OTP_STORE: object | None = None
 _CDK_LOCKS: dict[str, threading.Lock] = {}
 _CDK_LOCKS_GUARD = threading.Lock()
 _CDK_LOCK_WAIT = 600
+
+
+def _otp_store():
+    global _OTP_STORE
+    if _OTP_STORE is None:
+        from pathlib import Path
+
+        from core.otp_identity_store import OtpIdentityStore
+
+        _OTP_STORE = OtpIdentityStore(
+            Path(__file__).resolve().parent.parent / "otp_identity.sqlite3"
+        )
+    return _OTP_STORE
+
+
+def _cdk_fingerprint(cdk: str) -> str:
+    return _otp_store().fingerprint("paymesh", cdk)
+
+
+def _remember_durable_codes(cdk: str, codes: list[tuple[str, str | None, int | None]]) -> None:
+    if not codes:
+        return
+    identities: list[str] = []
+    for code in codes:
+        identities.extend(_identity_claims(code))
+    _otp_store().remember_many("paymesh", _cdk_fingerprint(cdk), identities)
+
+
+def _identity_claims(code: tuple[str, str | None, int | None]) -> list[str]:
+    identities = [_code_identity(code)]
+    if code[0]:
+        identities.append(f"value:{code[0]}")
+    return identities
+
+
+def _claim_durable_code(
+    cdk: str,
+    code: tuple[str, str | None, int | None],
+    observed: list[tuple[str, str | None, int | None]],
+) -> bool:
+    observed_identities: list[str] = []
+    for item in observed:
+        observed_identities.extend(_identity_claims(item))
+    return bool(
+        _otp_store().claim_with_snapshot(
+            "paymesh",
+            _cdk_fingerprint(cdk),
+            claim_identities=_identity_claims(code),
+            observed_identities=observed_identities,
+        )
+    )
 
 
 def _cdk_lock_key(cdk: str) -> str:
@@ -350,9 +419,20 @@ def _historical_emails() -> set[str]:
     }
 
 
-def _unused_alias_variants(email: str, limit: int) -> list[str]:
+def _unused_alias_variants(
+    email: str,
+    limit: int,
+    routed_domains: Sequence = (),
+) -> list[str]:
+    from core.paymesh_aliases import build_paymesh_alias_plan
+
     used = _historical_emails()
-    return [alias for alias in _alias_variants(email, limit) if _cache_key(alias) not in used]
+    try:
+        plan = build_paymesh_alias_plan(email, limit=limit, routed_domains=routed_domains)
+    except PaymeshMailError:
+        # Fallback về original-only khi routed domain không hợp lệ tại runtime.
+        plan = build_paymesh_alias_plan(email, limit=limit, routed_domains=())
+    return [c.email for c in plan.candidates if _cache_key(c.email) not in used]
 
 
 def _config_values() -> tuple[str, int, int]:
@@ -391,7 +471,8 @@ def _ledger():
     return _LEDGER
 
 
-def pick_account(job_id: str, cdks: list[str]) -> PaymeshMailAccount:
+def pick_account(job_id: str, cdks: list[str], *, routed_domains: Sequence = ()) -> PaymeshMailAccount:
+    from core.paymesh_aliases import normalize_paymesh_routed_domains
     from core.provider_card_ledger import ProviderCardQuotaError
 
     owner = str(job_id or "").strip()
@@ -418,13 +499,17 @@ def pick_account(job_id: str, cdks: list[str]) -> PaymeshMailAccount:
                         raise
                     lookup_data = lookup_order(cdk, api_base=api_base, timeout=timeout)
                     redeemed = _account_from_payload(cdk, lookup_data)
-                variants = _unused_alias_variants(redeemed.email, limit=limit)
+                source_domain = redeemed.email.split("@", 1)[1] if "@" in redeemed.email else None
+                domains = normalize_paymesh_routed_domains(routed_domains, source_domain=source_domain)
+                variants = _unused_alias_variants(redeemed.email, limit=limit, routed_domains=domains)
+                cap = limit * (1 + len(domains))
                 slot = ledger.reserve(
                     cdk,
                     variants,
                     owner,
-                    remote_remaining=MAX_ACCOUNTS_PER_CDK,
-                    configured_limit=limit,
+                    remote_remaining=cap,
+                    configured_limit=cap,
+                    max_capacity=cap,
                 )
                 seen_codes = _SEEN_CODES_BY_CDK.setdefault(ledger.card_key(cdk), set())
                 seen_codes.update(redeemed.seen_codes)
@@ -466,12 +551,31 @@ def _inventory_store(store_path=None):
     return _INVENTORY_STORE
 
 
+def pick_account_for_inventory(
+    job_id: str,
+    inventory_id: str,
+    *,
+    routed_domains: Sequence = (),
+) -> PaymeshMailAccount:
+    """Resolve one durable job assignment and reuse the existing Paymesh flow."""
+    value = str(inventory_id or "").strip()
+    if not value:
+        raise PaymeshMailError("Thiếu Paymesh inventory ID đã gán cho job")
+    store = _inventory_store()
+    inventory = store.get_inventory(value)
+    if inventory is None or inventory.provider != "paymesh" or inventory.state != "active":
+        raise PaymeshMailError("Paymesh inventory đã gán không còn khả dụng")
+    raw_cdk = store.resolve_raw_cdk(value)
+    return pick_account(job_id, [raw_cdk], routed_domains=routed_domains)
+
+
 def pick_account_by_inventory(
     job_id: str,
     inventory_ids: list[str],
     *,
     store_path: str | None = None,
     ttl_seconds: float = 600,
+    routed_domains: Sequence = (),
 ) -> PaymeshMailAccount:
     """Acquire a Paymesh alias using a managed inventory ID with fencing lease.
 
@@ -481,6 +585,7 @@ def pick_account_by_inventory(
     import uuid
 
     from core.cdk_inventory_store import CdkInventoryConflict
+    from core.paymesh_aliases import normalize_paymesh_routed_domains
 
     owner = str(job_id or "").strip()
     if not owner:
@@ -506,7 +611,15 @@ def pick_account_by_inventory(
         owner_token = uuid.uuid4().hex
         try:
             redeemed = redeem_cdk(raw_cdk, api_base=api_base, timeout=timeout)
-            variants = _unused_alias_variants(redeemed.email, limit=limit)
+            source_domain = redeemed.email.split("@", 1)[1] if "@" in redeemed.email else None
+            domains = normalize_paymesh_routed_domains(routed_domains, source_domain=source_domain)
+            variants = _unused_alias_variants(redeemed.email, limit=limit, routed_domains=domains)
+            cap = limit * (1 + len(domains))
+            if inventory.configured_limit < cap:
+                try:
+                    store.update_configured_limit(inventory_id, cap)
+                except Exception:
+                    pass
             reservation = store.reserve_first_available_slot(
                 inventory_id, variants, owner,
                 operation_id=operation_id, owner_token=owner_token,
@@ -620,6 +733,14 @@ def fetch_latest_otp(
     )
 
 
+def block_account_card(email: str, reason: str = "provider_rejected") -> bool:
+    """Block the raw Paymesh card after a provider-level account rejection."""
+    account = get_account_context(email)
+    if account is None or account.reservation_id or account.inventory_id:
+        return False
+    return bool(_ledger().block_card(account.email, account.job_id, reason))
+
+
 def release_account(email: str, status: str = "available", note: str | None = None) -> bool:
     del note
     account = _CONTEXT_CACHE.pop(_cache_key(email), None)
@@ -656,8 +777,17 @@ def mark_account_consumed(email: str) -> bool:
                 owner_token=account.owner_token or "",
             )
         )
-    else:
+        if changed:
+            _CONTEXT_CACHE.pop(_cache_key(email), None)
+        return changed
+    try:
         changed = bool(_ledger().consume(account.email, account.job_id))
-    if changed:
+    finally:
+        # Raw CDK reservations retain the per-CDK lock until the account is
+        # consumed or released; always clean up even when ledger transition fails.
         _CONTEXT_CACHE.pop(_cache_key(email), None)
+        try:
+            _get_cdk_lock(account.cdk).release()
+        except RuntimeError:
+            pass
     return changed
