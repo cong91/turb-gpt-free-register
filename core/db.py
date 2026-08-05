@@ -393,6 +393,7 @@ def _query_collection_page(collection: str, *, status: str | None = None,
 def _account_filter_sql(
     plan_filter: str | None = None,
     codex_filter: str | None = None,
+    free_plus_export_filter: str | None = None,
 ) -> tuple[list[str], list[Any]]:
     """把账号列表的兼容过滤条件下推到 SQLite。
 
@@ -403,13 +404,20 @@ def _account_filter_sql(
     params: list[Any] = []
     plan = str(plan_filter or "").strip().lower()
     codex = str(codex_filter or "").strip().lower()
+    free_plus_export = str(free_plus_export_filter or "").strip().lower()
 
     plan_expr = (
         "lower(COALESCE(NULLIF(CAST(json_extract(payload, '$.current_plan_type') AS TEXT), ''), "
         "CAST(json_extract(payload, '$.plan_type') AS TEXT), ''))"
     )
     if plan and plan not in {"all", "any"}:
-        if plan == "plus":
+        if plan in {"free_plus", "free_plus_trial", "plus_trial_eligible"}:
+            where.extend([
+                f"{plan_expr} = ?",
+                "COALESCE(json_extract(payload, '$.plus_trial_eligible'), 0) IN (1, '1', 'true')",
+            ])
+            params.append("free")
+        elif plan == "plus":
             # 与 _account_matches_plan_filter 保持一致：free(可试用)不算已开通 Plus。
             where.extend([f"{plan_expr} LIKE ?", f"{plan_expr} NOT LIKE ?"])
             params.extend(["%plus%", "%free%"])
@@ -419,6 +427,13 @@ def _account_filter_sql(
         else:
             where.append(f"{plan_expr} = ?")
             params.append(plan)
+
+    if free_plus_export and free_plus_export not in {"all", "any"}:
+        exported_expr = "json_extract(payload, '$.free_plus_exported_at')"
+        if free_plus_export in {"unexported", "pending", "未导出"}:
+            where.append(f"({exported_expr} IS NULL OR CAST({exported_expr} AS TEXT) = '')")
+        elif free_plus_export in {"exported", "done", "已导出"}:
+            where.append(f"({exported_expr} IS NOT NULL AND CAST({exported_expr} AS TEXT) != '')")
 
     status_expr = "lower(COALESCE(CAST(json_extract(payload, '$.codex_status') AS TEXT), ''))"
     live_status_expr = "lower(COALESCE(CAST(json_extract(payload, '$.live_check_status') AS TEXT), ''))"
@@ -537,6 +552,46 @@ def _account_line(row: dict) -> str:
     return "----".join(parts)
 
 
+def _registration_password(row: dict) -> str:
+    value = row.get("registration_password")
+    if value is not None:
+        return str(value or "")
+    extra_json = row.get("extra_json")
+    if extra_json:
+        try:
+            extra = json.loads(extra_json) if isinstance(extra_json, str) else extra_json
+        except (TypeError, ValueError, json.JSONDecodeError):
+            extra = {}
+        if isinstance(extra, dict):
+            return str(extra.get("registration_password") or "")
+    return ""
+
+
+def _normalize_account_line_format(format_name: str | None = None) -> str:
+    value = str(format_name or "modern").strip().lower()
+    if value in {"legacy", "old", "current_legacy"}:
+        return "legacy"
+    if value in {"modern", "current", "email_pass_2fa"}:
+        return "modern"
+    raise ValueError("format 仅支持 modern 或 legacy")
+
+
+def account_line(row: dict, format_name: str | None = None) -> str:
+    """生成账号导出行；格式仅影响导出，不改变账号存储。"""
+    output_format = _normalize_account_line_format(format_name)
+    if output_format == "legacy":
+        material = row.get("original_email_line") or row.get("email") or ""
+        token = row.get("access_token") or ""
+        totp = row.get("totp_secret") or ""
+        return f"{material}----{token}----{totp}" if totp else f"{material}----{token}"
+    email = str(row.get("email") or "")
+    password = _registration_password(row)
+    totp = str(row.get("totp_secret") or "")
+    return f"{email} | {password} | {totp}"
+
+
+
+
 def _registered_email_line(row: dict) -> str:
     """生成注册成功邮箱 TXT 的行内容；token 由注册成功的token.txt 单独保存。"""
     return row.get("original_email_line") or row.get("email") or ""
@@ -606,18 +661,32 @@ def _decorate_account(row: dict) -> dict:
 
 
 def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> bool:
-    """账号套餐过滤。plus 表示已开通 Plus（兼容 plus/chatgpt_plus/plus_trial 等标记）。"""
+    """账号套餐过滤。plus 表示已开通 Plus；free_plus 表示可用 Plus 试用。"""
     f = str(plan_filter or "").strip().lower()
     if not f or f in {"all", "any"}:
         return True
     plan = str(row.get("current_plan_type") or row.get("plan_type") or "").strip().lower()
+    if f in {"free_plus", "free_plus_trial", "plus_trial_eligible"}:
+        return plan == "free" and bool(row.get("plus_trial_eligible"))
     if f == "plus":
-        # “free(可Plus试用)”/plus_trial_eligible 只是可试用，不算已开通 Plus。
-        # 只有套餐字段本身是 Plus/ChatGPT Plus/plus_* 且不含 free 时才命中。
+        # “free(可Plus试用)”只是可试用，不算已开通 Plus。
         return "plus" in plan and "free" not in plan
     if f == "free":
         return plan == "free"
     return plan == f
+
+
+def _account_matches_free_plus_export_filter(row: dict, export_filter: str | None = None) -> bool:
+    value = str(export_filter or "").strip().lower()
+    if not value or value in {"all", "any"}:
+        return True
+    exported = bool(row.get("free_plus_exported_at"))
+    if value in {"unexported", "pending", "未导出"}:
+        return not exported
+    if value in {"exported", "done", "已导出"}:
+        return exported
+    return True
+
 
 
 def _decorate_outlook(row: dict, account_by_email: dict[str, dict] | None = None) -> dict:
@@ -766,6 +835,10 @@ def insert_account(
     device_id: str | None = None,
     proxy_used: str | None = None,
     email_source: str | None = None,
+    source_cdk: str | None = None,
+    registration_password: str | None = None,
+    twofa_status: str | None = None,
+    twofa_error: str | None = None,
     extra: dict | None = None,
     codex_status: str | None = None,   # success / failed / skipped / missing
     codex_error: str | None = None,    # 失败原因（仅 codex_status=failed 时有意义）
@@ -777,6 +850,11 @@ def insert_account(
         existing = _find_by_email(accounts, email)
         outlook_row = _find_by_email(outlook_rows, email)
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
+        registration_password = (
+            str(registration_password)
+            if registration_password is not None
+            else str((extra or {}).get("registration_password") or "")
+        )
 
         if existing is None:
             row_id = _next_id(accounts)
@@ -799,6 +877,14 @@ def insert_account(
             "expires_at": expires_at if expires_at is not None else row.get("expires_at"),
             "proxy_used": proxy_used if proxy_used is not None else row.get("proxy_used"),
             "email_source": email_source if email_source is not None else row.get("email_source"),
+            "source_cdk": source_cdk if source_cdk is not None else row.get("source_cdk"),
+            "registration_password": (
+                registration_password
+                if registration_password
+                else row.get("registration_password") or _registration_password(row)
+            ),
+            "twofa_status": twofa_status if twofa_status is not None else row.get("twofa_status"),
+            "twofa_error": twofa_error if twofa_error is not None else row.get("twofa_error"),
             "extra_json": extra_json if extra_json is not None else row.get("extra_json"),
             "codex_status": codex_status if codex_status is not None else row.get("codex_status"),
             "codex_error": codex_error if codex_error is not None else row.get("codex_error"),
@@ -1292,6 +1378,7 @@ def _filtered_decorated_accounts(
     plan_filter: str | None = None,
     codex_filter: str | None = None,
     q: str | None = None,
+    free_plus_export_filter: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> list[dict]:
@@ -1305,6 +1392,7 @@ def _filtered_decorated_accounts(
     decorated = [_decorate_account(r) for r in rows]
     decorated = [r for r in decorated if _account_matches_plan_filter(r, plan_filter)]
     decorated = [r for r in decorated if _matches_codex_status_filter(r, codex_filter)]
+    decorated = [r for r in decorated if _account_matches_free_plus_export_filter(r, free_plus_export_filter)]
     decorated = [r for r in decorated if _account_matches_query(r, q)]
     # 按创建时间筛选（date_from/date_to 为 ISO 字符串或 YYYY-MM-DD）
     if date_from or date_to:
@@ -1334,6 +1422,7 @@ def list_account_plan_check_statuses(
     q: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
+    free_plus_export_filter: str | None = None,
 ) -> dict:
     """返回不含 Token/邮箱密码的套餐查询轻量状态快照。"""
     fields = (
@@ -1352,6 +1441,7 @@ def list_account_plan_check_statuses(
         "extract_link_long_url", "extract_link_copy_paste",
         "extract_link_image_url_png", "extract_link_image_url_svg",
         "extract_link_expires_at",
+        "free_plus_exported_at", "free_plus_export_count", "free_plus_export_format", "free_plus_export_source",
         "codex_status", "codex_error",
         "codex_agent_status", "codex_agent_message",
         "codex_agent_runtime_id", "codex_agent_sub2api_url",
@@ -1363,7 +1453,11 @@ def list_account_plan_check_statuses(
     with _LOCK:
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
-        extra_where, extra_params = _account_filter_sql(plan_filter, codex_filter)
+        extra_where, extra_params = _account_filter_sql(
+            plan_filter,
+            codex_filter,
+            free_plus_export_filter,
+        )
         candidates, total, latest = _query_collection_page(
             "accounts",
             archived=archived,
@@ -1436,6 +1530,7 @@ def list_accounts(
     plan_filter: str | None = None,
     codex_filter: str | None = None,
     q: str | None = None,
+    free_plus_export_filter: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> list[dict]:
@@ -1447,6 +1542,7 @@ def list_accounts(
         plan_filter=plan_filter,
         codex_filter=codex_filter,
         q=q,
+        free_plus_export_filter=free_plus_export_filter,
         date_from=date_from,
         date_to=date_to,
     )
@@ -1460,13 +1556,18 @@ def list_accounts_page(
     plan_filter: str | None = None,
     codex_filter: str | None = None,
     q: str | None = None,
+    free_plus_export_filter: str | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> dict:
     with _LOCK:
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
-        extra_where, extra_params = _account_filter_sql(plan_filter, codex_filter)
+        extra_where, extra_params = _account_filter_sql(
+            plan_filter,
+            codex_filter,
+            free_plus_export_filter,
+        )
         candidates, total, latest = _query_collection_page(
             "accounts",
             archived=archived,
@@ -1740,6 +1841,91 @@ def update_accounts_note(account_ids: list[int] | None, note: str) -> tuple[list
     return updated, skipped
 
 
+def mark_accounts_free_plus_exported(
+    account_ids: list[int],
+    *,
+    format_name: str,
+    source: str = "free_plus_txt",
+) -> tuple[list[dict], list[dict]]:
+    """记录 Free Plus 导出并归档；普通手动归档不会调用此入口。"""
+    ids = {int(item) for item in account_ids}
+    updated: list[dict] = []
+    skipped: list[dict] = []
+    with _LOCK:
+        rows = _load_accounts()
+        seen_ids: set[int] = set()
+        now = _now()
+        for row in rows:
+            row_id = int(row.get("id") or 0)
+            if row_id not in ids:
+                continue
+            seen_ids.add(row_id)
+            if not _account_matches_plan_filter(row, "free_plus"):
+                skipped.append({"id": row_id, "email": row.get("email"), "reason": "不是可用 Plus 试用账号"})
+                continue
+            row["free_plus_exported_at"] = now
+            row["free_plus_export_count"] = int(row.get("free_plus_export_count") or 0) + 1
+            row["free_plus_export_format"] = _normalize_account_line_format(format_name)
+            row["free_plus_export_source"] = str(source or "free_plus_txt")
+            row["archived"] = True
+            row["archived_at"] = now
+            row["updated_at"] = now
+            updated.append({
+                "id": row_id,
+                "email": row.get("email"),
+                "free_plus_exported_at": now,
+                "free_plus_export_count": row["free_plus_export_count"],
+                "archived": True,
+            })
+        for item in ids - seen_ids:
+            skipped.append({"id": item, "reason": "账号不存在"})
+        if updated:
+            _save_accounts(rows)
+    return updated, skipped
+
+
+def set_accounts_free_plus_export_state(
+    account_ids: list[int],
+    *,
+    exported: bool,
+) -> tuple[list[dict], list[dict]]:
+    """手动校准历史导出状态；不改变账号的归档状态。"""
+    ids = {int(item) for item in account_ids}
+    updated: list[dict] = []
+    skipped: list[dict] = []
+    with _LOCK:
+        rows = _load_accounts()
+        seen_ids: set[int] = set()
+        now = _now()
+        for row in rows:
+            row_id = int(row.get("id") or 0)
+            if row_id not in ids:
+                continue
+            seen_ids.add(row_id)
+            if exported:
+                row["free_plus_exported_at"] = row.get("free_plus_exported_at") or now
+                row["free_plus_export_count"] = max(1, int(row.get("free_plus_export_count") or 0))
+                row["free_plus_export_source"] = "manual"
+            else:
+                row["free_plus_exported_at"] = None
+                row["free_plus_export_count"] = 0
+                row["free_plus_export_format"] = None
+                row["free_plus_export_source"] = None
+            row["updated_at"] = now
+            updated.append({
+                "id": row_id,
+                "email": row.get("email"),
+                "free_plus_exported_at": row.get("free_plus_exported_at"),
+                "free_plus_export_count": row.get("free_plus_export_count") or 0,
+                "archived": bool(row.get("archived")),
+            })
+        for item in ids - seen_ids:
+            skipped.append({"id": item, "reason": "账号不存在"})
+        if updated:
+            _save_accounts(rows)
+    return updated, skipped
+
+
 def archive_account(acc_id: int, archived: bool = True) -> bool:
     """归档/取消归档单个已注册账号。归档不会删除 token，只影响默认账号列表查询。"""
     with _LOCK:
@@ -1993,6 +2179,7 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
                 "plan_type": raw.get("plan_type"),
                 "expires_at": raw.get("expires_at"),
                 "device_id": raw.get("device_id"),
+                "registration_password": (raw.get("registration_password") or raw.get("account_password") or "").strip(),
                 "proxy_used": raw.get("proxy_used"),
                 "email_source": source,
                 "extra_json": json.dumps({"imported_registered": True}, ensure_ascii=False),
@@ -2474,6 +2661,7 @@ def _new_job_row(
     retry_action: str | None = None,
     email: str | None = None,
     account_id: int | None = None,
+    provider_context: dict | None = None,
 ) -> dict:
     job_uuid = str(uuid.uuid4())
     log_file = str(_LOG_DIR / f"{job_uuid}.log")
@@ -2494,15 +2682,28 @@ def _new_job_row(
         "started_at": None,
         "completed_at": None,
         "account_id": account_id,
+        "provider_context": dict(provider_context or {}),
         "created_at": _now(),
     }
 
 
-def create_job(email_source: str) -> dict:
-    """创建一个首次执行的 pending 注册任务。"""
+def create_job(
+    email_source: str,
+    *,
+    job_type: str = "registration",
+    email: str | None = None,
+    provider_context: dict | None = None,
+) -> dict:
+    """创建一个首次执行的 pending 任务。"""
     with _LOCK:
         rows = _load_jobs()
-        row = _new_job_row(rows, email_source=email_source)
+        row = _new_job_row(
+            rows,
+            email_source=email_source,
+            job_type=job_type,
+            email=email,
+            provider_context=provider_context,
+        )
         rows.append(row)
         _save_jobs(rows)
         return dict(row)
@@ -2553,6 +2754,7 @@ def create_retry_job(
             retry_action=("codex" if job_type == "codex_retry" else "registration"),
             email=email,
             account_id=account_id,
+            provider_context=dict(source.get("provider_context") or {}),
         )
         rows.append(row)
         _save_jobs(rows)

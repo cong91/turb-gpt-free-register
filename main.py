@@ -185,14 +185,28 @@ def run_registration(
     driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
     if driver_mode in ("roxy", "roxybrowser", "fingerprint", "browser"):
         from core.roxy_registration import run_roxy_registration
-        return run_roxy_registration(
-            email=email,
-            name=name,
-            birthday=birthday or generate_random_birthday(),
-            proxy=proxy,
-            otp_code=otp_code,
-            batch_dir=batch_dir,
-        )
+
+        if proxy:
+            return run_roxy_registration(
+                email=email,
+                name=name,
+                birthday=birthday or generate_random_birthday(),
+                proxy=proxy,
+                otp_code=otp_code,
+                batch_dir=batch_dir,
+            )
+
+        from core.nordvpn_wireguard import proxy_for_registration
+
+        with proxy_for_registration() as nordvpn_proxy:
+            return run_roxy_registration(
+                email=email,
+                name=name,
+                birthday=birthday or generate_random_birthday(),
+                proxy=nordvpn_proxy,
+                otp_code=otp_code,
+                batch_dir=batch_dir,
+            )
     if driver_mode in ("cloak", "cloakbrowser"):
         from core.cloakbrowser_registration import run_cloak_registration
         return run_cloak_registration(
@@ -438,16 +452,21 @@ def run_registration(
 
         # ==================== 阶段7: 设置 2FA（受 config.ENABLE_2FA 控制）====================
         totp_secret = None
+        twofa_status = "disabled"
+        twofa_error = None
         if _twofa_cfg.ENABLE_2FA:
             # 步骤14-20: 重认证（要再收一次邮箱 OTP）→ enroll TOTP → activate
             try:
                 totp_secret = setup_2fa(session, email)
+                twofa_status = "active"
             except Exception as exc:
-                logger.error(f"2FA 设置失败: {exc}")
-                logger.debug("2FA 错误详情:", exc_info=True)
-                logger.warning("将继续保存账号信息（不含 TOTP secret），可后续手动设置")
+                twofa_status = "failed"
+                twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                logger.error(f"2FA 设置失败: {twofa_error}")
+                raise RuntimeError(f"2FA 设置失败，未保存为成功账号: {twofa_error}") from exc
         else:
             logger.debug("已跳过 2FA 设置 (config.ENABLE_2FA=False)")
+
 
         # ==================== 阶段 7.5: Codex OAuth（注册成功→拿回调/CPA凭证）====================
         # 用全新干净 session 从头登录该邮箱，走 邮箱OTP→手机短信验证(接码)→选workspace
@@ -494,6 +513,8 @@ def run_registration(
                 "device_id": session.device_id,
                 "sentinel_sid": getattr(session, "sentinel_sid", None),
                 "browser_profile": getattr(session, "browser_profile", None),
+                "twofa_status": twofa_status,
+                "twofa_error": twofa_error,
                 "codex": codex_result,
             },
         )
@@ -537,6 +558,7 @@ def run_registration(
 
         return {"success": task_success, "email": email, "account_id": account_id,
                 "access_token": access_token, "totp_secret": totp_secret,
+                "twofa_status": twofa_status, "twofa_error": twofa_error,
                 "flow": flow_result, "codex": codex_result,
                 "error": task_error}
 

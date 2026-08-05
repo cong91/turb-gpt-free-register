@@ -56,6 +56,185 @@ def post_register_dwell(email: str, *, label: str = "注册后") -> None:
     time.sleep(seconds)
 
 
+class _BrowserResponse:
+    def __init__(self, response):
+        self.status_code = int(getattr(response, "status", 0) or 0)
+        text = getattr(response, "text", "")
+        self.text = text() if callable(text) else str(text or "")
+        self._response = response
+        self.url = str(getattr(response, "url", "") or "")
+
+    def json(self):
+        return self._response.json()
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self.text[:500]}")
+
+
+class _ScriptResponse:
+    def __init__(self, payload: dict):
+        self.status_code = int(payload.get("status") or 0)
+        self.text = str(payload.get("text") or "")
+        self.url = str(payload.get("url") or "")
+        self._data = payload.get("json")
+
+    def json(self):
+        if self._data is not None:
+            return self._data
+        return json.loads(self.text or "{}")
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}: {self.text[:500]}")
+
+
+class BrowserPageTransport:
+    """用 Selenium 页面 fetch 执行 2FA 请求，保持当前浏览器登录态。"""
+
+    def __init__(self, driver):
+        self.driver = driver
+        self.device_id = ""
+        try:
+            cookie = self.driver.get_cookie("oai-did") or {}
+            self.device_id = str(cookie.get("value") or "")
+        except Exception:
+            pass
+
+    def navigator_language(self) -> str:
+        try:
+            return str(self.driver.execute_script("return navigator.language") or "en-US")
+        except Exception:
+            return "en-US"
+
+    def _request(self, method: str, url: str, headers: dict | None = None, data: str | None = None):
+        current_url = str(getattr(self.driver, "current_url", "") or "")
+        if current_url and urlparse(current_url).netloc != urlparse(url).netloc:
+            self.driver.get(url)
+        script = """
+        const done = arguments[arguments.length - 1];
+        const method = arguments[0];
+        const url = arguments[1];
+        const headers = arguments[2] || {};
+        const body = arguments[3];
+        fetch(url, {method, headers, body, credentials: 'include', redirect: 'follow'})
+          .then(async response => {
+            const text = await response.text();
+            let json = null;
+            try { json = text ? JSON.parse(text) : null; } catch (_) {}
+            done({status: response.status, url: response.url, text, json});
+          })
+          .catch(error => done({status: 0, url, text: String(error), json: null}));
+        """
+        payload = self.driver.execute_async_script(script, method, url, headers or {}, data)
+        return _ScriptResponse(payload or {"status": 0, "text": "browser request returned no response"})
+
+    def get(self, url: str, headers: dict | None = None, **kwargs):
+        return self._request("GET", url, headers=headers)
+
+    def post(self, url: str, headers: dict | None = None, **kwargs):
+        return self._request("POST", url, headers=headers, data=kwargs.get("data"))
+
+    def get_nextauth_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+        return {"accept": "*/*", "content-type": "application/json", "referer": referer}
+
+    def get_chatgpt_headers(self, referer: str = "https://chatgpt.com/login") -> dict:
+        return {"accept": "*/*", "content-type": "application/json", "referer": referer}
+
+    def get_auth_headers(self, referer: str = "https://auth.openai.com/create-account/password") -> dict:
+        return {"accept": "application/json", "content-type": "application/json", "origin": "https://auth.openai.com", "referer": referer}
+
+    def get_auth_navigate_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+        return {"accept": "text/html,application/xhtml+xml", "referer": referer}
+
+    def get_chatgpt_navigate_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+        return {"accept": "text/html,application/xhtml+xml", "referer": referer}
+
+    def navigate(self, url: str, referer: str | None = None) -> None:
+        self.driver.get(url)
+
+
+class BrowserContextTransport:
+    """用已登录 Playwright context 执行 2FA 请求，保持原浏览器 Cookie。"""
+
+    def __init__(self, context, page):
+        self.context = context
+        self.page = page
+        self.device_id = self._read_cookie("oai-did") or ""
+
+    def _read_cookie(self, name: str) -> str:
+        try:
+            cookies = self.context.cookies(["https://chatgpt.com", "https://auth.openai.com"])
+            for cookie in cookies:
+                if cookie.get("name") == name:
+                    return str(cookie.get("value") or "")
+        except Exception:
+            pass
+        return ""
+
+    def navigator_language(self) -> str:
+        try:
+            return str(self.page.evaluate("() => navigator.language") or "en-US")
+        except Exception:
+            return "en-US"
+
+    def _headers(self, headers: dict | None) -> dict:
+        out = dict(headers or {})
+        out.setdefault("accept", "*/*")
+        out.setdefault("origin", "https://chatgpt.com")
+        out.setdefault("user-agent", "Mozilla/5.0")
+        if self.device_id:
+            out.setdefault("oai-device-id", self.device_id)
+        return out
+
+    def get(self, url: str, headers: dict | None = None, **kwargs):
+        response = self.context.request.get(
+            url,
+            headers=self._headers(headers),
+            timeout=int(float(kwargs.get("timeout", 30)) * 1000),
+            fail_on_status_code=False,
+        )
+        return _BrowserResponse(response)
+
+    def post(self, url: str, headers: dict | None = None, **kwargs):
+        response = self.context.request.post(
+            url,
+            headers=self._headers(headers),
+            data=kwargs.get("data"),
+            timeout=int(float(kwargs.get("timeout", 30)) * 1000),
+            fail_on_status_code=False,
+        )
+        return _BrowserResponse(response)
+
+    def get_nextauth_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+        return {"accept": "*/*", "content-type": "application/json", "referer": referer}
+
+    def get_chatgpt_headers(self, referer: str = "https://chatgpt.com/login") -> dict:
+        return {"accept": "*/*", "content-type": "application/json", "referer": referer}
+
+    def get_auth_headers(self, referer: str = "https://auth.openai.com/create-account/password") -> dict:
+        return {"accept": "application/json", "content-type": "application/json", "origin": "https://auth.openai.com", "referer": referer}
+
+    def get_auth_navigate_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+        return {"accept": "text/html,application/xhtml+xml", "referer": referer}
+
+    def get_chatgpt_navigate_headers(self, referer: str = "https://chatgpt.com/") -> dict:
+        return {"accept": "text/html,application/xhtml+xml", "referer": referer}
+
+    def navigate(self, url: str, referer: str | None = None) -> None:
+        self.page.goto(url, wait_until="domcontentloaded")
+
+
+def setup_2fa_in_browser(context, page, email: str, otp_code: str | None = None) -> str:
+    """在现有 Playwright 登录态中执行 2FA 设置。"""
+    return setup_2fa(BrowserContextTransport(context, page), email, otp_code=otp_code)
+
+
+def setup_2fa_in_page(driver, email: str, otp_code: str | None = None) -> str:
+    """在现有 Selenium 登录态中执行 2FA 设置。"""
+    return setup_2fa(BrowserPageTransport(driver), email, otp_code=otp_code)
+
+
 def _account_material_line(email: str, row: dict | None = None) -> str:
     """优先输出 Outlook 原始素材；没有素材时退回邮箱地址。"""
     if row:
@@ -472,6 +651,18 @@ def save_account_data(
     if codex_status == "failed":
         codex_error = codex.get("message")
 
+    source_cdk = None
+    if email_source == "gmail_123452026":
+        from core.gmail_123452026_client import get_account_context
+
+        gmail_context = get_account_context(email)
+        source_cdk = gmail_context.cdk if gmail_context is not None else None
+    elif email_source == "paymesh":
+        from core.paymesh_mail_client import get_account_context
+
+        paymesh_context = get_account_context(email)
+        source_cdk = paymesh_context.cdk if paymesh_context is not None else None
+
     row_id = insert_account(
         email=email,
         access_token=access_token,
@@ -482,10 +673,16 @@ def save_account_data(
         expires_at=extra.get("expires"),
         proxy_used=proxy_used,
         email_source=email_source,
+        source_cdk=source_cdk,
+        registration_password=str(extra.get("registration_password") or ""),
+        twofa_status=str(extra.get("twofa_status") or ("active" if totp_secret else "disabled")),
+        twofa_error=extra.get("twofa_error"),
         extra=extra,
         codex_status=codex_status,
         codex_error=codex_error,
     )
+    from core.email_provider import mark_email_consumed
+    mark_email_consumed(email)
     batch_folder = _append_batch_archive(
         row_id=row_id,
         email=email,

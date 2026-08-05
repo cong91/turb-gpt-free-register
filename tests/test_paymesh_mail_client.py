@@ -28,6 +28,22 @@ class _Response:
 
 
 class PaymeshMailClientTests(unittest.TestCase):
+    def setUp(self):
+        from core import paymesh_mail_client as client
+        from core.otp_identity_store import OtpIdentityStore
+
+        self._otp_temp_dir = tempfile.TemporaryDirectory()
+        self._previous_otp_store = client._OTP_STORE
+        client._OTP_STORE = OtpIdentityStore(
+            Path(self._otp_temp_dir.name) / "otp.sqlite3"
+        )
+
+    def tearDown(self):
+        from core import paymesh_mail_client as client
+
+        client._OTP_STORE = self._previous_otp_store
+        self._otp_temp_dir.cleanup()
+
     def test_redeem_uses_paymesh_contract_without_exposing_card(self):
         session = Mock()
         session.post.return_value = _Response({
@@ -36,6 +52,10 @@ class PaymeshMailClientTests(unittest.TestCase):
                 "emailAddress": "User@example.com",
                 "endTime": "2026-08-01T00:00:00Z",
             },
+        })
+        session.get.return_value = _Response({
+            "code": 0,
+            "data": {"emailAddress": "User@example.com", "codes": []},
         })
 
         account = redeem_cdk("SECRET-CARD", session=session)
@@ -46,6 +66,53 @@ class PaymeshMailClientTests(unittest.TestCase):
             "https://sms.paymesh.cn/api/v1/redeem",
             json={"code": "SECRET-CARD"},
             headers={"Accept": "application/json", "Content-Type": "application/json"},
+            timeout=30,
+        )
+
+    def test_redeem_without_codes_looks_up_existing_otp_array(self):
+        session = Mock()
+        session.post.return_value = _Response({
+            "code": 0,
+            "data": {"emailAddress": "user@example.com"},
+        })
+        session.get.return_value = _Response({
+            "code": 0,
+            "data": {
+                "email": {
+                    "session": {"emailAddress": "user@example.com"},
+                    "codes": [{"id": 7, "code": "654321"}],
+                },
+            },
+        })
+
+        account = redeem_cdk("SECRET-CARD", session=session)
+
+        self.assertIn("id:7:654321", account.seen_codes)
+        self.assertEqual(session.get.call_count, 1)
+
+    def test_redeemed_card_code_2002_uses_lookup_even_when_lookup_code_is_2002(self):
+        session = Mock()
+        session.post.return_value = _Response({"code": 2002, "msg": "card already used"})
+        session.get.return_value = _Response({
+            "code": 2002,
+            "msg": "card already used",
+            "data": {
+                "email": {
+                    "session": {
+                        "emailAddress": "user@example.com",
+                        "status": "active",
+                    },
+                    "codes": [],
+                },
+            },
+        })
+
+        account = redeem_cdk("SECRET-CARD", session=session)
+
+        self.assertEqual(account.email, "user@example.com")
+        session.get.assert_called_once_with(
+            "https://sms.paymesh.cn/api/v1/order/lookup?code=SECRET-CARD&poll=true",
+            headers={"Accept": "application/json"},
             timeout=30,
         )
 
@@ -95,7 +162,7 @@ class PaymeshMailClientTests(unittest.TestCase):
             email="user+pm01@example.com",
             cdk="MAIL-ONE",
             remaining_uses=6,
-            seen_codes={"id:1"},
+            seen_codes={"id:1:111111"},
         )
         session.get.return_value = _Response({
             "code": 0,
@@ -115,16 +182,16 @@ class PaymeshMailClientTests(unittest.TestCase):
 
         self.assertEqual(code, "333333")
         self.assertEqual(account.email, "user+pm01@example.com")
-        self.assertIn("id:3", account.seen_codes)
+        self.assertIn("id:3:333333", account.seen_codes)
 
     @patch("core.paymesh_mail_client.time.sleep", return_value=None)
-    def test_poll_accepts_newer_code_when_provider_reuses_message_id(self, _sleep):
+    def test_poll_rejects_claimed_code_when_provider_reuses_message_id(self, _sleep):
         session = Mock()
         account = PaymeshMailAccount(
             email="user+pm01@example.com",
             cdk="MAIL-ONE",
             remaining_uses=6,
-            seen_codes={"id:7"},
+            seen_codes={"id:7:654321"},
         )
         session.get.return_value = _Response({
             "code": 0,
@@ -139,9 +206,197 @@ class PaymeshMailClientTests(unittest.TestCase):
         })
         after_ts = datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp()
 
-        code = poll_verification_code(account, max_wait=2, poll_interval=0, session=session, after_ts=after_ts)
+        with self.assertRaises(PaymeshMailError):
+            poll_verification_code(
+                account,
+                max_wait=2,
+                poll_interval=0,
+                session=session,
+                after_ts=after_ts,
+            )
 
-        self.assertEqual(code, "654321")
+    @patch("core.paymesh_mail_client.time.sleep", return_value=None)
+    def test_reused_message_id_allows_a_different_otp_value(self, _sleep):
+        session = Mock()
+        session.get.side_effect = [
+            _Response({
+                "code": 0,
+                "data": {
+                    "email": {
+                        "session": {"emailAddress": "user@example.com"},
+                        "codes": [{"id": 7, "code": "111111"}],
+                    },
+                },
+            }),
+            _Response({
+                "code": 0,
+                "data": {
+                    "email": {
+                        "session": {"emailAddress": "user@example.com"},
+                        "codes": [{"id": 7, "code": "222222"}],
+                    },
+                },
+            }),
+        ]
+        first = PaymeshMailAccount("first@example.com", "MAIL-ONE", 6)
+        second = PaymeshMailAccount("second@example.com", "MAIL-ONE", 6)
+
+        self.assertEqual(
+            poll_verification_code(first, max_wait=1, poll_interval=0, session=session),
+            "111111",
+        )
+        self.assertEqual(
+            poll_verification_code(second, max_wait=1, poll_interval=0, session=session),
+            "222222",
+        )
+
+    @patch("core.paymesh_mail_client.time.sleep", return_value=None)
+    def test_same_cdk_does_not_reuse_claimed_message_identity(self, _sleep):
+        session = Mock()
+        first = PaymeshMailAccount(
+            email="user+pm01@example.com",
+            cdk="MAIL-ONE",
+            remaining_uses=6,
+            seen_codes=set(),
+        )
+        second = PaymeshMailAccount(
+            email="user+pm02@example.com",
+            cdk="MAIL-ONE",
+            remaining_uses=6,
+            seen_codes=first.seen_codes,
+        )
+        session.get.return_value = _Response({
+            "code": 0,
+            "data": {
+                "email": {
+                    "session": {"emailAddress": "user@example.com"},
+                    "codes": [
+                        {"id": 7, "code": "654321", "receivedAt": "2026-08-01T00:01:00Z"},
+                    ],
+                },
+            },
+        })
+        after_ts = datetime(2026, 8, 1, tzinfo=timezone.utc).timestamp()
+
+        self.assertEqual(
+            poll_verification_code(first, max_wait=1, poll_interval=0, session=session, after_ts=after_ts),
+            "654321",
+        )
+        with self.assertRaises(PaymeshMailError):
+            poll_verification_code(second, max_wait=1, poll_interval=0, session=session, after_ts=after_ts)
+
+    @patch("core.paymesh_mail_client.time.sleep", return_value=None)
+    def test_claim_survives_empty_memory_context_after_restart(self, _sleep):
+        from core import paymesh_mail_client as client
+        from core.otp_identity_store import OtpIdentityStore
+
+        session = Mock()
+        session.get.return_value = _Response({
+            "code": 0,
+            "data": {
+                "email": {
+                    "session": {"emailAddress": "user@example.com"},
+                    "codes": [{"id": 7, "code": "654321"}],
+                },
+            },
+        })
+        first = PaymeshMailAccount("first@example.com", "MAIL-ONE", 6)
+        self.assertEqual(
+            poll_verification_code(first, max_wait=1, poll_interval=0, session=session),
+            "654321",
+        )
+
+        path = client._OTP_STORE.path
+        client._OTP_STORE = OtpIdentityStore(path)
+        restarted = PaymeshMailAccount("second@example.com", "MAIL-ONE", 6)
+        with self.assertRaises(PaymeshMailError):
+            poll_verification_code(restarted, max_wait=1, poll_interval=0, session=session)
+
+    @patch("core.paymesh_mail_client.time.sleep", return_value=None)
+    def test_old_code_filtered_by_after_ts_is_persisted_as_baseline(self, _sleep):
+        from core import paymesh_mail_client as client
+        from core.otp_identity_store import OtpIdentityStore
+
+        session = Mock()
+        session.get.return_value = _Response({
+            "code": 0,
+            "data": {
+                "email": {
+                    "session": {"emailAddress": "user@example.com"},
+                    "codes": [
+                        {"id": 7, "code": "654321", "receivedAt": "2026-08-01T00:00:00Z"},
+                    ],
+                },
+            },
+        })
+        after_ts = datetime(2026, 8, 1, 0, 1, tzinfo=timezone.utc).timestamp()
+        first = PaymeshMailAccount("first@example.com", "MAIL-ONE", 6)
+        with self.assertRaises(PaymeshMailError):
+            poll_verification_code(
+                first, max_wait=1, poll_interval=0, session=session, after_ts=after_ts
+            )
+
+        path = client._OTP_STORE.path
+        client._OTP_STORE = OtpIdentityStore(path)
+        restarted = PaymeshMailAccount("second@example.com", "MAIL-ONE", 6)
+        with self.assertRaises(PaymeshMailError):
+            poll_verification_code(restarted, max_wait=1, poll_interval=0, session=session)
+
+    @patch("core.paymesh_mail_client.time.sleep", return_value=None)
+    def test_claim_baselines_full_paymesh_otp_array(self, _sleep):
+        session = Mock()
+        session.get.return_value = _Response({
+            "code": 0,
+            "data": {
+                "email": {
+                    "session": {"emailAddress": "user@example.com"},
+                    "codes": [
+                        {"id": 1, "code": "111111"},
+                        {"id": 2, "code": "222222"},
+                    ],
+                },
+            },
+        })
+        first = PaymeshMailAccount("first@example.com", "MAIL-ONE", 6)
+        second = PaymeshMailAccount("second@example.com", "MAIL-ONE", 6)
+
+        self.assertEqual(
+            poll_verification_code(first, max_wait=1, poll_interval=0, session=session),
+            "222222",
+        )
+        with self.assertRaises(PaymeshMailError):
+            poll_verification_code(second, max_wait=1, poll_interval=0, session=session)
+
+    @patch("core.paymesh_mail_client.time.sleep", return_value=None)
+    def test_redeem_baseline_blocks_same_otp_under_new_message_id(self, _sleep):
+        redeem_session = Mock()
+        redeem_session.post.return_value = _Response({
+            "code": 0,
+            "data": {
+                "emailAddress": "user@example.com",
+                "codes": [{"id": 7, "code": "654321"}],
+            },
+        })
+        redeem_cdk("MAIL-ONE", session=redeem_session)
+
+        poll_session = Mock()
+        poll_session.get.return_value = _Response({
+            "code": 0,
+            "data": {
+                "email": {
+                    "session": {"emailAddress": "user@example.com"},
+                    "codes": [{"id": 8, "code": "654321"}],
+                },
+            },
+        })
+        restarted = PaymeshMailAccount("second@example.com", "MAIL-ONE", 6)
+        with self.assertRaises(PaymeshMailError):
+            poll_verification_code(
+                restarted,
+                max_wait=1,
+                poll_interval=0,
+                session=poll_session,
+            )
 
     @patch("core.paymesh_mail_client.redeem_cdk")
     @patch("core.paymesh_mail_client._config_values", return_value=("https://sms.paymesh.cn", 30, 6))
@@ -167,6 +422,28 @@ class PaymeshMailClientTests(unittest.TestCase):
         self.assertRegex(emails[0], r"^user\+[0-9a-f]{5}@example\.com$")
         self.assertEqual(len(emails), len(set(emails)))
         self.assertTrue(all(email.startswith("user+") for email in emails))
+        client._CONTEXT_CACHE.clear()
+        client._SEEN_CODES_BY_CDK.clear()
+        client._CDK_LOCKS.clear()
+        client._LEDGER = None
+
+    @patch("core.paymesh_mail_client.redeem_cdk")
+    @patch("core.paymesh_mail_client._config_values", return_value=("https://sms.paymesh.cn", 30, 6))
+    def test_terms_rejection_blocks_card_before_next_alias(self, _config, redeem):
+        from core import paymesh_mail_client as client
+
+        card = "SECRET-CARD"
+        redeem.return_value = PaymeshMailAccount("user@example.com", card, 6)
+        client._CONTEXT_CACHE.clear()
+        client._SEEN_CODES_BY_CDK.clear()
+        client._CDK_LOCKS.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client._LEDGER = ProviderCardLedger(Path(temp_dir) / "ledger.json", "paymesh")
+            account = client.pick_account("terms-job", [card])
+            self.assertTrue(client.block_account_card(account.email, "terms_rejected"))
+            self.assertTrue(client.release_account(account.email, status="failed"))
+            with self.assertRaisesRegex(PaymeshMailError, "bị chặn"):
+                client.pick_account("next-job", [card])
         client._CONTEXT_CACHE.clear()
         client._SEEN_CODES_BY_CDK.clear()
         client._CDK_LOCKS.clear()
@@ -286,6 +563,29 @@ class PaymeshMailClientTests(unittest.TestCase):
 
         lookup.assert_not_called()
         client._LEDGER = None
+    @patch("core.paymesh_mail_client.pick_account")
+    def test_assigned_inventory_resolves_only_its_card(self, pick_account):
+        from core import paymesh_mail_client as client
+        from core.cdk_inventory_store import CdkInventoryStore
+
+        pick_account.return_value = PaymeshMailAccount("user@example.com", "CARD-4", 6)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = CdkInventoryStore(Path(temp_dir) / "cdk.sqlite3")
+            inventory, _ = store.import_cdk("paymesh", "CARD-4", configured_limit=3)
+            client._INVENTORY_STORE = store
+
+            account = client.pick_account_for_inventory(
+                "job-4",
+                inventory.inventory_id,
+                routed_domains=["test.com"],
+            )
+
+        self.assertEqual(account.email, "user@example.com")
+        pick_account.assert_called_once_with(
+            "job-4", ["CARD-4"], routed_domains=["test.com"]
+        )
+        client._INVENTORY_STORE = None
+
     @patch("core.paymesh_mail_client.redeem_cdk")
     @patch("core.paymesh_mail_client._config_values", return_value=("https://sms.paymesh.cn", 30, 6))
     def test_inventory_pick_acquires_lease_and_reserves_slot(self, _config, redeem):
@@ -362,6 +662,62 @@ class PaymeshMailClientTests(unittest.TestCase):
         client._SEEN_CODES_BY_CDK.clear()
         client._CDK_LOCKS.clear()
         client._INVENTORY_STORE = None
+
+    @patch("core.paymesh_mail_client.redeem_cdk")
+    @patch("core.paymesh_mail_client._config_values", return_value=("https://sms.paymesh.cn", 30, 6))
+    def test_pick_account_with_routed_domain_yields_extra_aliases(self, _config, redeem):
+        from core import paymesh_mail_client as client
+
+        card = "SECRET-CARD"
+        redeem.return_value = PaymeshMailAccount("user@example.com", card, 6)
+        client._CONTEXT_CACHE.clear()
+        client._SEEN_CODES_BY_CDK.clear()
+        client._CDK_LOCKS.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client._LEDGER = ProviderCardLedger(Path(temp_dir) / "ledger.json", "paymesh")
+            emails = []
+            for index in range(12):
+                acct = client.pick_account(
+                    str(index), [card], routed_domains=["test.com"]
+                )
+                emails.append(acct.email)
+                self.assertTrue(client.mark_account_consumed(acct.email))
+            with self.assertRaisesRegex(PaymeshMailError, "hết quota"):
+                client.pick_account("13", [card], routed_domains=["test.com"])
+
+        domains = {email.rsplit("@", 1)[1] for email in emails}
+        self.assertEqual(domains, {"example.com", "test.com"})
+        self.assertEqual(len(emails), len(set(emails)))
+        self.assertEqual(sum(1 for e in emails if e.endswith("@example.com")), 6)
+        self.assertEqual(sum(1 for e in emails if e.endswith("@test.com")), 6)
+        client._CONTEXT_CACHE.clear()
+        client._SEEN_CODES_BY_CDK.clear()
+        client._CDK_LOCKS.clear()
+        client._LEDGER = None
+
+    @patch("core.paymesh_mail_client._config_values", return_value=("https://sms.paymesh.cn", 30, 6))
+    def test_pick_account_without_routed_keeps_six_quota(self, _config):
+        # Sanity: routed_domains=() phải giữ behavior cũ (cap=6).
+        from core import paymesh_mail_client as client
+
+        with patch("core.paymesh_mail_client.redeem_cdk") as redeem:
+            card = "SECRET-CARD"
+            redeem.return_value = PaymeshMailAccount("user@example.com", card, 6)
+            client._CONTEXT_CACHE.clear()
+            client._SEEN_CODES_BY_CDK.clear()
+            client._CDK_LOCKS.clear()
+            with tempfile.TemporaryDirectory() as temp_dir:
+                client._LEDGER = ProviderCardLedger(Path(temp_dir) / "ledger.json", "paymesh")
+                for index in range(6):
+                    acct = client.pick_account(str(index), [card])
+                    self.assertTrue(acct.email.endswith("@example.com"))
+                    self.assertTrue(client.mark_account_consumed(acct.email))
+                with self.assertRaisesRegex(PaymeshMailError, "hết quota"):
+                    client.pick_account("7", [card])
+            client._CONTEXT_CACHE.clear()
+            client._SEEN_CODES_BY_CDK.clear()
+            client._CDK_LOCKS.clear()
+            client._LEDGER = None
 
 
 if __name__ == "__main__":

@@ -317,7 +317,36 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,gmail_123452026,paymesh",
+    },
+    {
+        "key": "GMAIL_123452026_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Gmail CDK API", "help": "默认 http://gmail.123452026.xyz/api", "storage": "env",
+    },
+    {
+        "key": "GMAIL_123452026_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Gmail CDK 请求超时", "help": "单次 API 请求超时秒数",
+    },
+    {
+        "key": "GMAIL_123452026_ACCOUNTS_PER_CDK", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "每个 CDK 账号数", "help": "范围 1-6，实际还受 API remainingUses 限制",
+    },
+    {
+        "key": "PAYMESH_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Paymesh MAIL API", "help": "默认 https://sms.paymesh.cn；使用 /api/v1/redeem 与 /api/v1/order/lookup", "storage": "env",
+    },
+    {
+        "key": "PAYMESH_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Paymesh 请求超时", "help": "单次 API 请求超时秒数",
+    },
+    {
+        "key": "PAYMESH_ACCOUNTS_PER_CDK", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "每个 Paymesh card 账号数", "help": "范围 1-6；同一 MAIL card 复用别名",
+    },
+    {
+        "key": "PAYMESH_ROUTED_DOMAINS", "file": "email.py", "type": "list_str_multiline", "group": "邮箱 / OTP",
+        "label": "Paymesh routed domain (test local)",
+        "help": "每个域名一行（最多 2）；为同一 card 額外生成 xxx+hash@<domain> 别名用于本地防伪测试",
     },
     {
         "key": "GPTMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -618,6 +647,83 @@ EDITABLE_FIELDS = [
     {
         "key": "L_PHONE_PREFIX", "file": "codex.py", "type": "str", "group": "接码平台",
         "label": "L 号码前缀", "help": "L 返回号码不含国家码时填写，例如美国 10 位本地号填 1；留空则不补",
+    },
+    {
+        "key": "NORDVPN_WG_ENABLED", "file": "nordvpn_wireguard.py", "type": "bool", "group": "NordVPN WireGuard",
+        "label": "启用独立代理", "help": "手工 .conf fallback 开关；填写 Access Token 后会自动启用每个 Roxy 环境一个 NordLynx SOCKS5",
+    },
+    {
+        "key": "NORDVPN_ACCESS_TOKEN", "file": "nordvpn_account.py", "type": "str", "group": "NordVPN WireGuard",
+        "label": "NordVPN Access Token", "help": "仅保存到 .env；用于从 NordVPN API 获取 NordLynx 私钥，不会写入 Roxy Profile",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "NORDVPN_WG_COUNTRY_FILTER", "file": "nordvpn_wireguard.py", "type": "str", "group": "NordVPN WireGuard",
+        "label": "出口国家", "help": "两位国家代码，如 JP/US/SG；留空使用 NordVPN 推荐服务器",
+    },
+    {
+        "key": "NORDVPN_WG_WIREPROXY_EXE", "file": "nordvpn_wireguard.py", "type": "str", "group": "NordVPN WireGuard",
+        "label": "wireproxy 路径", "help": "留默认值即可；PATH 中没有时会自动下载已校验版本，也可填写完整路径",
+    },
+    {
+        "key": "NORDVPN_WG_AUTO_DOWNLOAD", "file": "nordvpn_wireguard.py", "type": "bool", "group": "NordVPN WireGuard",
+        "label": "自动安装 wireproxy", "help": "PATH 中找不到时自动下载固定版本并校验 SHA-256 到 data/tools",
+    },
+    {
+        "key": "NORDVPN_WG_PORT_START", "file": "nordvpn_wireguard.py", "type": "int", "group": "NordVPN WireGuard",
+        "label": "SOCKS5 起始端口", "help": "每个并发注册任务分配一个本地端口",
+    },
+    {
+        "key": "NORDVPN_WG_PORT_END", "file": "nordvpn_wireguard.py", "type": "int", "group": "NordVPN WireGuard",
+        "label": "SOCKS5 结束端口", "help": "端口区间大小至少等于最大并发 workers",
+    },
+    {
+        "key": "NORDVPN_WG_CONNECT_TIMEOUT", "file": "nordvpn_wireguard.py", "type": "float", "group": "NordVPN WireGuard",
+        "label": "代理就绪超时(秒)", "help": "等待 wireproxy 开始监听 SOCKS5 的最长时间",
+    },
+    {
+        "key": "NORDVPN_API_BASE", "file": "nordvpn_account.py", "type": "str", "group": "NordVPN WireGuard",
+        "label": "NordVPN API", "help": "默认 https://api.nordvpn.com，通常无需修改",
+    },
+    {
+        "key": "NORDVPN_API_TIMEOUT", "file": "nordvpn_account.py", "type": "float", "group": "NordVPN WireGuard",
+        "label": "API 超时(秒)", "help": "获取 NordLynx 凭据和推荐服务器的请求超时",
+    },
+    {
+        "key": "NORDVPN_SERVER_CACHE_TTL", "file": "nordvpn_account.py", "type": "int", "group": "NordVPN WireGuard",
+        "label": "服务器缓存(秒)", "help": "缓存推荐服务器列表，选取时仍会避开最近使用的服务器",
+    },
+    {
+        "key": "NORDVPN_ENABLED", "file": "nordvpn.py", "type": "bool", "group": "NordVPN",
+        "label": "启用 NordVPN CLI", "help": "开启后可通过命令行控制本地 NordVPN 连接；关闭则所有操作静默跳过",
+    },
+    {
+        "key": "NORDVPN_INSTALL_DIR", "file": "nordvpn.py", "type": "str", "group": "NordVPN",
+        "label": "NordVPN 安装目录", "help": "NordVPN.exe 所在目录，默认 C:\\Program Files\\NordVPN",
+    },
+    {
+        "key": "NORDVPN_CLI_TIMEOUT", "file": "nordvpn.py", "type": "int", "group": "NordVPN",
+        "label": "CLI 超时(秒)", "help": "单次 connect/disconnect 命令的最长等待秒数",
+    },
+    {
+        "key": "NORDVPN_POST_CONNECT_DELAY", "file": "nordvpn.py", "type": "float", "group": "NordVPN",
+        "label": "连接后等待(秒)", "help": "connect 成功后等待 NordLynx tunnel 稳定的额外秒数",
+    },
+    {
+        "key": "NORDVPN_COUNTRY_GROUPS", "file": "nordvpn.py", "type": "str", "group": "NordVPN",
+        "label": "国家分组", "help": "逗号分隔的国家/专业服务器分组代码，如 Japan,United_States；留空连接最佳服务器",
+    },
+    {
+        "key": "NORDVPN_AUTO_ROTATE_ENABLED", "file": "nordvpn.py", "type": "bool", "group": "NordVPN",
+        "label": "自动轮换IP", "help": "开启后每注册成功 N 个账号自动切换 NordVPN 服务器",
+    },
+    {
+        "key": "NORDVPN_AUTO_ROTATE_INTERVAL", "file": "nordvpn.py", "type": "int", "group": "NordVPN",
+        "label": "轮换间隔(个)", "help": "每成功注册多少个账号后自动切换一次 IP",
+    },
+    {
+        "key": "NORDVPN_AUTO_ROTATE_COUNTRY_GROUP", "file": "nordvpn.py", "type": "str", "group": "NordVPN",
+        "label": "轮换目标地区", "help": "自动轮换时连接的目标国家/地区分组；留空使用上方的国家分组",
     },
 ]
 

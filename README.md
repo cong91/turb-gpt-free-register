@@ -49,6 +49,7 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 - Cloudflare Worker 临时邮箱：自动创建 + JWT 取码（`cloudflare`，兼容 cloudflare_temp_email）
 - 通用 API 邮箱：`email----取码地址`
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
+- Paymesh MAIL card：`POST /api/v1/redeem` 领取邮箱，`GET /api/v1/order/lookup` 自动收取验证码（`paymesh`）
 - `EMAIL_SOURCE` 支持多个来源组合，例如：
 
 ```python
@@ -139,6 +140,29 @@ WebUI 配置页保存这些字段时会写入 `.env`（不是 config 源码）�
 
 ## 快速开始
 
+### Windows 一键启动
+
+双击项目根目录的 `start-local.bat` 即可启动。
+
+命令行方式：
+
+```bat
+start-local.bat
+```
+
+脚本会自动检查 Python 3.10+ / Node.js 18+、创建 `.venv`、按需安装 `requirements.txt`、在缺失时从 `.env.example` 创建 `.env`，然后启动 WebUI 并打开浏览器。
+
+常用参数：
+
+```bat
+start-local.bat -Port 5057
+start-local.bat -AuthCode "你的授权码"
+start-local.bat -NoBrowser
+start-local.bat -CheckOnly
+```
+
+`-CheckOnly` 只检查环境和依赖，不启动 WebUI，也不会提交注册任务。需要更多 PowerShell 参数时，`start-local.bat` 会原样转发给 `start-local.ps1`。
+
 ### WebUI 授权码
 
 WebUI 启动后，除 `/login` 外所有页面和 `/api/*` 接口都会校验授权码。推荐在 `.env` 中配置：
@@ -211,6 +235,19 @@ GPTMAIL_API_KEY=你的_GPTMail_API_Key
 
 服务地址固定为 `https://mail.chatgpt.org.uk`。未填写 Key 时，任务会提示填写 `GPTMail API Key`，不会使用公共测试 Key。
 
+#### Paymesh MAIL card（`paymesh`）
+
+在 WebUI 注册页选择 `Paymesh MAIL card`，每行输入一个 card；API 地址默认是 `https://sms.paymesh.cn`。也可以通过配置指定：
+
+```dotenv
+EMAIL_SOURCE=paymesh
+PAYMESH_API_BASE=https://sms.paymesh.cn
+PAYMESH_REQUEST_TIMEOUT=30
+PAYMESH_ACCOUNTS_PER_CDK=6
+```
+
+Provider 通过 `POST /api/v1/redeem`（body 为 `{"code":"..."}`）领取邮箱，再轮询 `GET /api/v1/order/lookup?code=...&poll=true` 获取 OTP。每个 card 最多分配 6 个邮箱别名；运行时 ledger 仅保存 card 哈希，不写入原始 card。账号注册成功后会把原始 card 作为 `source_cdk` 写入受保护的账号数据，用于追溯来源。
+
 #### Cloudflare Worker 临时邮箱（`cloudflare`）
 
 兼容 `cloudflare_temp_email` 类 Worker：注册时自动创建域名邮箱，并用 JWT 轮询收件箱提取 OpenAI 六位验证码。  
@@ -266,6 +303,37 @@ ROXY_ONE_PROFILE_PER_ACCOUNT = True
 ROXY_DELETE_PROFILE_AFTER_RUN = True
 ROXY_CREATE_USE_PROXY_POOL = True
 ```
+
+##### NordVPN accessToken → 独立 Roxy 代理
+
+Nếu chỉ có NordVPN accessToken (giống cách JNMBrowser cấu hình), vào WebUI
+`配置 → NordVPN WireGuard` và điền:
+
+```env
+NORDVPN_ACCESS_TOKEN=your_nordvpn_access_token
+NORDVPN_WG_COUNTRY_FILTER=JP
+```
+
+Khi có accessToken, chế độ này tự bật, không cần NordVPN desktop/CLI và không
+cần bật `NORDVPN_WG_ENABLED`. Mỗi task sẽ thực hiện theo thứ tự:
+
+1. Dùng Bearer token lấy `nordlynx_private_key` từ NordVPN Core API.
+2. Chọn một server NordLynx online khác với các server vừa dùng.
+3. Tạo một SOCKS5 cục bộ bằng `wireproxy`.
+4. Ghi SOCKS5 vào `proxyInfo` của `/browser/create`, sau đó mới `/browser/open`.
+5. Dừng `wireproxy` và xóa file config tạm khi task kết thúc.
+
+Nếu máy chưa có `wireproxy.exe`, chương trình tự tải release đã pin và kiểm tra
+SHA-256 vào `data/tools/wireproxy/`. Có thể tắt bằng
+`NORDVPN_WG_AUTO_DOWNLOAD=False` hoặc điền đường dẫn riêng tại
+`NORDVPN_WG_WIREPROXY_EXE`.
+
+Lưu ý:
+
+- Để trống `ROXY_PROFILE_ID`; NordVPN proxy chỉ được attach chắc chắn khi tạo profile mới.
+- Access token và NordLynx private key không được gửi vào Roxy profile hoặc log.
+- Token mode tự vô hiệu hóa cơ chế NordVPN CLI auto-rotation và không ép workers về 1.
+- Proxy explicit truyền từ caller vẫn có độ ưu tiên cao hơn NordVPN token mode.
 
 如要无头：
 

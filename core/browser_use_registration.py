@@ -2760,9 +2760,19 @@ def run_browser_use_registration(
             create_acknowledged = True
             logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
 
-            if _twofa_cfg.ENABLE_2FA:
-                logger.warning("[BrowserUse] 当前路径暂不自动设置 2FA，已跳过")
             totp_secret = None
+            twofa_status = "disabled"
+            twofa_error = None
+            if _twofa_cfg.ENABLE_2FA:
+                from core.account_export import setup_2fa_in_browser
+                try:
+                    totp_secret = setup_2fa_in_browser(context, page, email)
+                    twofa_status = "active"
+                except Exception as exc:
+                    twofa_status = "failed"
+                    twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                    logger.error("[BrowserUse] 2FA 设置失败: %s", twofa_error)
+                    raise RuntimeError(f"2FA 设置失败，未保存为成功账号: {twofa_error}") from exc
 
             codex_result = {
                 "status": "skipped",
@@ -2820,6 +2830,8 @@ def run_browser_use_registration(
                         "connect": session_info_open.raw,
                     },
                     "registration_password": openai_password,
+                    "twofa_status": twofa_status,
+                    "twofa_error": twofa_error,
                     "codex": codex_result,
                 },
             )
@@ -2831,6 +2843,8 @@ def run_browser_use_registration(
                 "account_id": account_id,
                 "access_token": access_token,
                 "totp_secret": totp_secret,
+                "twofa_status": twofa_status,
+                "twofa_error": twofa_error,
                 "codex": codex_result,
                 "error": None,
             }

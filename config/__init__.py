@@ -151,6 +151,14 @@ from config.email import (
     CLOUDMAIL_DOMAINS,
     CLOUDMAIL_AUTO_ADD_USER,
     CLOUDMAIL_RANDOM_LOCAL_LENGTH,
+    GMAIL_123452026_API_BASE,
+    GMAIL_123452026_REQUEST_TIMEOUT,
+    GMAIL_123452026_ACCOUNTS_PER_CDK,
+    GMAIL_123452026_ALLOW_INSECURE_HTTP,
+    PAYMESH_API_BASE,
+    PAYMESH_REQUEST_TIMEOUT,
+    PAYMESH_ACCOUNTS_PER_CDK,
+    PAYMESH_ROUTED_DOMAINS,
 )
 
 # ---------- 2FA ----------
@@ -180,6 +188,9 @@ _RELOADABLE_SUBMODULES = (
     "config.extract_link",
     "config.sub2api",
     "config.humanize",
+    "config.nordvpn",
+    "config.nordvpn_account",
+    "config.nordvpn_wireguard",
 )
 
 
@@ -209,9 +220,9 @@ def reload_all() -> list[str]:
 def _refresh_top_level_constants() -> None:
     """把刚 reload 的子模块的常量重新拷一份到 config 包顶层。"""
     import config as _self
-    from config import browser, openai_protocol, proxy as _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger
+    from config import browser, openai_protocol, proxy as _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger, nordvpn
     # 简单粗暴：枚举一遍重要常量，覆盖到 _self
-    for src in (browser, openai_protocol, _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger):
+    for src in (browser, openai_protocol, _proxy, register, email, twofa, roxybrowser, cloakbrowser, browser_use, skyvern, codex, extract_link, sub2api, humanize, flow_trigger, nordvpn):
         for k in dir(src):
             if k.isupper() or k in ("pick_proxy", "pick_browser_profile", "build_browser_environment", "validate_browser_profile"):
                 setattr(_self, k, getattr(src, k))
@@ -258,6 +269,15 @@ __all__ = [
     "CLOUDMAIL_API_BASE", "CLOUDMAIL_ADMIN_EMAIL", "CLOUDMAIL_PASSWORD", "CLOUDMAIL_TOKEN_PATH",
     "CLOUDMAIL_AUTH_TOKEN", "CLOUDMAIL_DOMAINS",
     "CLOUDMAIL_AUTO_ADD_USER", "CLOUDMAIL_RANDOM_LOCAL_LENGTH",
+    "GMAIL_123452026_API_BASE", "GMAIL_123452026_REQUEST_TIMEOUT",
+    "GMAIL_123452026_ACCOUNTS_PER_CDK", "GMAIL_123452026_ALLOW_INSECURE_HTTP",
+    "PAYMESH_API_BASE", "PAYMESH_REQUEST_TIMEOUT", "PAYMESH_ACCOUNTS_PER_CDK", "PAYMESH_ROUTED_DOMAINS",
     # twofa
     "ENABLE_2FA",
+    # nordvpn
+    "NORDVPN_ENABLED", "NORDVPN_INSTALL_DIR", "NORDVPN_CLI_TIMEOUT",
+    "NORDVPN_SERVICE_HOST", "NORDVPN_SERVICE_PORT",
+    "NORDVPN_POST_CONNECT_DELAY", "NORDVPN_COUNTRY_GROUPS",
+    "NORDVPN_AUTO_ROTATE_ENABLED", "NORDVPN_AUTO_ROTATE_INTERVAL",
+    "NORDVPN_AUTO_ROTATE_COUNTRY_GROUP",
 ]
