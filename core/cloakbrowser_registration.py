@@ -134,9 +134,19 @@ def run_cloak_registration(
         access_token = session_info["accessToken"]
         logger.info("[Cloak注册] 已拿到 accessToken：%s", email)
 
-        if _twofa_cfg.ENABLE_2FA:
-            logger.warning("[Cloak注册] 当前 CloakBrowser 自动化路径暂不执行 2FA 设置，已跳过")
         totp_secret = None
+        twofa_status = "disabled"
+        twofa_error = None
+        if _twofa_cfg.ENABLE_2FA:
+            from core.account_export import setup_2fa_in_page
+            try:
+                totp_secret = setup_2fa_in_page(driver, email)
+                twofa_status = "active"
+            except Exception as exc:
+                twofa_status = "failed"
+                twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                logger.error("[Cloak注册] 2FA 设置失败: %s", twofa_error)
+                raise RuntimeError(f"2FA 设置失败，未保存为成功账号: {twofa_error}") from exc
 
         codex_result = {
             "status": "skipped",
@@ -181,21 +191,14 @@ def run_cloak_registration(
                 "expires": session_info.get("expires"),
                 "cloakbrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
                 "registration_password": openai_password,
+                "twofa_status": twofa_status,
+                "twofa_error": twofa_error,
                 "codex": codex_result,
                 "network_traffic": network_traffic,
             },
         )
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
-        return {
-            "success": bool(codex_ok),
-            "email": email,
-            "account_id": account_id,
-            "access_token": access_token,
-            "totp_secret": totp_secret,
-            "codex": codex_result,
-            "network_traffic": network_traffic,
-            "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
-        }
+        return {"success": bool(codex_ok), "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "twofa_status": twofa_status, "twofa_error": twofa_error, "codex": codex_result, "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}"}
     except Exception as exc:
         if traffic_tracker is not None:
             try:

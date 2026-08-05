@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from core.gmail_123452026_client import (
@@ -27,6 +29,18 @@ class _Response:
 
 
 class Gmail123452026ClientTests(unittest.TestCase):
+    def setUp(self):
+        from core import gmail_123452026_client as client
+        from core.otp_identity_store import OtpIdentityStore
+
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.previous_otp_store = client._OTP_STORE
+        client._OTP_STORE = OtpIdentityStore(
+            Path(self.temp_dir.name) / "gmail-otp.sqlite3"
+        )
+        self.addCleanup(setattr, client, "_OTP_STORE", self.previous_otp_store)
+
     def test_redeem_parses_active_mailbox_without_exposing_cdk(self):
         session = Mock()
         session.post.return_value = _Response({
@@ -100,6 +114,38 @@ class Gmail123452026ClientTests(unittest.TestCase):
         self.assertEqual(session.post.call_count, 1)
 
     @patch("core.gmail_123452026_client.time.sleep", return_value=None)
+    def test_durable_otp_claim_skips_code_after_cache_reset(self, _sleep):
+        from core import gmail_123452026_client as client
+        from core.otp_identity_store import OtpIdentityStore
+
+        first_session = Mock()
+        first_session.post.return_value = _Response({"status": "success", "code": "111111"})
+        first = Gmail123452026Account("a@gmail.com", "SECRET-CDK", 1)
+        self.assertEqual(client.poll_verification_code(
+            first,
+            max_wait=1,
+            poll_interval=0,
+            session=first_session,
+        ), "111111")
+
+        path = client._OTP_STORE.path
+        client._OTP_STORE = OtpIdentityStore(path)
+        second_session = Mock()
+        second_session.post.side_effect = [
+            _Response({"status": "success", "code": "111111"}),
+            _Response({"status": "success", "code": "222222"}),
+        ]
+        second = Gmail123452026Account("b@route-one.net", "SECRET-CDK", 1)
+
+        self.assertEqual(client.poll_verification_code(
+            second,
+            max_wait=1,
+            poll_interval=0,
+            session=second_session,
+        ), "222222")
+        self.assertEqual(second_session.post.call_count, 2)
+
+    @patch("core.gmail_123452026_client.time.sleep", return_value=None)
     def test_fetch_latest_otp_skips_seen_code_and_returns_fresh_code(self, _sleep):
         session = Mock()
         session.post.side_effect = [
@@ -124,6 +170,37 @@ class Gmail123452026ClientTests(unittest.TestCase):
         self.assertEqual(code, "222222")
         self.assertIn("222222", account.seen_codes)
         self.assertEqual(session.post.call_count, 2)
+
+    @patch("core.gmail_123452026_client._batch_store")
+    @patch("core.gmail_123452026_client._inventory_store")
+    def test_restart_lookup_recovers_batch_assignment(self, inventory_store, batch_store):
+        from types import SimpleNamespace
+        from core import gmail_123452026_client as client
+
+        row = {
+            "email": "abcdef@route-one.net",
+            "raw_cdk": "SECRET-CDK",
+            "inventory_id": "inventory-1",
+            "job_id": "17",
+            "slot_id": "reservation-1",
+            "owner_token": "owner-1",
+            "alias_phase": "routed",
+            "alias_domain": "route-one.net",
+        }
+        connection = Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        inventory_store.return_value._connect.return_value = connection
+        batch_store.return_value.find_active_assignment.return_value = SimpleNamespace(
+            assignment_id="assignment-1",
+            batch_id="batch-1",
+        )
+        client._CONTEXT_CACHE.clear()
+
+        account = client.get_account_context(row["email"])
+
+        self.assertEqual(account.assignment_id, "assignment-1")
+        self.assertEqual(account.batch_id, "batch-1")
+        client._CONTEXT_CACHE.clear()
 
     @patch("core.gmail_123452026_client._ledger")
     def test_context_cannot_recover_raw_request_cdk_after_restart(self, ledger):
@@ -160,6 +237,127 @@ class Gmail123452026ClientTests(unittest.TestCase):
         with patch("core.db.get_job", return_value={"status": "failed"}):
             self.assertFalse(job_is_active("17"))
         client._LEDGER = None
+
+    @patch("core.gmail_123452026_client._batch_store")
+    @patch("core.gmail_123452026_client._inventory_store")
+    def test_batch_account_consume_completes_assignment(self, inventory_store, batch_store):
+        from core import gmail_123452026_client as client
+
+        account = Gmail123452026Account(
+            email="abcdef@route-one.net",
+            cdk="SECRET-CDK",
+            remaining_uses=0,
+            job_id="17",
+            inventory_id="inventory-1",
+            reservation_id="reservation-1",
+            owner_token="owner-1",
+            assignment_id="assignment-1",
+            batch_id="batch-1",
+        )
+        client._CONTEXT_CACHE[account.email] = account
+        inventory_store.return_value.consume_reservation.return_value = True
+        batch_store.return_value.complete.return_value = True
+
+        self.assertTrue(client.mark_account_consumed(account.email))
+
+        batch_store.return_value.complete.assert_called_once_with("assignment-1")
+        client._CONTEXT_CACHE.clear()
+
+    @patch("core.gmail_123452026_client._batch_store")
+    @patch("core.gmail_123452026_client._inventory_store")
+    def test_batch_account_release_fails_assignment_for_registration_error(
+        self,
+        inventory_store,
+        batch_store,
+    ):
+        from core import gmail_123452026_client as client
+
+        account = Gmail123452026Account(
+            email="abcdef@route-one.net",
+            cdk="SECRET-CDK",
+            remaining_uses=0,
+            job_id="17",
+            inventory_id="inventory-1",
+            reservation_id="reservation-1",
+            owner_token="owner-1",
+            assignment_id="assignment-1",
+            batch_id="batch-1",
+        )
+        client._CONTEXT_CACHE[account.email] = account
+        inventory_store.return_value.release_reservation.return_value = True
+        batch_store.return_value.fail.return_value = True
+
+        self.assertTrue(client.release_account(
+            account.email,
+            status="failed",
+            note="registration failed",
+        ))
+
+        batch_store.return_value.fail.assert_called_once_with(
+            "assignment-1",
+            reason="registration failed",
+        )
+        client._CONTEXT_CACHE.clear()
+
+    @patch("core.gmail_123452026_client.redeem_cdk")
+    @patch("core.gmail_123452026_client._config_values")
+    def test_pick_account_by_batch_claims_inventory_and_preserves_assignment(
+        self,
+        config_values,
+        redeem,
+    ):
+        from types import SimpleNamespace
+
+        from core import gmail_123452026_client as client
+        from core.gmail_cdk_batch_store import GmailCdkAssignment
+
+        cdk = "SECRET-CDK"
+        config_values.return_value = ("https://mail.example.com/api", 30, 3, False)
+        redeem.return_value = Gmail123452026Account("abcdef@gmail.com", cdk, 3)
+        client._CONTEXT_CACHE.clear()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory = SimpleNamespace(provider="gmail", state="active", configured_limit=3)
+            assignment = GmailCdkAssignment("assignment-1", "batch-1", "inventory-1", "17", "active")
+            reservation = SimpleNamespace(
+                email="abcdef@route-one.net",
+                reservation_id="reservation-1",
+                owner_token="owner-1",
+                alias_phase="routed",
+                alias_domain="route-one.net",
+            )
+            batch_store = SimpleNamespace(
+                claim=lambda batch_id, job_id: assignment,
+                fail=lambda assignment_id, reason="": True,
+            )
+            inventory_store = SimpleNamespace(
+                get_inventory=lambda inventory_id: inventory,
+                resolve_raw_cdk=lambda inventory_id: cdk,
+                reserve_gmail_alias=lambda *args, **kwargs: reservation,
+                update_provider_quota=lambda *args, **kwargs: inventory,
+            )
+            client._INVENTORY_STORE = inventory_store
+            client._BATCH_STORE = batch_store
+            account = client.pick_account_by_batch(
+                job_id="17",
+                batch_id="batch-1",
+                routed_domains=["route-one.net"],
+            )
+
+        self.assertEqual(account.email, "abcdef@route-one.net")
+        self.assertEqual(account.cdk, cdk)
+        self.assertEqual(account.batch_id, "batch-1")
+        self.assertEqual(account.assignment_id, "assignment-1")
+        self.assertEqual(account.alias_phase, "routed")
+        self.assertEqual(account.alias_domain, "route-one.net")
+        redeem.assert_called_once_with(
+            cdk,
+            api_base="https://mail.example.com/api",
+            timeout=30,
+            allow_insecure_http=False,
+        )
+        client._CONTEXT_CACHE.clear()
+        client._INVENTORY_STORE = None
+        client._BATCH_STORE = None
 
     @patch("core.gmail_123452026_client.redeem_cdk")
     @patch("core.gmail_123452026_client._config_values")

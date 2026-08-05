@@ -1,0 +1,31 @@
+<div id="tab-tools" class="hidden">
+  <section class="card reserved-test-alias-tool" aria-labelledby="reservedTestAliasTitle">
+    <div class="head">
+      <h2 id="reservedTestAliasTitle">生成测试邮箱别名</h2>
+    </div>
+    <div class="body">
+      <form id="reservedTestAliasForm" novalidate>
+        <div class="reserved-test-alias-fields">
+          <label class="fld">Base
+            <input id="reservedTestAliasBase" type="text" maxlength="32" autocomplete="off" spellcheck="false" placeholder="abcdef" required>
+          </label>
+          <label class="fld">数量
+            <input id="reservedTestAliasLimit" type="number" min="1" max="200" value="6" inputmode="numeric" required>
+          </label>
+          <label class="fld">测试域名 1
+            <input id="reservedTestAliasDomain1" type="text" autocomplete="off" spellcheck="false" placeholder="mail.test" required>
+          </label>
+          <label class="fld">测试域名 2（可选）
+            <input id="reservedTestAliasDomain2" type="text" autocomplete="off" spellcheck="false" placeholder="inbox.invalid">
+          </label>
+        </div>
+        <div class="reserved-test-alias-actions">
+          <button class="btn primary" id="btnGenerateReservedTestAliases" type="submit">生成别名</button>
+          <button class="btn" id="btnCopyReservedTestAliases" type="button" disabled>复制全部</button>
+          <span id="reservedTestAliasStatus" class="reserved-test-alias-status" role="status" aria-live="polite"></span>
+        </div>
+      </form>
+      <div id="reservedTestAliasResults" class="reserved-test-alias-results hidden" aria-label="测试邮箱别名结果"></div>
+    </div>
+  </section>
+</div>

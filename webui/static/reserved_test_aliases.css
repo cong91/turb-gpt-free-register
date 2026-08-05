@@ -1,0 +1,108 @@
+.reserved-test-alias-tool {
+  width: min(960px, 100%);
+}
+
+.reserved-test-alias-fields {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.2fr) minmax(96px, 0.4fr) minmax(180px, 1fr) minmax(180px, 1fr);
+  gap: 16px;
+  align-items: end;
+}
+
+.reserved-test-alias-fields .fld {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.reserved-test-alias-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+.reserved-test-alias-status {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.reserved-test-alias-status.is-error {
+  color: var(--red);
+}
+
+.reserved-test-alias-results {
+  margin-top: 16px;
+  max-height: min(520px, 55vh);
+  overflow: auto;
+  border-top: 1px solid var(--line);
+}
+
+.reserved-test-alias-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  min-height: 46px;
+  padding: 8px 0;
+  border-bottom: 1px solid #edf1f5;
+}
+
+.reserved-test-alias-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.reserved-test-alias-copy {
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.reserved-test-alias-copy:hover {
+  border-color: var(--blue);
+  color: var(--blue);
+  background: var(--soft);
+}
+
+.reserved-test-alias-copy:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+
+.reserved-test-alias-copy svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+@media (max-width: 860px) {
+  .reserved-test-alias-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .reserved-test-alias-fields {
+    grid-template-columns: 1fr;
+  }
+
+  .reserved-test-alias-actions .btn {
+    flex: 1 1 140px;
+  }
+}
