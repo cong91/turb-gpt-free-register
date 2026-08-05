@@ -13,6 +13,7 @@ from core.cdk_inventory_store import (
     CdkInventorySchemaError,
     CdkInventoryStore,
 )
+from core.gmail_aliases import build_gmail_alias_plan
 
 
 class CdkInventoryStoreTests(unittest.TestCase):
@@ -29,7 +30,7 @@ class CdkInventoryStoreTests(unittest.TestCase):
         self.store.initialize()
 
         with closing(sqlite3.connect(self.path)) as connection:
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
             tables = {
                 row[0]
                 for row in connection.execute(
@@ -277,6 +278,67 @@ class CdkInventoryStoreTests(unittest.TestCase):
                 operation_id="op-reserve-six-overflow",
                 owner_token="owner-overflow",
             )
+
+    def test_gmail_plan_allocates_original_then_routed_without_phase_regression(self):
+        record, _ = self.store.import_cdk("gmail", "routed-cdk", configured_limit=3)
+        plan = build_gmail_alias_plan(
+            "abcdef@gmail.com",
+            limit=3,
+            routed_domains=["route-one.net", "route-two.org"],
+        )
+        reservations = [
+            self.store.reserve_gmail_alias(
+                record.inventory_id,
+                plan.candidates,
+                f"job-{index}",
+                operation_id=f"op-routed-{index}",
+                owner_token=f"owner-{index}",
+                routed_domains=plan.routed_domains,
+            )
+            for index in range(6)
+        ]
+
+        self.assertEqual([item.alias_phase for item in reservations], ["original"] * 3 + ["routed"] * 3)
+        self.assertEqual(
+            [item.alias_domain for item in reservations[3:]],
+            ["route-one.net", "route-one.net", "route-two.org"],
+        )
+        self.assertTrue(self.store.release_reservation(
+            reservations[0].reservation_id,
+            operation_id="release-original-after-routed",
+            owner_token="owner-0",
+        ))
+        with self.assertRaisesRegex(CdkInventoryConflict, "exhausted"):
+            self.store.reserve_gmail_alias(
+                record.inventory_id,
+                plan.candidates,
+                "job-overflow",
+                operation_id="op-routed-overflow",
+                owner_token="owner-overflow",
+                routed_domains=plan.routed_domains,
+            )
+
+    def test_schema_one_migrates_to_gmail_phase_columns(self):
+        self.store.initialize()
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute("PRAGMA user_version = 1")
+            connection.commit()
+
+        reopened = CdkInventoryStore(self.path)
+        reopened.initialize()
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            inventory_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(cdk_inventory)")
+            }
+            slot_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(cdk_slots)")
+            }
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertIn("allocation_phase", inventory_columns)
+        self.assertIn("routing_domains", inventory_columns)
+        self.assertIn("alias_phase", slot_columns)
+        self.assertIn("alias_domain", slot_columns)
 
     def test_event_key_prevents_duplicate_audit_rows(self):
         record, _ = self.store.import_cdk("gmail", "event-key-cdk")

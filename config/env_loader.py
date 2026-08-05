@@ -29,6 +29,7 @@ SECRET_ENV_KEYS: dict[str, str] = {
     "BROWSER_USE_API_KEY": "Browser Use Cloud API Key",
     "SKYVERN_API_KEY": "Skyvern API Key",
     "ROXY_API_TOKEN": "RoxyBrowser 本地 API Token",
+    "NORDVPN_ACCESS_TOKEN": "NordVPN account access token",
     "PLAN_CHECK_PROXY": "套餐查询专用代理（可能包含认证信息）",
     "PLAN_CHECK_UPSTREAM_PROXY": "套餐查询本地上游代理地址（用于代理链）",
     "PROXY_POOL_UPSTREAM_PROXY": "代理池本地上游代理地址（用于代理链）",
