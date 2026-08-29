@@ -26,7 +26,7 @@ class ReservedTestAliasUiTests(unittest.TestCase):
         self.assertIn('id="reservedTestAliasDomain1"', html)
         self.assertIn('id="reservedTestAliasDomain2"', html)
         self.assertIn('id="reservedTestAliasLimit"', html)
-        self.assertIn('min="1" max="200" value="6"', html)
+        self.assertIn('min="1" max="1000" value="6"', html)
         self.assertIn('id="btnGenerateReservedTestAliases"', html)
         self.assertIn('id="btnCopyReservedTestAliases"', html)
         self.assertNotIn("/api/jobs", html)

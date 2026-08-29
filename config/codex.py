@@ -34,6 +34,10 @@ CODEX_OUTPUT_DIRNAME: str = "codex_accounts"
 # 请求超时（秒）
 CODEX_REQUEST_TIMEOUT: int = 30
 
+# “Codex 补跑”遇到浏览器临时网络断开时的整轮重试次数和退避间隔。
+CODEX_RETRY_NETWORK_ATTEMPTS: int = 2
+CODEX_RETRY_NETWORK_DELAY: float = 3.0
+
 
 # ============================================================
 # Codex 授权方式（2026-06-15 改造）
@@ -41,7 +45,7 @@ CODEX_REQUEST_TIMEOUT: int = 30
 # 旧方案"复用注册的已登录 session"会撞 /choose-an-account 卡死；
 # 新方案用全新干净 session 从头登录，走 OpenAI 标准风控路径
 # （邮箱 OTP → 手机短信验证 → 选 workspace → 拿 code），
-# 手机验证靠接码平台 GrizzlySMS 自动收码。
+# 手机验证通过 core.sms_provider 选择接码平台并自动收码。
 # ============================================================
 
 # 注册成功后是否自动跑 Codex 授权（True=自动，False=跳过）
@@ -92,6 +96,8 @@ CPA_SAVE_CALLBACK_RECEIPT: bool = True
 # 接码平台（手机短信验证用）
 # SMS_PROVIDER:
 #   "grizzly" = GrizzlySMS，接口说明见 https://api.grizzlysms.com
+#   "viotp"   = ViOTP JSON API（https://api.viotp.com）
+#   "hero"    = HeroSMS SMS-Activate-compatible API
 #   "l"       = 本地 L 取号服务，接口说明见 L_API.md
 #   "h"       = 本地 H 取号服务，接口说明见 H_API.md
 # ============================================================
@@ -125,6 +131,31 @@ SMS_POLL_INTERVAL: int = 5
 
 # 接码平台 HTTP 请求超时（秒）
 SMS_REQUEST_TIMEOUT: int = 30
+
+# ============================================================
+# HeroSMS（SMS_PROVIDER="hero" 时使用）
+# ============================================================
+
+HERO_SMS_API_BASE: str = "https://hero-sms.com/stubs/handler_api.php"
+HERO_SMS_API_KEY: str = env_str("HERO_SMS_API_KEY", "")
+HERO_SMS_SERVICE: str = env_str("HERO_SMS_SERVICE", "dr")
+# auto：实时 offer 按实际 cost 从低到高扫描；sticky country 只在同价位优先，较贵 sticky 会等低价候选失败后再试
+HERO_SMS_COUNTRY: str = env_str("HERO_SMS_COUNTRY", "auto")
+HERO_SMS_MAX_PRICE: str = env_str("HERO_SMS_MAX_PRICE", "")
+# 至少观察多少次后才判断 country 是否高失败率；单次失败不会立即排除
+HERO_SMS_COUNTRY_MIN_ATTEMPTS: int = 4
+# 达到该失败率才暂时排除；后续成功会重新计算并允许恢复
+HERO_SMS_COUNTRY_HIGH_FAILURE_RATE: float = 0.75
+
+# ============================================================
+# ViOTP（SMS_PROVIDER="viotp" 时使用）
+# ============================================================
+
+VIOTP_API_BASE: str = "https://api.viotp.com"
+VIOTP_API_TOKEN: str = env_str("VIOTP_API_TOKEN", "")
+VIOTP_SERVICE_ID: str = env_str("VIOTP_SERVICE_ID", "1234")
+VIOTP_COUNTRY: str = env_str("VIOTP_COUNTRY", "vn")
+VIOTP_NETWORK: str = env_str("VIOTP_NETWORK", "VINAPHONE")
 
 
 # ============================================================
@@ -161,4 +192,4 @@ L_ADMIN_AUTH_CODE: str = env_str("L_ADMIN_AUTH_CODE", "")
 L_PHONE_PREFIX: str = ""
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_AUTH_URL_SOURCE': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})
+apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_RETRY_NETWORK_ATTEMPTS': 'int', 'CODEX_RETRY_NETWORK_DELAY': 'float', 'CODEX_AUTH_URL_SOURCE': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'HERO_SMS_API_BASE': 'str', 'HERO_SMS_API_KEY': 'str', 'HERO_SMS_SERVICE': 'str', 'HERO_SMS_COUNTRY': 'str', 'HERO_SMS_MAX_PRICE': 'str', 'HERO_SMS_COUNTRY_MIN_ATTEMPTS': 'int', 'HERO_SMS_COUNTRY_HIGH_FAILURE_RATE': 'float', 'VIOTP_API_BASE': 'str', 'VIOTP_API_TOKEN': 'str', 'VIOTP_SERVICE_ID': 'str', 'VIOTP_COUNTRY': 'str', 'VIOTP_NETWORK': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})

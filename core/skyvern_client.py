@@ -167,7 +167,12 @@ class SkyvernClient:
             raise RuntimeError(f"Skyvern close browser session HTTP {resp.status_code}: {data}")
         return data if isinstance(data, dict) else {"ok": True, "data": data}
 
-    def open_session(self) -> SkyvernSession:
+    def open_session(self, proxy: str | None = None) -> SkyvernSession:
+        if proxy is not None:
+            raise RuntimeError(
+                "Skyvern Cloud hiện không hỗ trợ custom rotating proxy cho browser session; "
+                "hãy dùng Browser Use Cloud hoặc tắt rotating proxy."
+            )
         data = self.create_browser_session()
         session_id = self._session_id(data)
         address = self._browser_address(data)

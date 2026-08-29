@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import quote, urlencode
@@ -19,6 +18,7 @@ except Exception:  # WebUI 环境未装 curl_cffi 时使用标准库兜底
 
 from config import extract_link as cfg
 from core import db
+from core.rotating_proxy_runtime import EXTRACT_LINK_PROXY_SCOPE, resolve_rotating_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -81,24 +81,48 @@ def queue_settings() -> dict:
     return {"workers": _WORKERS, "queue_limit": _QUEUE_LIMIT}
 
 
-def _session():
+def _proxy_kwargs(proxy: str | None) -> dict[str, dict[str, str]]:
+    if proxy is None:
+        return {}
+    return {"proxies": {"http": proxy, "https": proxy}}
+
+
+def _urlopen(url: str, *, timeout: int, proxy: str | None = None, **kwargs):
+    if proxy is None:
+        return urlopen(url, timeout=timeout, **kwargs)
+    from urllib.request import ProxyHandler, build_opener
+
+    opener = build_opener(ProxyHandler({"http": proxy, "https": proxy}))
+    return opener.open(url, timeout=timeout, **kwargs)
+
+
+def _session(proxy: str | None = None):
     if curl_requests is None:
         return None
     return curl_requests.Session()
 
 
-def query_cdk(*, cdk: str | None = None) -> dict:
+def query_cdk(*, cdk: str | None = None, proxy: str | None = None, proxy_lane_id: int | None = None) -> dict:
     base = _api_base()
     code = _cdk(cdk)
+    active_proxy = resolve_rotating_proxy(
+        proxy,
+        scope=EXTRACT_LINK_PROXY_SCOPE,
+        lane_id=proxy_lane_id,
+    )
     timeout = _int_setting("EXTRACT_LINK_REQUEST_TIMEOUT", 30, 5, 300)
-    s = _session()
+    s = _session(active_proxy)
     try:
         if s is None:
             req = Request(f"{base}/api/cdk?{urlencode({'code': code})}", headers={"Accept": "application/json"})
-            with urlopen(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout=timeout, proxy=active_proxy) as resp:
                 payload = json.loads(resp.read().decode("utf-8", "replace") or "{}")
             return payload if isinstance(payload, dict) else {}
-        resp = s.get(f"{base}/api/cdk?{urlencode({'code': code})}", timeout=timeout)
+        resp = s.get(
+            f"{base}/api/cdk?{urlencode({'code': code})}",
+            timeout=timeout,
+            **_proxy_kwargs(active_proxy),
+        )
         try:
             payload = resp.json()
         except Exception:
@@ -113,11 +137,23 @@ def query_cdk(*, cdk: str | None = None) -> dict:
             pass
 
 
-def _create_extract_job(*, token: str, link_type: str, cdk: str) -> dict:
+def _create_extract_job(
+    *,
+    token: str,
+    link_type: str,
+    cdk: str,
+    proxy: str | None = None,
+    proxy_lane_id: int | None = None,
+) -> dict:
     base = _api_base()
     timeout = _int_setting("EXTRACT_LINK_REQUEST_TIMEOUT", 30, 5, 300)
     payload = {"link_type": _link_type(link_type), "cdk": _cdk(cdk), "token": token}
-    s = _session()
+    active_proxy = resolve_rotating_proxy(
+        proxy,
+        scope=EXTRACT_LINK_PROXY_SCOPE,
+        lane_id=proxy_lane_id,
+    )
+    s = _session(active_proxy)
     try:
         if s is None:
             body = json.dumps(payload).encode("utf-8")
@@ -127,12 +163,17 @@ def _create_extract_job(*, token: str, link_type: str, cdk: str) -> dict:
                 headers={"Accept": "application/json", "Content-Type": "application/json"},
                 method="POST",
             )
-            with urlopen(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout=timeout, proxy=active_proxy) as resp:
                 data = json.loads(resp.read().decode("utf-8", "replace") or "{}")
             if not isinstance(data, dict) or not data.get("job_id"):
                 raise RuntimeError(f"提链服务未返回 job_id: {data}")
             return data
-        resp = s.post(f"{base}/api/extract", json=payload, timeout=timeout)
+        resp = s.post(
+            f"{base}/api/extract",
+            json=payload,
+            timeout=timeout,
+            **_proxy_kwargs(active_proxy),
+        )
         try:
             data = resp.json()
         except Exception:
@@ -149,15 +190,26 @@ def _create_extract_job(*, token: str, link_type: str, cdk: str) -> dict:
             pass
 
 
-def _iter_sse_events(*, job_id: str, cdk: str):
+def _iter_sse_events(
+    *,
+    job_id: str,
+    cdk: str,
+    proxy: str | None = None,
+    proxy_lane_id: int | None = None,
+):
     base = _api_base()
     timeout = _int_setting("EXTRACT_LINK_EVENT_TIMEOUT", 180, 30, 900)
     url = f"{base}/api/jobs/{quote(job_id, safe='')}/events?{urlencode({'cdk': _cdk(cdk)})}"
-    s = _session()
+    active_proxy = resolve_rotating_proxy(
+        proxy,
+        scope=EXTRACT_LINK_PROXY_SCOPE,
+        lane_id=proxy_lane_id,
+    )
+    s = _session(active_proxy)
     try:
         if s is None:
             req = Request(url, headers={"Accept": "text/event-stream"})
-            with urlopen(req, timeout=timeout) as resp:
+            with _urlopen(req, timeout=timeout, proxy=active_proxy) as resp:
                 event = "message"
                 data_lines: list[str] = []
                 for raw in resp:
@@ -187,7 +239,12 @@ def _iter_sse_events(*, job_id: str, cdk: str):
                         data = {"raw": text}
                     yield event, data
             return
-        resp = s.get(url, timeout=timeout, stream=True)
+        resp = s.get(
+            url,
+            timeout=timeout,
+            stream=True,
+            **_proxy_kwargs(active_proxy),
+        )
         if resp.status_code < 200 or resp.status_code >= 300:
             raise RuntimeError(f"监听提链事件失败 HTTP {resp.status_code}: {(resp.text or '')[:300]}")
         event = "message"
@@ -266,13 +323,33 @@ def _format_failure_reason(exc: Exception, logs: list[str] | None = None, last_e
     return reason[:500]
 
 
-def _run_extract(*, account_id: int, email: str, access_token: str, link_type: str, cdk: str, trigger: str) -> dict:
+def _run_extract(
+    *,
+    account_id: int,
+    email: str,
+    access_token: str,
+    link_type: str,
+    cdk: str,
+    trigger: str,
+    proxy: str | None = None,
+    proxy_lane_id: int | None = None,
+) -> dict:
     logs: list[str] = []
     last_event = None
     try:
         if not db.mark_account_extract_running(account_id):
             return {"ok": False, "error": "账号已删除或提链状态已被重置"}
-        job = _create_extract_job(token=access_token, link_type=link_type, cdk=cdk)
+        active_proxy = resolve_rotating_proxy(
+            proxy,
+            scope=EXTRACT_LINK_PROXY_SCOPE,
+            lane_id=proxy_lane_id,
+        )
+        job = _create_extract_job(
+            token=access_token,
+            link_type=link_type,
+            cdk=cdk,
+            proxy=active_proxy,
+        )
         job_id = str(job.get("job_id") or "")
         db.update_account_extract(account_id, {
             "ok": False,
@@ -282,7 +359,7 @@ def _run_extract(*, account_id: int, email: str, access_token: str, link_type: s
             "message": "提链任务已创建，等待结果",
             "cdk_remaining": job.get("cdk_remaining"),
         })
-        for event, data in _iter_sse_events(job_id=job_id, cdk=cdk):
+        for event, data in _iter_sse_events(job_id=job_id, cdk=cdk, proxy=active_proxy):
             last_event = {"event": event, "data": data}
             if event == "log":
                 msg = str((data or {}).get("message") or "")[:300]
@@ -328,7 +405,17 @@ def _run_extract(*, account_id: int, email: str, access_token: str, link_type: s
         _QUEUE_SLOTS.release()
 
 
-def enqueue_account_extract(*, account_id: int, email: str, access_token: str, trigger: str = "manual", link_type: str | None = None, cdk: str | None = None) -> dict:
+def enqueue_account_extract(
+    *,
+    account_id: int,
+    email: str,
+    access_token: str,
+    trigger: str = "manual",
+    link_type: str | None = None,
+    cdk: str | None = None,
+    proxy: str | None = None,
+    proxy_lane_id: int | None = None,
+) -> dict:
     if not _QUEUE_SLOTS.acquire(blocking=False):
         return {"accepted": False, "busy": False, "error": "提链队列已满"}
     try:
@@ -337,7 +424,17 @@ def enqueue_account_extract(*, account_id: int, email: str, access_token: str, t
         if not db.claim_account_extract(account_id, trigger=trigger, link_type=lt):
             _QUEUE_SLOTS.release()
             return {"accepted": False, "busy": True, "error": "该账号正在提链中"}
-        fut = _EXECUTOR.submit(_run_extract, account_id=account_id, email=email, access_token=access_token, link_type=lt, cdk=code, trigger=trigger)
+        fut = _EXECUTOR.submit(
+            _run_extract,
+            account_id=account_id,
+            email=email,
+            access_token=access_token,
+            link_type=lt,
+            cdk=code,
+            trigger=trigger,
+            proxy=proxy,
+            proxy_lane_id=proxy_lane_id,
+        )
         return {"accepted": True, "busy": False, "future": fut, "link_type": lt}
     except Exception:
         _QUEUE_SLOTS.release()

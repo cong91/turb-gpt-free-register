@@ -1,0 +1,69 @@
+"""Resolve the configured rotating proxy for every network workflow."""
+from __future__ import annotations
+
+import threading
+from urllib.parse import unquote, urlparse
+
+REGISTRATION_PROXY_SCOPE = "registration"
+CODEX_OAUTH_PROXY_SCOPE = "codex_oauth"
+CODEX_RETRY_PROXY_SCOPE = "codex_retry"
+PLAN_CHECK_PROXY_SCOPE = "plan_check"
+LIVE_CHECK_PROXY_SCOPE = "live_check"
+CODEX_AGENT_PROXY_SCOPE = "codex_agent"
+TWOFA_RETRY_PROXY_SCOPE = "twofa_retry"
+TWOFA_CHANGE_PROXY_SCOPE = "twofa_change"
+EMAIL_CHANGE_PROXY_SCOPE = "email_change"
+EXTRACT_LINK_PROXY_SCOPE = "extract_link"
+
+
+def default_proxy_lane_id() -> int:
+    """Use the stable worker suffix when available, otherwise the thread identity."""
+    name = str(threading.current_thread().name or "")
+    suffix = name.rsplit("_", 1)[-1]
+    if suffix.isdigit():
+        return int(suffix)
+    return int(threading.get_ident())
+
+
+def custom_proxy_details(proxy: str) -> dict[str, object]:
+    """Convert a proxy URL into a provider-neutral custom proxy payload."""
+    value = str(proxy or "").strip()
+    parsed = urlparse(value if "://" in value else f"//{value}")
+    scheme = str(parsed.scheme or "http").lower()
+    if scheme not in {"http", "https", "socks5", "socks5h"} or not parsed.hostname or not parsed.port:
+        raise ValueError("rotating proxy URL không hợp lệ cho cloud browser")
+    details: dict[str, object] = {
+        "host": parsed.hostname,
+        "port": int(parsed.port),
+    }
+    if parsed.username is not None:
+        details["username"] = unquote(parsed.username)
+    if parsed.password is not None:
+        details["password"] = unquote(parsed.password)
+    return details
+
+
+def resolve_rotating_proxy(
+    proxy: str | None,
+    *,
+    scope: str,
+    lane_id: int | None = None,
+) -> str | None:
+    """Return an explicit proxy or acquire one rotating lease for this workflow lane."""
+    if proxy is not None:
+        return proxy
+
+    from config import proxy as proxy_config
+
+    if not bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False)):
+        return None
+
+    effective_lane = default_proxy_lane_id() if lane_id is None else lane_id
+    from core.rotating_proxy_manager import get_rotating_proxy_manager
+
+    manager = get_rotating_proxy_manager()
+    if scope == REGISTRATION_PROXY_SCOPE:
+        lease = manager.acquire(effective_lane)
+    else:
+        lease = manager.acquire(effective_lane, scope=scope)
+    return lease.proxy_url

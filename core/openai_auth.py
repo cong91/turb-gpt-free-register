@@ -37,6 +37,26 @@ class AccountUnusableError(Exception):
         self.error_code = error_code
 
 
+ACCOUNT_DEACTIVATED_STATUS = "OpenAI đã khóa tài khoản"
+
+
+def account_unusable_message(error_code: str = "") -> str:
+    """Return one concise Vietnamese status for an unusable OpenAI account."""
+    messages = {
+        "account_deactivated": ACCOUNT_DEACTIVATED_STATUS,
+        "account_deleted": "OpenAI đã xóa tài khoản",
+        "account_banned": "OpenAI đã chặn tài khoản",
+    }
+    code = str(error_code or "").strip().lower()
+    return messages.get(code, "Tài khoản OpenAI không khả dụng")
+
+
+def account_unusable_error_message(error_code: str = "") -> str:
+    """Keep the technical error code on internal exceptions for diagnostics."""
+    code = str(error_code or "").strip().lower() or "account_deactivated"
+    return f"{account_unusable_message(code)} ({code})"
+
+
 # 远端返回这些 error code 时，判定邮箱素材已废，不再重试。
 _ACCOUNT_DEAD_CODES = frozenset({
     "account_deactivated",   # 账号已删除/停用
@@ -59,12 +79,26 @@ _ACCOUNT_DEAD_TEXT_MARKERS = (
     "your account has been deleted",
     "your account was deactivated",
     "your account was deleted",
+    "deleted or deactivated",
+    "deactivated or deleted",
+    "do not have an account because it has been deleted",
+    "account locked",
+    "account is locked",
+    "account has been locked",
+    "your account has been locked",
+    "temporarily locked",
+    "account suspended",
+    "account is suspended",
+    "account has been suspended",
+    "your account has been suspended",
     "账号已停用",
     "账号已禁用",
     "账号已删除",
+    "账号已锁定",
     "账户已停用",
     "账户已禁用",
     "账户已删除",
+    "账户已锁定",
 )
 
 
@@ -75,10 +109,12 @@ def detect_account_unusable_text(text: str) -> str:
         if code in low:
             return code
     if any(marker in low for marker in _ACCOUNT_DEAD_TEXT_MARKERS):
-        if "delete" in low or "删除" in low:
-            return "account_deleted"
+        if "deactivat" in low or "停用" in low:
+            return "account_deactivated"
         if "ban" in low or "封" in low:
             return "account_banned"
+        if "delete" in low or "删除" in low:
+            return "account_deleted"
         return "account_deactivated"
     return ""
 
@@ -478,7 +514,7 @@ def validate_email_otp(session: BrowserSession, code: str, sentinel_header: str 
         err_code = _extract_error_code(resp)
         if err_code in _ACCOUNT_DEAD_CODES:
             raise AccountUnusableError(
-                f"账号已废弃（{err_code}），邮箱不可再用", error_code=err_code,
+                account_unusable_error_message(err_code), error_code=err_code,
             )
         low = (resp.text or '').lower()
         if resp.status_code in (400, 401, 422) and any(k in low for k in (

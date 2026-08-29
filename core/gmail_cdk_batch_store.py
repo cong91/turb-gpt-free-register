@@ -7,14 +7,20 @@ import uuid
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
+
+from .gmail_batch_store_base import (
+    GmailBatchStoreBase,
+    GmailBatchError,
+    GmailBatchConflict,
+    Assignment,
+)
 
 
-class GmailCdkBatchError(RuntimeError):
-    """Batch Gmail CDK không thể claim hoặc chuyển trạng thái."""
-
-
-class GmailCdkBatchConflict(GmailCdkBatchError):
-    """Không còn Gmail CDK khả dụng cho job hiện tại."""
+# Backward compatibility aliases
+GmailCdkBatchError = GmailBatchError
+GmailCdkBatchConflict = GmailBatchConflict
+GmailCdkAssignment = Assignment
 
 
 @dataclass(frozen=True)
@@ -25,15 +31,6 @@ class GmailCdkBatchItem:
     state: str
     completed_count: int
     capacity: int
-
-
-@dataclass(frozen=True)
-class GmailCdkAssignment:
-    assignment_id: str
-    batch_id: str
-    inventory_id: str
-    job_id: str
-    state: str
 
 
 _SCHEMA_SQL = """
@@ -74,27 +71,39 @@ ON gmail_cdk_assignments(batch_id, job_id) WHERE state = 'active';
 """
 
 
-class GmailCdkBatchStore:
-    def __init__(self, path: str | Path, *, busy_timeout_ms: int = 3000):
-        self.path = Path(path)
-        self.busy_timeout_ms = max(1, int(busy_timeout_ms))
+class GmailCdkBatchStore(GmailBatchStoreBase):
+    """Gmail CDK batch store with CDK-specific polling."""
+
+    def _table_prefix(self) -> str:
+        return "gmail_cdk"
+
+    def _get_schema_sql(self) -> str:
+        return _SCHEMA_SQL
 
     def _connect(self) -> sqlite3.Connection:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(
-            self.path,
-            timeout=self.busy_timeout_ms / 1000,
-            isolation_level=None,
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA synchronous = FULL")
+        """Override to add WAL check."""
+        connection = super()._connect()
         if str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
             connection.close()
             raise GmailCdkBatchError("WAL is disabled for Gmail CDK batch state")
-        connection.executescript(_SCHEMA_SQL)
         return connection
+
+    def poll_otp(
+        self,
+        assignment: Assignment,
+        *,
+        after_ts: Optional[float] = None,
+        timeout: float = 60.0,
+        poll_interval: float = 2.0,
+    ) -> Optional[str]:
+        """Poll OTP via Gmail CDK client."""
+        from . import gmail_cdk_client
+        return gmail_cdk_client.poll_otp(
+            assignment.inventory_id,
+            after_ts=after_ts,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
 
     def create_batch(
         self,
@@ -103,6 +112,7 @@ class GmailCdkBatchStore:
         capacity: int,
         routed_domains=(),
     ) -> str:
+        """Create new Gmail CDK batch."""
         ids = list(dict.fromkeys(
             str(inventory_id or "").strip()
             for inventory_id in inventory_ids
@@ -125,100 +135,12 @@ class GmailCdkBatchStore:
             )
         return batch_id
 
-    def claim(self, batch_id: str, job_id: str) -> GmailCdkAssignment:
-        batch, owner = self._required(batch_id, job_id)
-        with self._transaction() as connection:
-            existing = connection.execute(
-                "SELECT * FROM gmail_cdk_assignments WHERE batch_id = ? AND job_id = ? AND state = 'active'",
-                (batch, owner),
-            ).fetchone()
-            if existing:
-                return self._assignment(existing)
-            row = connection.execute(
-                "SELECT i.*, b.capacity FROM gmail_cdk_batch_items i "
-                "JOIN gmail_cdk_batches b ON b.batch_id = i.batch_id "
-                "WHERE i.batch_id = ? AND i.state = 'active' "
-                "AND i.completed_count < b.capacity "
-                "AND NOT EXISTS (SELECT 1 FROM gmail_cdk_assignments a "
-                "WHERE a.batch_id = i.batch_id AND a.inventory_id = i.inventory_id AND a.state = 'active') "
-                "ORDER BY i.position LIMIT 1",
-                (batch,),
-            ).fetchone()
-            if row is None:
-                raise GmailCdkBatchConflict("Không còn Gmail CDK rảnh trong batch")
-            assignment_id = uuid.uuid4().hex
-            connection.execute(
-                "INSERT INTO gmail_cdk_assignments "
-                "(assignment_id, batch_id, inventory_id, job_id, state) "
-                "VALUES (?, ?, ?, ?, 'active')",
-                (assignment_id, batch, row["inventory_id"], owner),
-            )
-            created = connection.execute(
-                "SELECT * FROM gmail_cdk_assignments WHERE assignment_id = ?",
-                (assignment_id,),
-            ).fetchone()
-            return self._assignment(created)
-
-    def complete(self, assignment_id: str) -> bool:
-        return self._finish(assignment_id, "completed", item_state=None)
-
-    def fail(self, assignment_id: str, reason: str = "") -> bool:
-        return self._finish(assignment_id, "failed", item_state="failed", reason=reason)
-
     def exhaust(self, assignment_id: str, reason: str = "") -> bool:
+        """Mark assignment and item as exhausted (CDK-specific)."""
         return self._finish(assignment_id, "exhausted", item_state="exhausted", reason=reason)
 
-    def release(self, assignment_id: str, reason: str = "") -> bool:
-        return self._finish(assignment_id, "released", item_state=None, reason=reason)
-
-    def _finish(
-        self,
-        assignment_id: str,
-        target: str,
-        *,
-        item_state: str | None,
-        reason: str = "",
-    ) -> bool:
-        value = str(assignment_id or "").strip()
-        if not value:
-            raise GmailCdkBatchError("Assignment ID không được để trống")
-        with self._transaction() as connection:
-            row = connection.execute(
-                "SELECT * FROM gmail_cdk_assignments WHERE assignment_id = ?",
-                (value,),
-            ).fetchone()
-            if row is None:
-                return False
-            if row["state"] == target:
-                return True
-            if row["state"] != "active":
-                return False
-            connection.execute(
-                "UPDATE gmail_cdk_assignments SET state = ?, reason = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE assignment_id = ?",
-                (target, str(reason or "")[:300], value),
-            )
-            if target == "completed":
-                connection.execute(
-                    "UPDATE gmail_cdk_batch_items SET completed_count = completed_count + 1 "
-                    "WHERE batch_id = ? AND inventory_id = ?",
-                    (row["batch_id"], row["inventory_id"]),
-                )
-                connection.execute(
-                    "UPDATE gmail_cdk_batch_items SET state = 'exhausted' "
-                    "WHERE batch_id = ? AND inventory_id = ? "
-                    "AND completed_count >= (SELECT capacity FROM gmail_cdk_batches WHERE batch_id = ?)",
-                    (row["batch_id"], row["inventory_id"], row["batch_id"]),
-                )
-            elif item_state:
-                connection.execute(
-                    "UPDATE gmail_cdk_batch_items SET state = ?, failure_reason = ? "
-                    "WHERE batch_id = ? AND inventory_id = ?",
-                    (item_state, str(reason or "")[:300], row["batch_id"], row["inventory_id"]),
-                )
-            return True
-
-    def get_assignment(self, assignment_id: str) -> GmailCdkAssignment | None:
+    def get_assignment(self, assignment_id: str) -> Optional[GmailCdkAssignment]:
+        """Get assignment by ID (CDK-specific return type)."""
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM gmail_cdk_assignments WHERE assignment_id = ?",
@@ -226,16 +148,8 @@ class GmailCdkBatchStore:
             ).fetchone()
         return self._assignment(row) if row else None
 
-    def find_active_assignment(self, inventory_id: str, job_id: str) -> GmailCdkAssignment | None:
-        with closing(self._connect()) as connection:
-            row = connection.execute(
-                "SELECT * FROM gmail_cdk_assignments "
-                "WHERE inventory_id = ? AND job_id = ? AND state = 'active'",
-                (str(inventory_id), str(job_id)),
-            ).fetchone()
-        return self._assignment(row) if row else None
-
-    def get_item(self, batch_id: str, inventory_id: str) -> GmailCdkBatchItem | None:
+    def get_item(self, batch_id: str, inventory_id: str) -> Optional[GmailCdkBatchItem]:
+        """Get batch item details."""
         with closing(self._connect()) as connection:
             row = connection.execute(
                 "SELECT i.*, b.capacity FROM gmail_cdk_batch_items i "
@@ -246,45 +160,9 @@ class GmailCdkBatchStore:
         return self._item(row) if row else None
 
     @staticmethod
-    def _required(*values: str) -> tuple[str, ...]:
-        normalized = tuple(str(value or "").strip() for value in values)
-        if any(not value for value in normalized):
-            raise GmailCdkBatchError("Thiếu dữ liệu batch Gmail CDK")
-        return normalized
-
-    @staticmethod
-    def _assignment(row: sqlite3.Row) -> GmailCdkAssignment:
-        return GmailCdkAssignment(
-            row["assignment_id"], row["batch_id"], row["inventory_id"], row["job_id"], row["state"]
-        )
-
-    @staticmethod
     def _item(row: sqlite3.Row) -> GmailCdkBatchItem:
+        """Convert database row to GmailCdkBatchItem."""
         return GmailCdkBatchItem(
             row["batch_id"], row["inventory_id"], int(row["position"]), row["state"],
             int(row["completed_count"]), int(row["capacity"]),
         )
-
-    class _Transaction:
-        def __init__(self, store: "GmailCdkBatchStore"):
-            self.store = store
-            self.connection: sqlite3.Connection | None = None
-
-        def __enter__(self) -> sqlite3.Connection:
-            self.connection = self.store._connect()
-            self.connection.execute("BEGIN IMMEDIATE")
-            return self.connection
-
-        def __exit__(self, exc_type, exc, tb) -> None:
-            if self.connection is None:
-                return
-            try:
-                if exc_type is None:
-                    self.connection.commit()
-                else:
-                    self.connection.rollback()
-            finally:
-                self.connection.close()
-
-    def _transaction(self) -> "GmailCdkBatchStore._Transaction":
-        return self._Transaction(self)

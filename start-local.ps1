@@ -79,6 +79,107 @@ function Assert-NodeVersion {
     Write-Host "[OK] Node.js $version"
 }
 
+function Test-TcpPort {
+    param(
+        [string]$HostName,
+        [int]$Port
+    )
+
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $task = $client.ConnectAsync($HostName, $Port)
+        return $task.Wait(500) -and $client.Connected
+    } catch {
+        return $false
+    } finally {
+        $client.Dispose()
+    }
+}
+
+function Get-ListeningProcessIds {
+    param(
+        [int]$Port
+    )
+
+    $listenerPids = New-Object 'System.Collections.Generic.List[int]'
+    $connections = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)
+    foreach ($connection in $connections) {
+        if ($connection.OwningProcess -gt 0) {
+            $null = $listenerPids.Add([int]$connection.OwningProcess)
+        }
+    }
+
+    if ($listenerPids.Count -eq 0) {
+        $netstatLines = @(netstat -ano -p tcp | Select-String -Pattern 'LISTENING')
+        foreach ($line in $netstatLines) {
+            $columns = $line.ToString().Trim() -split '\s+'
+            if ($columns.Count -ge 5 -and
+                $columns[0] -eq 'TCP' -and
+                $columns[1] -match ":$Port$" -and
+                $columns[3] -eq 'LISTENING' -and
+                $columns[4] -match '^\d+$') {
+                $null = $listenerPids.Add([int]$columns[4])
+            }
+        }
+    }
+
+    return @($listenerPids | Sort-Object -Unique)
+}
+
+function Stop-ListenersOnPort {
+    param(
+        [string]$HostName,
+        [int]$Port
+    )
+
+    $listenerPids = @(Get-ListeningProcessIds -Port $Port)
+    if ($listenerPids.Count -eq 0) {
+        if (Test-TcpPort -HostName $HostName -Port $Port) {
+            throw "Khong the xac dinh process dang giu cong $HostName`:$Port."
+        }
+
+        Write-Host "[PORT] Cong $HostName`:$Port dang trong."
+        return
+    }
+
+    foreach ($listenerPid in $listenerPids) {
+        if ($listenerPid -le 0 -or $listenerPid -eq $PID) {
+            continue
+        }
+
+        $process = Get-Process -Id $listenerPid -ErrorAction SilentlyContinue
+        if ($process) {
+            Write-Host "[PORT] Force-close PID $listenerPid ($($process.ProcessName)) tren cong $Port..."
+            Stop-Process -Id $listenerPid -Force -ErrorAction Stop
+        }
+    }
+
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        if (-not (Test-TcpPort -HostName $HostName -Port $Port)) {
+            Write-Host "[OK] Da giai phong cong $HostName`:$Port."
+            return
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "Khong the giai phong cong $HostName`:$Port sau khi force-close process."
+}
+
+function Get-FileSha256 {
+    param(
+        [string]$Path
+    )
+
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.IO.File]::ReadAllBytes($Path)
+        return ([System.BitConverter]::ToString($sha256.ComputeHash($bytes))).Replace("-", "")
+    } finally {
+        $sha256.Dispose()
+    }
+}
+
 Push-Location $projectRoot
 try {
     Assert-NodeVersion
@@ -102,7 +203,7 @@ try {
 
     Assert-PythonVersion -Executable $venvPython
 
-    $requirementsHash = (Get-FileHash $requirementsPath -Algorithm SHA256).Hash
+    $requirementsHash = Get-FileSha256 $requirementsPath
     $installedHash = if (Test-Path $requirementsStamp) {
         (Get-Content $requirementsStamp -Raw).Trim()
     } else {
@@ -145,6 +246,8 @@ try {
         Write-Host "[OK] He thong da san sang. Khong khoi dong WebUI vi dang dung -CheckOnly."
         exit 0
     }
+
+    Stop-ListenersOnPort -HostName $ListenHost -Port $Port
 
     $webArguments = @("web.py", "--host", $ListenHost, "--port", $Port.ToString())
     if ($AuthCode) {

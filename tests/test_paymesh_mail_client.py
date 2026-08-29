@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 from core.paymesh_mail_client import (
     PaymeshMailAccount,
     PaymeshMailError,
+    fetch_latest_otp,
     poll_verification_code,
     redeem_cdk,
 )
@@ -37,6 +38,26 @@ class PaymeshMailClientTests(unittest.TestCase):
         client._OTP_STORE = OtpIdentityStore(
             Path(self._otp_temp_dir.name) / "otp.sqlite3"
         )
+
+    @patch("core.paymesh_mail_client.poll_verification_code", return_value="654321")
+    @patch("core.paymesh_mail_client.get_account_context")
+    def test_fetch_latest_otp_uses_paymesh_default_wait(self, get_context, poll):
+        from config import email as email_config
+
+        get_context.return_value = PaymeshMailAccount("user@example.com", "MAIL-ONE", 6)
+        with patch.object(email_config, "PAYMESH_OTP_MAX_WAIT", 180):
+            self.assertEqual(fetch_latest_otp("user@example.com"), "654321")
+
+        self.assertEqual(poll.call_args.kwargs["max_wait"], 180)
+
+    @patch("core.paymesh_mail_client.poll_verification_code", return_value="654321")
+    @patch("core.paymesh_mail_client.get_account_context")
+    def test_fetch_latest_otp_explicit_wait_wins(self, get_context, poll):
+        get_context.return_value = PaymeshMailAccount("user@example.com", "MAIL-ONE", 6)
+
+        self.assertEqual(fetch_latest_otp("user@example.com", max_wait=12), "654321")
+
+        self.assertEqual(poll.call_args.kwargs["max_wait"], 12)
 
     def tearDown(self):
         from core import paymesh_mail_client as client

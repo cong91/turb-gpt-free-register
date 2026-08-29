@@ -4,9 +4,11 @@ import ctypes
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 from core import db
+from core.rotating_proxy_runtime import CODEX_RETRY_PROXY_SCOPE, resolve_rotating_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,31 @@ def is_retrying(email: str) -> bool:
         return (email or "").strip().lower() in _RETRYING
 
 
+def active_retrying_emails() -> set[str]:
+    """Return emails with a retry reservation in this WebUI process."""
+    with _RETRYING_LOCK:
+        return set(_RETRYING)
+
+
+def reconcile_persisted_retrying_statuses() -> dict[str, int]:
+    """Reset persisted retrying states that have no live process reservation."""
+    active = active_retrying_emails()
+    reset = 0
+    for row in db.list_accounts(limit=5000, archived="all"):
+        if str(row.get("codex_status") or "").strip().lower() != "retrying":
+            continue
+        email = str(row.get("email") or "").strip()
+        if not email or email.lower() in active:
+            continue
+        if db.update_account_codex_status(
+            email,
+            "failed",
+            "WebUI khởi động lại; trạng thái retrying cũ không còn worker",
+        ):
+            reset += 1
+    return {"reset": reset, "active": len(active)}
+
+
 def is_stop_requested(email: str) -> bool:
     with _RETRYING_LOCK:
         return (email or "").strip().lower() in _STOP_REQUESTED
@@ -97,6 +124,24 @@ def is_stop_requested(email: str) -> bool:
 def check_stop_requested(email: str) -> None:
     if is_stop_requested(email):
         raise CodexRetryStopped("用户手动停止 Codex 补跑")
+
+
+def _is_retryable_browser_network_result(result: dict) -> bool:
+    """Only retry failures caused by a transient browser/network disconnect."""
+    if not isinstance(result, dict) or result.get("ok"):
+        return False
+    text = str(result.get("message") or result.get("error") or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "err_empty_response",
+            "err_connection_reset",
+            "err_connection_closed",
+            "err_timed_out",
+            "err_network_changed",
+            "err_proxy_connection_failed",
+        )
+    )
 
 
 def _async_raise(thread_id: int, exc_type: type[BaseException]) -> bool:
@@ -168,6 +213,11 @@ def run_worker(
     batch_label: str | None = None,
     clear_log: bool = True,
     target_log_path: str | Path | None = None,
+    oauth_driver: str | None = None,
+    proxy: str | None = None,
+    proxy_lane_id: int | None = None,
+    lease_owner_id: str | None = None,
+    sub2_callback_context: dict | None = None,
 ) -> dict:
     """执行一次 Codex 补跑。调用前必须先 reserve，结束时会自动 release。"""
     fh: logging.FileHandler | None = None
@@ -180,7 +230,7 @@ def run_worker(
             _RESERVED_AT[key] = time.time()
         check_stop_requested(email)
 
-        from core.codex_oauth import run_codex_oauth
+        from core.codex_oauth import run_codex_oauth, sub2_callback_override
 
         path = Path(target_log_path) if target_log_path else log_path(email)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,8 +253,9 @@ def run_worker(
             from config import codex as codex_cfg
             from config import roxybrowser as roxy_cfg
             logger.info(
-                "[Codex 补跑] 已热加载配置：CODEX_OAUTH_DRIVER=%s ROXY_OPEN_HEADLESS=%s ROXY_KEEP_BROWSER_OPEN=%s",
+                "[Codex 补跑] 已热加载配置：CODEX_OAUTH_DRIVER=%s SMS_PROVIDER=%s ROXY_OPEN_HEADLESS=%s ROXY_KEEP_BROWSER_OPEN=%s",
                 getattr(codex_cfg, "CODEX_OAUTH_DRIVER", ""),
+                getattr(codex_cfg, "SMS_PROVIDER", ""),
                 getattr(roxy_cfg, "ROXY_OPEN_HEADLESS", ""),
                 getattr(roxy_cfg, "ROXY_KEEP_BROWSER_OPEN", ""),
             )
@@ -214,9 +265,81 @@ def run_worker(
         if batch_label:
             logger.info("[Codex 补跑] 批量任务：%s", batch_label)
         logger.info("[Codex 补跑] 开始：%s", email)
-        logger.info("[Codex 补跑] 阶段说明：获取授权地址 → 登录邮箱 → 邮箱 OTP → 手机验证 → 捕获 callback → 提交/保存凭证")
         check_stop_requested(email)
-        result = run_codex_oauth(email, force=True)
+        account = db.get_account_by_email(email)
+        oauth_kwargs = {"force": True}
+        if oauth_driver:
+            oauth_kwargs["oauth_driver"] = str(oauth_driver).strip()
+        login_mode = str((account or {}).get("codex_login_mode") or "").strip().lower()
+        has_saved_credentials = bool(
+            str((account or {}).get("email") or "").strip()
+            and str((account or {}).get("registration_password") or "")
+            and str((account or {}).get("totp_secret") or "").strip()
+        )
+        if account and (login_mode == "credentials" or has_saved_credentials):
+            from core.codex_login_credentials import CodexLoginCredentials
+
+            oauth_kwargs["credentials"] = CodexLoginCredentials.from_account(account)
+            logger.info("[Codex 补跑] 阶段说明：获取授权地址 → 密码登录 → authenticator 2FA → 手机验证 → 捕获 callback → 提交/保存凭证")
+        else:
+            logger.info("[Codex 补跑] 阶段说明：获取授权地址 → 登录邮箱 → 邮箱 OTP → 手机验证 → 捕获 callback → 提交/保存凭证")
+        from config import codex as codex_cfg
+        max_attempts = max(1, int(getattr(codex_cfg, "CODEX_RETRY_NETWORK_ATTEMPTS", 2) or 2))
+        retry_delay = max(0.0, float(getattr(codex_cfg, "CODEX_RETRY_NETWORK_DELAY", 3.0) or 3.0))
+        from core.nordvpn_wireguard import is_per_profile_proxy_enabled, proxy_for_registration
+
+        rotating_proxy = resolve_rotating_proxy(
+            proxy,
+            scope=CODEX_RETRY_PROXY_SCOPE,
+            lane_id=proxy_lane_id,
+        )
+        if rotating_proxy is None and is_per_profile_proxy_enabled():
+            proxy_context = (
+                proxy_for_registration(owner_id=lease_owner_id)
+                if lease_owner_id is not None
+                else proxy_for_registration()
+            )
+        else:
+            proxy_context = nullcontext(rotating_proxy)
+        callback_scope = (
+            sub2_callback_override(
+                str(sub2_callback_context.get("path") or ""),
+                {
+                    "request_id": str(sub2_callback_context.get("request_id") or ""),
+                    "event_id": str(sub2_callback_context.get("event_id") or ""),
+                    "account_id": int(sub2_callback_context.get("account_id") or 0),
+                    "email": str(sub2_callback_context.get("email") or email),
+                },
+            )
+            if isinstance(sub2_callback_context, dict)
+            else nullcontext()
+        )
+        with callback_scope:
+            with proxy_context as active_proxy:
+                if active_proxy:
+                    oauth_kwargs["proxy"] = active_proxy
+                    if rotating_proxy is not None:
+                        logger.info(
+                            "[Codex 补跑] 使用 rotating proxy lease，lane=%s",
+                            proxy_lane_id if proxy_lane_id is not None else "thread",
+                        )
+                    else:
+                        logger.info("[Codex 补跑] 使用 NordVPN WireGuard SOCKS5 lease，OAuth 不使用 PROXY_POOL")
+                result = run_codex_oauth(email, **oauth_kwargs)
+                for attempt in range(2, max_attempts + 1):
+                    if not _is_retryable_browser_network_result(result):
+                        break
+                    check_stop_requested(email)
+                    logger.warning(
+                        "[Codex 补跑] 浏览器临时网络错误，重新开启 OAuth：attempt=%s/%s delay=%.1fs error=%s",
+                        attempt,
+                        max_attempts,
+                        retry_delay,
+                        str(result.get("message") or result.get("error") or "")[:180],
+                    )
+                    if retry_delay:
+                        time.sleep(retry_delay)
+                    result = run_codex_oauth(email, **oauth_kwargs)
         check_stop_requested(email)
         logger.info(
             "[Codex 补跑] 结果：status=%s ok=%s file=%s callback=%s",
@@ -228,7 +351,7 @@ def run_worker(
             logger.info("[Codex 补跑] %s 成功", email)
         elif result_status == "deactivated":
             db.update_account_codex_status(email, "deactivated", result.get("message"))
-            logger.warning("[Codex 补跑] %s 账号已废: %s", email, result.get("message"))
+            logger.warning("[Codex Chạy bù] %s: %s", email, result.get("message") or "Tài khoản OpenAI không khả dụng")
         else:
             db.update_account_codex_status(email, result_status, result.get("message"))
             logger.warning("[Codex 补跑] %s 失败: %s", email, result.get("message"))

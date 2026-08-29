@@ -12,6 +12,7 @@ def nordvpn_status_payload(
 ) -> dict:
     """Return NordVPN runtime and registration-gate state for WebUI display."""
     from config import nordvpn as nordvpn_config
+    from config import nordvpn_wireguard as wireguard_config
 
     if nordvpn_cli is None:
         from core import nordvpn_cli as nordvpn_cli
@@ -23,6 +24,9 @@ def nordvpn_status_payload(
     connected = bool(nordvpn_cli.is_connected()) if configured else False
     ready = bool(configured and service_running and connected)
     rotation = registration_service.nordvpn_rotation_status()
+    from core.nordvpn_wireguard import list_active_leases
+
+    wireguard_leases = list_active_leases()
     rotation_pending = bool(rotation.get("rotation_pending"))
     rotation_blocked = bool(
         rotation_pending and rotation.get("gate_state") == "awaiting_confirmation"
@@ -52,6 +56,9 @@ def nordvpn_status_payload(
         "rotation_detail": rotation.get("rotation_detail"),
         "gate_state": rotation.get("gate_state"),
         "waiting_jobs": rotation.get("waiting_jobs", 0),
+        "wireguard_enabled": bool(getattr(wireguard_config, "NORDVPN_WG_ENABLED", False)),
+        "wireguard_active_count": len(wireguard_leases),
+        "wireguard_leases": wireguard_leases,
         "message": message,
     }
 

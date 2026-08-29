@@ -4,8 +4,7 @@
 
 旧方案"复用注册的已登录 session"会撞 /choose-an-account 卡死（React SPA 解析不出
 可提交字段）。新方案改为用**全新干净 session**从头登录，走 OpenAI 标准风控路径，
-手机号验证靠接码平台自动收码，当前通过 core.sms_provider 支持 GrizzlySMS 和 L_API.md
-定义的本地 L 取号服务。
+手机号验证靠接码平台自动收码，当前通过 core.sms_provider 支持 GrizzlySMS、ViOTP 和本地 L/H 服务。
 
 完整接口链（2026-06-15 浏览器抓包确认，均 POST auth.openai.com，json）：
     1. 提交邮箱   /api/accounts/authorize/continue  {"username":{"kind":"email","value":邮箱}}  带 sentinel(authorize_continue)
@@ -20,6 +19,8 @@
 build_codex_storage / save_codex_credential）沿用原流程。
 """
 import base64
+from contextlib import contextmanager
+import contextvars
 import hashlib
 import json
 import logging
@@ -35,12 +36,40 @@ import pyotp
 # 协议级常量（CLIENT_ID/URL/SCOPE/OUTPUT_DIRNAME）虽然不会改，统一从 _cfg 读，
 # 这样 reload 后立即生效，不用再分两套导入。
 from config import codex as _cfg
+
+
+_SUB2_CALLBACK_OVERRIDE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "sub2_callback_override",
+    default=None,
+)
+
+
+@contextmanager
+def sub2_callback_override(path: str, extra_body: dict[str, object]):
+    """Temporarily route one OAuth callback through an automation endpoint."""
+    normalized_path = "/" + str(path or "").strip().lstrip("/")
+    if normalized_path == "/":
+        raise ValueError("sub2 automation callback path is required")
+    token = _SUB2_CALLBACK_OVERRIDE.set({
+        "path": normalized_path,
+        "extra_body": {
+            key: value if isinstance(value, (int, float, bool)) else str(value).strip()
+            for key, value in dict(extra_body or {}).items()
+            if str(value or "").strip()
+        },
+    })
+    try:
+        yield
+    finally:
+        _SUB2_CALLBACK_OVERRIDE.reset(token)
 from core.session import BrowserSession
 from core.humanize import delay as human_delay
 from core.openai_auth import (
     _is_transient_network_error,
     _extract_error_code,
     detect_account_unusable_response_body,
+    account_unusable_error_message,
+    account_unusable_message,
     AccountUnusableError,
     request_sentinel_token,
     build_sentinel_header,
@@ -299,7 +328,13 @@ def _sub2_codex_headers() -> dict:
     return headers
 
 
-def _sub2_codex_request_json(method: str, path: str, body: dict | None = None) -> dict:
+def _sub2_codex_request_json(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    extra_headers: dict[str, str] | None = None,
+) -> dict:
     from config import sub2api as _sub2_cfg
     base = _sub2_codex_base()
     timeout = int(getattr(_sub2_cfg, "SUB2API_API_TIMEOUT", 20) or 20)
@@ -307,10 +342,16 @@ def _sub2_codex_request_json(method: str, path: str, body: dict | None = None) -
     url = f"{base}{normalized_path}"
     session = curl_requests.Session()
     try:
+        headers = _sub2_codex_headers()
+        headers.update({
+            str(key): str(value)
+            for key, value in dict(extra_headers or {}).items()
+            if str(key).strip() and str(value).strip()
+        })
         resp = session.request(
             method.upper(),
             url,
-            headers=_sub2_codex_headers(),
+            headers=headers,
             data=None if body is None else json.dumps(body),
             timeout=timeout,
         )
@@ -385,12 +426,68 @@ def _summarize_sub2_response(payload: dict) -> str:
     return str(payload)[:300]
 
 
+def _sub2_account_id(payload: dict) -> str:
+    """从 sub2api 创建响应中提取后续更新账号所需的 ID。"""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        data = payload if isinstance(payload, dict) else {}
+    for key in ("id", "account_id", "accountId"):
+        value = data.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _apply_sub2_model_mapping(payload: dict, model_mapping: dict[str, str]) -> None:
+    """把 OAuth 创建后的模型映射补写到 sub2api 账号。"""
+    account_id = _sub2_account_id(payload)
+    if not account_id:
+        logger.warning("[Codex][sub2] 账号已创建，但响应没有 account id，无法设置模型映射")
+        return
+    update_path = f"/api/v1/admin/accounts/{account_id}"
+    _sub2_codex_request_json(
+        "PUT",
+        update_path,
+        {"credentials": {"model_mapping": model_mapping}},
+    )
+    logger.info("[Codex][sub2] 已为账号 %s 设置模型映射: %s", account_id, ", ".join(model_mapping))
+
+
 def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_uri: str = "") -> dict:
     """提交 OAuth callback 给 sub2。"""
     from config import sub2api as _sub2_cfg
+    sub2_defaults = _sub2_cfg.get_sub2api_account_defaults()
+    model_mapping = dict(sub2_defaults["model_mapping"] or {})
+    override = _SUB2_CALLBACK_OVERRIDE.get()
     path = str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PATH", "/api/v1/admin/openai/create-from-oauth") or "/api/v1/admin/openai/create-from-oauth")
-    mode = str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PAYLOAD_MODE", "create_from_oauth") or "create_from_oauth").strip().lower()
-    if mode == "callback_url":
+    extra_headers: dict[str, str] = {}
+    extra_body: dict[str, object] = {}
+    if isinstance(override, dict):
+        path = str(override.get("path") or "")
+        extra_body = dict(override.get("extra_body") or {})
+        callback_secret = str(getattr(_sub2_cfg, "SUB2API_AUTOMATION_CALLBACK_SECRET", "") or "").strip()
+        if not callback_secret:
+            raise RuntimeError("[Codex][sub2] automation callback secret is not configured")
+        extra_headers["X-Sub2API-Automation-Secret"] = callback_secret
+    mode = (
+        "exchange_code"
+        if isinstance(override, dict)
+        else str(getattr(_sub2_cfg, "SUB2_CODEX_CALLBACK_PAYLOAD_MODE", "create_from_oauth") or "create_from_oauth").strip().lower()
+    )
+    if isinstance(override, dict):
+        callback_value = str(callback_url or "").strip()
+        if not session_id:
+            raise RuntimeError("[Codex][sub2] reauthorization callback 缺少 session_id")
+        parsed = urlparse(callback_value)
+        query = parse_qs(parsed.query)
+        if not query.get("code", [""])[0]:
+            raise RuntimeError("[Codex][sub2] reauthorization callback 缺少 code")
+        if not query.get("state", [""])[0]:
+            raise RuntimeError("[Codex][sub2] reauthorization callback 缺少 state")
+        body = {"session_id": session_id, "callback_url": callback_value}
+        if redirect_uri:
+            body["redirect_uri"] = redirect_uri
+    elif mode == "callback_url":
         body = {"callback_url": str(callback_url or "").strip()}
     elif mode == "redirect_url":
         body = {"redirect_url": str(callback_url or "").strip()}
@@ -402,23 +499,31 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
         if not session_id:
             raise RuntimeError("[Codex][sub2] exchange-code 缺少 session_id")
         if not code:
-            raise RuntimeError(f"[Codex][sub2] callback_url 缺少 code: {callback_url}")
+            raise RuntimeError("[Codex][sub2] callback_url 缺少 code")
         if not state:
-            raise RuntimeError(f"[Codex][sub2] callback_url 缺少 state: {callback_url}")
+            raise RuntimeError("[Codex][sub2] callback_url 缺少 state")
         body = {"session_id": session_id, "code": code, "state": state}
         if redirect_uri:
             body["redirect_uri"] = redirect_uri
         if mode in {"create_from_oauth", "create-from-oauth", "create_oauth_account"}:
-            body.setdefault("concurrency", 3)
-            body.setdefault("priority", 50)
+            body["concurrency"] = 3
+            body["priority"] = int(sub2_defaults["priority"])
+            body["group_ids"] = list(sub2_defaults["group_ids"])
+    if extra_body:
+        body.update(extra_body)
 
     max_attempts = max(1, int(getattr(_cfg, "CPA_CALLBACK_SUBMIT_RETRIES", 5) or 5))
     base_delay = max(1.0, float(getattr(_cfg, "CPA_CALLBACK_SUBMIT_RETRY_DELAY", 6) or 6))
     last_exc = None
     for attempt in range(1, max_attempts + 1):
         try:
-            logger.info("[Codex][sub2] 正在上传 OAuth callback（第 %s/%s 次）... callback=%s", attempt, max_attempts, callback_url)
-            payload = _sub2_codex_request_json("POST", path, body)
+            logger.info("[Codex][sub2] 正在上传 OAuth callback（第 %s/%s 次）...", attempt, max_attempts)
+            payload = _sub2_codex_request_json("POST", path, body, extra_headers=extra_headers)
+            if mode in {"create_from_oauth", "create-from-oauth", "create_oauth_account"} and model_mapping:
+                try:
+                    _apply_sub2_model_mapping(payload, model_mapping)
+                except Exception as exc:
+                    logger.warning("[Codex][sub2] 账号已创建，但模型映射设置失败: %s", exc)
             logger.info("[Codex][sub2] callback 已上传并处理完成（第 %s 次成功）响应=%s", attempt, _summarize_sub2_response(payload))
             return payload
         except Exception as exc:
@@ -856,13 +961,13 @@ def _submit_email_otp(session: BrowserSession, code: str) -> None:
         error_code = _extract_error_code(resp)
         if error_code in ("account_deactivated", "account_deleted", "account_banned"):
             raise AccountUnusableError(
-                f"[Codex] 账号已废（{error_code}）status={resp.status_code}: {(resp.text or '')[:200]}",
+                account_unusable_error_message(error_code),
                 error_code=error_code,
             )
         body_error_code = detect_account_unusable_response_body(resp.text or "")
         if body_error_code:
             raise AccountUnusableError(
-                f"[Codex] 账号已废（{body_error_code}）status={resp.status_code}: {(resp.text or '')[:200]}",
+                account_unusable_error_message(body_error_code),
                 error_code=body_error_code,
             )
         raise RuntimeError(
@@ -896,7 +1001,9 @@ def _do_phone_verification(session: BrowserSession) -> None:
 
     实际平台适配在 core.sms_provider：
         - SMS_PROVIDER="grizzly"：GrizzlySMS handler_api.php
-        - SMS_PROVIDER="l"：L_API.md 的 /take-phone 和 /fetch-code JSON 接口
+        - SMS_PROVIDER="viotp"：ViOTP request/session JSON API
+        - SMS_PROVIDER="hero"：HeroSMS SMS-Activate-compatible API；country=auto 时按实时 cost 从低到高扫描，sticky country 仅在同价位优先
+        - SMS_PROVIDER="l" / "h"：本地 JSON 接码接口
     """
     http = sms_provider._http()
     max_retries = _cfg.SMS_MAX_RETRIES
@@ -906,7 +1013,10 @@ def _do_phone_verification(session: BrowserSession) -> None:
         for attempt in range(1, max_retries + 1):
             activation_id = None
             try:
-                activation_id, phone = sms_provider.acquire_number(http)
+                activation_id, phone = sms_provider.acquire_number(
+                    http,
+                    lane_key=sms_provider.default_lane_key(),
+                )
                 logger.info(
                     f"[Codex] 手机验证尝试 {attempt}/{max_retries}，"
                     f"provider={provider}, activation_id={activation_id}, 号码=+{phone}"
@@ -1327,19 +1437,25 @@ def run_codex_oauth(
     otp_provider=None,
     proxy: str | None = None,
     force: bool = False,
+    credentials=None,
+    oauth_driver: str | None = None,
+    proxy_lane_id: int | None = None,
     _cpa_reauth_round: int = 1,
 ) -> dict:
     """
-    注册成功后的 Codex OAuth 授权入口（全新 session + 接码方案）。
+    注册成功后的 Codex OAuth 授权入口。
 
-    不复用注册的 session：内部新建干净 BrowserSession，从头登录该邮箱，
-    走 邮箱 OTP → 手机短信验证 → 选 workspace → 拿 code → 换 token → 落盘。
+    默认走邮箱 OTP；传入 credentials 时使用所选浏览器 profile 走密码和
+    authenticator TOTP 后复用原有手机短信、workspace、callback 与 token 流程。
 
     Args:
         email: 已注册成功的账号邮箱
         otp_provider: 邮箱 OTP 获取回调 fn(email, after_ts)->code，默认用 wait_for_otp
-        proxy: 代理（不传从 PROXY_POOL 抽）
+        proxy: 代理（不传按 rotating lease 或现有配置选择）
         force: True 时跳过 ENABLE_CODEX_AUTO 开关限制，供手动补跑使用
+        credentials: 可选 CodexLoginCredentials；仅限浏览器驱动
+        oauth_driver: 可选显式驱动；未传时使用 CODEX_OAUTH_DRIVER
+        proxy_lane_id: rotating proxy lane；未传时使用当前 worker thread
 
     Returns:
         结构化结果 dict。任何异常都被吞掉转 status=failed，不向上抛，不影响注册主流程。
@@ -1351,22 +1467,78 @@ def run_codex_oauth(
 
     # Codex OAuth 支持多种驱动：
     # protocol：原纯协议；roxy/cloak/browser_use：用真实浏览器跑页面并捕获 localhost callback。
+    if proxy is None:
+        try:
+            from core.rotating_proxy_runtime import (
+                CODEX_OAUTH_PROXY_SCOPE,
+                resolve_rotating_proxy,
+            )
+
+            proxy = resolve_rotating_proxy(
+                None,
+                scope=CODEX_OAUTH_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+            )
+        except Exception as exc:
+            return _codex_result(
+                status="failed",
+                email=email,
+                message=f"rotating proxy lease failed: {type(exc).__name__}: {str(exc)[:180]}",
+            )
+
     try:
         from config import codex as _codex_cfg
         from config import roxybrowser as _roxy_cfg
-        oauth_driver = str(getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", "protocol") or "protocol").strip().lower()
-        if oauth_driver == "same_as_registration":
-            oauth_driver = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
-        if oauth_driver in ("roxy", "roxybrowser", "fingerprint", "browser"):
+        selected_oauth_driver = str(
+            oauth_driver or getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", "protocol") or "protocol"
+        ).strip().lower()
+        if selected_oauth_driver == "same_as_registration":
+            selected_oauth_driver = str(
+                getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol"
+            ).strip().lower()
+        if credentials:
+            credential_email = str(getattr(credentials, "email", "") or "").strip().lower()
+            if credential_email != str(email or "").strip().lower():
+                return _codex_result(status="failed", email=email, message="Codex credential email mismatch")
+            if selected_oauth_driver not in (
+                "roxy", "roxybrowser", "fingerprint", "browser",
+                "cloak", "cloakbrowser",
+                "browser_use", "browseruse", "browser-use", "bu",
+                "skyvern", "sv",
+            ):
+                return _codex_result(
+                    status="failed",
+                    email=email,
+                    message="Codex credential login 只支持 Roxy/Cloak/BrowserUse/Skyvern browser driver",
+                )
+        if selected_oauth_driver in ("roxy", "roxybrowser", "fingerprint", "browser"):
             from core.roxy_codex_oauth import run_roxy_codex_oauth
-            return run_roxy_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)
-        if oauth_driver in ("browser_use", "browseruse", "browser-use", "bu"):
+            return run_roxy_codex_oauth(
+                email,
+                otp_provider=otp_provider,
+                proxy=proxy,
+                force=True,
+                credentials=credentials,
+            )
+        if selected_oauth_driver in ("browser_use", "browseruse", "browser-use", "bu"):
             from core.browser_use_codex_oauth import run_browser_use_codex_oauth
-            return run_browser_use_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)
-        if oauth_driver in ("skyvern", "sv"):
+            return run_browser_use_codex_oauth(
+                email,
+                otp_provider=otp_provider,
+                proxy=proxy,
+                force=True,
+                credentials=credentials,
+            )
+        if selected_oauth_driver in ("skyvern", "sv"):
             from core.skyvern_codex_oauth import run_skyvern_codex_oauth
-            return run_skyvern_codex_oauth(email, otp_provider=otp_provider, proxy=proxy, force=True)
-        if oauth_driver in ("cloak", "cloakbrowser"):
+            return run_skyvern_codex_oauth(
+                email,
+                otp_provider=otp_provider,
+                proxy=proxy,
+                force=True,
+                credentials=credentials,
+            )
+        if selected_oauth_driver in ("cloak", "cloakbrowser"):
             from config import cloakbrowser as _cloak_cfg
             from core.cloakbrowser_driver import build_cloak_driver
             from core.roxy_codex_oauth import run_roxy_codex_oauth
@@ -1381,6 +1553,7 @@ def run_codex_oauth(
                     existing_opened=opened,
                     reuse_existing_profile=True,
                     clear_existing_state=True,
+                    credentials=credentials,
                 )
             finally:
                 if not bool(getattr(_cloak_cfg, "CLOAK_KEEP_BROWSER_OPEN", False)):
@@ -1388,9 +1561,15 @@ def run_codex_oauth(
                         driver.quit()
                     except Exception:
                         pass
-        if oauth_driver not in ("protocol", "api", "http"):
-            raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={oauth_driver!r}，可选 protocol / roxy / cloak / browser_use / skyvern")
-    except ImportError:
+        if selected_oauth_driver not in ("protocol", "api", "http"):
+            raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={selected_oauth_driver!r}，可选 protocol / roxy / cloak / browser_use / skyvern")
+    except ImportError as exc:
+        if credentials:
+            return _codex_result(
+                status="failed",
+                email=email,
+                message=f"Codex credential driver unavailable: {type(exc).__name__}",
+            )
         # 没装 selenium / 未提供 roxy 配置时继续走协议模式，保持旧行为。
         pass
 
@@ -1544,11 +1723,12 @@ def run_codex_oauth(
             message=f"plan={id_claims.get('plan_type') or 'unknown'}",
         )
     except AccountUnusableError as exc:
-        logger.warning(f"[Codex] 账号已废（{exc.error_code}）：{email}")
+        message = account_unusable_message(exc.error_code)
+        logger.warning(f"[Codex] {message}（{exc.error_code or 'account_deactivated'}）：{email}")
         return _codex_result(
             status="deactivated",
             email=email,
-            message=f"账号已废（{exc.error_code}）",
+            message=message,
         )
     except Exception as exc:
         if _is_cpa_callback_reauth_error(exc) and _cpa_reauth_round < 2:
@@ -1561,6 +1741,8 @@ def run_codex_oauth(
                 otp_provider=otp_provider,
                 proxy=proxy,
                 force=force,
+                credentials=credentials,
+                proxy_lane_id=proxy_lane_id,
                 _cpa_reauth_round=_cpa_reauth_round + 1,
             )
         logger.warning(f"[Codex] 失败：{email}，{type(exc).__name__}: {str(exc)[:200]}")
