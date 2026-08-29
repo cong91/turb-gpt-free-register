@@ -1,11 +1,9 @@
 <!DOCTYPE html>
-<!-- ai-note: Giữ template nguyên khối cho bản sửa Paymesh; tách registration JS trong refactor riêng để tránh mở rộng phạm vi. -->
-<html lang="vi">
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GPT 注册控制台</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='reserved_test_aliases.css') }}">
   <style>
     * { box-sizing: border-box; }
     html { max-width: 100%; overflow-x: clip; }
@@ -200,8 +198,8 @@
       width: 100%; max-width: 100%; min-width: 0;
       max-height: 320px; overflow: auto; line-height: 1.5;
     }
-    #logPanel, #retryLogPanel, #liveLogPanel, #totpLogPanel, #emailChangeLogPanel, #qrPanel { min-width: 0; max-width: 100%; overflow-x: hidden; }
-    #logPanel:not(.hidden), #retryLogPanel:not(.hidden), #liveLogPanel:not(.hidden), #totpLogPanel:not(.hidden), #emailChangeLogPanel:not(.hidden), #qrPanel:not(.hidden) {
+    #logPanel, #retryLogPanel, #liveLogPanel, #totpLogPanel, #qrPanel { min-width: 0; max-width: 100%; overflow-x: hidden; }
+    #logPanel:not(.hidden), #retryLogPanel:not(.hidden), #liveLogPanel:not(.hidden), #totpLogPanel:not(.hidden), #qrPanel:not(.hidden) {
       position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
       z-index: 1000; display: block; width: min(1100px, calc(100vw - 48px));
       max-height: min(760px, calc(100vh - 48px)); overflow: hidden;
@@ -209,9 +207,9 @@
       background: var(--surface); box-shadow: 0 0 0 9999px rgba(15,23,42,.45), 0 24px 70px rgba(15,23,42,.34);
     }
     #qrPanel:not(.hidden) { width: min(520px, calc(100vw - 48px)); text-align: center; }
-    #logPanel h3, #retryLogPanel h3, #liveLogPanel h3, #totpLogPanel h3, #emailChangeLogPanel h3, #qrPanel h3 { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-    #logPanel h3 .btn, #retryLogPanel h3 .btn, #liveLogPanel h3 .btn, #totpLogPanel h3 .btn, #emailChangeLogPanel h3 .btn, #qrPanel h3 .btn { margin-left:auto; float:none !important; }
-    #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #totpLogPanel .log, #emailChangeLogPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
+    #logPanel h3, #retryLogPanel h3, #liveLogPanel h3, #totpLogPanel h3, #qrPanel h3 { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+    #logPanel h3 .btn, #retryLogPanel h3 .btn, #liveLogPanel h3 .btn, #totpLogPanel h3 .btn, #qrPanel h3 .btn { margin-left:auto; float:none !important; }
+    #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #totpLogPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
     #qrPanel img { display:block; max-width:min(360px, calc(100vw - 96px)); max-height:420px; margin:12px auto; border:1px solid var(--line); border-radius:10px; background:#fff; }
     #qrPanel .qr-link { display:block; word-break:break-all; white-space:normal; font-size:12px; color:var(--muted); margin-top:8px; }
     .hidden { display: none !important; }
@@ -332,22 +330,6 @@
     .jobs-toolbar-v2 {
       display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
       padding: 16px;
-    }
-    .gmail-cdk-batch-v2 {
-      display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px 12px;
-      align-items: end; padding: 0 16px 16px;
-    }
-    .gmail-cdk-batch-v2 label { color: #606266; font-size: 14px; }
-    .gmail-cdk-batch-v2 textarea {
-      grid-column: 1; width: 100%; min-height: 84px; resize: vertical;
-      border: 1px solid #dcdfe6; border-radius: 6px; padding: 10px 12px;
-      font: inherit; font-size: 14px; line-height: 1.5; box-sizing: border-box;
-    }
-    .gmail-cdk-batch-v2 textarea:focus { outline: none; border-color: #409eff; }
-    .gmail-cdk-batch-v2 [data-cdk-count] { color: #909399; font-size: 13px; padding-bottom: 10px; }
-    @media (max-width: 720px) {
-      .gmail-cdk-batch-v2 { grid-template-columns: minmax(0, 1fr); }
-      .gmail-cdk-batch-v2 [data-cdk-count] { padding-bottom: 0; }
     }
     .jobs-toolbar-v2 .jobs-tb-btn {
       min-height: 40px; border: 1px solid #dcdfe6; border-radius: 6px;
@@ -669,8 +651,6 @@
       min-height: 32px !important; min-width: 0 !important; max-width: 48px;
     }
     .jobs-v2-pager .pager-goto input:focus { outline: none; border-color: #377DFF; }
-    .pager-bar .pager-goto { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
-    .pager-bar .pager-goto input { width:58px; padding:6px 7px; border:1px solid var(--border); border-radius:7px; text-align:center; }
     .jobs-v2-pager button {
       min-height: 32px; height: 32px; border: 1px solid #dcdfe6; border-radius: 4px;
       background: #fff; color: #606266; font: inherit; font-size: 14px;
@@ -756,17 +736,17 @@
       text-align: left; vertical-align: middle;
     }
     .accounts-table-v2 .col-id { width: 72px; }
-    .accounts-table-v2 .col-email { width: 330px; }
+    .accounts-table-v2 .col-email { width: 240px; }
     .accounts-table-v2 .col-source { width: 90px; }
     .accounts-table-v2 .col-token { width: 100px; }
     .accounts-table-v2 .col-password { width: 120px; }
-    .accounts-table-v2 .col-plan { width: 220px; }
+    .accounts-table-v2 .col-plan { width: 120px; }
     .accounts-table-v2 .col-note { width: 140px; }
     .accounts-table-v2 .col-small { width: 170px; }
     .accounts-table-v2 .col-status { width: 100px; }
     .accounts-table-v2 .col-agent { width: 140px; }
     .accounts-table-v2 .col-time { width: 170px; }
-    .accounts-table-v2 .col-actions { width: 148px; }
+    .accounts-table-v2 .col-actions { width: 160px; }
     .accounts-table-v2 input[type="checkbox"] {
       width: 16px !important; height: 16px !important;
       min-width: 16px !important; min-height: 16px !important;
@@ -804,23 +784,11 @@
     }
     .accounts-table-v2 .acc-v2-email {
       font-weight: 700; color: #303133; line-height: 1.35;
-      overflow: visible; text-overflow: clip; white-space: normal;
-      overflow-wrap: anywhere; word-break: break-word;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     }
     .accounts-table-v2 .acc-v2-sub {
       margin-top: 2px; color: #909399; font-size: 12px; line-height: 1.3;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-    }
-    .accounts-table-v2 .acc-v2-email-history,
-    .accounts-table-v2 .acc-v2-email-user {
-      margin-top: 2px; color: #909399; font-size: 12px; line-height: 1.35;
-      white-space: normal; overflow: visible; text-overflow: clip;
-      overflow-wrap: anywhere; word-break: break-word;
-    }
-    .accounts-table-v2 .acc-v2-email-user { color: #606266; }
-    .accounts-table-v2 .acc-v2-email-status {
-      margin-top: 2px; color: #e6a23c; font-size: 12px; line-height: 1.35;
-      white-space: normal; overflow-wrap: anywhere;
     }
     .accounts-table-v2 .acc-v2-muted { color: #c0c4cc; }
     .accounts-table-v2 .pill {
@@ -840,17 +808,6 @@
     }
     .accounts-table-v2 .pill.status-running {
       color: #fa8c16; background: #fff7e6; border-color: #ffd591;
-    }
-    .accounts-table-v2 .plan-promo-stack {
-      display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
-      width: 100%; white-space: normal;
-    }
-    .accounts-table-v2 .plan-promo-head {
-      display: flex; align-items: center; gap: 5px; flex-wrap: wrap;
-    }
-    .accounts-table-v2 .plan-promo-stack .pill {
-      height: auto; min-height: 26px; max-width: 100%; line-height: 1.3;
-      text-align: left; white-space: normal; overflow-wrap: anywhere;
     }
     .accounts-table-v2 .acc-v2-token-copy {
       display: inline-flex; align-items: center; justify-content: center;
@@ -926,15 +883,13 @@
       opacity: .55; cursor: not-allowed;
     }
     .accounts-table-v2 .acc-v2-actions {
-      display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-items: center;
-      width: 100%;
+      display: flex; flex-wrap: nowrap; gap: 6px; align-items: center;
     }
     .accounts-table-v2 .acc-v2-actions > button {
       min-height: 28px; padding: 0 10px; border-radius: 4px;
       border: 1px solid #dcdfe6; background: #fff; color: #606266;
       font: inherit; font-size: 12px; cursor: pointer; line-height: 1;
       white-space: nowrap;
-      width: 100%; padding-left: 6px; padding-right: 6px;
     }
     .accounts-table-v2 .acc-v2-actions > button:hover:not(:disabled) {
       color: #377DFF; border-color: #c6e2ff; background: #ecf5ff;
@@ -954,13 +909,12 @@
     .accounts-table-v2 .acc-v2-actions > button:disabled {
       opacity: .55; cursor: not-allowed;
     }
-    .accounts-table-v2 .acc-v2-more { position: relative; min-width: 0; }
+    .accounts-table-v2 .acc-v2-more { position: relative; flex-shrink: 0; }
     .accounts-table-v2 .acc-v2-more-btn {
       min-height: 28px; padding: 0 10px; border-radius: 4px;
       border: 1px solid #dcdfe6; background: #fff; color: #606266;
       font: inherit; font-size: 12px; cursor: pointer; line-height: 1;
       white-space: nowrap; display: inline-flex; align-items: center; gap: 4px;
-      width: 100%; justify-content: center; box-sizing: border-box;
     }
     .accounts-table-v2 .acc-v2-more-btn:hover,
     .accounts-table-v2 .acc-v2-more.open .acc-v2-more-btn {
@@ -973,20 +927,17 @@
     }
     .accounts-table-v2 .acc-v2-more-menu {
       display: none; position: fixed; z-index: 4000;
-      width: 320px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px);
-      grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px;
-      padding: 6px; overflow-y: auto; overscroll-behavior: contain;
+      min-width: 148px; padding: 4px 0;
       background: #fff; border: 1px solid #e4e7ed; border-radius: 6px;
       box-shadow: 0 6px 16px rgba(0,0,0,.12);
     }
-    .accounts-table-v2 .acc-v2-more.open .acc-v2-more-menu { display: grid; }
+    .accounts-table-v2 .acc-v2-more.open .acc-v2-more-menu { display: block; }
     .accounts-table-v2 .acc-v2-more-menu button {
       display: block; width: 100%; box-sizing: border-box;
       border: none; border-radius: 0; background: transparent;
       color: #606266; font: inherit; font-size: 13px;
-      text-align: left; padding: 8px 10px; min-height: 34px; line-height: 1.35;
-      cursor: pointer; white-space: normal; overflow-wrap: anywhere;
-      border-radius: 4px;
+      text-align: left; padding: 8px 14px; min-height: 0; line-height: 1.4;
+      cursor: pointer; white-space: nowrap;
     }
     .accounts-table-v2 .acc-v2-more-menu button:hover:not(:disabled) {
       background: #f5f7fa; color: #377DFF;
@@ -1006,11 +957,6 @@
     }
     .accounts-table-v2 .acc-v2-more-menu button:disabled {
       opacity: .45; cursor: not-allowed;
-    }
-    @media (max-width: 480px) {
-      .accounts-table-v2 .acc-v2-more-menu {
-        width: calc(100vw - 16px); grid-template-columns: 1fr;
-      }
     }
     .accounts-panel-v2 .jobs-v2-pager {
       border-top: 1px solid #ebeef5;
@@ -1598,7 +1544,7 @@
     .outlook-panel-v2 .jobs-v2-pager { border-top: 1px solid #ebeef5; }
 
     /* ---- 邮箱池导入弹窗 ---- */
-    #outlookImportModal:not(.hidden), #emailChangeModalV2:not(.hidden) {
+    #outlookImportModal:not(.hidden) {
       position: fixed; inset: 0; z-index: 1200;
       display: flex; align-items: center; justify-content: center;
       padding: 24px; box-sizing: border-box;
@@ -1886,17 +1832,6 @@
       line-height: 1.45; white-space: normal; overflow: visible;
       overflow-wrap: anywhere; word-break: break-word;
     }
-    .nordvpn-status-v2 {
-      margin-top: 18px; padding: 12px 14px; border: 1px solid #d9e2ec;
-      border-radius: 8px; background: #f8fafc; color: #344054;
-      font-size: 13px; line-height: 1.45;
-    }
-    .nordvpn-status-v2.is-ready { border-color: #b7e4c7; background: #f0fdf4; color: #166534; }
-    .nordvpn-status-v2.is-warning { border-color: #f6d68b; background: #fffbeb; color: #92400e; }
-    .nordvpn-status-v2.is-muted { color: #667085; }
-    .nordvpn-status-v2-title { font-weight: 700; margin-bottom: 4px; }
-    .nordvpn-status-v2-meta { display: flex; gap: 10px; flex-wrap: wrap; color: inherit; }
-    .nordvpn-status-v2-actions { margin-top: 10px; }
     .config-field-wrap { min-width: 0; }
     .config-field-wrap > label.fld { margin-bottom: 0; }
     .config-external-link {
@@ -2096,12 +2031,6 @@
       </svg>
       <span class="sidebar-item-label">邮箱池</span>
     </button>
-    <button type="button" data-tab="tools" class="sidebar-item">
-      <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z"/>
-      </svg>
-      <span class="sidebar-item-label">工具</span>
-    </button>
     <button type="button" data-tab="config" class="sidebar-item">
       <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
@@ -2121,6 +2050,12 @@
         <path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/>
       </svg>
       <span>Github 仓库</span>
+    </a>
+    <a href="/?ui=legacy" title="切换到历史版顶部导航 UI">
+      <svg class="sidebar-footer-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M3 6h18M3 12h18M3 18h18"/>
+      </svg>
+      <span>切换老 UI</span>
     </a>
     <form class="sidebar-logout" method="post" action="/logout">
       <button type="submit">
@@ -2215,67 +2150,7 @@
             </button>
           </span>
         </label>
-        <label class="jobs-tb-field">Nguồn email
-          <select id="emailProviderV2" data-email-provider>
-            <option value="">Theo cấu hình hiện tại</option>
-            <option value="gmail_123452026">Gmail CDK</option>
-            <option value="paymesh">Paymesh MAIL card</option>
-            <option value="local_test">Local test (dry-run)</option>
-          </select>
-        </label>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnStartV2">开始注册</button>
-      </div>
-      <div class="gmail-cdk-batch-v2 hidden" data-provider-input="gmail_123452026">
-        <label for="gmailCdkBatchV2">Gmail CDK batch</label>
-        <textarea id="gmailCdkBatchV2" data-cdk-batch-input placeholder="Mỗi dòng một CDK" autocomplete="off" spellcheck="false"></textarea>
-        <div class="provider-inline-config">
-          <label class="fld-inline">Gmail routed domain 1
-            <input data-gmail-routed-domain type="text" placeholder="relay-one.net" autocomplete="off" spellcheck="false">
-          </label>
-          <label class="fld-inline">Gmail routed domain 2 (optional)
-            <input data-gmail-routed-domain type="text" placeholder="relay-two.org" autocomplete="off" spellcheck="false">
-          </label>
-          <span class="hint">Domain routing/catch-all thật phải chuyển thư về mailbox của CDK. Quota routed là N tổng.</span>
-        </div>
-        <span data-cdk-count>0 CDK</span>
-      </div>
-      <div class="gmail-cdk-batch-v2 hidden" data-provider-input="paymesh">
-        <label for="paymeshCdkBatchV2">Paymesh MAIL card batch</label>
-        <textarea id="paymeshCdkBatchV2" data-cdk-batch-input placeholder="Mỗi dòng một MAIL card" autocomplete="off" spellcheck="false"></textarea>
-        <span data-cdk-count>0 CDK</span>
-        <div class="provider-inline-config">
-          <label class="fld-inline">Paymesh routed domain 1
-            <input data-paymesh-routed-domain type="text" placeholder="test.com" autocomplete="off" spellcheck="false">
-          </label>
-          <label class="fld-inline">Paymesh routed domain 2 (optional)
-            <input data-paymesh-routed-domain type="text" placeholder="mail.test" autocomplete="off" spellcheck="false">
-          </label>
-          <span class="hint">Alias local sẽ tạo thêm xxx+hash@&lt;domain&gt; để test local chống giả mạo email.</span>
-        </div>
-        <div class="provider-inline-config" data-provider-config="paymesh">
-          <label class="fld-inline">Paymesh API
-            <input id="paymeshApiBaseInline" data-config-key="PAYMESH_API_BASE" type="text" placeholder="https://sms.paymesh.cn" autocomplete="off">
-          </label>
-          <label class="fld-inline">每 card 账号数
-            <input id="paymeshAccountsPerCdkInline" data-config-key="PAYMESH_ACCOUNTS_PER_CDK" type="number" min="1" max="6" value="6" inputmode="numeric">
-          </label>
-          <button type="button" class="jobs-tb-btn" id="paymeshSaveConfigInline" title="保存到配置也立即生效">保存</button>
-          <span class="hint" data-cdk-batch-hint></span>
-        </div>
-      </div>
-      <div class="gmail-cdk-batch-v2 hidden" data-provider-input="local_test">
-        <div class="provider-inline-config">
-          <label class="fld-inline">Local test base
-            <input data-local-test-base type="text" maxlength="32" placeholder="sampleuser" autocomplete="off" spellcheck="false">
-          </label>
-          <label class="fld-inline">Test domain 1
-            <input data-local-test-domain type="text" placeholder="mail.test" autocomplete="off" spellcheck="false">
-          </label>
-          <label class="fld-inline">Test domain 2 (optional)
-            <input data-local-test-domain type="text" placeholder="inbox.invalid" autocomplete="off" spellcheck="false">
-          </label>
-          <span class="hint">Local test dry-run không gọi OpenAI, browser, OTP hoặc email provider.</span>
-        </div>
       </div>
       <div id="regWarnV2"></div>
       <div class="jobs-table-v2-wrap">
@@ -2327,15 +2202,9 @@
             </span>
           </label>
           <button type="button" class="acc-v2-toggle" id="showArchivedAccountsV2" aria-pressed="false" title="默认只显示未归档账号；开启后单独查看归档账号">查看归档</button>
-          <button type="button" class="acc-v2-toggle" id="showPlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示已开通套餐的账号">已开通套餐</button>
-          <button type="button" class="acc-v2-toggle" id="showPlusTrialAccountsOnlyV2" aria-pressed="false" title="只查询/显示当前为 free 且存在 eligible_promo_campaigns 套餐优惠的账号，不限 Plus">有套餐优惠</button>
-          <label class="acc-v2-inline" title="指定 eligible_promo_campaigns 中的套餐类型；留空表示全部优惠类型">优惠类型
-            <select id="promoTypeFilterV2"><option value="">全部</option><option value="plus">Plus</option><option value="pro">Pro</option><option value="go">Go</option><option value="team">Team</option><option value="business">Business</option></select>
-          </label>
-          <label class="acc-v2-inline" title="按 eligible_promo_campaigns 优惠百分比筛选">优惠力度
-            <select id="promoDiscountFilterV2"><option value="">全部</option><option value="100">100%优惠</option></select>
-          </label>
-          <button type="button" class="acc-v2-toggle" id="showFreeAccountsOnlyV2" aria-pressed="false" title="只查询/显示已明确不能试用套餐的 free 账号；资格未知的账号不包含">free不可试用套餐</button>
+          <button type="button" class="acc-v2-toggle" id="showPlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示已开通 Plus 的账号">已开通Plus</button>
+          <button type="button" class="acc-v2-toggle" id="showPlusTrialAccountsOnlyV2" aria-pressed="false" title="只查询/显示当前为 free 且可试用 Plus 的账号">可试用Plus</button>
+          <button type="button" class="acc-v2-toggle" id="showFreeAccountsOnlyV2" aria-pressed="false" title="只查询/显示已明确不能试用 Plus 的 free 账号；资格未知的账号不包含">free不可试用Plus</button>
           <label class="acc-v2-inline" title="按账号状态筛选账号">
             <select id="codexStatusFilterV2">
               <option value="">全部状态</option>
@@ -2364,12 +2233,6 @@
             <input type="date" id="dateFromAccountsV2">
             <input type="date" id="dateToAccountsV2">
           </div>
-          <button type="button" class="acc-v2-toggle" id="showFreePlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示可用 Plus 试用的账号">可用Plus试用</button>
-          <select id="freePlusExportFilterV2" title="筛选 Free Plus 导出状态">
-            <option value="">Free Plus 状态</option>
-            <option value="unexported">未导出</option>
-            <option value="exported">已导出</option>
-          </select>
           <button type="button" class="jobs-tb-btn" id="btnRefreshAccountsV2" title="重新加载当前筛选条件和当前页账号列表">刷新账号</button>
 
         </div>
@@ -2389,26 +2252,12 @@
         </div>
         <div class="acc-v2-btn-group">
           <span class="acc-v2-btn-group-title">批量</span>
-          <label class="acc-v2-inline" title="选择账号整行复制/下载格式">导出格式
-            <select id="accountExportFormatV2">
-              <option value="modern">email | pass | 2fa</option>
-              <option value="legacy">Legacy</option>
-            </select>
-          </label>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusAllV2" title="导出当前筛选结果中尚未导出的 Free Plus 账号，并自动归档">Export Free Plus</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusSelectedV2" disabled title="导出选中的 Free Plus 账号，并自动归档">导出已选 Free Plus</button>
-           <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusExportedV2" disabled title="手动把选中账号标记为已导出，用于校准旧数据">标记已导出</button>
-           <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusUnexportedV2" disabled title="手动把选中账号标记为未导出，用于校准旧数据">标记未导出</button>
-           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnSetupSelectedTotpV2" disabled title="给选中的账号批量开启 2FA，并在完成后写回 TOTP 密钥">批量开2FA</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnChangeSelectedEmailsV2" disabled title="为选中的账号从指定邮箱来源领取新邮箱并换绑">批量换邮箱</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnSetupSelectedTotpV2" disabled title="给选中的账号批量开启 2FA，并在完成后写回 TOTP 密钥">批量开2FA</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnNoteSelectedAccountsV2" disabled title="给选中的账号统一设置备注，留空可清空备注">备注</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLinesV2" disabled title="复制选中账号的完整整行，每个账号一行">复制行</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedTokensV2" disabled title="复制选中账号的 Token，每个账号一行">复制Token</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedEmailsV2" disabled title="复制选中账号的邮箱，每个账号一行">复制邮箱</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedTxtV2" disabled title="把选中账号的完整整行保存为 TXT 文件，每个账号一行">下载TXT</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedFullExportV2" disabled title="把选中账号按“邮箱---邮箱接码API---密码---https://2fa.run/----2FA:密钥”格式导出为 TXT 文件">完整导出</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedFullExportV2" disabled title="把选中账号的“邮箱---邮箱接码API---密码---https://2fa.run/----2FA:密钥”格式复制到剪贴板">复制完整导出</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLoginCredentialsV2" disabled title="把选中账号按“邮箱---密码---2FA密钥”格式复制到剪贴板">复制登录凭据</button>
           <button type="button" class="jobs-tb-btn" id="btnArchiveSelectedAccountsV2" disabled title="归档选中的账号；默认账号列表将不再查询/显示这些账号">归档选中</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedAccountsV2" disabled title="删除选中的本地账号/token记录">删除</button>
         </div>
@@ -2463,12 +2312,6 @@
         <button class="btn" id="btnCloseTotpLog" style="float:right;min-height:28px;">关闭</button>
       </h3>
       <div class="log" id="totpLogContent">加载中…</div>
-    </div>
-    <div class="body hidden" id="emailChangeLogPanel">
-      <h3>换绑日志：<span id="emailChangeLogAccount" style="font-size:13px;font-weight:400;color:var(--muted);"></span>
-        <button class="btn" id="btnCloseEmailChangeLog" style="float:right;min-height:28px;">关闭</button>
-      </h3>
-      <div class="log" id="emailChangeLogContent">加载中…</div>
     </div>
   </div>
 
@@ -2602,8 +2445,6 @@
     </section>
   </div>
 
-  {% include '_reserved_test_aliases_tool.html' %}
-
   <!-- ============ 配置 ============ -->
   <div id="tab-config" class="hidden">
     <div class="config-overview-v2" id="configOverviewV2" aria-label="配置概览">
@@ -2705,20 +2546,6 @@
     </div>
   </div>
 </div>
-<div id="emailChangeModalV2" class="hidden" role="dialog" aria-modal="true">
-  <div class="outlook-import-dialog" role="document" style="max-width:520px;">
-    <div class="outlook-import-head"><div class="outlook-import-head-main"><h3>邮箱换绑</h3><p id="emailChangeHintV2">选择新邮箱来源。系统将自动领取邮箱、发送并验证 OTP。</p></div><button type="button" class="outlook-import-close" id="btnCloseEmailChangeV2">×</button></div>
-    <div class="outlook-import-body">
-      <label class="outlook-import-field"><span>新邮箱来源</span><select id="emailChangeSourceV2">
-        <option value="outlook">Outlook 邮箱池</option><option value="generic_api">通用 API</option><option value="imap">通用 IMAP</option>
-        <option value="cloudflare_domain">Cloudflare 域名邮箱</option><option value="cloudflare">Cloudflare 临时邮箱</option>
-        <option value="gptmail">GPTMail</option><option value="mailnest">MailNest</option><option value="cloudmail">CloudMail</option><option value="remail">Remail</option>
-      </select></label>
-      <div class="banner warn">换绑成功后当前 access_token 会失效并被清空，系统会立即使用新邮箱自动查活并刷新 AT。原邮箱会保留在账号记录中。</div>
-    </div>
-    <div class="outlook-import-foot"><button type="button" class="jobs-tb-btn" id="btnCancelEmailChangeV2">取消</button><button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnSubmitEmailChangeV2">开始换绑</button></div>
-  </div>
-</div>
 <div class="body hidden" id="logPanel">
   <h3>任务 #<span id="logJobId"></span> 日志 <button class="btn" id="btnCloseLog" style="float:right;min-height:28px;">关闭</button></h3>
   <div class="log" id="logContent">加载中…</div>
@@ -2772,12 +2599,7 @@ function _renderPager(id, total) {
     <button onclick="pagerGo('${id}',1)"${p.page >= totalPages ? ' disabled' : ''}>下一页 →</button>
     <select onchange="pagerSetSize('${id}',this.value)">${sizes.map(s =>
       `<option value="${s}"${p.size === s ? ' selected' : ''}>${s} 条/页</option>`
-    ).join('')}</select>
-    ${id === 'accounts' ? `<label class="pager-goto">前往
-      <input type="number" min="1" max="${totalPages}" value="${p.page}" inputmode="numeric"
-        onkeydown="if(event.key==='Enter'){pagerJump('${id}',this.value);event.preventDefault();}">
-      页 <button type="button" onclick="pagerJump('${id}',this.previousElementSibling.value)">跳转</button>
-    </label>` : ''}`;
+    ).join('')}</select>`;
   const el = document.getElementById('pager-' + id);
   if (el) el.innerHTML = html;
 
@@ -2818,8 +2640,9 @@ function _renderPager(id, total) {
         </div>
         <label class="pager-goto">前往
           <input type="number" min="1" max="${totalPages}" value="${p.page}" inputmode="numeric"
-            onkeydown="if(event.key==='Enter'){pagerJump('${id}',this.value);event.preventDefault();}">
-          页 <button type="button" onclick="pagerJump('${id}',this.previousElementSibling.value)">跳转</button>
+            onkeydown="if(event.key==='Enter'){pagerJump('${id}',this.value);event.preventDefault();}"
+            onchange="pagerJump('${id}',this.value)">
+          页
         </label>`;
     }
   }
@@ -2958,7 +2781,7 @@ function debounce(fn, wait=250) {
 
 // ---------- Tab 切换 ----------
 function activateTab(tab, persist=true) {
-  const allowed = ['register','accounts','codex','outlook','tools','config'];
+  const allowed = ['register','accounts','codex','outlook','config'];
   if (!allowed.includes(tab)) tab = 'register';
   $$('nav button').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
   allowed.forEach(t => $('#tab-'+t).classList.toggle('hidden', t !== tab));
@@ -2984,12 +2807,9 @@ async function loadSummary() {
 }
 
 // ---------- 注册 / 任务 ----------
-async function startRegistrationFromInputs(countEl, workersEl, providerEl, startBtn) {
+async function startRegistrationFromInputs(countEl, workersEl, startBtn) {
   const count = parseInt((countEl?.value || '1'), 10);
   const workers = parseInt((workersEl?.value || '3'), 10);
-  const email_source = (providerEl?.value || '').trim();
-  const providerPanel = providerEl?.closest('#tab-register')?.querySelector(`[data-provider-input="${email_source}"]`);
-  const provider_cdks = parseProviderCdkBatch(providerPanel?.querySelector('[data-cdk-batch-input]')?.value || '');
   const activeCount = Number(JOB_STATUS_COUNTS.active || 0);
   if (activeCount > 0) {
     const ok = confirm(
@@ -3006,24 +2826,7 @@ async function startRegistrationFromInputs(countEl, workersEl, providerEl, start
   };
   const b2 = $('#btnStartV2'); if (b2) b2.disabled = true;
   try {
-    const payload = {count, workers};
-    if (email_source) payload.email_source = email_source;
-    if (email_source === 'gmail_123452026') {
-      payload.gmail_cdks = provider_cdks;
-      payload.gmail_routed_domains = Array.from(providerPanel?.querySelectorAll('[data-gmail-routed-domain]') || [])
-        .map(el => el.value.trim()).filter(Boolean);
-    }
-    if (email_source === 'paymesh') {
-      payload.paymesh_cdks = provider_cdks;
-      payload.paymesh_routed_domains = Array.from(providerPanel?.querySelectorAll('[data-paymesh-routed-domain]') || [])
-        .map(el => el.value.trim()).filter(Boolean);
-    }
-    if (email_source === 'local_test') {
-      payload.local_test_base = providerPanel?.querySelector('[data-local-test-base]')?.value || '';
-      payload.local_test_domains = Array.from(providerPanel?.querySelectorAll('[data-local-test-domain]') || [])
-        .map(el => el.value.trim()).filter(Boolean);
-    }
-    const r = await api('/api/jobs', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    const r = await api('/api/jobs', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({count, workers}) });
     const warnHtml = r.warning ? `<div class="banner warn">${esc(r.warning)}（本次并发 ${r.workers || workers}）</div>` : `<div class="banner info">已提交 ${r.submitted} 个任务，本次并发 ${r.workers || workers}</div>`;
     const warnEl = $('#regWarnV2'); if (warnEl) warnEl.innerHTML = warnHtml;
     const c2 = $('#regCountV2'); if (c2) c2.value = count;
@@ -3102,22 +2905,7 @@ function bindJobsBodyEvents(bodyEl) {
 // 注册任务区
 (() => {
   const startV2 = $('#btnStartV2');
-  const providerV2 = $('#emailProviderV2');
-  const cdkBatchV2 = $('#gmailCdkBatchV2');
-  const paymeshBatchV2 = $('#paymeshCdkBatchV2');
-  if (startV2) startV2.addEventListener('click', () => startRegistrationFromInputs($('#regCountV2'), $('#regWorkersV2'), providerV2, startV2));
-  if (providerV2) providerV2.addEventListener('change', () => { syncProviderInputs(providerV2); syncCdkBatchCount(providerV2); });
-  if (providerV2) syncProviderInputs(providerV2);
-  if (cdkBatchV2) cdkBatchV2.addEventListener('input', () => updateCdkBatchCount(cdkBatchV2));
-  document.querySelectorAll('[data-gmail-routed-domain], [data-paymesh-routed-domain], #paymeshAccountsPerCdkInline').forEach(input => {
-    input.addEventListener('input', () => syncCdkBatchCount(providerV2));
-  });
-  if (paymeshBatchV2) paymeshBatchV2.addEventListener('input', () => updateCdkBatchCount(paymeshBatchV2));
-  const paymeshSaveInline = $('#paymeshSaveConfigInline');
-  if (paymeshSaveInline) paymeshSaveInline.addEventListener('click', () => saveInlineConfig({
-    '#paymeshApiBaseInline': 'PAYMESH_API_BASE',
-    '#paymeshAccountsPerCdkInline': 'PAYMESH_ACCOUNTS_PER_CDK',
-  }));
+  if (startV2) startV2.addEventListener('click', () => startRegistrationFromInputs($('#regCountV2'), $('#regWorkersV2'), startV2));
   const delV2 = $('#btnDeleteSelectedJobsV2');
   if (delV2) delV2.addEventListener('click', deleteSelectedJobs);
   const retryV2 = $('#btnRetrySelectedJobsV2');
@@ -3166,7 +2954,7 @@ function renderJobs() {
         <td class="col-check"><input type="checkbox" class="job-row-check" data-job-id="${esc(j.id)}" ${JOB_SELECTED.has(Number(j.id)) ? 'checked' : ''} ${running ? 'disabled title="运行中的任务不能选择"' : ''}></td>
         <td class="col-id">#${esc(j.id)}${j.parent_job_id ? `<div class="sub-cell" title="重试自任务 #${esc(j.parent_job_id)}">↳ #${esc(j.parent_job_id)} · ${esc(j.retry_attempt || 1)}</div>` : ''}</td>
         <td class="col-status">${pillV2(j.display_status || j.status)}</td>
-        <td class="col-email" title="${esc(j.email || '-')}">${esc(j.email || '-')}${j.job_type === 'local_test' ? '<div class="sub-cell">Local test</div>' : ''}</td>
+        <td class="col-email" title="${esc(j.email || '-')}">${esc(j.email || '-')}</td>
         <td class="col-time" title="${esc(started)}">${esc(started)}</td>
         <td class="col-time" title="${esc(completed)}">${esc(completed)}</td>
         <td class="col-traffic">${formatTraffic(j.network_traffic)}</td>
@@ -3230,11 +3018,8 @@ function updateModalScrollLock() {
   const opened = !$('#logPanel').classList.contains('hidden')
     || !$('#retryLogPanel').classList.contains('hidden')
     || !$('#liveLogPanel').classList.contains('hidden')
-    || !$('#totpLogPanel').classList.contains('hidden')
-    || !$('#emailChangeLogPanel').classList.contains('hidden')
     || !$('#qrPanel').classList.contains('hidden')
-    || !$('#outlookImportModal').classList.contains('hidden')
-    || !$('#emailChangeModalV2').classList.contains('hidden');
+    || !$('#outlookImportModal').classList.contains('hidden');
   const locked = document.body.classList.contains('modal-open');
   if (opened && !locked) {
     modalScrollY = window.scrollY || document.documentElement.scrollTop || 0;
@@ -3435,10 +3220,6 @@ async function pollLog() {
 let accountsLoading = false;
 let planStatusLoading = false;
 let planStatusRevision = '';
-let SHOW_FREE_PLUS_ACCOUNTS_ONLY = false;
-function getFreePlusExportFilter() {
-  return ($('#freePlusExportFilterV2')?.value || '');
-}
 function getAccountsQuery() {
   const el = document.getElementById('qAccountsV2');
   return (el ? el.value : '').trim();
@@ -3457,11 +3238,7 @@ function getCodexBulkWorkers() {
 }
 function getAccountsPlanFilter() {
   if (SHOW_PLUS_ACCOUNTS_ONLY) return 'plus';
-  if (SHOW_PLUS_TRIAL_ACCOUNTS_ONLY) {
-    const type = (document.getElementById('promoTypeFilterV2')?.value || '').trim().toLowerCase();
-    const discount = (document.getElementById('promoDiscountFilterV2')?.value || '').trim();
-    return (type || discount) ? `promo:${type || '*'}:${discount}` : 'promo';
-  }
+  if (SHOW_PLUS_TRIAL_ACCOUNTS_ONLY) return 'plus_trial';
   if (SHOW_FREE_ACCOUNTS_ONLY) return 'free_no_trial';
   return '';
 }
@@ -3472,12 +3249,12 @@ async function loadAccounts() {
     const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
     const plan = getAccountsPlanFilter();
     const codex = getAccountsCodexFilter();
-    const freePlusExport = getFreePlusExportFilter();
+    const totp = getAccountsTotpFilter();
     const q = getAccountsQuery();
     const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
     const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
     const p = PAGERS.accounts;
-    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
     ACCOUNTS = res.items || [];
     ACCOUNTS_TOTAL = Number(res.total || ACCOUNTS.length || 0);
     const totalPages = Math.max(1, Math.ceil(ACCOUNTS_TOTAL / p.size));
@@ -3491,15 +3268,14 @@ async function pollAccountPlanStatuses() {
   planStatusLoading = true;
   try {
     const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
+    const plan = getAccountsPlanFilter();
     const codex = getAccountsCodexFilter();
     const totp = getAccountsTotpFilter();
     const q = getAccountsQuery();
     const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
     const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
     const p = PAGERS.accounts;
-    const plan = getAccountsPlanFilter();
-    const freePlusExport = getFreePlusExportFilter();
-    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&totp_status=${encodeURIComponent(totp)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
     const items = snapshot.items || [];
     const accountById = new Map(ACCOUNTS.map(r => [Number(r.id), r]));
     const hasUnknown = items.some(item => !accountById.has(Number(item.id)));
@@ -3625,42 +3401,6 @@ function _discountLabel(r) {
   if (!Number.isNaN(n)) return `${n}折扣`;
   return `${amount}折扣`;
 }
-function _promoPlanName(key, campaign) {
-  const meta = (campaign && typeof campaign === 'object' && campaign.metadata && typeof campaign.metadata === 'object') ? campaign.metadata : {};
-  const raw = String(meta.plan_name || key || '套餐').trim();
-  const known = {
-    chatgptplusplan:'Plus', chatgptproplan:'Pro', chatgptteamplan:'Team',
-    chatgptbusinessplan:'Business', chatgptgoplan:'Go', plus:'Plus', pro:'Pro',
-    team:'Team', business:'Business', go:'Go'
-  };
-  const normalized = raw.toLowerCase().replace(/[\s_-]/g, '');
-  if (known[normalized]) return known[normalized];
-  return raw.replace(/^chatgpt/i, '').replace(/plan$/i, '') || raw;
-}
-function _promoDurationLabel(duration) {
-  if (!duration || typeof duration !== 'object' || duration.num_periods == null) return '';
-  const n = duration.num_periods;
-  const period = String(duration.period || '').toLowerCase();
-  const unit = period === 'month' ? '个月' : period === 'year' ? '年' : period === 'week' ? '周' : period === 'day' ? '天' : period;
-  return `${n}${unit}`;
-}
-function _promoSummaries(campaigns) {
-  if (!campaigns || typeof campaigns !== 'object') return [];
-  return Object.entries(campaigns).map(([key, campaign]) => {
-    const meta = (campaign && typeof campaign === 'object' && campaign.metadata && typeof campaign.metadata === 'object') ? campaign.metadata : {};
-    const percentage = meta.discount && meta.discount.percentage;
-    const offer = percentage !== undefined && percentage !== null && percentage !== ''
-      ? (Number(percentage) === 100 ? '免费' : `${percentage}%折扣`)
-      : String(meta.promotion_type_label || meta.title || (campaign && campaign.id) || '有优惠');
-    const duration = _promoDurationLabel(meta.duration);
-    return `${_promoPlanName(key, campaign)}：${offer}${duration ? `/${duration}` : ''}`;
-  });
-}
-function _promoStackHtml(baseText, baseClass, summaries, title, detailBtn = '') {
-  const base = `<span class="pill ${baseClass}" title="${esc(title)}">${esc(baseText)}</span>`;
-  const lines = summaries.map(item => `<span class="pill status-success" title="${esc(item)}">${esc(item)}</span>`).join('');
-  return `<div class="plan-promo-stack"><div class="plan-promo-head">${base}${detailBtn}</div>${lines}</div>`;
-}
 function _planCell(r) {
   const ok = r.plan_check_ok;
   const err = r.plan_check_error || '';
@@ -3671,8 +3411,6 @@ function _planCell(r) {
     route === 'direct_fallback' ? `网络: 直连回退${r.plan_check_proxy_fallback_reason ? ` (${r.plan_check_proxy_fallback_reason})` : ''}` :
     route === 'direct' ? '网络: 直连' : '';
   const title = [err ? esc(err) : checked, routeLabel].filter(Boolean).join('；');
-  const campaigns = (r.eligible_promo_campaigns && typeof r.eligible_promo_campaigns === 'object') ? r.eligible_promo_campaigns : {};
-  const promoSummaries = _promoSummaries(campaigns);
   if (['queued','running'].includes(r.plan_check_status)) {
     const automatic = r.plan_check_trigger === 'registration_auto';
     const queued = r.plan_check_status === 'queued';
@@ -3684,7 +3422,7 @@ function _planCell(r) {
   if (err || r.plan_check_status === 'failed') {
     const reason = err || '套餐查询失败，未返回具体原因';
     const hasLastSuccess = Boolean(r.plan_last_success_at);
-    const lastPlan = hasLastSuccess ? `${plan}${promoSummaries.length ? `（${promoSummaries.join('；')}）` : ''}` : '';
+    const lastPlan = hasLastSuccess ? `${plan}${r.plus_trial_eligible ? '/可Plus试用' : ''}` : '';
     const lastText = lastPlan ? `（上次: ${lastPlan}）` : '';
     const lastTitle = hasLastSuccess ? `上次成功: ${esc(r.plan_last_success_at)}` : '';
     return `<div class="extract-link-cell"><span class="pill status-failed" title="${[esc(reason), lastTitle].filter(Boolean).join('；')}">查询失败${esc(lastText)}</span><div class="extract-link-error" title="${esc(reason)}">${esc(reason)}</div></div>`;
@@ -3696,11 +3434,10 @@ function _planCell(r) {
     if (!checkedOk) {
       return `<span class="pill status-running" title="${title}">${esc(plan)}（待查资格）</span>`;
     }
-    const cls = promoSummaries.length ? 'status-success' : 'status-used';
-    const t = promoSummaries.length ? `${title}；可用套餐优惠：${promoSummaries.join('；')}` : title;
-    const keys = Object.keys(campaigns);
-    const detailBtn = keys.length ? `<button type="button" class="promo-detail-btn" data-promo-details="${esc(JSON.stringify(campaigns))}">详情(${keys.length})</button>` : '';
-    return _promoStackHtml('free', cls, promoSummaries, t, detailBtn);
+    const text = r.plus_trial_eligible ? 'free(可Plus试用)' : 'free';
+    const cls = r.plus_trial_eligible ? 'status-success' : 'status-used';
+    const t = r.plus_trial_eligible ? `${title}；Plus 试用资格可用` : title;
+    return `<span class="pill ${cls}" title="${t}">${esc(text)}</span>`;
   }
 
   const cls = 'status-success';
@@ -3719,7 +3456,7 @@ function _planCell(r) {
   if (r.plan_renews_at) detail.push(`续费时间: ${r.plan_renews_at}`);
   if (r.discount_expires_at) detail.push(`折扣结束: ${r.discount_expires_at}`);
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
-  return _promoStackHtml(text, cls, promoSummaries, detail.join('；'));
+  return `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
 }
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {
@@ -3801,10 +3538,7 @@ function _tokenCellV2(r) {
 function _accountsV2MoreMenu(r) {
   const parts = [
     `<button type="button" data-account-copy-secret="copy_line" data-account-id="${esc(r.id)}">复制整行</button>`,
-    `<button type="button" data-account-copy-secret="login_credentials" data-account-id="${esc(r.id)}" title="复制邮箱、注册密码和 2FA 密钥">复制登录凭据</button>`,
     `<button type="button" data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button>`,
-    `<button type="button" data-account-change-email="${esc(r.id)}" title="从指定邮箱来源领取新邮箱并换绑">换绑邮箱</button>`,
-    `<button type="button" data-account-change-email-log="${esc(r.id)}" title="查看最近一次邮箱换绑日志">换绑日志</button>`,
     `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this); return false;" title="重新登录该账号，成功则刷新最新 AT/accessToken">查活刷新AT</button>`,
     `<button type="button" data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button>`,
     `<button type="button" data-account-totp-log="${esc(r.email)}" title="查看该账号最近一次 2FA 设置日志">2FA日志</button>`,
@@ -3827,15 +3561,14 @@ function positionAccountsV2MoreMenu(wrap) {
   const menu = wrap.querySelector('.acc-v2-more-menu');
   if (!btn || !menu) return;
   const rect = btn.getBoundingClientRect();
-  const menuW = Math.min(320, window.innerWidth - 16);
-  menu.style.width = `${menuW}px`;
-  menu.style.maxHeight = `${Math.max(160, window.innerHeight - 16)}px`;
-  const menuH = Math.min(menu.scrollHeight || menu.offsetHeight || 0, window.innerHeight - 16);
+  const menuW = Math.max(menu.offsetWidth || 148, 148);
+  const menuH = menu.offsetHeight || 0;
   let left = rect.right - menuW;
   left = Math.max(8, Math.min(left, window.innerWidth - menuW - 8));
   let top = rect.bottom + 4;
-  if (top + menuH > window.innerHeight - 8) top = rect.top - menuH - 4;
-  top = Math.max(8, Math.min(top, window.innerHeight - menuH - 8));
+  if (top + menuH > window.innerHeight - 8 && rect.top - menuH - 4 > 8) {
+    top = rect.top - menuH - 4;
+  }
   menu.style.left = `${left}px`;
   menu.style.top = `${top}px`;
 }
@@ -3846,19 +3579,14 @@ function renderAccounts() {
     <tr>
       <td class="col-check"><input type="checkbox" class="account-row-check" data-account-id="${esc(r.id)}" ${ACCOUNT_SELECTED.has(Number(r.id)) ? 'checked' : ''}></td>
       <td class="col-id">#${esc(r.id)}</td>
-      <td class="col-email" title="${esc(r.email || '-')}${r.original_email ? `\n原邮箱: ${esc(r.original_email)}` : ''}\n${esc(r.user_name || '-')}">
+      <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
-        ${r.original_email ? `<div class="acc-v2-email-history">原邮箱: ${esc(r.original_email)}</div>` : ''}
-        <div class="acc-v2-email-user">${esc(r.user_name || '-')}</div>
-        ${['queued','running'].includes(r.email_change_status) ? '<div class="acc-v2-email-status">换绑中</div>' : (r.email_change_status === 'failed' ? `<div class="acc-v2-email-status" title="${esc(r.email_change_error || '')}">换绑失败: ${esc(r.email_change_error || '-')}</div>` : '')}
+        <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
       </td>
-      <td class="col-source" title="${esc(r.source_cdk || r.email_source || '')}">
-        ${esc(r.email_source || '-')}
-        ${r.source_cdk ? `<div class="acc-v2-sub">CDK: ${esc(r.source_cdk)}</div>` : ''}
-      </td>
+      <td class="col-source">${esc(r.email_source || '-')}</td>
       <td class="col-token">${_tokenCellV2(r)}</td>
       <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}">${esc(short(r.password, 18))}</span>` : '<span class="acc-v2-muted">-</span>'}</td>
-      <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${r.free_plus_exported_at ? `<span class="pill status-used" title="Free Plus 导出时间: ${esc(r.free_plus_exported_at)}">已导出${r.free_plus_export_count ? ` ${esc(r.free_plus_export_count)} 次` : ''}</span>` : (r.archived ? '<span class="pill status-used">仅归档</span>' : '')}</div><div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
+      <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
       <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-small">${_totpCellV2(r)}</td>
       <td class="col-status">${_codexCellV2(r)}</td>
@@ -3892,9 +3620,8 @@ function updateAccountSelectionUi(pageRows = null) {
   const v2Ids = [
     'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
     'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
-    'btnSetupSelectedTotpV2', 'btnChangeSelectedEmailsV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
+    'btnSetupSelectedTotpV2', 'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
-    'btnExportFreePlusSelectedV2', 'btnMarkFreePlusExportedV2', 'btnMarkFreePlusUnexportedV2',
   ];
   v2Ids.forEach(id => {
     const el = document.getElementById(id);
@@ -4011,38 +3738,6 @@ function closeTotpLogModal() {
 }
 $('#btnCloseTotpLog').addEventListener('click', closeTotpLogModal);
 
-let emailChangeLogAccountId = null, emailChangeLogTimer = null;
-function openEmailChangeLog(accountId) {
-  emailChangeLogAccountId = Number(accountId);
-  $('#emailChangeLogAccount').textContent = `账号 #${emailChangeLogAccountId}`;
-  $('#emailChangeLogPanel').classList.remove('hidden');
-  $('#emailChangeLogContent').textContent = '加载中…';
-  updateModalScrollLock();
-  pollEmailChangeLog();
-  clearInterval(emailChangeLogTimer);
-  emailChangeLogTimer = setInterval(pollEmailChangeLog, 3000);
-}
-async function pollEmailChangeLog() {
-  if (!emailChangeLogAccountId) return;
-  try {
-    const r = await api(`/api/accounts/${encodeURIComponent(emailChangeLogAccountId)}/change-email-log`);
-    const content = $('#emailChangeLogContent');
-    const atBottom = content.scrollTop + content.clientHeight >= content.scrollHeight - 30;
-    content.textContent = r.log || '(暂无换绑日志)';
-    $('#emailChangeLogAccount').textContent = `账号 #${emailChangeLogAccountId}${r.email ? ' · ' + r.email : ''}`;
-    if (atBottom) content.scrollTop = content.scrollHeight;
-    if (!r.running) clearInterval(emailChangeLogTimer);
-  } catch(e) {}
-}
-function closeEmailChangeLog() {
-  $('#emailChangeLogPanel').classList.add('hidden');
-  updateModalScrollLock();
-  clearInterval(emailChangeLogTimer);
-  emailChangeLogTimer = null;
-  emailChangeLogAccountId = null;
-}
-$('#btnCloseEmailChangeLog').addEventListener('click', closeEmailChangeLog);
-
 // 账号操作按钮（事件委托）
 async function onAccountsBodyClick(e) {
   const moreToggle = e.target.closest('[data-acc-more-toggle]');
@@ -4071,14 +3766,12 @@ async function onAccountsBodyClick(e) {
     const field = copySecretBtn.dataset.accountCopySecret;
     copySecretBtn.disabled = true;
     try {
-      const formatName = field === 'copy_line' ? getAccountExportFormat() : 'modern';
-      const value = await fetchOneAccountSecret(id, field, formatName);
+      const value = await fetchOneAccountSecret(id, field);
       if (!value) { showToast('可复制内容为空'); return; }
       copyText(value);
       showToast(
         field === 'access_token' ? 'Token 已复制' :
         field === 'codex_agent_token' ? 'Agent Token 已复制' :
-        field === 'login_credentials' ? '邮箱、注册密码和 2FA 密钥已复制' :
         field === 'totp_secret' ? '2FA 密钥已复制' :
         field === 'totp_code' ? `验证码已复制：${value}` :
         '账号整行已复制'
@@ -4146,18 +3839,6 @@ async function onAccountsBodyClick(e) {
   const noteBtn = e.target.closest('[data-account-note]');
   if (noteBtn) {
     await editAccountNote(Number(noteBtn.dataset.accountNote), noteBtn);
-    return;
-  }
-
-  const changeEmailBtn = e.target.closest('[data-account-change-email]');
-  if (changeEmailBtn) {
-    openEmailChangeModal([Number(changeEmailBtn.dataset.accountChangeEmail)]);
-    return;
-  }
-
-  const changeEmailLogBtn = e.target.closest('[data-account-change-email-log]');
-  if (changeEmailLogBtn) {
-    openEmailChangeLog(Number(changeEmailLogBtn.dataset.accountChangeEmailLog));
     return;
   }
 
@@ -4392,45 +4073,9 @@ async function refreshAccountsList(btn) {
   if (plusV2) plusV2.addEventListener('click', () => {
     applyAccountsPlusFilter(!SHOW_PLUS_ACCOUNTS_ONLY);
   });
-  const freePlusV2 = $('#showFreePlusAccountsOnlyV2');
-  if (freePlusV2) freePlusV2.addEventListener('click', () => {
-    SHOW_FREE_PLUS_ACCOUNTS_ONLY = !SHOW_FREE_PLUS_ACCOUNTS_ONLY;
-    if (SHOW_FREE_PLUS_ACCOUNTS_ONLY) {
-      SHOW_PLUS_ACCOUNTS_ONLY = false;
-      setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), false);
-    }
-    setAccountsFilterToggle(freePlusV2, SHOW_FREE_PLUS_ACCOUNTS_ONLY);
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-    pollAccountPlanStatuses();
-  });
-  const exportAllFreePlus = $('#btnExportFreePlusAllV2');
-  if (exportAllFreePlus) exportAllFreePlus.addEventListener('click', () => exportFreePlus('all_filtered', false));
-  const exportSelectedFreePlus = $('#btnExportFreePlusSelectedV2');
-  if (exportSelectedFreePlus) exportSelectedFreePlus.addEventListener('click', () => exportFreePlus('selected', false));
-  const markExported = $('#btnMarkFreePlusExportedV2');
-  if (markExported) markExported.addEventListener('click', () => setFreePlusExportState(true));
-  const markUnexported = $('#btnMarkFreePlusUnexportedV2');
-  if (markUnexported) markUnexported.addEventListener('click', () => setFreePlusExportState(false));
-  const freePlusExportV2 = $('#freePlusExportFilterV2');
-  if (freePlusExportV2) freePlusExportV2.addEventListener('change', () => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-    pollAccountPlanStatuses();
-  });
   const plusTrialV2 = $('#showPlusTrialAccountsOnlyV2');
   if (plusTrialV2) plusTrialV2.addEventListener('click', () => {
     applyAccountsPlusTrialFilter(!SHOW_PLUS_TRIAL_ACCOUNTS_ONLY);
-  });
-  const promoTypeV2 = $('#promoTypeFilterV2');
-  if (promoTypeV2) promoTypeV2.addEventListener('change', () => {
-    applyAccountsPlusTrialFilter(true);
-  });
-  const promoDiscountV2 = $('#promoDiscountFilterV2');
-  if (promoDiscountV2) promoDiscountV2.addEventListener('change', () => {
-    applyAccountsPlusTrialFilter(true);
   });
   const freeV2 = $('#showFreeAccountsOnlyV2');
   if (freeV2) freeV2.addEventListener('click', () => {
@@ -4449,61 +4094,17 @@ async function refreshAccountsList(btn) {
 })();
 
 
-function getAccountExportFormat() {
-  return ($('#accountExportFormatV2')?.value || 'modern');
-}
-
-async function exportFreePlus(scope, allowReexport = false) {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
-  if (scope === 'selected' && !ids.length) { showToast('请先选择 Free Plus 账号'); return; }
-  const formatName = getAccountExportFormat();
-  if (formatName === 'legacy' && !confirm('Legacy 会包含原始邮箱素材和 Access Token，确定继续吗？')) return;
-  if (allowReexport && !confirm('已导出的账号将再次导出并增加导出次数，确定继续吗？')) return;
-  try {
-    const body = {scope, account_ids: scope === 'selected' ? ids : undefined, format: formatName, allow_reexport: allowReexport};
-    if (scope === 'all_filtered') {
-      body.archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
-      body.free_plus_export = getFreePlusExportFilter();
-    }
-    const r = await api('/api/accounts/free-plus/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-    if (!r.download_url) throw new Error('服务端未返回下载地址');
-    const a = document.createElement('a');
-    a.href = r.download_url;
-    a.download = r.filename || '';
-    document.body.appendChild(a);
-    a.click();
-    setTimeout(() => a.remove(), 1000);
-    showToast(`已生成 ${r.count} 个 Free Plus TXT${r.skipped_count ? `，跳过 ${r.skipped_count} 个` : ''}`);
-    setTimeout(() => { ACCOUNT_SELECTED.clear(); loadAccounts(); pollAccountPlanStatuses(); }, 900);
-  } catch (err) {
-    showToast('Free Plus 导出失败: ' + err.message);
-  }
-}
-
-async function setFreePlusExportState(exported) {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
-  if (!ids.length) { showToast('请先选择账号'); return; }
-  const action = exported ? '已导出' : '未导出';
-  if (!confirm(`确定将选中 ${ids.length} 个账号标记为${action}吗？`)) return;
-  try {
-    const r = await api('/api/accounts/free-plus/export-state', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({account_ids: ids, exported})});
-    showToast(`已更新 ${r.updated_count} 个账号`);
-    ACCOUNT_SELECTED.clear();
-    await loadAccounts();
-  } catch (err) { showToast('更新导出状态失败: ' + err.message); }
-}
-
-async function fetchAccountSecrets(ids, field, formatName = getAccountExportFormat()) {
+async function fetchAccountSecrets(ids, field) {
   const r = await api('/api/accounts/secret-bulk', {
     method:'POST',
     headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({account_ids: ids, field, format: formatName}),
+    body: JSON.stringify({account_ids: ids, field}),
   });
   return (r.values || []).map(x => x.value).filter(Boolean);
 }
 
-async function fetchOneAccountSecret(id, field, formatName = getAccountExportFormat()) {
-  const r = await api(`/api/accounts/${encodeURIComponent(id)}/secret?field=${encodeURIComponent(field)}&format=${encodeURIComponent(formatName)}`);
+async function fetchOneAccountSecret(id, field) {
+  const r = await api(`/api/accounts/${encodeURIComponent(id)}/secret?field=${encodeURIComponent(field)}`);
   return r.value || '';
 }
 
@@ -4589,8 +4190,7 @@ async function copySelectedAccountLines() {
   const ids = Array.from(ACCOUNT_SELECTED).map(Number);
   if (!ids.length) { showToast('请先选择账号'); return; }
   try {
-    const formatName = getAccountExportFormat();
-  const lines = await fetchAccountSecrets(ids, 'copy_line', formatName);
+    const lines = await fetchAccountSecrets(ids, 'copy_line');
     if (!lines.length) { showToast('选中账号没有可复制整行'); return; }
     copyText(lines.join('\n'));
     showToast(`已复制 ${lines.length} 行`);
@@ -4761,8 +4361,7 @@ async function downloadSelectedAccountTxt() {
   if (!ids.length) { showToast('请先选择账号'); return; }
   let lines = [];
   try {
-    const formatName = getAccountExportFormat();
-    lines = await fetchAccountSecrets(ids, 'copy_line', formatName);
+    lines = await fetchAccountSecrets(ids, 'copy_line');
   } catch(err) { showToast('生成 TXT 失败: ' + err.message); return; }
   if (!lines.length) { showToast('选中账号没有可下载整行'); return; }
   const now = new Date();
@@ -4777,52 +4376,6 @@ async function downloadSelectedAccountTxt() {
   a.click();
   setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 800);
   showToast(`已下载 ${lines.length} 个账号 TXT`);
-}
-
-async function downloadSelectedAccountFullExport() {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
-  if (!ids.length) { showToast('请先选择账号'); return; }
-  let lines = [];
-  try {
-    lines = await fetchAccountSecrets(ids, 'full_export');
-  } catch(err) { showToast('生成完整导出失败: ' + err.message); return; }
-  if (!lines.length) { showToast('选中账号没有可导出内容'); return; }
-  const now = new Date();
-  const pad = n => String(n).padStart(2, '0');
-  const filename = `accounts-full-export-${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}.txt`;
-  const blob = new Blob(['\ufeff' + lines.join('\n') + '\n'], {type: 'text/plain;charset=utf-8'});
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 800);
-  showToast(`已导出 ${lines.length} 个账号`);
-}
-
-async function copySelectedAccountFullExport() {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
-  if (!ids.length) { showToast('请先选择账号'); return; }
-  let lines = [];
-  try {
-    lines = await fetchAccountSecrets(ids, 'full_export');
-  } catch(err) { showToast('复制完整导出失败: ' + err.message); return; }
-  if (!lines.length) { showToast('选中账号没有可复制内容'); return; }
-  copyText(lines.join('\n'));
-  showToast(`已复制 ${lines.length} 个账号完整导出`);
-}
-
-async function copySelectedAccountLoginCredentials() {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
-  if (!ids.length) { showToast('请先选择账号'); return; }
-  let lines = [];
-  try {
-    lines = await fetchAccountSecrets(ids, 'login_credentials');
-  } catch(err) { showToast('复制登录凭据失败: ' + err.message); return; }
-  if (!lines.length) { showToast('选中账号没有可复制的登录凭据'); return; }
-  copyText(lines.join('\n'));
-  showToast(`已复制 ${lines.length} 个账号登录凭据`);
 }
 
 async function downloadSelectedCpa() {
@@ -5377,50 +4930,8 @@ async function copyCurrentPageTokens() {
 async function copyCurrentPageLines() {
   const ids = ACCOUNTS.map(r => Number(r.id));
   if (!ids.length) { showToast('当前页没有账号'); return; }
-  try {
-    const formatName = getAccountExportFormat();
-    copyText((await fetchAccountSecrets(ids, 'copy_line', formatName)).join('\n'));
-  } catch(e) { showToast('复制失败: ' + e.message); }
+  try { copyText((await fetchAccountSecrets(ids, 'copy_line')).join('\n')); } catch(e) { showToast('复制失败: ' + e.message); }
 }
-let EMAIL_CHANGE_ACCOUNT_IDS = [];
-function openEmailChangeModal(ids) {
-  EMAIL_CHANGE_ACCOUNT_IDS = (ids || []).map(Number).filter(Boolean);
-  if (!EMAIL_CHANGE_ACCOUNT_IDS.length) { showToast('请先选择账号'); return; }
-  $('#emailChangeHintV2').textContent = EMAIL_CHANGE_ACCOUNT_IDS.length === 1
-    ? `将为账号 #${EMAIL_CHANGE_ACCOUNT_IDS[0]} 换绑新邮箱，请选择来源。`
-    : `将为选中的 ${EMAIL_CHANGE_ACCOUNT_IDS.length} 个账号分别领取并换绑新邮箱。`;
-  $('#emailChangeModalV2').classList.remove('hidden');
-  updateModalScrollLock();
-}
-function closeEmailChangeModal() {
-  $('#emailChangeModalV2').classList.add('hidden');
-  EMAIL_CHANGE_ACCOUNT_IDS = [];
-  updateModalScrollLock();
-}
-async function submitEmailChange() {
-  const ids = EMAIL_CHANGE_ACCOUNT_IDS.slice();
-  const source = $('#emailChangeSourceV2').value;
-  if (!ids.length) return;
-  const btn = $('#btnSubmitEmailChangeV2');
-  btn.disabled = true;
-  try {
-    const url = ids.length === 1 ? `/api/accounts/${ids[0]}/change-email` : '/api/accounts/change-email-bulk';
-    const body = ids.length === 1 ? {source} : {source, account_ids: ids};
-    const r = await api(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-    closeEmailChangeModal();
-    ACCOUNT_SELECTED.clear();
-    showToast(ids.length === 1 ? '邮箱换绑任务已开始' : `已开始 ${r.started_count || 0} 个换绑任务，跳过 ${(r.skipped || []).length} 个`);
-    planStatusRevision = '';
-    loadAccounts();
-    const poll = setInterval(loadAccounts, 5000);
-    setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
-  } catch (e) { showToast('邮箱换绑失败: ' + e.message); }
-  finally { btn.disabled = false; }
-}
-$('#btnCloseEmailChangeV2').addEventListener('click', closeEmailChangeModal);
-$('#btnCancelEmailChangeV2').addEventListener('click', closeEmailChangeModal);
-$('#btnSubmitEmailChangeV2').addEventListener('click', submitEmailChange);
-$('#emailChangeModalV2').addEventListener('click', e => { if (e.target.id === 'emailChangeModalV2') closeEmailChangeModal(); });
 (function bindAccountsToolbarV2() {
   const bind = (id, fn) => {
     const el = document.getElementById(id);
@@ -5432,7 +4943,6 @@ $('#emailChangeModalV2').addEventListener('click', e => { if (e.target.id === 'e
   bind('btnDownloadSelectedCpaV2', downloadSelectedCpa);
   bind('btnStopSelectedCodexV2', stopSelectedCodex);
   bind('btnSetupSelectedTotpV2', setupSelectedTotp);
-  bind('btnChangeSelectedEmailsV2', () => openEmailChangeModal(Array.from(ACCOUNT_SELECTED)));
   bind('btnNoteSelectedAccountsV2', noteSelectedAccounts);
   bind('btnCopySelectedLinesV2', copySelectedAccountLines);
   bind('btnCopySelectedTokensV2', copySelectedAccountTokens);
@@ -5440,9 +4950,6 @@ $('#emailChangeModalV2').addEventListener('click', e => { if (e.target.id === 'e
   bind('btnCopyAllTokensV2', copyCurrentPageTokens);
   bind('btnCopyAllLinesV2', copyCurrentPageLines);
   bind('btnDownloadSelectedTxtV2', downloadSelectedAccountTxt);
-  bind('btnDownloadSelectedFullExportV2', downloadSelectedAccountFullExport);
-  bind('btnCopySelectedFullExportV2', copySelectedAccountFullExport);
-  bind('btnCopySelectedLoginCredentialsV2', copySelectedAccountLoginCredentials);
   bind('btnArchiveSelectedAccountsV2', archiveSelectedAccounts);
   bind('btnDeleteSelectedAccountsV2', deleteSelectedAccounts);
 })();
@@ -6288,7 +5795,6 @@ function emailConfigSectionForKey(key) {
   if (['USE_EMAIL_SERVICE','REGISTER_EMAIL','REGISTER_NAME','OTP_MAX_WAIT','OTP_POLL_INTERVAL','EMAIL_SOURCE'].includes(key)) {
     return ['通用邮箱 / OTP', '邮箱来源选择、OTP 等待参数、手动邮箱等通用设置'];
   }
-  if (key.startsWith('GMAIL_123452026_')) return ['Gmail CDK', 'Gmail provider API、quota 和 HTTP 安全设置；batch CDK 请在注册任务页输入'];
   if (key.startsWith('GPTMAIL_')) return ['GPTMail', 'GPTMail 临时邮箱 API 配置'];
   if (key.startsWith('MAIL_NEST_')) return ['MailNest', 'MailNest / 迈巢临时邮箱 API 配置'];
   if (key.startsWith('CLOUDMAIL_')) return ['CloudMail', 'CloudMail 域名随机邮箱、Token 和收信 API 配置'];
@@ -6301,11 +5807,10 @@ function emailConfigSectionForKey(key) {
 }
 
 function smsConfigSectionForKey(key) {
-  if (['SMS_PROVIDER','SMS_COUNTRY','SMS_SERVICE','SMS_MAX_PRICE','SMS_MAX_RETRIES','SMS_CODE_WAIT'].includes(key)) {
-    return ['通用接码', '接码通道选择、国家/服务代码、价格、等待和重试参数；SMSBower 的 OpenAI 服务代码为 dr，openai/chatgpt 会自动转换'];
+  if (['SMS_PROVIDER','SMS_COUNTRY','SMS_SERVICE','SMS_MAX_RETRIES','SMS_CODE_WAIT'].includes(key)) {
+    return ['通用接码', '接码通道选择、国家/服务代码、等待和重试参数；H 通道可复用 SMS_SERVICE/SMS_COUNTRY 作为 projectId/country'];
   }
   if (key === 'SMS_API_KEY') return ['GrizzlySMS', 'GrizzlySMS 平台 API Key 配置'];
-  if (key.startsWith('SMSBOWER_')) return ['SMSBower', 'SMSBower handler_api、V2取号和供应商/价格筛选配置'];
   if (key.startsWith('H_')) return ['H 接码', 'H_API.md 本地 H 取号服务配置；项目ID/国家留空时复用通用字段'];
   if (key.startsWith('L_')) return ['L 接码', 'L_API.md 本地 L 取号服务配置'];
   return ['其他接码配置', ''];
@@ -6476,15 +5981,6 @@ function getAutoPlanCheckValue() {
   const fv = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, f.key) ? CONFIG_PENDING_UPDATES[f.key] : f.value;
   return !!fv;
 }
-function getProtocolFingerprintReuseField() {
-  return (CONFIG || []).find(f => f.key === 'PROTOCOL_REUSE_FINGERPRINT_BY_EMAIL') || null;
-}
-function getProtocolFingerprintReuseValue() {
-  const f = getProtocolFingerprintReuseField();
-  if (!f) return false;
-  const fv = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, f.key) ? CONFIG_PENDING_UPDATES[f.key] : f.value;
-  return !!fv;
-}
 function registrationDriverLabel(value) {
   const cur = String(value || '').trim().toLowerCase();
   const hit = registrationDriverChoices().find(c => String(c.value) === cur);
@@ -6538,7 +6034,7 @@ function renderRegistrationDriverCard() {
     labelEl.textContent = label;
     labelEl.classList.toggle('is-placeholder', !label || label === '—');
   }
-  if (hintEl) hintEl.textContent = `驱动标识: ${cur} · 自动查套餐: ${getAutoPlanCheckValue() ? '开' : '关'} · 协议指纹: ${getProtocolFingerprintReuseValue() ? '同邮箱保持' : '每次新建'}`;
+  if (hintEl) hintEl.textContent = `驱动标识: ${cur} · 自动查套餐: ${getAutoPlanCheckValue() ? '开' : '关'}`;
 }
 function renderRegistrationDriverField(f) {
   return `
@@ -6552,15 +6048,11 @@ function renderRegistrationDriverField(f) {
 function renderRegistrationSettingsSection(fields) {
   const driver = fields.find(f => f.key === 'REGISTRATION_DRIVER') || fields[0];
   const autoPlan = fields.find(f => f.key === 'AUTO_PLAN_CHECK_AFTER_REGISTER');
-  const reuseFingerprint = fields.find(f => f.key === 'PROTOCOL_REUSE_FINGERPRINT_BY_EMAIL');
   return `
     <div class="config-section-v2-body config-section-v2-body--single">
       ${driver ? renderRegistrationDriverField(driver) : '<div class="banner warn">未找到注册方式配置项</div>'}
     </div>
-    ${(autoPlan || reuseFingerprint) ? `<div class="config-switches-v2" style="margin-top:14px;">
-      ${autoPlan ? renderFeatureSwitchField(autoPlan, { withIcon: false }) : ''}
-      ${reuseFingerprint ? renderFeatureSwitchField(reuseFingerprint, { withIcon: false }) : ''}
-    </div>` : ''}
+    ${autoPlan ? `<div class="config-switches-v2" style="margin-top:14px;">${renderFeatureSwitchField(autoPlan, { withIcon: false })}</div>` : ''}
   `;
 }
 function renderFeatureSwitchField(f, opts = {}) {
@@ -6595,13 +6087,7 @@ function renderConfigRecommendedLinks(f) {
     if (!/^https?:\/\//i.test(url)) return '';
     const label = String(item?.label || url);
     const description = String(item?.description || '').trim();
-    const descriptionLinkUrl = String(item?.description_link_url || '').trim();
-    const descriptionLinkLabel = String(item?.description_link_label || '').trim();
-    const descriptionAfterLink = String(item?.description_after_link || '');
-    const descriptionHtml = description
-      ? `：${esc(description)}${/^https?:\/\//i.test(descriptionLinkUrl) && descriptionLinkLabel ? `<a href="${attrEsc(descriptionLinkUrl)}" target="_blank" rel="noopener noreferrer">${esc(descriptionLinkLabel)}</a>${esc(descriptionAfterLink)}` : ''}`
-      : '';
-    return `<span class="config-recommendations-item"><a href="${attrEsc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>${descriptionHtml}</span>`;
+    return `<span class="config-recommendations-item"><a href="${attrEsc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>${description ? `：${esc(description)}` : ''}</span>`;
   }).filter(Boolean).join('');
   if (!items) return '';
   return `<div class="config-recommendations" role="note"><span class="config-recommendations-title">推荐家宽</span>${items}</div>`;
@@ -6609,9 +6095,7 @@ function renderConfigRecommendedLinks(f) {
 function renderConfigPlainFieldV2(f) {
   const fv = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, f.key) ? CONFIG_PENDING_UPDATES[f.key] : f.value;
   let control = '';
-  if (Array.isArray(f.choices) && f.choices.length) {
-    control = `<select data-key="${attrEsc(f.key)}">${f.choices.map(item => `<option value="${attrEsc(item.value)}"${String(fv) === String(item.value) ? ' selected' : ''}>${esc(item.label || item.value)}</option>`).join('')}</select>`;
-  } else if (f.type === 'int') {
+  if (f.type === 'int') {
     control = `<input type="number" data-key="${attrEsc(f.key)}" value="${attrEsc(fv == null ? '' : fv)}">`;
   } else if (f.type === 'float') {
     control = `<input type="number" step="0.1" data-key="${attrEsc(f.key)}" value="${attrEsc(fv == null ? '' : fv)}">`;
@@ -6640,18 +6124,12 @@ function renderMixedConfigSectionV2(name, fields, intro) {
   const switches = fields.filter(f => f.type === 'bool');
   const inputs = fields.filter(f => f.type !== 'bool');
   const extra = name === 'RoxyBrowser' ? renderRoxyWorkspaceToolsV2() : '';
-  const nordvpnStatus = name === 'NordVPN' ? `
-    <div class="nordvpn-status-v2 is-muted" id="nordvpnStatusV2" aria-live="polite">
-      <div class="nordvpn-status-v2-title">NordVPN 运行状态</div>
-      <div class="nordvpn-status-v2-meta">正在读取本地服务与 NordLynx 状态…</div>
-    </div>` : '';
   return `
     <section class="config-section-v2" id="${esc(slug)}" data-config-section="${esc(name)}">
       ${renderConfigSectionHead(name, intro || '')}
       ${extra}
       ${switches.length ? `<div class="config-switches-v2">${switches.map(f => renderFeatureSwitchField(f, { withIcon: false })).join('')}</div>` : ''}
       ${inputs.length ? `<div class="config-section-v2-body">${inputs.map(renderConfigPlainFieldV2).join('')}</div>` : ''}
-      ${nordvpnStatus}
       <div class="config-section-v2-actions">
         <button type="button" class="btn primary" data-save-config-v2>保存</button>
       </div>
@@ -6914,15 +6392,12 @@ function renderConfigSectionV2(name, fields) {
       .map(k => fields.find(f => f.key === k))
       .filter(Boolean)
       .concat(fields.filter(f => !preferred.includes(f.key)));
-    const switches = ordered.filter(f => f.type === 'bool');
-    const inputs = ordered.filter(f => f.type !== 'bool');
     return `
       <section class="config-section-v2" id="${esc(slug)}" data-config-section="${esc(name)}">
         ${renderConfigSectionHead(name, '')}
         <div class="config-switches-v2">
-          ${switches.map(f => renderFeatureSwitchField(f, { withIcon: true })).join('')}
+          ${ordered.map(f => renderFeatureSwitchField(f, { withIcon: true })).join('')}
         </div>
-        ${inputs.length ? `<div class="config-section-v2-body">${inputs.map(renderConfigPlainFieldV2).join('')}</div>` : ''}
         <div class="config-section-v2-actions">
           <button type="button" class="btn primary" data-save-config-v2>保存</button>
         </div>
@@ -6948,7 +6423,7 @@ function renderConfigSectionV2(name, fields) {
       name,
       fields,
       emailConfigSectionForKey,
-      ['通用邮箱 / OTP', 'Gmail CDK', 'GPTMail', 'MailNest', 'CloudMail', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
+      ['通用邮箱 / OTP', 'GPTMail', 'MailNest', 'CloudMail', 'Remail', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
       { get: () => CONFIG_EMAIL_ACTIVE_SECTION_V2, set: v => { CONFIG_EMAIL_ACTIVE_SECTION_V2 = v; } },
       'email-section-v2'
     );
@@ -6958,7 +6433,7 @@ function renderConfigSectionV2(name, fields) {
       name,
       fields,
       smsConfigSectionForKey,
-      ['通用接码', 'GrizzlySMS', 'SMSBower', 'H 接码', 'L 接码', '其他接码配置'],
+      ['通用接码', 'GrizzlySMS', 'H 接码', 'L 接码', '其他接码配置'],
       { get: () => CONFIG_SMS_ACTIVE_SECTION_V2, set: v => { CONFIG_SMS_ACTIVE_SECTION_V2 = v; } },
       'sms-section-v2'
     );
@@ -6984,7 +6459,6 @@ function renderConfigLayoutV2() {
   `).join('');
   sections.innerHTML = names.map(name => renderConfigSectionV2(name, groups[name] || [])).join('');
   renderRegistrationDriverCard();
-  refreshNordVPNStatusV2();
   const sectionMount = document.getElementById('configRegistrationSelectV2');
   if (sectionMount) renderRegistrationEpSelect(sectionMount, 'configRegistrationSelectV2');
   bindRoxyWorkspaceToolsV2();
@@ -6999,45 +6473,6 @@ function setActiveConfigNav(slug) {
   document.querySelectorAll('#configNavV2 .config-nav-v2-item').forEach(btn => {
     btn.classList.toggle('is-active', btn.dataset.configTarget === slug);
   });
-}
-async function refreshNordVPNStatusV2() {
-  const status = $('#nordvpnStatusV2');
-  if (!status) return;
-  try {
-    const r = await api('/api/nordvpn/status');
-      status.classList.toggle('is-ready', !!r.ready && !r.rotation_blocked);
-      status.classList.toggle('is-warning', !!r.configured && (!r.ready || !!r.rotation_blocked));
-
-    status.classList.toggle('is-muted', !r.configured);
-      const queueState = r.rotation_blocked
-        ? ` · 队列已暂停 · 等待 ${Number(r.waiting_jobs || 0)} 个 job`
-        : (r.rotation_in_progress ? ' · 正在自动更换 IP' : '');
-      const retryAction = r.rotation_blocked
-        ? '<div class="nordvpn-status-v2-actions"><button type="button" class="btn" data-retry-nordvpn-rotation>重试自动轮换</button></div>'
-        : '';
-      const rotationReason = r.rotation_blocked && r.rotation_error
-        ? `<div class="nordvpn-status-v2-meta">原因：${esc(r.rotation_error)}</div>`
-        : (r.rotation_detail ? `<div class="nordvpn-status-v2-meta">${esc(r.rotation_detail)}</div>` : '');
-      status.innerHTML = `<div class="nordvpn-status-v2-title">NordVPN 运行状态</div>` +
-        `<div class="nordvpn-status-v2-meta">${esc(r.message)} · 服务 ${r.service_running ? '运行中' : '未运行'} · NordLynx ${r.connected ? '已连接' : '未连接'}${queueState}</div>${rotationReason}${retryAction}`;
-
-  } catch (e) {
-    status.classList.remove('is-ready');
-    status.classList.add('is-warning');
-    status.innerHTML = `<div class="nordvpn-status-v2-title">NordVPN 运行状态</div><div class="nordvpn-status-v2-meta">读取失败：${esc(e.message)}</div>`;
-  }
-}
-async function retryNordVPNRotationV2(button) {
-  if (button) button.disabled = true;
-  try {
-    const r = await api('/api/nordvpn/rotation/retry', { method: 'POST' });
-    showToast(r.message || 'NordVPN 自动轮换成功');
-  } catch (e) {
-    showToast('NordVPN 自动轮换失败: ' + e.message);
-  } finally {
-    if (button) button.disabled = false;
-    await refreshNordVPNStatusV2();
-  }
 }
 function bindConfigLayoutV2() {
   const nav = document.getElementById('configNavV2');
@@ -7054,12 +6489,6 @@ function bindConfigLayoutV2() {
   if (layout && !layout.dataset.epBound) {
     layout.dataset.epBound = '1';
     layout.addEventListener('click', (e) => {
-      const retryNordVPN = e.target.closest('[data-retry-nordvpn-rotation]');
-      if (retryNordVPN) {
-        e.preventDefault();
-        retryNordVPNRotationV2(retryNordVPN);
-        return;
-      }
       const codexTab = e.target.closest('[data-codex-section-v2]');
       if (codexTab) {
         e.preventDefault();
@@ -7200,87 +6629,9 @@ function readConfigElementValue(el, f) {
     if (el.type === 'checkbox') return !!el.checked;
     return el.value === 'true';
   }
-  if (f.type === 'int') {
-    const value = parseInt(String(el.value || '').trim(), 10);
-    return Number.isFinite(value) ? value : Number(f.value || 0);
-  }
-  if (f.type === 'float') {
-    const value = parseFloat(String(el.value || '').trim());
-    return Number.isFinite(value) ? value : Number(f.value || 0);
-  }
+  if (f.type === 'int') return parseInt(el.value || '0', 10);
+  if (f.type === 'float') return parseFloat(el.value || '0');
   return isPlaceholderEmpty(el.value) ? '' : el.value.trim();
-}
-
-function syncProviderInputs(providerEl) {
-  const root = providerEl?.closest('#tab-register') || document;
-  const selected = providerEl?.value || '';
-  root.querySelectorAll('[data-provider-input]').forEach(panel => {
-    panel.classList.toggle('hidden', panel.dataset.providerInput !== selected);
-  });
-}
-
-function parseProviderCdkBatch(value) {
-  return [...new Set(String(value || '').replace(/,/g, '\n').split(/\r?\n/).map(s => s.trim()).filter(Boolean))];
-}
-
-function parseGmailCdkBatch(value) {
-  return parseProviderCdkBatch(value);
-}
-
-function accountsPerCdkForProvider(provider) {
-  const v = provider?.value || '';
-  if (v === 'paymesh') {
-    const el = $('#paymeshAccountsPerCdkInline');
-    return Math.max(1, Math.min(6, parseInt(el?.value || '6', 10) || 6));
-  }
-  if (v === 'gmail_123452026') {
-    const f = CONFIG.find(x => x.key === 'GMAIL_123452026_ACCOUNTS_PER_CDK');
-    return Math.max(1, Math.min(6, parseInt(f?.value || '6', 10) || 6));
-  }
-  return 1;
-}
-
-function syncCdkBatchCount(providerEl) {
-  if (!providerEl) return;
-  const panel = providerEl.closest('#tab-register')?.querySelector(`[data-provider-input="${providerEl.value}"]`);
-  const input = panel?.querySelector('[data-cdk-batch-input]');
-  if (!input) return;
-  const cdks = parseProviderCdkBatch(input.value || '');
-  const perCdk = accountsPerCdkForProvider(providerEl);
-  const domainSelector = providerEl.value === 'paymesh'
-    ? '[data-paymesh-routed-domain]'
-    : '[data-gmail-routed-domain]';
-  const routedDomains = [...new Set(Array.from(panel.querySelectorAll(domainSelector))
-    .map(el => el.value.trim().toLowerCase().replace(/\.+$/, '')).filter(Boolean))];
-  const isPaymesh = providerEl.value === 'paymesh';
-  const multiplier = isPaymesh ? 1 + routedDomains.length : (routedDomains.length ? 2 : 1);
-  const count = Math.min(200, cdks.length * perCdk * multiplier);
-  const countEl = panel.querySelector('[data-cdk-count]');
-  if (countEl) countEl.textContent = `${cdks.length} CDK · 最多 ${count} 账号`;
-  const hintEl = panel.querySelector('[data-cdk-batch-hint]');
-  if (hintEl) hintEl.textContent = cdks.length ? `将自动设置注册数量为 ${count}` : '';
-  if (cdks.length) {
-    const reg = $('#regCountV2');
-    if (reg) reg.value = String(count);
-  }
-}
-
-function saveInlineConfig(keys) {
-  const updates = {};
-  for (const [elId, key] of Object.entries(keys)) {
-    const el = $(elId);
-    if (el) updates[key] = el.value;
-  }
-  return api('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({updates}) })
-    .then(r => { showToast(r.reloaded ? '配置已生效' : '配置已保存'); })
-    .catch(e => showToast('保存失败: ' + e.message));
-}
-
-function updateCdkBatchCount(input) {
-  if (!input || !input.matches('[data-cdk-batch-input]')) return;
-  const panel = input.closest('[data-provider-input]');
-  const providerEl = $('#emailProviderV2');
-  syncCdkBatchCount(providerEl);
 }
 
 function trackConfigFieldChange(e) {
@@ -7289,7 +6640,7 @@ function trackConfigFieldChange(e) {
   const f = CONFIG.find(x => x.key === el.dataset.key);
   if (!f) return;
   CONFIG_PENDING_UPDATES[f.key] = readConfigElementValue(el, f);
-  if (f.key === 'AUTO_PLAN_CHECK_AFTER_REGISTER' || f.key === 'PROTOCOL_REUSE_FINGERPRINT_BY_EMAIL') renderRegistrationDriverCard();
+  if (f.key === 'AUTO_PLAN_CHECK_AFTER_REGISTER') renderRegistrationDriverCard();
 }
 $('#tab-config').addEventListener('input', trackConfigFieldChange);
 $('#tab-config').addEventListener('change', trackConfigFieldChange);
@@ -7304,14 +6655,12 @@ async function saveConfigUpdates(triggerBtn) {
     updates[f.key] = readConfigElementValue(el, f);
   });
   const buttons = [triggerBtn, ...$$('#tab-config [data-save-config-v2]')].filter(Boolean);
-  const savedSection = triggerBtn?.closest('[data-config-section]')?.dataset.configSection || '';
   buttons.forEach(btn => { btn.disabled = true; });
   try {
     const r = await api('/api/config', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({updates}) });
     for (const [k, v] of Object.entries(updates)) { const f = CONFIG.find(x => x.key === k); if (f) f.value = v; delete CONFIG_PENDING_UPDATES[k]; }
     renderConfigLayoutV2();
-    const okText = savedSection === 'NordVPN' ? '配置已保存并热加载；NordVPN 连接状态请看状态栏' : '配置已保存并热加载';
-    showToast(r.reloaded ? okText : '配置已保存（需重启）');
+    showToast(r.reloaded ? '配置已生效' : '配置已保存（需重启）');
   } catch(e) { showToast('保存失败: ' + e.message); }
   finally { buttons.forEach(btn => { btn.disabled = false; }); }
 }
@@ -7335,8 +6684,5 @@ jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidd
 setInterval(loadSummary, 30000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 10000);
 </script>
-{% include 'promo_details.html' %}
-<script src="{{ url_for('static', filename='reserved_test_aliases.js') }}"></script>
-<script src="{{ url_for('static', filename='vi.js') }}"></script>
 </body>
 </html>

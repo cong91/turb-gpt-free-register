@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-from pathlib import Path
-
+from core.app_state_db import APP_STATE_DB_PATH
 from core.cdk_inventory_store import CdkInventoryStore
 
 
@@ -35,7 +34,7 @@ def create_paymesh_job_assignments(
     if not raw_cdks:
         raise ValueError("Chưa nhập Paymesh MAIL card cho batch đăng ký")
     inventory = store or CdkInventoryStore(
-        Path(__file__).resolve().parent.parent / "cdk_inventory.sqlite3"
+        APP_STATE_DB_PATH
     )
     inventory_ids = [
         inventory.import_cdk(

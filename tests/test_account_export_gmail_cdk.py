@@ -4,10 +4,22 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core.account_export import save_account_data
+from core.account_export import checkpoint_account_data, save_account_data
 
 
 class GmailCdkAccountExportTests(unittest.TestCase):
+    @patch("core.email_provider.mark_email_consumed", return_value=True)
+    @patch("core.db.insert_account", return_value=19)
+    def test_checkpoint_consumes_batch_alias_before_twofa(self, insert_account, mark_consumed):
+        row_id = checkpoint_account_data(
+            email="alias@gmail.com",
+            access_token="token",
+            email_source="gmail_api_url",
+        )
+
+        self.assertEqual(row_id, 19)
+        mark_consumed.assert_called_once_with("alias@gmail.com")
+
     @patch("core.plan_check_service.enqueue_account_plan_check", return_value={"accepted": True})
     @patch("core.email_provider.mark_email_consumed", return_value=True)
     @patch("core.gmail_123452026_client.get_account_context")
@@ -64,13 +76,14 @@ class GmailCdkAccountExportTests(unittest.TestCase):
         context = object()
         page = object()
         self.assertEqual(
-            setup_2fa_in_browser(context, page, "user@example.com", "123456"),
+            setup_2fa_in_browser(context, page, "user@example.com"),
             "SECRET",
         )
         transport = setup_2fa.call_args.args[0]
         self.assertIs(transport.context, context)
         self.assertIs(transport.page, page)
-        self.assertEqual(setup_2fa.call_args.kwargs["otp_code"], "123456")
+        self.assertEqual(setup_2fa.call_args.args[1], "user@example.com")
+        self.assertEqual(setup_2fa.call_args.kwargs["reauth"], False)
 
 
 if __name__ == "__main__":

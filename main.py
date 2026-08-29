@@ -16,7 +16,6 @@ from config import twofa as _twofa_cfg
 from config import email as _email_cfg
 from config import roxybrowser as _roxy_cfg
 from config import openai_protocol as _protocol_cfg
-from config import register as _register_cfg
 from core.session import BrowserSession
 from core.chatgpt_auth import get_providers, get_csrf_token, signin_openai
 from core.openai_auth import (
@@ -27,21 +26,18 @@ from core.openai_auth import (
     send_email_otp,
     network_preflight,
     navigate_about_you,
-    navigate_create_account_password,
-    navigate_email_otp_send,
-    request_password_sentinel_bundle,
-    generate_registration_password,
-    register_user,
     EmailOtpInvalidError,
     create_account,
 )
 from core.account_export import (
+    checkpoint_account_data,
     follow_oauth_callback,
     fetch_session,
-    setup_2fa,
+    setup_2fa_for_registration,
     save_account_data,
     create_batch_archive_dir,
 )
+from core import db
 from core.email_provider import acquire_email, wait_for_otp
 from core.humanize import delay as human_delay
 from core.name_samples import random_display_name
@@ -78,14 +74,6 @@ def configure_logging(verbose: bool = False) -> None:
 def _is_success(result: dict) -> bool:
     """判断单次注册结果是否成功，集中收敛批量统计规则。"""
     return isinstance(result, dict) and bool(result.get("success"))
-
-
-def _protocol_registration_fingerprint_seed(email: str) -> str | None:
-    """按配置决定协议注册是否跨任务复用同邮箱指纹。"""
-    if not bool(getattr(_register_cfg, "PROTOCOL_REUSE_FINGERPRINT_BY_EMAIL", False)):
-        return None
-    identity = str(email or "").strip().lower()
-    return f"registration:{identity}" if identity else None
 
 
 def _finalize_registration_session(
@@ -176,21 +164,26 @@ def run_registration(
     proxy: str = None,
     otp_code: str = None,
     batch_dir=None,
-    on_email_acquired: Callable[[str], None] | None = None,
+    proxy_lane_id: int | None = None,
+    lease_owner_id: str | None = None,
 ):
     """
-    执行完整的 ChatGPT 邮箱密码注册流程。
+    执行完整的 ChatGPT 注册流程。
+
+    Browser registration drivers always force the OpenAI password step;
+    the legacy protocol driver retains its own OTP flow.
 
     OpenAI 当前默认流程：signin 时携带 login_hint+screen_hint=login_or_signup
-    → 进入 /create-account/password 并提交密码 → 发送并验证邮箱 OTP
-    → about-you 提交昵称生日 → 完成。
+    → follow_authorize 重定向链自动落到 /email-verification 并触发 OTP 发送
+    → 用户输入验证码 → validate_email_otp → about-you 提交昵称生日 → 完成。
 
     Args:
         email: 注册邮箱
         name: 用户显示名称
         birthday: 生日，格式 YYYY-MM-DD
-        proxy: 代理地址（不传则从 PROXY_POOL 随机抽）
+        proxy: 代理地址（不传则按当前配置从代理池或代理旋转 lease 获取）
         otp_code: 邮箱验证码（如果为None，会等待手动输入）
+        proxy_lane_id: 代理旋转 lane；批量注册时由 worker lane 传入
     """
     # 可选注册驱动：
     #   protocol     = 原有纯协议（curl_cffi）
@@ -199,6 +192,18 @@ def run_registration(
     #   browser_use  = Browser Use Cloud stealth Chromium + Playwright
     #   skyvern      = Skyvern Browser Sessions + Playwright
     driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+    from core.rotating_proxy_runtime import (
+        REGISTRATION_PROXY_SCOPE,
+        resolve_rotating_proxy,
+    )
+
+    proxy = resolve_rotating_proxy(
+        proxy,
+        scope=REGISTRATION_PROXY_SCOPE,
+        lane_id=proxy_lane_id,
+    )
+    if proxy and proxy_lane_id is not None:
+        logger.info("[RotatingProxy] registration lane=%s 已分配 proxy lease", proxy_lane_id)
     if driver_mode in ("roxy", "roxybrowser", "fingerprint", "browser"):
         from core.roxy_registration import run_roxy_registration
 
@@ -214,7 +219,12 @@ def run_registration(
 
         from core.nordvpn_wireguard import proxy_for_registration
 
-        with proxy_for_registration() as nordvpn_proxy:
+        proxy_context = (
+            proxy_for_registration(owner_id=lease_owner_id)
+            if lease_owner_id is not None
+            else proxy_for_registration()
+        )
+        with proxy_context as nordvpn_proxy:
             return run_roxy_registration(
                 email=email,
                 name=name,
@@ -225,15 +235,33 @@ def run_registration(
             )
     if driver_mode in ("cloak", "cloakbrowser"):
         from core.cloakbrowser_registration import run_cloak_registration
-        return run_cloak_registration(
-            email=email,
-            name=name,
-            birthday=birthday or generate_random_birthday(),
-            proxy=proxy,
-            otp_code=otp_code,
-            batch_dir=batch_dir,
-            on_email_acquired=on_email_acquired,
+
+        if proxy is not None:
+            return run_cloak_registration(
+                email=email,
+                name=name,
+                birthday=birthday or generate_random_birthday(),
+                proxy=proxy,
+                otp_code=otp_code,
+                batch_dir=batch_dir,
+            )
+
+        from core.nordvpn_wireguard import proxy_for_registration
+
+        proxy_context = (
+            proxy_for_registration(owner_id=lease_owner_id)
+            if lease_owner_id is not None
+            else proxy_for_registration()
         )
+        with proxy_context as nordvpn_proxy:
+            return run_cloak_registration(
+                email=email,
+                name=name,
+                birthday=birthday or generate_random_birthday(),
+                proxy=nordvpn_proxy,
+                otp_code=otp_code,
+                batch_dir=batch_dir,
+            )
     if driver_mode in ("browser_use", "browseruse", "browser-use", "bu"):
         from core.browser_use_registration import run_browser_use_registration
         return run_browser_use_registration(
@@ -261,26 +289,30 @@ def run_registration(
             f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，可选 protocol / roxy / cloak / browser_use / skyvern"
         )
 
-    # 纯协议驱动没有“邮箱输入框”可等待，因此在创建 BrowserSession 前领取。
-    if not str(email or "").strip():
-        if not _email_cfg.USE_EMAIL_SERVICE:
-            raise RuntimeError(
-                "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
-                "或开启 USE_EMAIL_SERVICE 并从邮箱池领取。"
+    # Protocol driver: nếu PROXY_POOL rỗng nhưng NordVPN WireGuard đang bật
+    # → dùng proxy_for_registration() giống Roxy driver
+    if proxy is None:
+        from core.nordvpn_wireguard import is_per_profile_proxy_enabled, proxy_for_registration
+        if is_per_profile_proxy_enabled():
+            from core.nordvpn_wireguard import proxy_for_registration as _pfr
+            proxy_context = (
+                _pfr(owner_id=lease_owner_id)
+                if lease_owner_id is not None
+                else _pfr()
             )
-        email = acquire_email()
-        if on_email_acquired:
-            on_email_acquired(email)
+            with proxy_context as nordvpn_proxy:
+                return run_registration(
+                    email=email,
+                    name=name,
+                    birthday=birthday,
+                    proxy=nordvpn_proxy or "",
+                    otp_code=otp_code,
+                    batch_dir=batch_dir,
+                    lease_owner_id=lease_owner_id,
+                )
 
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
-    fingerprint_seed = _protocol_registration_fingerprint_seed(email)
-    reuse_fingerprint = fingerprint_seed is not None
-    # 单个 BrowserSession 生命周期内始终复用同一指纹；是否跨任务按邮箱
-    # 稳定复用由 PROTOCOL_REUSE_FINGERPRINT_BY_EMAIL 控制。
-    session = BrowserSession(
-        proxy=proxy,
-        fingerprint_seed=fingerprint_seed,
-    )
+    session = BrowserSession(proxy=proxy)
 
     # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
     proxy_label = "无"
@@ -299,29 +331,11 @@ def run_registration(
         birthday = generate_random_birthday()
 
     logger.info(f"[注册] 开始：{email}，代理={proxy_label}")
-    logger.info(
-        "[指纹] 生命周期模式：%s",
-        "同邮箱保持" if reuse_fingerprint else "每次任务重新创建",
-    )
     logger.info(f"[注册] 本次随机生日: {birthday}")
-    fp = session.fingerprint_summary()
-    logger.info(
-        "[指纹] 协议注册统一上下文: device_id=%s oai_session_id=%s auth_session_logging_id=%s "
-        "ua=%s lang=%s tz=%s(%s) screen=%sx%s@%s cpu=%s mem=%s geo=%s:%s",
-        session.device_id[:12] + "...",
-        session.oai_session_id[:12] + "...",
-        session.auth_session_logging_id[:12] + "...",
-        BrowserSession._short_value(fp.get("user_agent"), 72),
-        fp.get("accept_language"),
-        fp.get("timezone_iana"),
-        fp.get("timezone_offset_minutes"),
-        fp.get("screen_width"), fp.get("screen_height"), fp.get("device_pixel_ratio"),
-        fp.get("hardware_concurrency"), fp.get("device_memory"),
-        fp.get("geo_country") or "?", fp.get("geo_city") or "?",
-    )
+    logger.debug(f"[注册] 设备ID={session.device_id}，会话日志ID={session.auth_session_logging_id}")
 
     create_acknowledged = False
-    registration_password = None
+    account_id: int | None = None
     try:
         # 网络预检必须在 signin/follow_authorize 之前完成；预检不带邮箱，不会触发 OTP。
         network_preflight(session)
@@ -349,32 +363,16 @@ def run_registration(
         authorize_url = signin_openai(session, csrf_token, email)
         human_delay("api")
 
+        # 记录"OTP 触发"前的时间戳，自动取信箱时只看此后的邮件，
+        # 避免取到上次注册留下的旧 OTP。
+        otp_after_ts = time.time()
+
         # ==================== 阶段2: OpenAI Auth ====================
         # 步骤4: 跟随 authorize URL（建立 auth.openai.com 的 cookies）
-        authorize_final_url = follow_authorize(session, authorize_url)
-        human_delay("navigate")
-
-        # 步骤5-8: 强制走邮箱+密码注册，不使用 passwordless OTP-only 分支。
-        navigate_create_account_password(session, authorize_final_url)
-        human_delay("navigate")
-        registration_password = generate_registration_password()
-        password_sentinel = request_password_sentinel_bundle(session)
-        password_sentinel_header, password_so_header = build_sentinel_header(
-            session, password_sentinel, "username_password_create"
-        )
-        human_delay("challenge")
-        register_result = register_user(
-            session,
-            email,
-            registration_password,
-            password_sentinel_header,
-            password_so_header,
-        )
-        create_acknowledged = True
-
-        # 只读取本次发送之后到达的验证码，避免误取历史邮件。
-        otp_after_ts = time.time()
-        navigate_email_otp_send(session, register_result.get("continue_url"))
+        # 由于步骤3已携带 login_hint + screen_hint=login_or_signup，
+        # 重定向链会直接走到 /email-verification 并自动触发 OTP 发送，
+        # 不需要 /create-account/password、register_user、单独 send_email_otp 调用。
+        follow_authorize(session, authorize_url)
         human_delay("navigate")
 
         # ==================== 阶段3: 验证码验证 ====================
@@ -386,11 +384,15 @@ def run_registration(
         validate_result = None
         max_otp_attempts = 3
         current_otp = otp_code
+        previous_submitted_otp = None
         for otp_attempt in range(1, max_otp_attempts + 1):
             if current_otp is None:
                 if _email_cfg.USE_EMAIL_SERVICE:
                     logger.info(f"[OTP] 等待验证码：{email}（第 {otp_attempt}/{max_otp_attempts} 次）")
-                    current_otp = wait_for_otp(email, after_ts=otp_after_ts)
+                    wait_kwargs = {"after_ts": otp_after_ts}
+                    if previous_submitted_otp:
+                        wait_kwargs["before_code"] = previous_submitted_otp
+                    current_otp = wait_for_otp(email, **wait_kwargs)
                 else:
                     logger.info("")
                     logger.info(f"[OTP] 请检查邮箱，输入收到的 6 位验证码（第 {otp_attempt}/{max_otp_attempts} 次）:")
@@ -414,6 +416,7 @@ def run_registration(
                 if otp_attempt >= max_otp_attempts:
                     raise
                 logger.warning(f"[OTP] 验证码错误/过期：{str(exc)[:180]}，准备重新发送并重新获取验证码")
+                previous_submitted_otp = current_otp
                 otp_after_ts = time.time()
                 send_email_otp(session)
                 human_delay("api")
@@ -522,34 +525,70 @@ def run_registration(
                 )
             human_delay("post_auth")
 
+        account_id = checkpoint_account_data(
+            email=email,
+            access_token=access_token,
+            email_source=None,
+            proxy_used=session.proxy or None,
+            registration_ip=(getattr(session, "exit_geo", {}) or {}).get("ip"),
+            extra={
+                "user": session_info.get("user"),
+                "account": session_info.get("account"),
+                "expires": session_info.get("expires"),
+                "device_id": session.device_id,
+                "sentinel_sid": getattr(session, "sentinel_sid", None),
+                "browser_profile": getattr(session, "browser_profile", None),
+                "registration_password": "",
+            },
+        )
+        logger.info("[检查点] token 已保存：账号ID=%s，2FA=pending", account_id)
+
         # ==================== 阶段7: 设置 2FA（受 config.ENABLE_2FA 控制）====================
         totp_secret = None
         twofa_status = "disabled"
         twofa_error = None
         if _twofa_cfg.ENABLE_2FA:
-            # 步骤14-20: 重认证（要再收一次邮箱 OTP）→ enroll TOTP → activate
+            # 注册完成后先用邮箱 OTP re-auth，再 enroll TOTP → activate
             try:
-                totp_secret = setup_2fa(session, email)
+                totp_secret = setup_2fa_for_registration(session, email)
                 twofa_status = "active"
             except Exception as exc:
                 twofa_status = "failed"
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 logger.error(f"2FA 设置失败: {twofa_error}")
-                raise RuntimeError(f"2FA 设置失败，未保存为成功账号: {twofa_error}") from exc
+                db.update_account_2fa(account_id, status="failed", error=twofa_error)
+                return {
+                    "success": False,
+                    "email": email,
+                    "account_id": account_id,
+                    "access_token": access_token,
+                    "totp_secret": None,
+                    "twofa_status": twofa_status,
+                    "twofa_error": twofa_error,
+                    "error": f"2FA 设置失败，账号已保存：{twofa_error}",
+                }
         else:
             logger.debug("已跳过 2FA 设置 (config.ENABLE_2FA=False)")
 
 
-        # ==================== 阶段 7.5: Codex OAuth（注册成功→拿回调/CPA凭证）====================
-        # 用全新干净 session 从头登录该邮箱，走 邮箱OTP→手机短信验证(接码)→选workspace
-        # →拿 code 的标准路径（不复用注册 session，避免撞 choose-an-account）。
-        # 产出：
-        #   1) codex_result["callback_url"]  命中 redirect_uri 的整条 Location（携带 code/state）
-        #   2) codex_result["file_path"]     CPA 可直接导入的 codex-{email}.json
+        # ==================== 阶段 7.5: 套餐检查 → Codex OAuth ====================
+        # 2FA active 后才允许查询套餐；Codex 只能在套餐结果已落库后执行。
         codex_result = {"status": "skipped", "ok": False, "message": "未触发"}
         try:
             from core.codex_oauth import run_codex_oauth
-            codex_result = run_codex_oauth(email)
+            from core.registration_auto_codex import run_registration_auto_codex
+
+            auto_codex = run_registration_auto_codex(
+                account_id=account_id,
+                email=email,
+                access_token=access_token,
+                # AUTO_CODEX_FOR_FREE_AFTER_REGISTER is its own opt-in and must
+                # bypass the legacy ENABLE_CODEX_AUTO gate after plan confirmation.
+                run_codex=lambda: run_codex_oauth(email, proxy=session.proxy, force=True),
+                proxy=session.proxy or None,
+                twofa_status=twofa_status,
+            )
+            codex_result = auto_codex["codex"]
         except Exception as exc:
             codex_result = {
                 "status": "failed",
@@ -577,7 +616,9 @@ def run_registration(
             totp_secret=totp_secret,
             email_source=resolve_email_source(email),
             proxy_used=session.proxy or None,
+            registration_ip=(getattr(session, "exit_geo", {}) or {}).get("ip"),
             batch_dir=batch_dir,
+            auto_plan_check=False,
             extra={
                 "user": session_info.get("user"),
                 "account": session_info.get("account"),
@@ -585,9 +626,9 @@ def run_registration(
                 "device_id": session.device_id,
                 "sentinel_sid": getattr(session, "sentinel_sid", None),
                 "browser_profile": getattr(session, "browser_profile", None),
+                "registration_driver": "protocol",
                 "twofa_status": twofa_status,
                 "twofa_error": twofa_error,
-                "registration_password": registration_password,
                 "codex": codex_result,
             },
         )
@@ -751,7 +792,7 @@ def main():
     sys.exit(0 if success_count == args.count else 1)
 
 
-def run_one_batch_item(index: int, total: int, batch_dir=None) -> dict:
+def run_one_batch_item(index: int, total: int, batch_dir=None, proxy_lane_id: int | None = None) -> dict:
     """执行批量注册中的一个任务，返回结构化结果。"""
     logger.info(f"[批量] 开始第 {index + 1}/{total} 个注册")
     try:
@@ -761,7 +802,8 @@ def run_one_batch_item(index: int, total: int, batch_dir=None) -> dict:
             name=name,
             birthday=birthday,
             batch_dir=batch_dir,
-            # proxy 不传 → BrowserSession 会从 PROXY_POOL 随机抽
+            proxy_lane_id=0 if proxy_lane_id is None else proxy_lane_id,
+            lease_owner_id=f"registration-batch:{index}:{email}",
         )
     except Exception as exc:
         logger.error(f"[批量] 第 {index + 1} 个注册准备阶段失败: {type(exc).__name__}: {exc}")
@@ -806,7 +848,13 @@ def run_parallel_batch(
         nonlocal next_index
         if stop_submitting or next_index >= count:
             return False
-        future = executor.submit(run_one_batch_item, next_index, count, batch_dir)
+        future = executor.submit(
+            run_one_batch_item,
+            next_index,
+            count,
+            batch_dir,
+            next_index % max(1, workers),
+        )
         future_to_index[future] = next_index
         next_index += 1
         if delay > 0 and next_index < count:

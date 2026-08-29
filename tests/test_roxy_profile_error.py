@@ -38,6 +38,18 @@ class RoxyProfileErrorTests(unittest.TestCase):
 
         self.assertIsNone(roxy_registration._profile_submission_error(snapshot))
 
+    def test_unsupported_email_error_is_terminal(self):
+        snapshot = {
+            "url": "https://auth.openai.com/about-you",
+            "text": "This email is not supported.",
+            "errors": [],
+        }
+
+        self.assertEqual(
+            roxy_registration._profile_submission_error(snapshot),
+            "This email is not supported.",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

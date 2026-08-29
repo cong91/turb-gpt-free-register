@@ -85,6 +85,30 @@ class PaymeshEmailProviderTests(unittest.TestCase):
         self.assertEqual(code, "654321")
         fetch_latest_otp.assert_called_once_with("user@example.com", after_ts=123.0, max_wait=12)
 
+    @patch("core.paymesh_mail_client.fetch_latest_otp", return_value="654321")
+    @patch("core.email_provider.resolve_email_source", return_value="paymesh")
+    def test_wait_for_otp_uses_paymesh_specific_default(self, _resolve, fetch_latest_otp):
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), \
+             patch.object(email_config, "PAYMESH_OTP_MAX_WAIT", 180):
+            code = email_provider.wait_for_otp("user@example.com", after_ts=123.0)
+
+        self.assertEqual(code, "654321")
+        fetch_latest_otp.assert_called_once_with(
+            "user@example.com", after_ts=123.0, max_wait=180
+        )
+
+    @patch("core.outlook_client.fetch_latest_otp", return_value="123456")
+    @patch("core.email_provider.resolve_email_source", return_value="outlook")
+    def test_wait_for_otp_keeps_global_default_for_other_sources(self, _resolve, fetch_latest_otp):
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), \
+             patch.object(email_config, "OTP_MAX_WAIT", 90):
+            code = email_provider.wait_for_otp("user@outlook.com", after_ts=123.0)
+
+        self.assertEqual(code, "123456")
+        fetch_latest_otp.assert_called_once_with(
+            "user@outlook.com", after_ts=123.0
+        )
+
     @patch("core.paymesh_mail_client.release_account", return_value=True)
     @patch("core.email_provider.resolve_email_source", return_value="paymesh")
     def test_release_unconsumed_returns_paymesh_reservation(self, _resolve, release_account):

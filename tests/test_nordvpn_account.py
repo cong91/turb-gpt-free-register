@@ -149,6 +149,18 @@ class NordVPNAccountClientTests(unittest.TestCase):
         self.assertEqual(first.hostname, "jp1")
         self.assertEqual(second.hostname, "jp2")
 
+    def test_choose_server_excludes_persisted_active_hostnames(self):
+        client = account.NordVPNAccountClient(access_token="token-secret", http=_Http([]))
+        servers = [
+            account.NordLynxServer("jp1", "1.1.1.1", _PUBLIC_KEY, "JP", 1),
+            account.NordLynxServer("jp2", "1.1.1.2", _PUBLIC_KEY, "JP", 2),
+        ]
+        with mock.patch.object(client, "servers", return_value=servers), \
+             mock.patch.object(account.random, "choice", side_effect=lambda items: items[0]):
+            selected = client.choose_server("JP", excluded_hostnames={"jp1"})
+
+        self.assertEqual(selected.hostname, "jp2")
+
     def test_request_exception_is_translated(self):
         http = _Http([requests.RequestException("network down")])
         client = account.NordVPNAccountClient(access_token="token-secret", http=http)

@@ -8,6 +8,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from core import app_state_db
+
 
 class ProviderCardQuotaError(RuntimeError):
     """Card không còn slot khả dụng hoặc ledger không hợp lệ."""
@@ -42,6 +44,12 @@ class ProviderCardLedger:
         return str(email or "").strip().lower()
 
     def _load(self) -> dict:
+        if app_state_db.is_app_state_path(self.path):
+            key = f"provider_card_ledger:{self.provider_name}"
+            data = app_state_db.get_named_document(key, None)
+            if isinstance(data, dict) and isinstance(data.get("cards"), dict):
+                return data
+            return {"version": 1, "cards": {}}
         if not self.path.exists():
             return {"version": 1, "cards": {}}
         try:
@@ -53,6 +61,11 @@ class ProviderCardLedger:
         return data
 
     def _save(self, data: dict) -> None:
+        if app_state_db.is_app_state_path(self.path):
+            app_state_db.set_named_document(
+                f"provider_card_ledger:{self.provider_name}", data
+            )
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
         temp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")

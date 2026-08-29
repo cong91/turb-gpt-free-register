@@ -38,9 +38,9 @@ HUMANIZE_DELAYS = {
     # 点击前观察/移动鼠标。
     "click": (0.15, 0.85),
     # 单字符输入间隔。
-    "keystroke": (0.035, 0.18),
+    "keystroke": (0.025, 0.11),
     # 输入中偶尔停顿。
-    "typing_pause": (0.18, 0.75),
+    "typing_pause": (0.10, 0.45),
     # 页面打开后的短暂观察。
     "page_warmup": (0.7, 2.2),
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import ipaddress
+import random
 import re
 import string
 from collections.abc import Sequence
@@ -60,13 +61,16 @@ def canonical_gmail(email: str) -> str:
     return f"{local}@gmail.com"
 
 
-def _dot_locals(local: str) -> list[str]:
+def _dot_locals(local: str, count: int = 2) -> list[str]:
     positions = list(range(1, len(local)))
     if not positions:
         return []
-    preferred = [positions[0], positions[-1]]
+    # Stable pseudo-random ordering keeps aliases recoverable after restart
+    # while avoiding the same dot position for every source mailbox.
+    random.Random(f"gmail-dot:{local}").shuffle(positions)
+    selected = positions[: min(max(0, count), len(positions))]
     out = []
-    for position in preferred:
+    for position in selected:
         value = f"{local[:position]}.{local[position:]}"
         if value not in out:
             out.append(value)
@@ -80,7 +84,7 @@ def _plus_locals(local: str, count: int) -> list[str]:
 
 def _variant_locals(local: str, count: int) -> list[str]:
     variants = [local]
-    variants.extend(_dot_locals(local)[: min(2, max(0, count - 1))])
+    variants.extend(_dot_locals(local, count=min(2, max(0, count - 1))))
     variants.extend(_plus_locals(local, count - len(variants)))
     return variants[:count]
 
@@ -101,6 +105,75 @@ def generate_gmail_variants(email: str, limit: int = MAX_GMAIL_VARIANTS) -> list
     canonical = canonical_gmail(email)
     local = canonical.split("@", 1)[0]
     return [f"{value}@gmail.com" for value in _variant_locals(local, count)]
+
+
+MAX_GMAIL_DUAL_DOMAIN_VARIANTS = MAX_GMAIL_VARIANTS * 2  # 6 gmail.com + 6 googlemail.com
+
+
+def generate_gmail_dual_domain_variants(
+    email: str,
+    limit: int = MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
+) -> list[str]:
+    """Sinh biến thể trên cả gmail.com và googlemail.com từ một Gmail gốc.
+
+    Mọi biến thể đều forward về cùng một hộp thư (cùng code_url), nên dùng chung
+    một Gmail API URL record để lấy OTP.
+
+    Thứ tự: 6 biến thể gmail.com trước, rồi 6 biến thể googlemail.com.
+    Ví dụ với limit=12:
+        willjacob6442@gmail.com, w.illjacob6442@gmail.com, ...+xxxxx@gmail.com,
+        willjacob6442@googlemail.com, w.illjacob6442@googlemail.com, ...
+    """
+    count = max(0, min(MAX_GMAIL_DUAL_DOMAIN_VARIANTS, int(limit)))
+    if count == 0:
+        return []
+    canonical = canonical_gmail(email)
+    local = canonical.split("@", 1)[0]
+
+    gmail_count = min(MAX_GMAIL_VARIANTS, count)
+    googlemail_count = count - gmail_count
+
+    variants = [f"{value}@gmail.com" for value in _variant_locals(local, gmail_count)]
+    if googlemail_count > 0:
+        variants.extend(
+            f"{value}@googlemail.com"
+            for value in _variant_locals(local, googlemail_count)
+        )
+    return variants
+
+
+def generate_gmail_dual_domain_aliases(
+    email: str,
+    limit: int = MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
+) -> list[str]:
+    """Sinh đúng số alias yêu cầu, tối đa một alias có dấu chấm."""
+    count = max(0, min(MAX_GMAIL_DUAL_DOMAIN_VARIANTS, int(limit)))
+    if count == 0:
+        return []
+
+    local, source_domain = _gmail_parts(email)
+    source_values = {
+        f"{local}@gmail.com",
+        f"{local}@googlemail.com",
+    }
+    source_value = str(email or "").strip().lower().split("+", 1)[0]
+    if "." in source_value.split("@", 1)[0]:
+        source_values.add(source_value)
+    raw_count = count + len(source_values)
+    gmail_count = min(MAX_GMAIL_VARIANTS, raw_count)
+    googlemail_count = raw_count - gmail_count
+
+    dotted = _dot_locals(local, count=1)
+    local_variants = dotted + _plus_locals(local, raw_count - len(dotted))
+    variants = [f"{value}@gmail.com" for value in local_variants[:gmail_count]]
+    variants.extend(
+        f"{value}@googlemail.com"
+        for value in local_variants[gmail_count:gmail_count + googlemail_count]
+    )
+    aliases = [value for value in variants if value not in source_values]
+    if source_domain == "googlemail.com":
+        aliases = [value for value in aliases if value != f"{local}@googlemail.com"]
+    return aliases[:count]
 
 
 def _normalize_domain(domain: str) -> str:

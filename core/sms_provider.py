@@ -9,7 +9,8 @@
 
 当前支持：
     - GrizzlySMS：GET 文本接口，文档 https://api.grizzlysms.com
-    - SMSBower：GET handler_api 兼容接口，文档 https://smsbower.app/cn/api?page=client
+    - ViOTP：GET JSON 接口，租号后由 session 状态驱动过期
+    - HeroSMS：SMS-Activate-compatible GET 接口；按实时 cost 从低到高扫描，sticky country 仅在同价位优先
     - L：本地 JSON 管理接口，文档 L_API.md
     - H：本地 JSON 管理接口，文档 H_API.md
 
@@ -25,10 +26,12 @@ from urllib.parse import urljoin
 
 from curl_cffi.requests import Session as CurlSession
 
+from config import IMPERSONATE
+
 # 注意：用 `from config import codex` 而不是 `from config.codex import X`，
 # 这样 WebUI 调 config.reload_all() 后，本模块通过 codex.X 读到的是最新值。
 from config import codex as _cfg
-from config import IMPERSONATE
+from core import hero_sms_client, viotp_sms_client
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,7 @@ _MIN_CANCEL_DELAY = 125
 # 记录每个 activation_id 的取号时间，供 cancel() 判断是否要等。
 # 用模块级 dict 而不是改 acquire_number 返回值，保持向后兼容。
 _ACQUIRED_AT: dict[str, float] = {}
+_ACQUIRED_METADATA: dict[str, dict] = {}
 
 
 class SmsProviderError(RuntimeError):
@@ -65,6 +69,11 @@ def _http() -> CurlSession:
 
 def _provider() -> str:
     return str(getattr(_cfg, "SMS_PROVIDER", "grizzly") or "grizzly").strip().lower()
+
+
+def default_lane_key() -> str:
+    """Return a stable non-secret lane key for the current worker thread."""
+    return f"thread:{threading.current_thread().name}"
 
 
 def _request_grizzly(http: CurlSession, params: dict) -> str:
@@ -100,85 +109,20 @@ def _request_grizzly(http: CurlSession, params: dict) -> str:
     return text
 
 
-def _request_smsbower(http: CurlSession, params: dict) -> str:
-    """发 SMSBower handler_api 请求，返回去空白的响应文本。"""
-    api_key = str(getattr(_cfg, "SMSBOWER_API_KEY", "") or "").strip()
-    if not api_key:
-        raise SmsProviderError("SMSBower API Key 不能为空")
-    base = str(getattr(_cfg, "SMSBOWER_API_BASE", "") or "").strip()
-    if not base:
-        raise SmsProviderError("SMSBOWER_API_BASE 不能为空")
-    resp = http.get(base, params={"api_key": api_key, **params})
-    text = (resp.text or "").strip()
-    if resp.status_code != 200:
-        raise SmsProviderError(f"SMSBower HTTP {resp.status_code}: {text[:200]}")
-    if text in ("BAD_KEY", "BAD_ACTION", "BAD_SERVICE", "WRONG_SERVICE", "BAD_STATUS", "NO_ACTIVATION"):
-        if text == "BAD_KEY":
-            raise SmsProviderError("SMSBower API key 无效（BAD_KEY）")
-        if text in ("BAD_SERVICE", "WRONG_SERVICE"):
-            raise SmsProviderError(f"SMSBower 服务代码无效（{text}），OpenAI/ChatGPT 请填写 dr")
-        if text == "NO_ACTIVATION":
-            raise SmsProviderError("SMSBower 激活 ID 不存在（NO_ACTIVATION）")
-        raise SmsProviderError(f"SMSBower 请求参数错误：{text}")
-    if text in ("NO_NUMBERS", "NO_BALANCE", "NO_MONEY"):
-        if text in ("NO_BALANCE", "NO_MONEY"):
-            raise SmsNoBalanceError(f"SMSBower 余额不足（{text}），请充值")
-        raise SmsNoNumbersError("SMSBower 暂无可用号码（NO_NUMBERS）")
-    if text.startswith("The service is prohibited"):
-        raise SmsProviderError(f"SMSBower 该服务被禁售：{text}")
-    return text
+def _translate_viotp_error(exc: viotp_sms_client.ViOtpClientError) -> SmsProviderError:
+    if exc.status_code == "-2":
+        return SmsNoBalanceError(f"ViOTP 余额不足：{exc}")
+    if exc.status_code == "-3":
+        return SmsNoNumbersError(f"ViOTP 暂无可用号码：{exc}")
+    return SmsProviderError(str(exc))
 
 
-def _smsbower_number_params(service: str | None, country: str | None) -> dict:
-    service_code = str(service or _cfg.SMS_SERVICE or "").strip()
-    if service_code.lower() in ("openai", "chatgpt"):
-        service_code = "dr"
-    params = {
-        "action": "getNumberV2" if bool(getattr(_cfg, "SMSBOWER_USE_V2", True)) else "getNumber",
-        "service": service_code,
-        "country": str(country or _cfg.SMS_COUNTRY or "").strip(),
-    }
-    for key, value in (
-        ("maxPrice", getattr(_cfg, "SMS_MAX_PRICE", "")),
-        ("minPrice", getattr(_cfg, "SMSBOWER_MIN_PRICE", "")),
-        ("providerIds", getattr(_cfg, "SMSBOWER_PROVIDER_IDS", "")),
-        ("exceptProviderIds", getattr(_cfg, "SMSBOWER_EXCEPT_PROVIDER_IDS", "")),
-        ("phoneException", getattr(_cfg, "SMSBOWER_PHONE_EXCEPTION", "")),
-    ):
-        value = str(value or "").strip()
-        if value:
-            params[key] = value
-    return params
-
-
-def _request_smsbower_number(http: CurlSession, params: dict) -> tuple[dict, str]:
-    """按兼容性顺序取号，筛选无库存时放宽供应商条件。"""
-    candidates: list[dict] = [dict(params)]
-    if params.get("action") == "getNumberV2":
-        candidates.append({**params, "action": "getNumber"})
-    if params.get("providerIds"):
-        without_provider = {key: value for key, value in params.items() if key != "providerIds"}
-        candidates.append(without_provider)
-        if params.get("action") == "getNumberV2":
-            candidates.append({**without_provider, "action": "getNumber"})
-    unique = []
-    for candidate in candidates:
-        if candidate not in unique:
-            unique.append(candidate)
-    for index, candidate in enumerate(unique):
-        try:
-            return candidate, _request_smsbower(http, candidate)
-        except SmsNoNumbersError:
-            if index + 1 < len(unique):
-                logger.warning("[SMSBower] 取号筛选无库存，放宽条件重试：action=%s providerIds=%s", candidate.get("action"), candidate.get("providerIds", "-"))
-                continue
-            raise
-        except SmsProviderError as exc:
-            if candidate.get("action") == "getNumberV2" and "BAD_ACTION" in str(exc) and index + 1 < len(unique):
-                logger.warning("[SMSBower] getNumberV2 不被当前接口支持，回退兼容接口")
-                continue
-            raise
-    raise SmsProviderError("SMSBower 没有可用的取号请求方案")
+def _translate_hero_error(exc: hero_sms_client.HeroSmsClientError) -> SmsProviderError:
+    if exc.code == "NO_BALANCE":
+        return SmsNoBalanceError(f"HeroSMS 余额不足：{exc}")
+    if exc.code == "NO_NUMBERS":
+        return SmsNoNumbersError(f"HeroSMS 暂无可用号码：{exc}")
+    return SmsProviderError(str(exc))
 
 
 def _l_url(path: str) -> str:
@@ -391,6 +335,7 @@ def acquire_number(
     http: CurlSession | None = None,
     service: str | None = None,
     country: str | None = None,
+    lane_key: str | None = None,
 ) -> tuple[str, str]:
     """
     取一个手机号（getNumber）。
@@ -404,27 +349,45 @@ def acquire_number(
     own_http = http is None
     http = http or _http()
     try:
-        if _provider() == "smsbower":
-            params, text = _request_smsbower_number(http, _smsbower_number_params(service, country))
-            if params["action"] == "getNumberV2":
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    data = None
-                if isinstance(data, dict):
-                    activation_id = str(data.get("activationId") or data.get("id") or "").strip()
-                    phone = str(data.get("phoneNumber") or data.get("phone") or "").strip()
-                    if activation_id and phone:
-                        _ACQUIRED_AT[activation_id] = time.time()
-                        return activation_id, phone
-                raise SmsProviderError(f"SMSBower getNumberV2 响应格式异常：{text[:200]}")
-            if not text.startswith("ACCESS_NUMBER:"):
-                raise SmsProviderError(f"SMSBower getNumber 非预期响应：{text[:200]}")
-            parts = text.split(":", 2)
-            if len(parts) < 3:
-                raise SmsProviderError(f"SMSBower getNumber 响应格式异常：{text[:200]}")
-            activation_id, phone = parts[1].strip(), parts[2].strip()
+        if _provider() == "hero":
+            try:
+                activation_id, phone, metadata = hero_sms_client.acquire_number_with_metadata(
+                    http,
+                    api_base=getattr(_cfg, "HERO_SMS_API_BASE", ""),
+                    api_key=getattr(_cfg, "HERO_SMS_API_KEY", ""),
+                    service=service or getattr(_cfg, "HERO_SMS_SERVICE", "dr"),
+                    country=country or getattr(_cfg, "HERO_SMS_COUNTRY", "auto"),
+                    max_price=(getattr(_cfg, "HERO_SMS_MAX_PRICE", "") or _cfg.SMS_MAX_PRICE),
+                    lane_key=lane_key or "",
+                )
+            except hero_sms_client.HeroSmsClientError as exc:
+                raise _translate_hero_error(exc) from exc
             _ACQUIRED_AT[activation_id] = time.time()
+            _ACQUIRED_METADATA[activation_id] = metadata
+            logger.info(
+                "[SMS:HeroSMS] 取号成功：lane=%s country=%s offerCost=%s activation_id=%s, phone=+%s",
+                metadata.get("lane_key") or "-",
+                metadata.get("country") or "-",
+                metadata.get("price") or "-",
+                activation_id,
+                phone,
+            )
+            return activation_id, phone
+
+        if _provider() == "viotp":
+            try:
+                activation_id, phone = viotp_sms_client.acquire_number(
+                    http,
+                    api_base=getattr(_cfg, "VIOTP_API_BASE", ""),
+                    token=getattr(_cfg, "VIOTP_API_TOKEN", ""),
+                    service_id=getattr(_cfg, "VIOTP_SERVICE_ID", ""),
+                    country=country or getattr(_cfg, "VIOTP_COUNTRY", ""),
+                    network=getattr(_cfg, "VIOTP_NETWORK", ""),
+                )
+            except viotp_sms_client.ViOtpClientError as exc:
+                raise _translate_viotp_error(exc) from exc
+            _ACQUIRED_AT[activation_id] = time.time()
+            logger.info(f"[SMS:ViOTP] 取号成功：request_id={activation_id}, phone=+{phone}")
             return activation_id, phone
 
         if _provider() == "l":
@@ -541,6 +504,7 @@ def wait_for_sms_code(
         total_wait = max_wait or _cfg.SMS_CODE_WAIT
         logger.info(f"[SMS] 等待短信验证码 activation_id={activation_id}，最长 {total_wait}s...")
         round_no = 0
+        hero_resend_requested = False
         while time.time() < deadline:
             try:
                 from core.registration_service import check_stop_requested
@@ -554,6 +518,70 @@ def wait_for_sms_code(
                 f"[SMS] 第 {round_no} 轮获取验证码 activation_id={activation_id}，"
                 f"已等 {elapsed}s，剩余约 {remaining_before}s"
             )
+            if provider == "hero":
+                try:
+                    text = hero_sms_client.get_status(
+                        http,
+                        api_base=getattr(_cfg, "HERO_SMS_API_BASE", ""),
+                        api_key=getattr(_cfg, "HERO_SMS_API_KEY", ""),
+                        activation_id=activation_id,
+                    )
+                except hero_sms_client.HeroSmsClientError as exc:
+                    raise _translate_hero_error(exc) from exc
+                if text.startswith("STATUS_OK:"):
+                    code = text.split(":", 1)[1].strip()
+                    if not code:
+                        raise SmsProviderError("HeroSMS 收到空验证码")
+                    logger.info(f"[SMS:HeroSMS] 第 {round_no} 轮收到验证码：{code}")
+                    return code
+                if text == "STATUS_CANCEL":
+                    raise SmsProviderError("HeroSMS 激活已被取消（STATUS_CANCEL）")
+                if text.startswith("STATUS_WAIT_RESEND") and not hero_resend_requested:
+                    try:
+                        hero_sms_client.set_status(
+                            http,
+                            api_base=getattr(_cfg, "HERO_SMS_API_BASE", ""),
+                            api_key=getattr(_cfg, "HERO_SMS_API_KEY", ""),
+                            activation_id=activation_id,
+                            status=3,
+                        )
+                    except hero_sms_client.HeroSmsClientError as exc:
+                        raise _translate_hero_error(exc) from exc
+                    hero_resend_requested = True
+                    logger.info(f"[SMS:HeroSMS] 已请求重发短信 activation_id={activation_id}")
+                remaining = max(0, int(deadline - time.time()))
+                logger.info(
+                    f"[SMS:HeroSMS] 第 {round_no} 轮未收到验证码，状态={text}，"
+                    f"{interval}s 后重试（剩余 {remaining}s）"
+                )
+                time.sleep(interval)
+                continue
+
+            if provider == "viotp":
+                try:
+                    status, code = viotp_sms_client.get_session(
+                        http,
+                        api_base=getattr(_cfg, "VIOTP_API_BASE", ""),
+                        token=getattr(_cfg, "VIOTP_API_TOKEN", ""),
+                        request_id=activation_id,
+                    )
+                except viotp_sms_client.ViOtpClientError as exc:
+                    raise _translate_viotp_error(exc) from exc
+                if status == 1:
+                    if not code:
+                        raise SmsProviderError("ViOTP 会话已完成但响应缺少 Code")
+                    logger.info(f"[SMS:ViOTP] 第 {round_no} 轮收到验证码：{code}")
+                    return code
+                if status == 2:
+                    raise SmsCodeTimeout(f"ViOTP 会话已过期，request_id={activation_id}")
+                remaining = max(0, int(deadline - time.time()))
+                logger.info(
+                    f"[SMS:ViOTP] 第 {round_no} 轮未收到验证码，状态={status}，"
+                    f"{interval}s 后重试（剩余 {remaining}s）"
+                )
+                time.sleep(interval)
+                continue
+
             if provider == "l":
                 data = _post_l_json(http, "/api/admin/l/fetch-code", {"id": activation_id})
                 code = str(data.get("code") or "").strip()
@@ -583,15 +611,6 @@ def wait_for_sms_code(
                     f"[SMS:H] 第 {round_no} 轮未收到验证码，状态={status or raw or 'WAIT'}，"
                     f"{interval}s 后重试（剩余 {remaining}s）"
                 )
-                time.sleep(interval)
-                continue
-
-            if provider == "smsbower":
-                text = _request_smsbower(http, {"action": "getStatus", "id": activation_id})
-                if text.startswith("STATUS_OK:"):
-                    return text.split(":", 1)[1].strip().strip("'")
-                if text == "STATUS_CANCEL":
-                    raise SmsProviderError("SMSBower 激活已被取消（STATUS_CANCEL）")
                 time.sleep(interval)
                 continue
 
@@ -629,13 +648,24 @@ def set_status(activation_id: str, status: int, http: CurlSession | None = None)
     own_http = http is None
     http = http or _http()
     try:
-        if _provider() == "l":
-            logger.debug(f"[SMS:L] 忽略状态设置 id={activation_id}, status={status}")
+        provider = _provider()
+        if provider == "hero":
+            try:
+                return hero_sms_client.set_status(
+                    http,
+                    api_base=getattr(_cfg, "HERO_SMS_API_BASE", ""),
+                    api_key=getattr(_cfg, "HERO_SMS_API_KEY", ""),
+                    activation_id=activation_id,
+                    status=status,
+                )
+            except hero_sms_client.HeroSmsClientError as exc:
+                raise _translate_hero_error(exc) from exc
+        if provider == "viotp":
+            logger.debug(f"[SMS:ViOTP] 忽略状态设置 request_id={activation_id}, status={status}")
             return "OK"
-        if _provider() == "smsbower":
-            if int(status) == 1:
-                return "OK"
-            return _request_smsbower(http, {"action": "setStatus", "status": str(status), "id": activation_id})
+        if provider in ("l", "h"):
+            logger.debug(f"[SMS:{provider.upper()}] 忽略状态设置 id={activation_id}, status={status}")
+            return "OK"
         return _request_grizzly(http, {"action": "setStatus", "status": str(status), "id": activation_id})
     finally:
         if own_http:
@@ -643,7 +673,23 @@ def set_status(activation_id: str, status: int, http: CurlSession | None = None)
 
 
 def complete(activation_id: str, http: CurlSession | None = None) -> None:
-    """标记激活完成（status=6）。失败只告警不抛，避免影响主流程。"""
+    """标记激活完成；不支持主动完成的 provider 只清理本地状态。"""
+    hero_metadata = _ACQUIRED_METADATA.pop(activation_id, None)
+    if hero_metadata is not None:
+        hero_sms_client.record_country_verified(hero_metadata)
+    if _provider() == "hero":
+        try:
+            set_status(activation_id, 6, http=http)
+            logger.info(f"[SMS:HeroSMS] 已标记完成 activation_id={activation_id}")
+        except Exception as exc:
+            logger.warning(f"[SMS:HeroSMS] 标记完成失败（不影响结果）：{exc}")
+        finally:
+            _ACQUIRED_AT.pop(activation_id, None)
+        return
+    if _provider() == "viotp":
+        logger.info(f"[SMS:ViOTP] 会话由平台自动完成 request_id={activation_id}")
+        _ACQUIRED_AT.pop(activation_id, None)
+        return
     if _provider() == "l":
         logger.info(f"[SMS:L] 已完成 id={activation_id}")
         _ACQUIRED_AT.pop(activation_id, None)
@@ -652,14 +698,6 @@ def complete(activation_id: str, http: CurlSession | None = None) -> None:
         # H 成功 fetch-code 后后台会自动按多次收码策略重取；这里不 release。
         logger.info(f"[SMS:H] 已完成 id={activation_id}")
         _ACQUIRED_AT.pop(activation_id, None)
-        return
-    if _provider() == "smsbower":
-        try:
-            set_status(activation_id, 6, http=http)
-        except Exception as exc:
-            logger.warning(f"[SMSBower] 标记完成失败（不影响结果）：{exc}")
-        finally:
-            _ACQUIRED_AT.pop(activation_id, None)
         return
     try:
         set_status(activation_id, 6, http=http)
@@ -718,6 +756,36 @@ def cancel(activation_id: str, http: CurlSession | None = None, background: bool
 
     失败只告警不抛，不影响主流程。
     """
+    hero_metadata = _ACQUIRED_METADATA.pop(activation_id, None)
+    if hero_metadata is not None:
+        hero_sms_client.record_country_unusable(hero_metadata, "Codex 手机验证未完成")
+    if _provider() == "hero":
+        acquired_at = _ACQUIRED_AT.get(activation_id)
+        if acquired_at is not None and time.time() - acquired_at < _MIN_CANCEL_DELAY:
+            if not background:
+                _do_cancel_sync(activation_id, _http)
+                return
+            t = threading.Thread(
+                target=_do_cancel_sync,
+                args=(activation_id, _http),
+                name=f"hero-sms-cancel-{activation_id}",
+                daemon=True,
+            )
+            t.start()
+            logger.debug(f"[SMS:HeroSMS] 取消任务已派后台：activation_id={activation_id}")
+            return
+        try:
+            set_status(activation_id, 8, http=http)
+            logger.info(f"[SMS:HeroSMS] 已取消 activation_id={activation_id}")
+        except Exception as exc:
+            logger.warning(f"[SMS:HeroSMS] 取消失败（不影响主流程）：{exc}")
+        finally:
+            _ACQUIRED_AT.pop(activation_id, None)
+        return
+    if _provider() == "viotp":
+        logger.info(f"[SMS:ViOTP] 平台不支持主动取消，等待会话自动过期 request_id={activation_id}")
+        _ACQUIRED_AT.pop(activation_id, None)
+        return
     if _provider() == "l":
         try:
             _release_l_number(activation_id, http=http)
@@ -730,14 +798,6 @@ def cancel(activation_id: str, http: CurlSession | None = None, background: bool
             _release_h_number(activation_id, http=http)
         except Exception as exc:
             logger.warning(f"[SMS:H] 释放号码失败（不影响主流程）：id={activation_id}, {type(exc).__name__}: {exc}")
-            _ACQUIRED_AT.pop(activation_id, None)
-        return
-    if _provider() == "smsbower":
-        try:
-            set_status(activation_id, 8, http=http)
-        except Exception as exc:
-            logger.warning(f"[SMSBower] 释放号码失败（不影响主流程）：{exc}")
-        finally:
             _ACQUIRED_AT.pop(activation_id, None)
         return
 

@@ -13,13 +13,28 @@ WebUI 启动入口。
 import argparse
 import logging
 import os
+import socket
 import tempfile
 import webbrowser
 from pathlib import Path
 from threading import Timer
 
+from core import codex_retry_service
 from webui.app import create_app
 from webui.auth import is_generated_code
+
+
+def _assert_listen_address_available(host: str, port: int) -> None:
+    """Fail before Werkzeug can reuse a socket already owned by another server."""
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    address = (host, port, 0, 0) if family == socket.AF_INET6 else (host, port)
+    listen_socket = socket.socket(family, socket.SOCK_STREAM)
+    try:
+        listen_socket.bind(address)
+    except OSError as exc:
+        raise RuntimeError(f"端口 {port} 已被占用，无法启动 WebUI") from exc
+    finally:
+        listen_socket.close()
 
 
 def _acquire_single_instance(port: int):
@@ -88,12 +103,19 @@ def main() -> None:
         os.environ["WEBUI_AUTH_CODE"] = args.auth_code
 
     try:
+        _assert_listen_address_available(args.host, args.port)
         instance_lock = _acquire_single_instance(args.port)
     except RuntimeError as exc:
         logger.error(str(exc))
         raise SystemExit(2) from exc
 
     app = create_app(auth_code=args.auth_code)
+    retry_recovery = codex_retry_service.reconcile_persisted_retrying_statuses()
+    if retry_recovery["reset"]:
+        logger.warning(
+            "已重置 %s 个没有活动 worker 的 Codex retrying 状态",
+            retry_recovery["reset"],
+        )
     url = f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}"
     logger.info(f"WebUI 已启动：{url}")
     if is_generated_code():

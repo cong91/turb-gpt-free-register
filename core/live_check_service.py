@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import random
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -11,7 +10,8 @@ from pathlib import Path
 
 from core import db
 from core.account_liveness import check_account_liveness, log_path
-from core.chatgpt_plan import _mask_proxy, open_plan_check_proxy, resolve_plan_check_route
+from core.chatgpt_plan import resolve_plan_check_route
+from core.rotating_proxy_runtime import LIVE_CHECK_PROXY_SCOPE, resolve_rotating_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -21,36 +21,6 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="live-ch
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
 _RUNNING: set[int] = set()
 _LOCK = threading.Lock()
-_NETWORK_RETRY_HINTS = (
-    "403", "429", "502", "503", "504", "proxy", "socks", "timeout",
-    "timed out", "connection", "closed", "reset",
-)
-
-
-def _configured_live_check_proxies(proxy_cfg) -> list[str]:
-    """查活优先使用套餐专用代理池，未配置时使用注册代理池。"""
-    values = list(getattr(proxy_cfg, "PLAN_CHECK_PROXY", []) or [])
-    if not values:
-        values = list(getattr(proxy_cfg, "PROXY_POOL", []) or [])
-    return [str(value).strip() for value in values if str(value).strip()]
-
-
-def _live_proxy_route(proxy_url: str, proxy_cfg) -> dict:
-    route = resolve_plan_check_route(explicit_proxy=proxy_url)
-    upstream = str(getattr(proxy_cfg, "PLAN_CHECK_UPSTREAM_PROXY", "") or "").strip()
-    if upstream:
-        route["upstream_proxy"] = upstream
-        route["upstream_proxy_used"] = _mask_proxy(upstream) or None
-        route["network_route"] = "proxy_chain"
-    route["proxy_mode"] = "proxy_pool"
-    return route
-
-
-def _retryable_live_check_result(result: dict) -> bool:
-    if result.get("ok") or result.get("status") == "deactivated":
-        return False
-    text = str(result.get("error") or "").lower()
-    return any(hint in text for hint in _NETWORK_RETRY_HINTS)
 
 
 def is_checking(email: str) -> bool:
@@ -69,23 +39,27 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
         f.write(f"{stamp} [INFO] {line}\n")
 
 
-def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: str) -> dict:
-    relay = None
+def _run_live_check(
+    *,
+    account_id: int,
+    email: str,
+    proxy: str | None,
+    trigger: str,
+    proxy_lane_id: int | None = None,
+) -> dict:
     try:
         with _LOCK:
             _RUNNING.add(int(account_id))
         if not db.mark_account_live_check_running(account_id):
             _append_log(email, "[查活] 账号已删除或查活状态已被重置，取消执行")
             return {"ok": False, "status": "failed", "error": "账号已删除或查活状态已被重置"}
-        from config import proxy as proxy_cfg
-        candidates = _configured_live_check_proxies(proxy_cfg)
-        route = resolve_plan_check_route(explicit_proxy=proxy)
-        # 查活规则独立于套餐查询的 direct/auto 选择：只要任一代理池有数据，
-        # 就禁止直连，并从池中随机选择一个出口。
-        if candidates and not str(route.get("proxy") or "").strip():
-            route = _live_proxy_route(random.choice(candidates), proxy_cfg)
-        selected_proxy = str(route.get("proxy") or "").strip()
-        timeout = float(getattr(proxy_cfg, "PLAN_CHECK_TIMEOUT", 15.0) or 15.0)
+        selected_proxy = resolve_rotating_proxy(
+            proxy,
+            scope=LIVE_CHECK_PROXY_SCOPE,
+            lane_id=proxy_lane_id,
+        )
+        route = resolve_plan_check_route(explicit_proxy=selected_proxy)
+        selected_proxy = route.get("proxy")
         # 查活必须沿用账号注册时记录的邮箱来源。不能只调用
         # resolve_email_source(email)：Remail 等临时邮箱的上下文只在领取进程
         # 内存中存在，服务重启后按当前 EMAIL_SOURCE 推断会把来源判错。
@@ -103,73 +77,42 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
             f"proxy_mode={route.get('proxy_mode')} proxy_used={route.get('proxy_used') or '-'} "
             f"fallback_reason={route.get('proxy_fallback_reason') or '-'}"
         )
-        # 每个代理出口使用独立 BrowserSession/指纹/Cookie。网络类失败后换池中
-        # 尚未使用的代理；池非空时绝不直连。
-        max_routes = max(1, int(getattr(proxy_cfg, "PLAN_CHECK_MAX_ATTEMPTS", 3) or 3))
-        used_proxies: set[str] = set()
-        result: dict = {"ok": False, "status": "failed", "error": "查活未执行"}
-        for route_attempt in range(1, max_routes + 1):
-            selected_proxy = str(route.get("proxy") or "").strip()
-            if selected_proxy:
-                used_proxies.add(selected_proxy)
-            effective_proxy, relay = open_plan_check_proxy(
-                route, selected_proxy, timeout=timeout,
-            )
-            _append_log(
-                email,
-                f"[查活] 网络出口尝试 {route_attempt}/{max_routes}："
-                f"{_mask_proxy(selected_proxy) or 'direct'}",
-            )
+        result = check_account_liveness(
+            email,
+            proxy=selected_proxy,
+            clear_log=False,
+            email_source=email_source,
+        )
+        # 认证链早期 403 通常是该出口被 CF 拦截，不代表账号死亡。
+        # auto/proxy 模式下如果用了代理，额外直连兜底一次，便于和套餐查询的 auto 语义保持接近。
+        from config import proxy as proxy_config
+
+        # Preserve the old direct fallback only when rotating proxy is disabled.
+        # A rotating lease must remain the only route for this workflow.
+        error_text = str(result.get("error") or "")
+        if (
+            not bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False))
+            and not result.get("ok")
+            and result.get("status") == "failed"
+            and "403" in error_text
+            and selected_proxy
+            and str(route.get("network_route") or "") == "proxy"
+        ):
+            _append_log(email, "[查活] 代理出口收到 403，尝试直连兜底一次")
+            # BrowserSession 约定：None=从代理池抽取，""=明确直连。
             result = check_account_liveness(
                 email,
-                proxy=effective_proxy,
+                proxy="",
                 clear_log=False,
                 email_source=email_source,
-                fingerprint_state={"force_fresh": route_attempt > 1},
             )
-            if relay is not None:
-                relay.close()
-                relay = None
-            if not _retryable_live_check_result(result):
-                break
-
-            remaining = [item for item in candidates if item not in used_proxies]
-            if remaining and route_attempt < max_routes:
-                next_proxy = random.choice(remaining)
-                _append_log(
-                    email,
-                    "[查活] 当前代理发生网络/403错误，放弃该会话并随机切换下一代理："
-                    f"{_mask_proxy(next_proxy)}",
-                )
-                route = _live_proxy_route(next_proxy, proxy_cfg)
-                continue
-
-            if candidates:
-                break
-
-            # 没有任何代理池数据时，保留原先的一次直连兜底行为。
-            if selected_proxy and route_attempt < max_routes:
-                _append_log(
-                    email,
-                    "[查活] 未配置可替换代理，启动独立直连会话兜底一次",
-                )
-                route = resolve_plan_check_route(explicit_proxy="")
-                continue
-            break
         db.update_account_liveness(account_id, result)
         if result.get("ok"):
             _append_log(email, "[查活] 完成：账号正常，已刷新最新 AT/accessToken")
         elif result.get("status") == "deactivated":
-            _append_log(email, f"[查活] 完成：账号已废 {result.get('error') or ''}")
+            _append_log(email, f"[查活] 完成：{result.get('error') or 'OpenAI đã khóa tài khoản'}")
         else:
             _append_log(email, f"[查活] 完成：失败 {result.get('error') or ''}")
-        result.update({
-            "network_route": route.get("network_route"),
-            "proxy_used": _mask_proxy(selected_proxy) or None,
-            "upstream_proxy_used": route.get("upstream_proxy_used"),
-            "proxy_mode": route.get("proxy_mode"),
-            "proxy_fallback_reason": route.get("proxy_fallback_reason"),
-        })
         return result
     except Exception as exc:
         result = {
@@ -189,14 +132,19 @@ def _run_live_check(*, account_id: int, email: str, proxy: str | None, trigger: 
             pass
         return result
     finally:
-        if relay is not None:
-            relay.close()
         with _LOCK:
             _RUNNING.discard(int(account_id))
         _QUEUE_SLOTS.release()
 
 
-def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "manual", proxy: str | None = None) -> dict:
+def enqueue_account_live_check(
+    *,
+    account_id: int,
+    email: str,
+    trigger: str = "manual",
+    proxy: str | None = None,
+    proxy_lane_id: int | None = None,
+) -> dict:
     account_id = int(account_id)
     email = str(email or "").strip()
     if not email:
@@ -215,6 +163,7 @@ def enqueue_account_live_check(*, account_id: int, email: str, trigger: str = "m
             email=email,
             proxy=proxy,
             trigger=str(trigger or "manual"),
+            proxy_lane_id=proxy_lane_id,
         )
     except Exception as exc:
         _QUEUE_SLOTS.release()

@@ -37,16 +37,18 @@ class GPTMailWebUiTests(unittest.TestCase):
         outlook_pool_summary.assert_not_called()
         submit_registration.assert_called_once_with(count=1, workers=1)
 
+    @patch("webui.app.db.gmail_api_url_email_pool_summary", return_value={"total": 0, "available": 0, "used": 0, "failed": 0})
     @patch("webui.app.db.domain_email_pool_summary", return_value={"total": 0, "available": 0, "used": 0, "failed": 0})
     @patch("webui.app.db.outlook_pool_summary")
     @patch("webui.app.db.count_accounts", return_value=0)
-    def test_summary_does_not_count_gptmail_as_outlook_pool(self, count_accounts, outlook_pool_summary, domain_pool_summary):
+    def test_summary_does_not_count_gptmail_as_outlook_pool(self, count_accounts, outlook_pool_summary, domain_pool_summary, _gmail_api_url_pool):
         outlook_pool_summary.return_value = {"total": 0, "available": 0, "used": 0, "failed": 0}
         with patch.object(email_config, "EMAIL_SOURCE", "gptmail"):
             response = self.client.get("/api/summary")
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json()["outlook_total"], 0)
+        self.assertEqual(response.get_json()["gmail_api_url_available"], 0)
         outlook_pool_summary.assert_not_called()
 
     @patch("webui.app.svc.submit_registration")

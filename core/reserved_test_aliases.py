@@ -7,7 +7,9 @@ import itertools
 import re
 from collections.abc import Sequence
 
-MAX_RESERVED_TEST_ALIASES = 200
+from core.registration_limits import MAX_REGISTRATION_TASKS
+
+MAX_RESERVED_TEST_ALIASES = MAX_REGISTRATION_TASKS
 MAX_RESERVED_TEST_DOMAINS = 2
 MAX_RESERVED_TEST_BASE_LENGTH = 32
 _RESERVED_TEST_TLDS = (".example", ".invalid", ".test")
@@ -26,6 +28,23 @@ def _normalize_domains(domains: Sequence[str]) -> list[str]:
     normalized: list[str] = []
     for raw_domain in domains:
         domain = str(raw_domain or "").strip().lower().rstrip(".")
+        
+        # Reject domains with paths
+        if "/" in domain or "\\" in domain:
+            raise ReservedTestAliasError(f"Domain không được chứa path: {domain}")
+        
+        # Reject localhost
+        if domain == "localhost":
+            raise ReservedTestAliasError("Domain 'localhost' không được phép")
+        
+        # Reject real TLDs (only allow .test, .invalid, .example, .localhost)
+        if domain and not any(domain.endswith(tld) or domain == tld.lstrip(".") for tld in _RESERVED_TEST_TLDS):
+            # Also allow .localhost as a valid reserved TLD
+            if not domain.endswith(".localhost"):
+                raise ReservedTestAliasError(
+                    f"Chỉ được sử dụng domain reserved test (.test, .invalid, .example, .localhost): {domain}"
+                )
+        
         if domain not in normalized:
             normalized.append(domain)
 
@@ -56,6 +75,17 @@ def generate_reserved_test_aliases(
     """Generate deterministic fake mailbox aliases for reserved test domains."""
     normalized_domains = _normalize_domains(domains)
     value = str(base or "").strip().lower()
+    
+    # Reject empty base
+    if not value:
+        raise ReservedTestAliasError("Base không được để trống")
+    
+    # Reject base with dots or plus signs
+    if "." in value:
+        raise ReservedTestAliasError("Base không được chứa dấu chấm")
+    if "+" in value:
+        raise ReservedTestAliasError("Base không được chứa dấu cộng")
+    
     if not _BASE_PATTERN.fullmatch(value):
         raise ReservedTestAliasError("Base chỉ được chứa chữ cái thường và chữ số")
     if len(value) > MAX_RESERVED_TEST_BASE_LENGTH:

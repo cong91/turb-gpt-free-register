@@ -1,6 +1,6 @@
 ---
 purpose: Project rules for AI agents
-updated: 2026-07-30
+updated: 2026-08-15
 source: generated-by-zcode-starterkit
 ---
 
@@ -14,7 +14,7 @@ Maintain the Python-first ChatGPT registration and Codex OAuth tool without leak
 
 1. This `AGENTS.md` and the task-specific nearby code/tests.
 2. `README.md`, `.env.example`, and relevant files under `config/`.
-3. `.zcode/memory/project/tech-stack.md` and `.zcode/memory/project/project.md`.
+3. `.codex/memory/project/tech-stack.md` and `.codex/memory/project/project.md`; consult preserved legacy `.zcode/` memory only when needed.
 4. Code and tests; external guidance applies only when it matches this repository.
 
 ## Stack and Structure
@@ -72,12 +72,12 @@ These principles apply to implementation and architecture decisions:
 
 ## Boundaries and Gotchas
 
-- Registration/OAuth code touches external services and account state. Do not run `python main.py` or submit WebUI jobs as a generic smoke test.
+- Registration/OAuth code touches external services and account state. The agent **is permitted** to run `python main.py` and submit WebUI jobs when needed to confirm end-to-end functionality (owner-authorized). Each run consumes real resources (SMS credit, email slot, proxy quota) — run deliberately, not repeatedly as a generic smoke test.
 - WebUI auth and secret endpoints are security-sensitive; preserve header/cookie checks and add negative tests for bypass attempts.
 - Runtime data belongs outside tracked source. Check `.gitignore` before introducing new generated paths.
 - Dynamic configuration reads such as `from config import email as _email_cfg` preserve WebUI hot reload; binding mutable values directly can leave stale settings.
 - Persistence changes must preserve coordinated JSON and TXT outputs, and `accounts_viewer.html` must be treated as a credential-bearing export.
-- Ruff currently reports 45 pre-existing issues, including undefined names in `core/roxy_codex_oauth.py`; do not mix unrelated cleanup into feature work.
+- Ruff is not clean; the 2026-08-15 setup scan reported 1,194 findings across the current dirty worktree, including undefined names in `core/roxy_codex_oauth.py`. Do not mix unrelated cleanup into feature work.
 
 ## Verified Commands
 
@@ -85,9 +85,9 @@ These principles apply to implementation and architecture decisions:
 - `python -m pip check`
 - `python -m unittest discover -s tests -p 'test_*.py' -v`
 - `python -m compileall -q main.py web.py core config webui tests`
-- `python main.py --help` and `python web.py --help`
+- `python -X utf8 main.py --help` and `python -X utf8 web.py --help`
 - `node --check sentinel/sentinel-runner.js && node --check sentinel/sdk.js`
-- `ruff check . --exclude .zcode,.beads` (known baseline: 45 findings; not clean)
+- `ruff check . --exclude .zcode,.beads,.codex` (known non-clean baseline; report the live result)
 
 ## Code Example
 

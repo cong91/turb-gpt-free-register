@@ -292,7 +292,7 @@ def poll_verification_code(
     account: PaymeshMailAccount,
     *,
     max_wait: int,
-    poll_interval: int = 3,
+    poll_interval: int = 2,
     session=None,
     api_base: str = DEFAULT_API_BASE,
     timeout: int = 30,
@@ -345,9 +345,9 @@ def _otp_store():
 
         from core.otp_identity_store import OtpIdentityStore
 
-        _OTP_STORE = OtpIdentityStore(
-            Path(__file__).resolve().parent.parent / "otp_identity.sqlite3"
-        )
+        from core.app_state_db import APP_STATE_DB_PATH
+
+        _OTP_STORE = OtpIdentityStore(APP_STATE_DB_PATH)
     return _OTP_STORE
 
 
@@ -450,11 +450,9 @@ def _ledger():
         from pathlib import Path
 
         from core.provider_card_ledger import ProviderCardLedger
+        from core.app_state_db import APP_STATE_DB_PATH
 
-        _LEDGER = ProviderCardLedger(
-            Path(__file__).resolve().parent.parent / "paymesh_card_ledger.json",
-            provider_name="paymesh",
-        )
+        _LEDGER = ProviderCardLedger(APP_STATE_DB_PATH, provider_name="paymesh")
         from core import db
 
         def account_exists(email: str) -> bool:
@@ -546,7 +544,9 @@ def _inventory_store(store_path=None):
 
         from core.cdk_inventory_store import CdkInventoryStore
 
-        path = Path(store_path) if store_path else Path(__file__).resolve().parent.parent / "cdk_inventory.sqlite3"
+        from core.app_state_db import APP_STATE_DB_PATH
+
+        path = Path(store_path) if store_path else APP_STATE_DB_PATH
         _INVENTORY_STORE = CdkInventoryStore(path)
     return _INVENTORY_STORE
 
@@ -723,9 +723,11 @@ def fetch_latest_otp(
     if account is None:
         raise PaymeshMailError("Không tìm thấy context Paymesh để lấy OTP")
     api_base, timeout, _ = _config_values()
+    from core.email_provider import otp_max_wait_for_source
+
     return poll_verification_code(
         account,
-        max_wait=int(max_wait if max_wait is not None else _email_cfg.OTP_MAX_WAIT),
+        max_wait=otp_max_wait_for_source("paymesh", max_wait),
         poll_interval=int(poll_interval if poll_interval is not None else _email_cfg.OTP_POLL_INTERVAL),
         api_base=api_base,
         timeout=timeout,
