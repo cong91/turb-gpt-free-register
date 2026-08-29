@@ -261,7 +261,7 @@ def pick_account() -> OutlookAccount:
         summary = outlook_pool_summary()
         raise OutlookClientError(
             f"Outlook 账号池没有可用账号: {summary}. "
-            "请在 WebUI 的邮箱库中导入新邮箱。"
+            "请先通过 WebUI 邮箱池或显式导入操作写入数据库。"
         )
 
     account = OutlookAccount(

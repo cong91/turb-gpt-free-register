@@ -10,17 +10,90 @@ EMAIL_SOURCE 支持单个或多个来源：
     "gptmail"
     "mailnest"
     "cloudmail"
+    "tinyhost"
     "outlook,generic_api,mailnest,cloudmail"          # 按顺序兜底
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
 import logging
 from typing import Iterable
 
+from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
+
 logger = logging.getLogger(__name__)
+_BEFORE_CODE_UNSET = object()
+
+
+def _current_otp_job_id() -> int | None:
+    """Return the active registration job ID for correlated OTP logs."""
+    try:
+        from core import registration_service as _registration_service
+
+        value = getattr(_registration_service._THREAD_CTX, "job_id", None)
+        return int(value) if value is not None else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _get_code_url_account(email: str, source: str):
+    """Resolve a Gmail API URL account for either URL-backed provider."""
+    if source == "gmail_api_url":
+        from core.gmail_api_url_client import get_account_context, get_batch_account_context
+
+        account = get_account_context(email) or get_batch_account_context(email)
+    elif source == "qan8_gmail_api":
+        account = Qan8GmailApiAllocator().get_account_context(email)
+    else:
+        return None
+    if not account:
+        raise ValueError(f"Gmail API URL account not found: {email}")
+    return account
+
+
+def snapshot_verification_code(email: str, *, stage: str | None = None) -> str | None:
+    """Capture a URL provider's current code before triggering a new OTP."""
+    source = resolve_email_source(email)
+    if source not in {"gmail_api_url", "qan8_gmail_api"}:
+        return None
+
+    from core.gmail_api_url_client import snapshot_verification_code as snapshot_code
+
+    account = _get_code_url_account(email, source)
+    code = snapshot_code(account)
+    logger.info(
+        "[EmailProvider][OTP] pre-request snapshot source=%s present=%s job=%s stage=%s",
+        source,
+        bool(code),
+        _current_otp_job_id() or "-",
+        stage or "-",
+    )
+    return code
+
+
+def acknowledge_verification_code(
+    email: str,
+    otp: str,
+    *,
+    stage: str | None = None,
+) -> None:
+    """Persist a URL provider OTP only after its remote validation succeeds."""
+    source = resolve_email_source(email)
+    if source not in {"gmail_api_url", "qan8_gmail_api"}:
+        return
+
+    from core.gmail_api_url_client import acknowledge_verification_code as acknowledge_code
+
+    account = _get_code_url_account(email, source)
+    acknowledge_code(account, otp)
+    logger.info(
+        "[EmailProvider][OTP] validation acknowledged source=%s job=%s stage=%s",
+        source,
+        _current_otp_job_id() or "-",
+        stage or "-",
+    )
 
 _VALID_SOURCES = (
-    "outlook", "generic_api", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail",
-    "gmail_123452026", "paymesh",
+    "outlook", "generic_api", "gmail_api_url", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "tinyhost",
+    "gmail_123452026", "paymesh", "qan8_gmail_api",
 )
 
 _SOURCE_ALIASES = {
@@ -77,6 +150,9 @@ def _pick_from_source(
     paymesh_inventory_id: str | None = None,
     paymesh_inventory_ids: list[str] | None = None,
     paymesh_routed_domains: list[str] | None = None,
+    gmail_api_url_batch_id: str | None = None,
+    qan8_gmail_api_batch_id: str | None = None,
+    qan8_gmail_api_lane_id: int | None = None,
 ) -> str:
     if source == "gmail_123452026":
         if gmail_batch_id:
@@ -126,12 +202,32 @@ def _pick_from_source(
     if source == "cloudflare":
         from core.cf_temp_mail_client import pick_account
         return pick_account().email
+    if source == "tinyhost":
+        from core.tinyhost_mail_client import create_account
+        return create_account().email
     if source == "cloudflare_domain":
         from core.qqmail_client import pick_domain_email
         return pick_domain_email()
     if source == "generic_api":
         from core.generic_api_mail_client import pick_account
         return pick_account().email
+    if source == "gmail_api_url":
+        if gmail_api_url_batch_id:
+            from core.gmail_api_url_client import get_email_from_batch
+            return get_email_from_batch(
+                batch_id=gmail_api_url_batch_id,
+                job_id=str(job_id or "standalone"),
+            ).email
+        from core.gmail_api_url_client import pick_account
+        return pick_account().email
+    if source == "qan8_gmail_api":
+        if not qan8_gmail_api_batch_id or qan8_gmail_api_lane_id is None:
+            raise ValueError("QAN8 Gmail API requires a batch_id and lane_id")
+        return Qan8GmailApiAllocator().acquire_account(
+            batch_id=qan8_gmail_api_batch_id,
+            job_id=job_id or "standalone",
+            lane_id=int(qan8_gmail_api_lane_id),
+        ).email
     if source == "mailnest":
         from core.mailnest_client import pick_account
         return pick_account().email
@@ -153,6 +249,9 @@ def acquire_email(
     paymesh_inventory_id: str | None = None,
     paymesh_inventory_ids: list[str] | None = None,
     paymesh_routed_domains: list[str] | None = None,
+    gmail_api_url_batch_id: str | None = None,
+    qan8_gmail_api_batch_id: str | None = None,
+    qan8_gmail_api_lane_id: int | None = None,
 ) -> str:
     """领取注册邮箱；显式 source 仅使用该 provider，否则按全局配置兜底。
 
@@ -183,6 +282,9 @@ def acquire_email(
                 paymesh_inventory_id=paymesh_inventory_id,
                 paymesh_inventory_ids=paymesh_inventory_ids,
                 paymesh_routed_domains=paymesh_routed_domains,
+                gmail_api_url_batch_id=gmail_api_url_batch_id,
+                qan8_gmail_api_batch_id=qan8_gmail_api_batch_id,
+                qan8_gmail_api_lane_id=qan8_gmail_api_lane_id,
             )
             logger.info(f"[EmailProvider] 使用邮箱来源: {source}, email={email}")
             return email
@@ -195,6 +297,9 @@ def acquire_email(
 
 def resolve_email_source(email: str) -> str:
     """根据邮箱在各池中的归属判断实际来源。"""
+    if Qan8GmailApiAllocator().get_account_context(email):
+        return "qan8_gmail_api"
+
     from core.gmail_123452026_client import get_account_context as get_gmail_cdk_context
     if get_gmail_cdk_context(email):
         return "gmail_123452026"
@@ -207,6 +312,9 @@ def resolve_email_source(email: str) -> str:
     from core.cf_temp_mail_client import get_account_context as get_cf_context
     if get_cf_context(email):
         return "cloudflare"
+    from core.tinyhost_mail_client import get_account_context as get_tinyhost_context
+    if get_tinyhost_context(email):
+        return "tinyhost"
     from core.mailnest_client import get_account_context as get_mailnest_context
     if get_mailnest_context(email):
         return "mailnest"
@@ -217,6 +325,13 @@ def resolve_email_source(email: str) -> str:
     from core import db
     if db.get_generic_api_email_by_email(email):
         return "generic_api"
+    if db.get_gmail_api_url_email_by_email(email):
+        return "gmail_api_url"
+    # Alias batch: alias (vd willjacob6442+xxx@gmail.com) không nằm trong pool,
+    # phải tra qua batch context để nhận ra là gmail_api_url.
+    from core.gmail_api_url_client import get_batch_account_context
+    if get_batch_account_context(email):
+        return "gmail_api_url"
     if db.get_outlook_by_email(email):
         return "outlook"
     if db._find_domain_email(db._load_domain_pool(), email):  # 内部轻量查询，仅本项目使用
@@ -232,14 +347,69 @@ def resolve_email_source(email: str) -> str:
     return parse_email_sources()[0]
 
 
+def otp_max_wait_for_source(source: str, max_wait: int | None = None) -> int:
+    """返回邮箱来源对应的 OTP 等待上限；显式值始终优先。"""
+    if max_wait is not None:
+        return int(max_wait)
+    from config import email as _email_cfg
+
+    if str(source or "").strip().lower() == "paymesh":
+        return int(getattr(_email_cfg, "PAYMESH_OTP_MAX_WAIT", 60) or 60)
+    return int(getattr(_email_cfg, "OTP_MAX_WAIT", 60) or 60)
+
+
+def _wait_for_code_url_otp(
+    account,
+    *,
+    source: str,
+    after_ts: float,
+    max_wait: int | None,
+    poll_interval: int | None,
+    before_code: str | None | object,
+    stage: str | None,
+) -> str:
+    """Poll one mailbox code URL with the shared Gmail API stale guard.
+
+    QAN8 aliases and imported Gmail API URL records are different allocation
+    records, but both resolve to the same ``email----code_url`` mailbox
+    contract. Normalize both account types before polling so OTP persistence
+    is always keyed by the original mailbox URL, never by an alias.
+    """
+    from core.gmail_api_url_client import GmailApiUrlAccount, poll_verification_code
+    from config import email as _email_cfg
+
+    normalized_account = GmailApiUrlAccount(
+        email=str(account.email),
+        code_url=str(account.code_url),
+    )
+    configured_interval = int(getattr(_email_cfg, "OTP_POLL_INTERVAL", 2) or 2)
+    poll_kwargs = {
+        "max_wait": max_wait if max_wait is not None else otp_max_wait_for_source(source),
+        "poll_interval": poll_interval if poll_interval is not None else configured_interval,
+        "after_ts": after_ts,
+        "job_id": _current_otp_job_id(),
+        "stage": stage,
+    }
+    if before_code is not _BEFORE_CODE_UNSET:
+        poll_kwargs["before_code"] = before_code
+    return poll_verification_code(normalized_account, **poll_kwargs)
+
+
 def wait_for_otp(
     email: str,
     after_ts: float,
     max_wait: int | None = None,
     poll_interval: int | None = None,
     settle_seconds: int | None = None,
+    before_code: str | None | object = _BEFORE_CODE_UNSET,
+    stage: str | None = None,
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
+
+    ``before_code`` 用于重发后的 stale guard；Gmail API URL 与 QAN8
+    provider 都按共享的原始 mailbox ``code_url`` 处理，其他 provider
+    保持原有参数行为。
+    ``stage`` 仅用于关联并发任务的 OTP 日志。
 
     USE_EMAIL_SERVICE=False 时走手动验证码通道（WebUI 提交 / CLI 输入），
     不再强制要求 Outlook clientId/refreshToken。
@@ -253,7 +423,7 @@ def wait_for_otp(
     if not use_service:
         from core.manual_otp import wait_for_manual_otp
         from config import email as _email_cfg
-        timeout = int(max_wait if max_wait is not None else (getattr(_email_cfg, "OTP_MAX_WAIT", 180) or 180))
+        timeout = int(max_wait if max_wait is not None else (getattr(_email_cfg, "OTP_MAX_WAIT", 60) or 60))
         job_id = None
         try:
             from core import registration_service as svc
@@ -262,15 +432,15 @@ def wait_for_otp(
             job_id = None
         return wait_for_manual_otp(email, timeout=timeout, job_id=job_id)
 
+    source = resolve_email_source(email)
     extra_kwargs = {}
-    if max_wait is not None:
-        extra_kwargs["max_wait"] = max_wait
+    if max_wait is not None or source == "paymesh":
+        extra_kwargs["max_wait"] = otp_max_wait_for_source(source, max_wait)
     if poll_interval is not None:
         extra_kwargs["poll_interval"] = poll_interval
     if settle_seconds is not None:
         extra_kwargs["settle_seconds"] = settle_seconds
 
-    source = resolve_email_source(email)
     if source == "gmail_123452026":
         from core.gmail_123452026_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
@@ -283,12 +453,39 @@ def wait_for_otp(
     if source == "cloudflare":
         from core.cf_temp_mail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "tinyhost":
+        from core.tinyhost_mail_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "cloudflare_domain":
         from core.qqmail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "generic_api":
         from core.generic_api_mail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "gmail_api_url":
+        # Email gốc trong pool trước; nếu là alias batch thì tra batch context
+        # (mọi alias share code_url của email gốc).
+        account = _get_code_url_account(email, source)
+        return _wait_for_code_url_otp(
+            account,
+            source=source,
+            after_ts=after_ts,
+            max_wait=extra_kwargs.get("max_wait"),
+            poll_interval=extra_kwargs.get("poll_interval"),
+            before_code=before_code,
+            stage=stage,
+        )
+    if source == "qan8_gmail_api":
+        account = _get_code_url_account(email, source)
+        return _wait_for_code_url_otp(
+            account,
+            source=source,
+            after_ts=after_ts,
+            max_wait=extra_kwargs.get("max_wait"),
+            poll_interval=extra_kwargs.get("poll_interval"),
+            before_code=before_code,
+            stage=stage,
+        )
     if source == "mailnest":
         from core.mailnest_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
@@ -314,12 +511,22 @@ def release_email(email: str, status: str = "available", note: str | None = None
     elif source == "cloudflare":
         from core.cf_temp_mail_client import release_account
         release_account(email, status=status, note=note)
+    elif source == "tinyhost":
+        from core.tinyhost_mail_client import release_account
+        release_account(email, status=status, note=note)
     elif source == "cloudflare_domain":
         from core.qqmail_client import release_domain_email
         release_domain_email(email, status=status, note=note)
     elif source == "generic_api":
         from core.generic_api_mail_client import release_account
         release_account(email, status=status, note=note)
+    elif source == "gmail_api_url":
+        from core.gmail_api_url_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "qan8_gmail_api":
+        Qan8GmailApiAllocator().release_account(
+            email, status=status, reason=str(note or "")
+        )
     elif source == "mailnest":
         from core.mailnest_client import release_account
         release_account(email, status=status, note=note)
@@ -350,6 +557,29 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
         changed = db.release_unconsumed_outlook(email, note=note)
     elif source == "generic_api":
         changed = db.release_unconsumed_generic_api_email(email, note=note)
+    elif source == "gmail_api_url":
+        provider_failed = "Provider error code=602" in str(note or "")
+        if provider_failed:
+            existing = db.get_gmail_api_url_email_by_email(email)
+            db.release_gmail_api_url_email(email, status="failed", note=note)
+            changed = existing is not None
+        else:
+            changed = db.release_unconsumed_gmail_api_url_email(email, note=note)
+        if not changed:
+            from core.gmail_api_url_client import get_batch_account_context, release_account
+            if get_batch_account_context(email):
+                changed = release_account(
+                    email,
+                    status="failed" if provider_failed else "available",
+                    note=note or "",
+                )
+    elif source == "qan8_gmail_api":
+        provider_failed = "Provider error code=602" in str(note or "")
+        changed = Qan8GmailApiAllocator().release_account(
+            email,
+            status="failed" if provider_failed else "available",
+            reason=str(note or ""),
+        )
     elif source == "cloudflare_domain":
         changed = db.release_unconsumed_domain_email(email, note=note)
     else:
@@ -375,4 +605,12 @@ def mark_email_consumed(email: str) -> bool:
     if source == "paymesh":
         from core.paymesh_mail_client import mark_account_consumed
         return mark_account_consumed(email)
+    if source == "gmail_api_url":
+        from core.gmail_api_url_client import release_account
+        return bool(release_account(email, status="used", note=""))
+    if source == "qan8_gmail_api":
+        return Qan8GmailApiAllocator().release_account(email, status="used", reason="")
+    if source == "tinyhost":
+        from core.tinyhost_mail_client import mark_domain_supported
+        return mark_domain_supported(email)
     return False

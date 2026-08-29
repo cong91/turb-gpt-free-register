@@ -22,7 +22,21 @@ USE_EMAIL_SERVICE = False
 #   "gptmail"           — GPTMail 临时邮箱 API（运行时随机生成邮箱并自动收码）
 #   "mailnest"          — MailNest/迈巢临时邮箱 API（运行时购买邮箱并自动收码）
 #   "cloudmail"         — CloudMail/Cloud Mail API（自动从平台获取域名并随机生成邮箱）
+#   "tinyhost"          — TinyHost 临时邮箱 API（全量 domain + user 并自动收码）
+#   "qan8_gmail_api"    — QAN8 Gmail API URL，按 worker lane 懒购买 source 并生成 client alias
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
+
+
+# ============================================================
+# QAN8 Gmail API URL: shop.qan8.com
+# ============================================================
+
+QAN8_API_BASE = "https://shop.qan8.com"
+QAN8_API_KEY = env_str("QAN8_API_KEY", "")
+QAN8_GMAIL_SKU_ID = env_str("QAN8_GMAIL_SKU_ID", "")
+QAN8_REQUEST_TIMEOUT = 15
+QAN8_ORDER_TIMEOUT = 120
+QAN8_ALIASES_PER_SOURCE = 12
 
 
 # ============================================================
@@ -42,6 +56,7 @@ GMAIL_123452026_ALLOW_INSECURE_HTTP = True
 
 PAYMESH_API_BASE = "https://sms.paymesh.cn"
 PAYMESH_REQUEST_TIMEOUT = 30
+PAYMESH_OTP_MAX_WAIT = 60
 PAYMESH_ACCOUNTS_PER_CDK = 6
 
 # Domain tùy chỉnh để tạo thêm alias local test cho Paymesh MAIL card.
@@ -71,8 +86,8 @@ OUTLOOK_API_BASE = "https://mail.chatai.codes"
 # OTP 轮询参数
 # ============================================================
 
-OTP_POLL_INTERVAL = 3
-OTP_MAX_WAIT = 90
+OTP_POLL_INTERVAL = 2
+OTP_MAX_WAIT = 60
 
 # Outlook 双协议取件：抓到一封 OTP 后再多等多少秒看是否有更晚到达的邮件。
 OTP_SETTLE_SECONDS = 5
@@ -173,5 +188,15 @@ CLOUDMAIL_AUTO_ADD_USER = True
 # 随机邮箱 local-part 长度。
 CLOUDMAIL_RANDOM_LOCAL_LENGTH = 12
 
+
+# ============================================================
+# TinyHost 临时邮箱 API：https://tinyhost.shop
+# ============================================================
+
+# TinyHost 不需要 API Key；地址由随机在线域名 + 随机 local-part 组成。
+TINYHOST_API_BASE = "https://tinyhost.shop"
+TINYHOST_REQUEST_TIMEOUT = 20
+TINYHOST_RANDOM_LOCAL_LENGTH = 12
+
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'GMAIL_123452026_API_BASE': 'str', 'GMAIL_123452026_REQUEST_TIMEOUT': 'int', 'GMAIL_123452026_ACCOUNTS_PER_CDK': 'int', 'GMAIL_123452026_ALLOW_INSECURE_HTTP': 'bool', 'PAYMESH_API_BASE': 'str', 'PAYMESH_REQUEST_TIMEOUT': 'int', 'PAYMESH_ACCOUNTS_PER_CDK': 'int', 'PAYMESH_ROUTED_DOMAINS': 'list_str_multiline', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int'})
+apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'QAN8_API_BASE': 'str', 'QAN8_API_KEY': 'str', 'QAN8_GMAIL_SKU_ID': 'str', 'QAN8_REQUEST_TIMEOUT': 'int', 'QAN8_ORDER_TIMEOUT': 'int', 'QAN8_ALIASES_PER_SOURCE': 'int', 'GMAIL_123452026_API_BASE': 'str', 'GMAIL_123452026_REQUEST_TIMEOUT': 'int', 'GMAIL_123452026_ACCOUNTS_PER_CDK': 'int', 'GMAIL_123452026_ALLOW_INSECURE_HTTP': 'bool', 'PAYMESH_API_BASE': 'str', 'PAYMESH_REQUEST_TIMEOUT': 'int', 'PAYMESH_OTP_MAX_WAIT': 'int', 'PAYMESH_ACCOUNTS_PER_CDK': 'int', 'PAYMESH_ROUTED_DOMAINS': 'list_str_multiline', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'TINYHOST_API_BASE': 'str', 'TINYHOST_REQUEST_TIMEOUT': 'int', 'TINYHOST_RANDOM_LOCAL_LENGTH': 'int'})

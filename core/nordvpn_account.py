@@ -14,6 +14,7 @@ import random
 import threading
 import time
 from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import urljoin
 
@@ -276,9 +277,29 @@ class NordVPNAccountClient:
             self._servers_cache[normalized_country] = (now, servers)
         return list(servers)
 
-    def choose_server(self, country_code: str | None = None) -> NordLynxServer:
+    def choose_server(
+        self,
+        country_code: str | None = None,
+        *,
+        excluded_hostnames: Iterable[str] = (),
+    ) -> NordLynxServer:
         """Prefer a server not used recently, then choose among the lowest loads."""
         servers = self.servers(country_code)
+        excluded = {
+            str(hostname).strip().lower()
+            for hostname in excluded_hostnames
+            if str(hostname).strip()
+        }
+        if excluded:
+            servers = [
+                server for server in servers
+                if server.hostname.strip().lower() not in excluded
+            ]
+        if not servers:
+            suffix = f" cho {str(country_code).strip().upper()}" if country_code else ""
+            raise NordVPNAccountError(
+                f"NordVPN không còn server NordLynx chưa được lease{suffix}"
+            )
         with self._cache_lock:
             recent = set(self._recent_hostnames)
             candidates = [server for server in servers if server.hostname not in recent] or servers
@@ -288,10 +309,18 @@ class NordVPNAccountClient:
             self._recent_hostnames.append(selected.hostname)
             return selected
 
-    def build_config(self, country_code: str | None = None) -> NordLynxConfig:
+    def build_config(
+        self,
+        country_code: str | None = None,
+        *,
+        excluded_hostnames: Iterable[str] = (),
+    ) -> NordLynxConfig:
         """Build a wireproxy-compatible NordLynx config for one Roxy profile."""
         private_key = self.private_key()
-        server = self.choose_server(country_code)
+        server = self.choose_server(
+            country_code,
+            excluded_hostnames=excluded_hostnames,
+        )
         text = (
             "[Interface]\n"
             f"Address = {_NORDLYNX_ADDRESS}\n"

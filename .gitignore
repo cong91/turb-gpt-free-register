@@ -51,6 +51,23 @@ gmail_cdk_batches.sqlite3-journal
 gmail_cdk_batches.sqlite3-wal
 gmail_cdk_batches.sqlite3-shm
 
+# Roxy profile manager runtime catalog and encrypted archives
+roxy_profile_manager*.sqlite3
+roxy_profile_manager*.sqlite3-*
+roxy_profile_archives/
+roxy_profile_staging/
+
+# ============================================================
+# Central application state database (runtime source of truth)
+app_state.sqlite3
+app_state.sqlite3-journal
+app_state.sqlite3-wal
+app_state.sqlite3-shm
+
+# Legacy runtime databases retained only for migration/rollback
+用于注册的Gmail API邮箱_batches.db
+registration_jobs.db
+
 # ============================================================
 # 缓存 / 临时文件 / 诊断输出
 # ============================================================
@@ -110,6 +127,7 @@ logs/
 run/
 
 # Local agent/workflow state
+.codex/
 .zcode/
 .beads/
 .planning/

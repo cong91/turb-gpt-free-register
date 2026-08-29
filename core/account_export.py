@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 注册后处理模块：
     1. 拉取 /api/auth/session，从中抽取 accessToken / user 信息
@@ -14,14 +13,18 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
+from typing import Any, Protocol
+from urllib.parse import urlencode, urlparse
 
 import pyotp
 
-from core.session import BrowserSession
 from core.humanize import delay as human_delay
+from core.session import BrowserSession
 
 logger = logging.getLogger(__name__)
+
+_TWOFA_ACTION_URL = "https://chatgpt.com/?action=enable&factor=totp"
+_TWOFA_REAUTH_MAX_ATTEMPTS = 3
 
 def _post_register_dwell_seconds() -> float:
     try:
@@ -89,8 +92,26 @@ class _ScriptResponse:
             raise RuntimeError(f"HTTP {self.status_code}: {self.text[:500]}")
 
 
+def _json_object_response(response, *, action: str) -> dict:
+    """Decode a browser API response without exposing its body in errors."""
+    try:
+        payload = response.json()
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            f"{action} response is not JSON: "
+            f"status={getattr(response, 'status_code', 0)} "
+            f"url={str(getattr(response, 'url', '') or '')[:160]}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"{action} response is not a JSON object: "
+            f"status={getattr(response, 'status_code', 0)}"
+        )
+    return payload
+
+
 class BrowserPageTransport:
-    """用 Selenium 页面 fetch 执行 2FA 请求，保持当前浏览器登录态。"""
+    """用 Selenium 页面 fetch 执行同源 API 请求，保持当前浏览器登录态。"""
 
     def __init__(self, driver):
         self.driver = driver
@@ -106,6 +127,12 @@ class BrowserPageTransport:
             return str(self.driver.execute_script("return navigator.language") or "en-US")
         except Exception:
             return "en-US"
+
+    def js_timezone_offset_min(self) -> int:
+        try:
+            return int(self.driver.execute_script("return new Date().getTimezoneOffset()") or 0)
+        except Exception:
+            return 0
 
     def _request(self, method: str, url: str, headers: dict | None = None, data: str | None = None):
         current_url = str(getattr(self.driver, "current_url", "") or "")
@@ -126,7 +153,23 @@ class BrowserPageTransport:
           })
           .catch(error => done({status: 0, url, text: String(error), json: null}));
         """
-        payload = self.driver.execute_async_script(script, method, url, headers or {}, data)
+        timeout = max(1, int(getattr(self.driver, "script_timeout", 30) or 30))
+        set_timeout = getattr(self.driver, "set_script_timeout", None)
+        previous_timeout = None
+        if callable(set_timeout):
+            try:
+                previous_timeout = getattr(self.driver, "script_timeout", None)
+                set_timeout(timeout)
+            except Exception:
+                previous_timeout = None
+        try:
+            payload = self.driver.execute_async_script(script, method, url, headers or {}, data)
+        finally:
+            if callable(set_timeout) and previous_timeout is not None:
+                try:
+                    set_timeout(previous_timeout)
+                except Exception:
+                    pass
         return _ScriptResponse(payload or {"status": 0, "text": "browser request returned no response"})
 
     def get(self, url: str, headers: dict | None = None, **kwargs):
@@ -154,8 +197,16 @@ class BrowserPageTransport:
         self.driver.get(url)
 
 
+class BrowserSessionTransport(Protocol):
+    """Minimal transport contract shared by Selenium and Playwright adapters."""
+
+    def get_nextauth_headers(self, referer: str = "https://chatgpt.com/") -> dict: ...
+
+    def get(self, url: str, headers: Any = None, **kwargs): ...
+
+
 class BrowserContextTransport:
-    """用已登录 Playwright context 执行 2FA 请求，保持原浏览器 Cookie。"""
+    """用已登录 Playwright context 执行同源 API 请求，保持原浏览器 Cookie。"""
 
     def __init__(self, context, page):
         self.context = context
@@ -177,6 +228,12 @@ class BrowserContextTransport:
             return str(self.page.evaluate("() => navigator.language") or "en-US")
         except Exception:
             return "en-US"
+
+    def js_timezone_offset_min(self) -> int:
+        try:
+            return int(self.page.evaluate("() => new Date().getTimezoneOffset()") or 0)
+        except Exception:
+            return 0
 
     def _headers(self, headers: dict | None) -> dict:
         out = dict(headers or {})
@@ -225,14 +282,14 @@ class BrowserContextTransport:
         self.page.goto(url, wait_until="domcontentloaded")
 
 
-def setup_2fa_in_browser(context, page, email: str, otp_code: str | None = None) -> str:
+def setup_2fa_in_browser(context, page, email: str, *, reauth: bool = False) -> str:
     """在现有 Playwright 登录态中执行 2FA 设置。"""
-    return setup_2fa(BrowserContextTransport(context, page), email, otp_code=otp_code)
+    return setup_2fa(BrowserContextTransport(context, page), email, reauth=reauth)
 
 
-def setup_2fa_in_page(driver, email: str, otp_code: str | None = None) -> str:
+def setup_2fa_in_page(driver, email: str, *, reauth: bool = False) -> str:
     """在现有 Selenium 登录态中执行 2FA 设置。"""
-    return setup_2fa(BrowserPageTransport(driver), email, otp_code=otp_code)
+    return setup_2fa(BrowserPageTransport(driver), email, reauth=reauth)
 
 
 def _account_material_line(email: str, row: dict | None = None) -> str:
@@ -333,13 +390,13 @@ def follow_oauth_callback(session: BrowserSession, continue_url: str, referer: s
     else:
         headers = session.get_auth_navigate_headers(referer=referer)
 
-    logger.info(f"[OAuth回调] 跟随 continue_url 完成 OAuth 回调...")
+    logger.info("[OAuth回调] 跟随 continue_url 完成 OAuth 回调...")
     resp = session.get(continue_url, headers=headers, allow_redirects=True)
     logger.info(f"[OAuth回调] 完成, 最终落点: {resp.url}")
     return resp.url
 
 
-def fetch_session(session: BrowserSession) -> dict:
+def fetch_session(session: BrowserSessionTransport) -> dict:
     """
     GET https://chatgpt.com/api/auth/session
     注册成功后立刻调用，拿到 accessToken / user / account / expires。
@@ -373,18 +430,15 @@ def fetch_session(session: BrowserSession) -> dict:
 
 
 def _trigger_reauth(session: BrowserSession, email: str) -> str:
-    """
-    步骤2-3: 发起密码重认证，返回 OpenAI authorize URL。
-    重定向链会自动触发邮箱发送一份新的 OTP（用于 2FA 重认证）。
-    """
-    # 重新拿一次 csrf（旧的可能已过期）
+    """为当前已认证 session 发起 2FA 重认证，返回 authorize URL。"""
     csrf_url = "https://chatgpt.com/api/auth/csrf"
     csrf_resp = session.get(csrf_url, headers=session.get_nextauth_headers(referer="https://chatgpt.com/"))
     csrf_resp.raise_for_status()
-    csrf_token = csrf_resp.json()["csrfToken"]
-    logger.info(f"[2FA] 重认证 CSRF: {csrf_token[:20]}...")
+    csrf_data = _json_object_response(csrf_resp, action="re-auth CSRF")
+    csrf_token = csrf_data.get("csrfToken")
+    if not csrf_token:
+        raise RuntimeError("re-auth CSRF response missing csrfToken")
 
-    # POST /api/auth/signin/openai 带 reauth 参数
     query = {
         "connection": "password",
         "login_hint": email,
@@ -393,72 +447,128 @@ def _trigger_reauth(session: BrowserSession, email: str) -> str:
         "ext-oai-did": session.device_id,
     }
     signin_url = "https://chatgpt.com/api/auth/signin/openai?" + urlencode(query)
-
     headers = session.get_nextauth_headers(referer="https://chatgpt.com/")
     headers["content-type"] = "application/x-www-form-urlencoded"
     headers["origin"] = "https://chatgpt.com"
-
     body = urlencode({
-        "callbackUrl": "https://chatgpt.com/?action=enable&factor=totp",
+        "callbackUrl": _TWOFA_ACTION_URL,
         "csrfToken": csrf_token,
         "json": "true",
     })
 
-    logger.info("[2FA] 发起重认证 signin/openai...")
-    resp = session.post(signin_url, headers=headers, data=body)
-    resp.raise_for_status()
-    auth_url = resp.json().get("url")
+    logger.info("[2FA] 当前 session 发起 re-auth...")
+    response = session.post(signin_url, headers=headers, data=body)
+    response.raise_for_status()
+    auth_data = _json_object_response(response, action="re-auth signin")
+    auth_url = auth_data.get("url")
     if not auth_url:
-        raise RuntimeError(f"未拿到 reauth authorize URL: {resp.text}")
+        raise RuntimeError(f"未拿到 reauth authorize URL: {response.text}")
     return auth_url
 
 
 def _follow_reauth(session: BrowserSession, auth_url: str) -> str:
-    """
-    步骤3: 跟随 authorize URL 触发邮箱 OTP 发送。
-    auth.openai.com 会重定向到 /email-verification 页面，期间发送 OTP 邮件。
-    """
+    """跟随 re-auth URL，等待认证页自身触发邮箱 OTP。"""
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
-    logger.info("[2FA] 跟随 authorize URL，触发 OTP 发送...")
-    resp = session.get(auth_url, headers=headers, allow_redirects=True)
-    resp.raise_for_status()
-    logger.info(f"[2FA] 落点 URL: {resp.url}")
-    return str(getattr(resp, "url", "") or "")
+    response = session.get(auth_url, headers=headers, allow_redirects=True)
+    final_url = str(getattr(response, "url", "") or "")
+    lower_url = final_url.lower()
+    logger.info("[2FA] re-auth OTP 页面: %s", final_url)
+    if "/log-in/password" in lower_url:
+        raise RuntimeError(
+            "re-auth 未进入 email-verification 页面，当前落在登录密码页"
+        )
+    if "email-verification" not in lower_url:
+        raise RuntimeError(
+            f"re-auth 未进入 email-verification 页面: {final_url[:180]}"
+        )
+    return final_url
 
 
 def _validate_reauth_otp(session: BrowserSession, code: str) -> str:
-    """
-    步骤4: 提交邮箱 OTP 验证。
-    返回 continue_url（带 code 参数的 callback URL，用于跳回 chatgpt.com）。
-    """
+    """提交已保存账号的 re-auth 邮箱 OTP。"""
     url = "https://auth.openai.com/api/accounts/email-otp/validate"
     headers = session.get_auth_headers(referer="https://auth.openai.com/email-verification")
-    body = json.dumps({"code": code})
-
-    logger.info(f"[2FA] 提交重认证 OTP: {code}")
-    resp = session.post(url, headers=headers, data=body)
-    resp.raise_for_status()
-    data = resp.json()
-    continue_url = data.get("continue_url")
+    response = session.post(url, headers=headers, data=json.dumps({"code": code}))
+    response.raise_for_status()
+    response_data = _json_object_response(response, action="re-auth OTP validate")
+    continue_url = response_data.get("continue_url")
     if not continue_url:
-        raise RuntimeError(f"OTP 验证响应缺少 continue_url: {data}")
+        raise RuntimeError(f"OTP 验证响应缺少 continue_url: {response.text}")
     return continue_url
 
 
-def _exchange_new_token(session: BrowserSession, continue_url: str) -> str:
-    """
-    步骤5: 跟随 continue_url 完成回调，再次拉 /api/auth/session 拿到新 accessToken
-    （此时 token 内嵌的 pwd_auth_time 是新鲜的，2FA enroll 才会接受）。
-    """
-    headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification")
-    logger.info("[2FA] 跟随 continue_url，刷新 session-token cookie...")
-    session.get(continue_url, headers=headers, allow_redirects=True)
+def _is_wrong_email_otp_error(exc: Exception) -> bool:
+    """判断是否是可通过重新登录并获取新码恢复的邮箱 OTP 错误。"""
+    error_text = str(exc).lower()
+    return "wrong_email_otp_code" in error_text or "wrong code" in error_text
 
-    # 拿新的 accessToken
-    new_session = fetch_session(session)
-    new_token = new_session["accessToken"]
-    logger.info(f"[2FA] 新 accessToken（含新鲜 pwd_auth_time）: {new_token[:40]}...")
+
+def _is_reauth_retryable_error(exc: Exception) -> bool:
+    """判断 re-auth 是否应重新建立认证步骤并重新获取邮箱 OTP。"""
+    if _is_wrong_email_otp_error(exc):
+        return True
+    error_text = str(exc).lower()
+    return any(
+        marker in error_text
+        for marker in (
+            "invalid_auth_step",
+            "invalid authorization step",
+            "未进入 email-verification",
+            "waiting for new otp",
+            "response is not json",
+            "response is not a json object",
+            "missing csrftoken",
+            "missing csrf token",
+        )
+    )
+
+
+def _reset_reauth_context(session: BrowserSessionTransport) -> None:
+    """Return the live session to ChatGPT before starting a fresh auth step."""
+    navigate = getattr(session, "navigate", None)
+    if callable(navigate):
+        navigate("https://chatgpt.com/")
+        return
+
+    headers = session.get_chatgpt_navigate_headers(referer="https://chatgpt.com/")
+    response = session.get(
+        "https://chatgpt.com/",
+        headers=headers,
+        allow_redirects=True,
+    )
+    response.raise_for_status()
+
+
+def _resend_reauth_otp(session: BrowserSessionTransport) -> None:
+    """Ask auth.openai.com for a fresh OTP after a failed re-auth attempt."""
+    from core.openai_auth import send_email_otp
+
+    send_email_otp(
+        session,
+        referer="https://auth.openai.com/email-verification",
+    )
+
+
+def _exchange_new_token(session: BrowserSession, continue_url: str) -> str:
+    """完成 re-auth 回调并取回带新认证时间的 access token。"""
+    headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/email-verification")
+    session.get(continue_url, headers=headers, allow_redirects=True)
+    new_token = fetch_session(session)["accessToken"]
+    logger.info("[2FA] re-auth 完成，刷新 accessToken")
     return new_token
+
+
+def _open_twofa_action(session: BrowserSession) -> None:
+    """在已登录的注册会话中打开首页 2FA action，不重新进入登录流程。"""
+    logger.info("[2FA] 在当前登录态打开首页 2FA action...")
+    navigate = getattr(session, "navigate", None)
+    if callable(navigate):
+        navigate(_TWOFA_ACTION_URL, referer="https://chatgpt.com/")
+        return
+
+    headers = session.get_chatgpt_navigate_headers(referer="https://chatgpt.com/")
+    response = session.get(_TWOFA_ACTION_URL, headers=headers, allow_redirects=True)
+    response.raise_for_status()
 
 
 def _enroll_totp(session: BrowserSession, access_token: str) -> tuple[str, str]:
@@ -525,27 +635,28 @@ def setup_2fa(
     email: str,
     otp_code: str | None = None,
     access_token: str | None = None,
+    *,
+    reauth: bool = False,
 ) -> str:
     """
-    完整的 2FA 设置流程。
-    会触发再发一份邮箱验证码：
-        - USE_EMAIL_SERVICE=True 时自动从 Outlook 账号池拉取
-        - 否则需要用户手动输入
+    为账号设置 2FA。
+
+    默认复用当前登录态完成 enroll/activate。需要 recent-auth 的流程通过
+    ``reauth=True`` 显式执行邮箱 OTP re-auth；注册流程使用
+    :func:`setup_2fa_for_registration`，在 enroll 前强制完成 re-auth。
 
     Args:
         session: 已完成注册的会话
-        email: 账号邮箱（用作 login_hint）
-        otp_code: 邮箱验证码（None 则按上述策略获取）
+        email: 账号邮箱
+        reauth: 是否先执行 re-auth 邮箱 OTP 流程
 
     Returns:
         TOTP secret（Base32 字符串），可直接用于 pyotp.TOTP() 生成 6 位动态码
     """
-    # 用模块属性读，支持 WebUI 热加载
     from config import email as _email_cfg
     from core.chatgpt_bootstrap import authenticated_bootstrap
-
     logger.info("=" * 60)
-    logger.info("开始设置 2FA")
+    logger.info("开始设置 2FA：%s", email)
     logger.info("=" * 60)
 
     if access_token:
@@ -555,74 +666,171 @@ def setup_2fa(
             human_delay("navigate")
             logger.info("[2FA] accessToken 预热完成")
         except Exception as exc:
-            logger.warning("[2FA] accessToken 预热失败，继续按重认证流程执行：%s: %s", type(exc).__name__, str(exc)[:180])
+            logger.warning("[2FA] accessToken 预热失败，继续按当前登录态执行：%s: %s", type(exc).__name__, str(exc)[:180])
 
-    # 阶段一：重认证
-    logger.info("[2FA] 阶段1：发起重认证")
-    reauth_otp_after_ts = time.time()
-    auth_url = _trigger_reauth(session, email)
-    logger.info("[2FA] 重认证 authorize URL 已获取")
-    human_delay("api")
-    _follow_reauth(session, auth_url)
-    logger.info("[2FA] 已跟随重认证 authorize URL")
-    human_delay("navigate")
-
-    if otp_code is None:
-        if _email_cfg.USE_EMAIL_SERVICE:
-            from core.email_provider import wait_for_otp
-            logger.info("[2FA] 自动等待邮箱重认证 OTP...")
-            otp_code = wait_for_otp(email, after_ts=reauth_otp_after_ts)
-            logger.info("[2FA] 已收到邮箱重认证 OTP")
-        else:
-            logger.info("")
-            logger.info("[2FA] 请检查邮箱，输入新收到的 6 位验证码")
-            otp_code = input(">>> 2FA 验证码: ").strip()
-            logger.info("[2FA] 已手动输入邮箱重认证 OTP")
-
-    human_delay("otp_input")
-    logger.info("[2FA] 正在提交邮箱重认证 OTP...")
-    try:
-        continue_url = _validate_reauth_otp(session, otp_code)
-    except Exception as first_exc:
-        # 部分取码接口会短暂返回缓存中的上一封邮件。若服务端拒绝验证码，
-        # 重新轮询一次并提交最新候选，避免第一次旧码直接终止整个 2FA 流程。
-        status_code = getattr(getattr(first_exc, "response", None), "status_code", None)
-        if status_code != 401 or not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", False)):
-            raise
-        logger.warning("[2FA] 首次 OTP 被拒绝，重新获取最新验证码后再试一次")
-        from core.email_provider import wait_for_otp
-        retry_settle = max(8, int(getattr(_email_cfg, "OTP_SETTLE_SECONDS", 5) or 5))
-        fresh_otp = wait_for_otp(
-            email,
-            after_ts=reauth_otp_after_ts,
-            settle_seconds=retry_settle,
+    if reauth:
+        from config import email as _email_cfg
+        from core.email_provider import (
+            acknowledge_verification_code,
+            snapshot_verification_code,
         )
-        if fresh_otp == otp_code:
-            logger.warning("[2FA] 重试仍获取到相同 OTP=%s，继续提交以保留原始错误信息", fresh_otp)
+
+        previous_submitted_otp = None
+        continue_url = None
+        for reauth_attempt in range(1, _TWOFA_REAUTH_MAX_ATTEMPTS + 1):
+            reauth_before_code = snapshot_verification_code(
+                email,
+                stage="twofa_reauth_request",
+            ) or previous_submitted_otp
+            reauth_otp_after_ts = time.time()
+            current_otp = otp_code if reauth_attempt == 1 else None
+            try:
+                auth_url = _trigger_reauth(session, email)
+                human_delay("api")
+                _follow_reauth(session, auth_url)
+                human_delay("navigate")
+                if reauth_attempt > 1:
+                    # A failed code invalidates the previous auth step; request
+                    # the next code only after rebuilding the auth page.
+                    _resend_reauth_otp(session)
+                if _email_cfg.USE_EMAIL_SERVICE:
+                    from core.email_provider import wait_for_otp
+
+                    logger.info(
+                        "[2FA] 等待 re-auth 邮箱 OTP（第 %s/%s 次）",
+                        reauth_attempt,
+                        _TWOFA_REAUTH_MAX_ATTEMPTS,
+                    )
+                    wait_kwargs = {
+                        "after_ts": reauth_otp_after_ts,
+                        "before_code": reauth_before_code,
+                        "stage": "twofa_reauth_email_otp",
+                    }
+                    current_otp = wait_for_otp(email, **wait_kwargs)
+                else:
+                    current_otp = current_otp or input(">>> 2FA 验证码: ").strip()
+                logger.info(
+                    "[2FA] re-auth OTP 已返回，提交校验（第 %s/%s 次）",
+                    reauth_attempt,
+                    _TWOFA_REAUTH_MAX_ATTEMPTS,
+                )
+                human_delay("otp_input")
+                continue_url = _validate_reauth_otp(session, current_otp)
+                acknowledge_verification_code(
+                    email,
+                    current_otp,
+                    stage="twofa_reauth_email_otp",
+                )
+                logger.info("[2FA] re-auth OTP 校验通过")
+            except Exception as exc:
+                if not _is_reauth_retryable_error(exc) or reauth_attempt >= _TWOFA_REAUTH_MAX_ATTEMPTS:
+                    raise
+                if current_otp:
+                    previous_submitted_otp = current_otp
+                logger.warning(
+                    "[2FA] re-auth 步骤失败，第 %s/%s 次，重新登录并获取新验证码：%s",
+                    reauth_attempt,
+                    _TWOFA_REAUTH_MAX_ATTEMPTS,
+                    str(exc)[:180],
+                )
+                try:
+                    _reset_reauth_context(session)
+                except Exception as reset_exc:
+                    logger.warning(
+                        "[2FA] re-auth retry session reset failed: %s: %s",
+                        type(reset_exc).__name__,
+                        str(reset_exc)[:160],
+                    )
+                continue
+            break
+        if not continue_url:
+            raise RuntimeError("re-auth 未返回 continue_url")
+        human_delay("api")
+        access_token = _exchange_new_token(session, continue_url)
+    else:
+        if access_token:
+            logger.info("[2FA] 复用现有登录态打开 2FA 页面")
         else:
-            logger.info("[2FA] 已获取新的 OTP=%s，替换首次候选", fresh_otp)
-        otp_code = fresh_otp
-        continue_url = _validate_reauth_otp(session, otp_code)
-    logger.info("[2FA] 邮箱重认证 OTP 验证通过，continue_url=%s", continue_url)
-    human_delay("api")
-    logger.info("[2FA] 正在交换新 token...")
-    new_token = _exchange_new_token(session, continue_url)
-    logger.info("[2FA] 已拿到新 token")
+            logger.info("[2FA] 使用当前登录态打开 2FA 页面")
+        _open_twofa_action(session)
+        human_delay("navigate")
+        home_session = fetch_session(session)
+        access_token = home_session["accessToken"]
     human_delay("api")
 
-    # 阶段二：enroll + activate
-    logger.info("[2FA] 阶段2：开始 enroll TOTP")
-    secret, session_id = _enroll_totp(session, new_token)
-    logger.info("[2FA] enroll 成功，session_id=%s", session_id)
+    secret, session_id = _enroll_totp(session, access_token)
     human_delay("form")
-    logger.info("[2FA] 正在激活 TOTP enrollment")
-    _activate_totp(session, new_token, secret, session_id)
-    logger.info("[2FA] TOTP 激活完成")
+    _activate_totp(session, access_token, secret, session_id)
 
     logger.info("=" * 60)
     logger.info(f"✅ 2FA 设置完成! Secret: {secret[:4]}...{secret[-4:]}")
     logger.info("=" * 60)
     return secret
+
+
+def setup_2fa_for_registration(session: BrowserSession, email: str) -> str:
+    """Enable MFA after the fresh signup session completes an email re-auth."""
+    logger.info("[2FA] 注册完成，先完成邮箱 re-auth 再 enroll TOTP...")
+    return setup_2fa(session, email, reauth=True)
+
+
+def checkpoint_account_data(
+    email: str,
+    access_token: str,
+    extra: dict | None = None,
+    *,
+    email_source: str | None = None,
+    proxy_used: str | None = None,
+    registration_ip: str | None = None,
+) -> int:
+    """在 2FA 前保存已创建账号的最小可恢复状态。"""
+    from core.db import insert_account
+
+    payload = dict(extra or {})
+    from core.account_locale import derive_account_locale
+
+    locale_fields = derive_account_locale(extra=payload)
+    user = payload.get("user") or {}
+    account = payload.get("account") or {}
+    source_cdk = None
+    if email_source == "gmail_123452026":
+        from core.gmail_123452026_client import get_account_context
+
+        context = get_account_context(email)
+        source_cdk = context.cdk if context is not None else None
+    elif email_source == "paymesh":
+        from core.paymesh_mail_client import get_account_context
+
+        context = get_account_context(email)
+        source_cdk = context.cdk if context is not None else None
+
+    row_id = insert_account(
+        email=email,
+        access_token=access_token,
+        user_id=user.get("id"),
+        user_name=user.get("name"),
+        plan_type=account.get("planType"),
+        expires_at=payload.get("expires"),
+        device_id=payload.get("device_id"),
+        proxy_used=proxy_used,
+        registration_ip=registration_ip,
+        account_locale=locale_fields["account_locale"],
+        account_country=locale_fields["account_country"],
+        account_locale_source=locale_fields["account_locale_source"],
+        email_source=email_source,
+        source_cdk=source_cdk,
+        registration_password=str(payload.get("registration_password") or ""),
+        twofa_status="pending",
+        twofa_error=None,
+        extra={**payload, "twofa_status": "pending", "twofa_error": None},
+    )
+    # The API-URL alias is already consumed at this checkpoint even if the
+    # later 2FA step needs a retry. Other providers keep their existing flow.
+    if email_source == "gmail_api_url":
+        from core.email_provider import mark_email_consumed
+
+        mark_email_consumed(email)
+    return row_id
 
 
 def save_account_data(
@@ -633,6 +841,7 @@ def save_account_data(
     output_path: Path | None = None,  # 兼容老接口，已废弃
     email_source: str | None = None,
     proxy_used: str | None = None,
+    registration_ip: str | None = None,
     batch_dir: Path | None = None,
     auto_plan_check: bool | None = None,
 ) -> int:
@@ -642,6 +851,9 @@ def save_account_data(
     """
     from core.db import insert_account
     extra = extra or {}
+    from core.account_locale import derive_account_locale
+
+    locale_fields = derive_account_locale(extra=extra)
     user = extra.get("user") or {}
     account = extra.get("account") or {}
     # 从 extra.codex 抽出顶层 codex 状态/错误，方便 WebUI 直接读账号字段
@@ -672,6 +884,10 @@ def save_account_data(
         plan_type=account.get("planType"),
         expires_at=extra.get("expires"),
         proxy_used=proxy_used,
+        registration_ip=registration_ip,
+        account_locale=locale_fields["account_locale"],
+        account_country=locale_fields["account_country"],
+        account_locale_source=locale_fields["account_locale_source"],
         email_source=email_source,
         source_cdk=source_cdk,
         registration_password=str(extra.get("registration_password") or ""),
@@ -729,11 +945,17 @@ def save_account_data(
         try:
             from config import register as _register_cfg
 
-            auto_plan_check = bool(getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False))
+            auto_plan_check = bool(
+                getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
+                or getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+            )
         except Exception:
             auto_plan_check = False
     if not auto_plan_check:
-        logger.info(f"[Plan] 注册后自动套餐查询已跳过: id={row_id}, email={email}")
+        logger.info(
+            f"[Plan] 注册后不创建异步套餐查询任务（当前流程可能已同步完成或配置已关闭）: "
+            f"id={row_id}, email={email}"
+        )
         return row_id
     # session 中的 account.planType 不能说明 Plus 试用资格。账号落库后只负责
     # 入队，由专用线程池异步查询并回写，避免占用注册工作线程。

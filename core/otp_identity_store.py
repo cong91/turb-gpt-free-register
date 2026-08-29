@@ -5,6 +5,8 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
+from core import app_state_db
+
 
 class OtpIdentityStoreError(RuntimeError):
     """OTP identity store cannot be initialized or updated."""
@@ -57,6 +59,8 @@ class OtpIdentityStore:
         )
         connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
         connection.execute("PRAGMA synchronous = FULL")
+        if app_state_db.is_app_state_path(self.path):
+            app_state_db.ensure_schema(connection)
         connection.execute(_SCHEMA_SQL)
         return connection
 

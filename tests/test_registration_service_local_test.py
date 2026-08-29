@@ -113,6 +113,20 @@ class LocalTestRegistrationServiceTests(unittest.TestCase):
         self.assertFalse(info["retryable"])
         self.assertIn("local", info["retry_reason"].lower())
 
+    def test_unsupported_email_is_a_terminal_email_pool_failure(self):
+        self.assertTrue(
+            registration_service._should_disable_failed_registration_email(
+                "RuntimeError: about-you 提交失败：This email is not supported."
+            )
+        )
+
+    def test_deactivated_account_is_a_terminal_email_pool_failure(self):
+        self.assertTrue(
+            registration_service._should_disable_failed_registration_email(
+                "AccountUnusableError: 账号已废（account_deactivated）"
+            )
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

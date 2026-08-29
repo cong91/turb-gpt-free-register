@@ -9,7 +9,7 @@ import logging
 import socket
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 from urllib.parse import quote, urlparse
 
 from core.session import BrowserSession
@@ -17,6 +17,20 @@ from core.session import BrowserSession
 logger = logging.getLogger(__name__)
 
 ACCOUNTS_CHECK_PATH = "/backend-api/accounts/check/v4-2023-04-27"
+
+
+class PlanCheckBrowserTransport(Protocol):
+    """已登录浏览器提供的同源 API 请求能力。"""
+
+    device_id: str
+
+    def navigator_language(self) -> str: ...
+
+    def js_timezone_offset_min(self) -> int: ...
+
+    def get_chatgpt_headers(self, referer: str = "https://chatgpt.com/") -> dict: ...
+
+    def get(self, url: str, headers: Any = None, **kwargs): ...
 
 
 def now_iso() -> str:
@@ -75,7 +89,11 @@ def _local_proxy_status(proxy: str) -> tuple[bool, bool, str | None]:
         return False, False, f"代理地址解析失败（{type(exc).__name__}）"
 
 
-def resolve_plan_check_route(explicit_proxy: Optional[str] = None) -> dict:
+def resolve_plan_check_route(
+    explicit_proxy: Optional[str] = None,
+    *,
+    exclude_proxy: Optional[str] = None,
+) -> dict:
     """解析套餐查询的实际网络路径。
 
     explicit_proxy 不是 None 时表示 API 调用方明确覆盖配置；空字符串代表直连。
@@ -104,9 +122,14 @@ def resolve_plan_check_route(explicit_proxy: Optional[str] = None) -> dict:
             "proxy_fallback_reason": None,
         }
 
-    selected = str(getattr(proxy_cfg, "PLAN_CHECK_PROXY", "") or "").strip()
+    configured = str(getattr(proxy_cfg, "PLAN_CHECK_PROXY", "") or "").strip()
+    selected = configured
     if not selected:
-        selected = str(proxy_cfg.pick_proxy() or "").strip()
+        for _ in range(8):
+            candidate = str(proxy_cfg.pick_proxy() or "").strip()
+            if candidate and candidate != str(exclude_proxy or "").strip():
+                selected = candidate
+                break
     if not selected:
         if mode == "proxy":
             raise ValueError("套餐查询网络模式为 proxy，但未配置 PLAN_CHECK_PROXY 或 PROXY_POOL")
@@ -172,8 +195,8 @@ def token_claims(token: str) -> dict:
     }
 
 
-def _common_headers(env: BrowserSession, token: str) -> dict[str, str]:
-    headers = env._get_common_headers()
+def _common_headers(env: PlanCheckBrowserTransport, token: str) -> dict[str, str]:
+    headers = env.get_chatgpt_headers(referer="https://chatgpt.com/")
     headers.update({
         "accept": "*/*",
         "authorization": f"Bearer {normalize_token(token)}",
@@ -184,7 +207,7 @@ def _common_headers(env: BrowserSession, token: str) -> dict[str, str]:
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "x-openai-target-path": ACCOUNTS_CHECK_PATH,
-        "x-openai-target-route": ACCOUNTS_CHECK_PATH,
+        "x-openai-target-route": "/backend-api/accounts/check/{version}",
     })
     return headers
 
@@ -228,6 +251,8 @@ def parse_accounts_check(data: dict, *, token: str = "") -> dict:
     subscription_plan = entitlement.get("subscription_plan") or ""
     has_active_subscription = bool(entitlement.get("has_active_subscription"))
     is_free = str(plan_type).lower() == "free" or str(subscription_plan).lower() == "chatgptfreeplan"
+    if not plan_type and is_free:
+        plan_type = "free"
     plus_trial_eligible = bool(is_free and plus_campaign)
 
     offers = ((item.get("eligible_offers") or {}).get("offers") or [])
@@ -291,7 +316,7 @@ def _plan_check_settings(
 
 
 def _retryable_plan_error(http_status: int | None) -> bool:
-    if http_status is None:
+    if http_status is None or http_status == 0:
         return True
     return http_status in {408, 409, 425, 429} or http_status >= 500
 
@@ -310,10 +335,12 @@ def check_account_plan(
     token: str,
     *,
     proxy: Optional[str] = None,
+    browser_transport: PlanCheckBrowserTransport | None = None,
     timezone_offset_min: str = "-",
     timeout: float | None = None,
     max_attempts: int | None = None,
     retry_delay: float | None = None,
+    proxy_lane_id: int | None = None,
 ) -> dict:
     token = normalize_token(token)
     if not token:
@@ -329,18 +356,35 @@ def check_account_plan(
             **{k: v for k, v in claims.items() if k != "payload"},
         }
 
-    try:
-        route = resolve_plan_check_route(proxy)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "checked_at": now_iso(),
-            "http_status": None,
-            "error": f"套餐查询网络配置错误: {exc}",
-            **{k: v for k, v in claims.items() if k != "payload"},
+    if browser_transport is None:
+        from core.rotating_proxy_runtime import PLAN_CHECK_PROXY_SCOPE, resolve_rotating_proxy
+
+        proxy = resolve_rotating_proxy(
+            proxy,
+            scope=PLAN_CHECK_PROXY_SCOPE,
+            lane_id=proxy_lane_id,
+        )
+
+    if browser_transport is not None:
+        route = {
+            "proxy": "",
+            "proxy_mode": "browser",
+            "network_route": "browser",
+            "proxy_used": None,
+            "proxy_fallback_reason": None,
         }
+    else:
+        try:
+            route = resolve_plan_check_route(proxy)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "checked_at": now_iso(),
+                "http_status": None,
+                "error": f"套餐查询网络配置错误: {exc}",
+                **{k: v for k, v in claims.items() if k != "payload"},
+            }
     route_meta = {k: v for k, v in route.items() if k != "proxy"}
-    url = f"https://chatgpt.com{ACCOUNTS_CHECK_PATH}?timezone_offset_min={quote(str(timezone_offset_min))}"
     try:
         timeout_seconds, attempts, base_delay = _plan_check_settings(timeout, max_attempts, retry_delay)
     except Exception as exc:
@@ -359,10 +403,25 @@ def check_account_plan(
     for attempt in range(1, attempts + 1):
         env = None
         resp = None
+        owns_env = browser_transport is None
         try:
             # 套餐查询只需要稳定的请求头，不需要额外访问 IP 地理信息接口。
-            env = BrowserSession(proxy=route["proxy"], detect_exit_geo=False, fingerprint_seed=account_seed)
-            resp = env.session.get(
+            env = (
+                browser_transport
+                if browser_transport is not None
+                else BrowserSession(
+                    proxy=route["proxy"],
+                    detect_exit_geo=False,
+                    fingerprint_seed=account_seed,
+                )
+            )
+            try:
+                offset_value = int(str(timezone_offset_min).strip())
+            except (TypeError, ValueError):
+                timezone_fn = getattr(env, "js_timezone_offset_min", None)
+                offset_value = int(timezone_fn()) if callable(timezone_fn) else 0
+            url = f"https://chatgpt.com{ACCOUNTS_CHECK_PATH}?timezone_offset_min={quote(str(offset_value))}"
+            resp = env.get(
                 url,
                 headers=_common_headers(env, token),
                 allow_redirects=False,
@@ -376,12 +435,31 @@ def check_account_plan(
                     "ok": False,
                     "checked_at": now_iso(),
                     "http_status": http_status,
-                    "error": "AT已过期/失效，请手动查活刷新" if is_auth_expired else f"HTTP {http_status}",
+                    "error": (
+                        "AT已过期/失效，请手动查活刷新"
+                        if is_auth_expired
+                        else response_text[:180] if http_status == 0 and response_text else f"HTTP {http_status}"
+                    ),
                     "response_preview": response_text[:500],
                     "retryable": _retryable_plan_error(http_status),
                     "token_expired": True if is_auth_expired else claims.get("token_expired"),
                     "needs_live_check": True if is_auth_expired else False,
                 }
+                if (
+                    http_status == 403
+                    and browser_transport is None
+                    and proxy is None
+                    and route.get("proxy_mode") == "auto"
+                    and attempt < attempts
+                ):
+                    alternate_route = resolve_plan_check_route(
+                        None,
+                        exclude_proxy=route.get("proxy"),
+                    )
+                    if alternate_route.get("proxy") != route.get("proxy"):
+                        route = alternate_route
+                        route_meta = {k: v for k, v in route.items() if k != "proxy"}
+                        last_result["retryable"] = True
             else:
                 try:
                     data: Any = resp.json()
@@ -414,8 +492,21 @@ def check_account_plan(
                 "error": f"{type(exc).__name__}: {exc}",
                 "retryable": True,
             }
+            if (
+                browser_transport is None
+                and proxy is None
+                and route.get("proxy_mode") == "auto"
+                and attempt < attempts
+            ):
+                alternate_route = resolve_plan_check_route(
+                    None,
+                    exclude_proxy=route.get("proxy"),
+                )
+                if alternate_route.get("proxy") != route.get("proxy"):
+                    route = alternate_route
+                    route_meta = {k: v for k, v in route.items() if k != "proxy"}
         finally:
-            if env is not None:
+            if owns_env and env is not None:
                 try:
                     env.session.close()
                 except Exception:

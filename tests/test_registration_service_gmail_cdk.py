@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from config import email as email_config
+from config import proxy as proxy_config
 from config import register as register_config
 from core import db, registration_service
 
@@ -60,6 +61,7 @@ class GmailCdkRegistrationServiceTests(unittest.TestCase):
             "gmail_cdks": [],
             "gmail_routed_domains": [],
             "gmail_batch_id": None,
+            "gmail_api_url_batch_id": None,
             "paymesh_cdks": [],
             "paymesh_routed_domains": [],
         })
@@ -142,6 +144,28 @@ class GmailCdkRegistrationServiceTests(unittest.TestCase):
             })
             self.assertNotIn("SECRET-ONE", repr(persisted))
 
+    def test_submit_persists_rotating_proxy_lane_per_worker_slot(self):
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(registration_service, "get_executor_workers", return_value=2):
+            jobs = registration_service.submit_registration(
+                count=4,
+                workers=2,
+                email_source="outlook",
+            )
+
+        self.assertEqual(len(submitted), 4)
+        self.assertEqual(
+            [db.get_job(job["id"])["provider_context"]["proxy_lane_id"] for job in jobs],
+            [0, 1, 0, 1],
+        )
+
     def test_retry_job_copies_persisted_gmail_batch_context(self):
         source = db.create_job(
             email_source="gmail_123452026",
@@ -180,6 +204,7 @@ class GmailCdkRegistrationServiceTests(unittest.TestCase):
             "gmail_cdks": [],
             "gmail_routed_domains": ["route-one.net"],
             "gmail_batch_id": "batch-restart",
+            "gmail_api_url_batch_id": None,
             "paymesh_cdks": [],
             "paymesh_routed_domains": [],
         })

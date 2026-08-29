@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from urllib.parse import urlparse
@@ -51,4 +50,14 @@ def validate_email_sources(
             normalize_paymesh_routed_domains(paymesh_routed_domains or [])
         except PaymeshAliasError as exc:
             return str(exc)
+
+    if "qan8_gmail_api" in sources:
+        api_base = str(getattr(config, "QAN8_API_BASE", "") or "").strip()
+        parsed = urlparse(api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "Địa chỉ QAN8 API không hợp lệ."
+        if not str(getattr(config, "QAN8_API_KEY", "") or "").strip():
+            return "Đã chọn qan8_gmail_api, hãy nhập QAN8 API Key trong cấu hình."
+        if not str(getattr(config, "QAN8_GMAIL_SKU_ID", "") or "").strip():
+            return "Đã chọn qan8_gmail_api, hãy nhập SKU Gmail của QAN8 trong cấu hình."
     return None

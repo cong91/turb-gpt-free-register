@@ -6,6 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GPT 注册控制台</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='reserved_test_aliases.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='roxy_profiles.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='email_change.css') }}">
   <style>
     * { box-sizing: border-box; }
     html { max-width: 100%; overflow-x: clip; }
@@ -200,8 +202,8 @@
       width: 100%; max-width: 100%; min-width: 0;
       max-height: 320px; overflow: auto; line-height: 1.5;
     }
-    #logPanel, #retryLogPanel, #liveLogPanel, #totpLogPanel, #qrPanel { min-width: 0; max-width: 100%; overflow-x: hidden; }
-    #logPanel:not(.hidden), #retryLogPanel:not(.hidden), #liveLogPanel:not(.hidden), #totpLogPanel:not(.hidden), #qrPanel:not(.hidden) {
+    #logPanel, #retryLogPanel, #liveLogPanel, #totpLogPanel, #importPlanPanel, #qrPanel { min-width: 0; max-width: 100%; overflow-x: hidden; }
+    #logPanel:not(.hidden), #retryLogPanel:not(.hidden), #liveLogPanel:not(.hidden), #totpLogPanel:not(.hidden), #importPlanPanel:not(.hidden), #qrPanel:not(.hidden) {
       position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
       z-index: 1000; display: block; width: min(1100px, calc(100vw - 48px));
       max-height: min(760px, calc(100vh - 48px)); overflow: hidden;
@@ -209,9 +211,36 @@
       background: var(--surface); box-shadow: 0 0 0 9999px rgba(15,23,42,.45), 0 24px 70px rgba(15,23,42,.34);
     }
     #qrPanel:not(.hidden) { width: min(520px, calc(100vw - 48px)); text-align: center; }
-    #logPanel h3, #retryLogPanel h3, #liveLogPanel h3, #totpLogPanel h3, #qrPanel h3 { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
-    #logPanel h3 .btn, #retryLogPanel h3 .btn, #liveLogPanel h3 .btn, #totpLogPanel h3 .btn, #qrPanel h3 .btn { margin-left:auto; float:none !important; }
-    #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #totpLogPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
+    #logPanel h3, #retryLogPanel h3, #liveLogPanel h3, #totpLogPanel h3, #importPlanPanel h3, #qrPanel h3 { display:flex; align-items:center; gap:10px; margin-bottom:10px; }
+    #logPanel h3 .btn, #retryLogPanel h3 .btn, #liveLogPanel h3 .btn, #totpLogPanel h3 .btn, #importPlanPanel h3 .btn, #qrPanel h3 .btn { margin-left:auto; float:none !important; }
+    #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #totpLogPanel .log, #importPlanPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
+    #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #importPlanPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
+    #importPlanPanel textarea { min-height: 180px; margin-top: 0; }
+    .import-plan-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:12px; }
+    .import-plan-summary { margin-top:12px; color:var(--muted); font-size:13px; line-height:1.5; }
+    .import-plan-results { margin-top:14px; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:#fff; }
+    .import-plan-result-toolbar { display:flex; align-items:center; gap:10px; padding:10px 12px; border-bottom:1px solid var(--line); background:var(--soft); flex-wrap:wrap; }
+    .import-plan-result-toolbar label { color:var(--muted); font-size:12px; font-weight:800; }
+    .import-plan-result-toolbar select { width:auto; min-width:190px; min-height:32px; margin-top:0; padding:5px 9px; font-size:12px; }
+    .import-plan-table-wrap { max-height:390px; overflow:auto; }
+    .import-plan-table { min-width:680px; table-layout:fixed; }
+    .import-plan-table th { position:sticky; top:0; z-index:1; background:#f8fafc; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+    .import-plan-table .import-plan-email { width:38%; white-space:normal; overflow-wrap:anywhere; font-family:ui-monospace,Consolas,monospace; font-size:12px; }
+    .import-plan-table .import-plan-result { width:23%; white-space:normal; }
+    .import-plan-table .import-plan-plan { width:15%; white-space:normal; }
+    .import-plan-table .import-plan-detail { width:24%; white-space:normal; overflow-wrap:anywhere; color:var(--muted); font-size:12px; }
+    .import-plan-badge { display:inline-flex; align-items:center; min-height:24px; padding:3px 8px; border-radius:999px; font-size:11px; font-weight:800; line-height:1.2; white-space:normal; }
+    .import-plan-badge--free_without_trial, .import-plan-badge--free_plus_trial { color:#166534; background:#edf8f1; }
+    .import-plan-badge--not_free_plan { color:#475467; background:#f2f4f7; }
+    .import-plan-badge--needs_live_check { color:#8a5700; background:#fff7e6; }
+    .import-plan-badge--check_failed { color:#b42318; background:#fff1f0; }
+    .import-plan-badge--not_found, .import-plan-badge--not_checked { color:#667085; background:#f2f4f7; }
+    .import-plan-badge--pending { color:#1d4ed8; background:#eef4ff; }
+    .import-plan-empty { padding:18px 12px; color:var(--muted); font-size:12px; text-align:center; }
+    @media (max-width:700px) {
+      .import-plan-result-toolbar select { width:100%; }
+      .import-plan-table-wrap { max-height:330px; }
+    }
     #qrPanel img { display:block; max-width:min(360px, calc(100vw - 96px)); max-height:420px; margin:12px auto; border:1px solid var(--line); border-radius:10px; background:#fff; }
     #qrPanel .qr-link { display:block; word-break:break-all; white-space:normal; font-size:12px; color:var(--muted); margin-top:8px; }
     .hidden { display: none !important; }
@@ -274,18 +303,21 @@
       background: transparent; border: none; width: auto; max-width: none;
     }
     .app-sidebar .sidebar-nav button,
-    .app-sidebar .sidebar-nav button.sidebar-item {
+    .app-sidebar .sidebar-nav a.sidebar-item {
       width: 100%; display: flex; align-items: center; gap: 10px;
       border: none; border-bottom: none; border-radius: 10px;
       background: transparent; color: #475569;
       font: inherit; font-size: 14px; font-weight: 600;
       padding: 10px 12px; cursor: pointer; text-align: left;
+      text-decoration: none;
       transition: background .15s ease, color .15s ease;
     }
-    .app-sidebar .sidebar-nav button:hover {
+    .app-sidebar .sidebar-nav button:hover,
+    .app-sidebar .sidebar-nav a.sidebar-item:hover {
       color: #0f172a; background: #f8fafc;
     }
-    .app-sidebar .sidebar-nav button.active {
+    .app-sidebar .sidebar-nav button.active,
+    .app-sidebar .sidebar-nav a.sidebar-item.active {
       color: var(--sidebar-accent); background: var(--sidebar-accent-soft);
       border-bottom: none;
     }
@@ -763,7 +795,7 @@
     .accounts-table-v2 .col-status { width: 100px; }
     .accounts-table-v2 .col-agent { width: 140px; }
     .accounts-table-v2 .col-time { width: 170px; }
-    .accounts-table-v2 .col-actions { width: 160px; }
+    .accounts-table-v2 .col-actions { width: 250px; }
     .accounts-table-v2 input[type="checkbox"] {
       width: 16px !important; height: 16px !important;
       min-width: 16px !important; min-height: 16px !important;
@@ -920,6 +952,12 @@
     .accounts-table-v2 .acc-v2-actions > button.danger {
       color: #e64545; border-color: #f89898; background: #ffe0e0;
     }
+    .accounts-table-v2 .acc-v2-actions > button.good {
+      color: #166534; border-color: #9ee0b3; background: #e7f8ed;
+    }
+    .accounts-table-v2 .acc-v2-actions > button.good:hover:not(:disabled) {
+      color: #166534; border-color: #67c23a; background: #d8f3e1;
+    }
     .accounts-table-v2 .acc-v2-actions > button.danger:hover:not(:disabled) {
       background: #f56c6c; border-color: #f56c6c; color: #fff;
     }
@@ -1067,6 +1105,110 @@
       width: 11px; height: 11px;
     }
     #accountsToolbarV2 { padding-top: 12px; }
+
+    /* ---- 账号工作台：筛选与批量命令分层 ---- */
+    .accounts-filter-v2 {
+      display: block; padding: 20px 20px 16px; border-bottom: 1px solid #e8edf3;
+      background: #fbfcfe;
+    }
+    .accounts-filter-heading {
+      display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 16px;
+    }
+    .accounts-eyebrow {
+      display: block; margin-bottom: 5px; color: #7b8794; font-size: 10px; font-weight: 800;
+      letter-spacing: .12em; line-height: 1.2;
+    }
+    .accounts-filter-heading h2 { color: #1f2937; font-size: 18px; font-weight: 700; line-height: 1.25; }
+    .accounts-filter-heading p { margin-top: 5px; color: #7b8794; font-size: 12px; line-height: 1.45; }
+    .accounts-filter-result {
+      flex: 0 0 auto; padding: 8px 10px; border: 1px solid #dce5ef; border-radius: 6px;
+      background: #fff; color: #52606d; font-size: 12px; font-weight: 700; white-space: nowrap;
+    }
+    .accounts-filter-grid {
+      display: grid; grid-template-columns: minmax(220px, 2fr) repeat(5, minmax(130px, 1fr));
+      gap: 12px; align-items: end;
+    }
+    .acc-v2-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: #52606d; font-size: 11px; font-weight: 700; }
+    .acc-v2-field input, .acc-v2-field select { width: 100%; min-width: 0; height: 38px; margin: 0; padding: 0 10px; border: 1px solid #dce5ef; border-radius: 6px; background: #fff; color: #273444; font-size: 13px; }
+    .acc-v2-field input:focus, .acc-v2-field select:focus { outline: none; border-color: #377dff; box-shadow: 0 0 0 2px #377dff18; }
+    .acc-v2-field-search { grid-column: span 2; }
+    .acc-v2-field-locale { grid-column: span 2; }
+    .acc-v2-date-field .acc-v2-date-select { width: 100%; }
+    .acc-v2-date-field .acc-v2-date-select-btn { width: 100%; height: 38px; }
+    .accounts-filter-actions { display: flex; min-height: 38px; align-items: end; gap: 8px; grid-column: span 2; }
+    .accounts-filter-actions button { flex: 1; }
+    #accountsToolbarV2 {
+      display: block; padding: 0; border: 0; background: #fff;
+    }
+    .accounts-commandbar-head {
+      display: flex; align-items: center; gap: 16px; min-height: 64px; padding: 12px 20px;
+      border-bottom: 1px solid #e8edf3; background: #fff;
+    }
+    .accounts-commandbar-head > div { min-width: 135px; }
+    .accounts-commandbar-head strong { display: block; color: #1f2937; font-size: 15px; line-height: 1.25; }
+    .accounts-scope-field, .accounts-format-field {
+      display: inline-flex; align-items: center; gap: 8px; color: #52606d; font-size: 12px; font-weight: 700; white-space: nowrap;
+    }
+    .accounts-scope-field select, .accounts-format-field select {
+      height: 34px; margin: 0; padding: 0 28px 0 10px; border: 1px solid #b9c9dc; border-radius: 6px; background: #f8fbff; color: #1f4f8f; font: inherit; font-size: 12px;
+    }
+    .accounts-workers-field { margin-left: auto; }
+    .accounts-scope-hint { color: #8b98a7; font-size: 12px; }
+    .accounts-commandbar-primary {
+      display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 20px;
+      background: #f8fbff; border-bottom: 1px solid #e8edf3;
+    }
+    .accounts-command-label { margin-right: 4px; color: #1f4f8f; font-size: 12px; font-weight: 800; }
+    .accounts-command-section { border-bottom: 1px solid #eef2f6; }
+    .accounts-command-section summary {
+      display: flex; align-items: center; gap: 10px; min-height: 44px; padding: 0 20px;
+      color: #344454; font-size: 13px; font-weight: 800; cursor: pointer; list-style: none;
+    }
+    .accounts-command-section summary::-webkit-details-marker { display: none; }
+    .accounts-command-section summary::before { content: ">"; color: #7b8794; font-size: 16px; transform: rotate(0deg); transition: transform .15s ease; }
+    .accounts-command-section[open] summary::before { transform: rotate(90deg); }
+    .accounts-command-section summary small { color: #8b98a7; font-size: 11px; font-weight: 500; }
+    .accounts-command-items { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 0 20px 14px 42px; }
+    .accounts-command-items .jobs-tb-btn { min-height: 32px; }
+    .accounts-command-items .accounts-format-field { min-height: 32px; padding-right: 4px; }
+    .accounts-command-items .accounts-format-field select { height: 32px; }
+    .accounts-filter-v2 .acc-v2-toggle, .accounts-filter-v2 .jobs-tb-btn { min-height: 38px; }
+    .accounts-table-v2 .acc-v2-domain { color: #377dff; font-size: 11px; font-weight: 700; }
+    @media (max-width: 1200px) {
+      .accounts-filter-grid { grid-template-columns: repeat(4, minmax(150px, 1fr)); }
+      .acc-v2-field-search, .acc-v2-field-locale { grid-column: span 2; }
+      .accounts-filter-actions { grid-column: span 4; justify-content: flex-start; }
+      .accounts-filter-actions button { flex: 0 1 auto; }
+    }
+    @media (max-width: 760px) {
+      .accounts-filter-heading, .accounts-commandbar-head { align-items: flex-start; flex-direction: column; }
+      .accounts-filter-grid { grid-template-columns: 1fr 1fr; }
+      .acc-v2-field-search, .acc-v2-field-locale, .accounts-filter-actions { grid-column: span 2; }
+      .accounts-commandbar-head { gap: 10px; }
+      .accounts-workers-field { margin-left: 0; }
+      .accounts-scope-hint { display: none; }
+      .accounts-command-items { padding-left: 20px; }
+    }
+    @media (max-width: 720px) {
+      :root { --sidebar-width: 0px; }
+      body { padding-left: 0; }
+      .app-sidebar {
+        position: static; width: 100%; height: auto; min-height: 0;
+        display: block; border-right: 0; border-bottom: 1px solid #eef0f4;
+      }
+      .sidebar-brand { height: 54px; }
+      .sidebar-nav {
+        display: flex; flex-direction: row; gap: 4px; overflow-x: auto; overflow-y: hidden;
+        padding: 6px 10px; border-top: 1px solid #f1f5f9;
+      }
+      .app-sidebar .sidebar-nav button,
+      .app-sidebar .sidebar-nav a.sidebar-item {
+        width: auto; flex: 0 0 auto; padding: 8px 10px; border-radius: 8px; font-size: 12px;
+      }
+      .sidebar-item-label { white-space: nowrap; }
+      .sidebar-footer { display: none; }
+      main { width: calc(100% - 24px); margin: 12px; }
+    }
 
     /* ---- Codex 授权 ---- */
     .codex-stats-v2 {
@@ -2010,6 +2152,12 @@
       </svg>
       <span class="sidebar-item-label">账号</span>
     </button>
+    <button type="button" data-tab="email-change" class="sidebar-item">
+      <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><path d="M22 6l-10 7L2 6"/><path d="M16 16l2 2 4-4"/>
+      </svg>
+      <span class="sidebar-item-label">Thông tin cá nhân</span>
+    </button>
     <button type="button" data-tab="codex" class="sidebar-item">
       <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
@@ -2027,6 +2175,12 @@
         <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z"/>
       </svg>
       <span class="sidebar-item-label">工具</span>
+    </button>
+    <button type="button" data-tab="roxy-profiles" class="sidebar-item">
+      <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h10M7 12h6M7 16h4"/>
+      </svg>
+      <span class="sidebar-item-label">Roxy Profiles</span>
     </button>
     <button type="button" data-tab="config" class="sidebar-item">
       <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2119,9 +2273,9 @@
         <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedJobsV2" disabled title="删除选中的非运行中任务，并同时删除对应日志">删除选中</button>
         <button type="button" class="jobs-tb-btn" id="btnCancelPendingV2" title="把所有排队任务标记为已取消">取消全部排队</button>
         <button type="button" class="jobs-tb-btn" id="btnRefreshJobsV2" title="手动刷新任务列表">刷新</button>
-        <label class="jobs-tb-field">注册数量
+        <label class="jobs-tb-field" id="regCountFieldV2">注册数量
           <span class="el-input-number">
-            <input id="regCountV2" type="number" min="1" max="200" value="1" inputmode="numeric">
+            <input id="regCountV2" type="number" min="1" max="1000" value="1" inputmode="numeric">
             <button type="button" class="el-input-number__increase" data-step-for="regCountV2" data-step="1" aria-label="增加">
               <svg viewBox="0 0 24 24"><polyline points="6 14 12 8 18 14"/></svg>
             </button>
@@ -2145,7 +2299,10 @@
           <select id="emailProviderV2" data-email-provider>
             <option value="">Theo cấu hình hiện tại</option>
             <option value="gmail_123452026">Gmail CDK</option>
+            <option value="gmail_api_url">Gmail API URL</option>
+            <option value="qan8_gmail_api">QAN8 Gmail API lazy</option>
             <option value="paymesh">Paymesh MAIL card</option>
+            <option value="tinyhost">TinyHost temp mail</option>
             <option value="local_test">Local test (dry-run)</option>
           </select>
         </label>
@@ -2187,6 +2344,34 @@
           </label>
           <button type="button" class="jobs-tb-btn" id="paymeshSaveConfigInline" title="保存到配置也立即生效">保存</button>
           <span class="hint" data-cdk-batch-hint></span>
+        </div>
+      </div>
+      <div class="gmail-cdk-batch-v2 hidden" data-provider-input="gmail_api_url">
+        <div class="provider-inline-config">
+          <label class="fld-inline">Số alias mỗi email (tối đa 12)
+            <input id="gmailApiUrlAliasCountV2" type="number" min="1" max="12" value="12"
+              inputmode="numeric" autocomplete="off"
+              title="1 email gốc → sinh tối đa 12 alias: tối đa 1 alias có dấu chấm, các alias còn lại dùng +; tổng 6 gmail.com + 6 googlemail.com. Tất cả share cùng URL lấy OTP.">
+          </label>
+          <button type="button" class="jobs-tb-btn" id="btnUseAllGmailApiUrlV2" title="Đặt số bản ghi bằng toàn bộ bản ghi chưa dùng trong kho">Dùng hết bản ghi chưa dùng</button>
+          <span class="hint">
+            Ô <b>Số bản ghi</b> chọn bao nhiêu email chưa dùng trong kho sẽ đăng ký.
+            Tối đa bằng số còn sẵn sàng: <b id="gmailApiUrlPoolAvailableV2">?</b>.
+            Bấm <b>Dùng hết</b> để lấy toàn bộ.<br>
+            Hệ thống nhân với số alias mỗi bản ghi (tối đa 12). Ví dụ: 3 × 12 = 36 tài khoản.
+          </span>
+        </div>
+      </div>
+      <div class="gmail-cdk-batch-v2 hidden" data-provider-input="qan8_gmail_api">
+        <div class="provider-inline-config">
+          <label class="fld-inline">Số alias mỗi source
+            <input id="qan8AliasCountV2" type="number" min="1" max="12" value="12"
+              inputmode="numeric" autocomplete="off"
+              title="Mỗi worker sở hữu một source Gmail riêng; source chỉ được thay khi hết alias.">
+          </label>
+          <span class="hint">
+            Mỗi worker = một lane = một mail gốc QAN8 khác nhau. Alias do client sinh ra và cùng nhận OTP qua code URL của mail gốc.
+          </span>
         </div>
       </div>
       <div class="gmail-cdk-batch-v2 hidden" data-provider-input="local_test">
@@ -2234,94 +2419,178 @@
     <h1 class="register-title">账号</h1>
     <section class="accounts-panel-v2" id="accountsPanelV2" aria-label="账号列表">
       <div class="accounts-filter-v2" id="accountsFilterV2">
-        <div class="acc-v2-btn-group acc-v2-search-wrap">
-          <input id="qAccountsV2" type="search" placeholder="搜索邮箱、token、来源…" autocomplete="off">
+        <div class="accounts-filter-heading">
+          <div>
+            <span class="accounts-eyebrow">ACCOUNT WORKSPACE</span>
+            <h2>Kho tài khoản</h2>
+            <p>Lọc trước, thao tác sau. Mọi lệnh hàng loạt đều chạy trên phạm vi đang chọn.</p>
+          </div>
+          <div class="accounts-filter-result" id="accountsFilterResultV2">0 kết quả</div>
         </div>
-
-        <div class="acc-v2-btn-group">
-          <span class="acc-v2-selected" id="accountsSelectedHintV2">已选 0</span>
-          <label class="acc-v2-inline" title="批量补跑 Codex 的并发线程数">线程
-            <span class="el-input-number">
-              <input id="codexBulkWorkersV2" type="number" min="1" max="16" value="3" inputmode="numeric">
-              <button type="button" class="el-input-number__increase" data-step-for="codexBulkWorkersV2" data-step="1" aria-label="增加">
-                <svg viewBox="0 0 24 24"><polyline points="6 14 12 8 18 14"/></svg>
-              </button>
-              <button type="button" class="el-input-number__decrease" data-step-for="codexBulkWorkersV2" data-step="-1" aria-label="减少">
-                <svg viewBox="0 0 24 24"><polyline points="6 10 12 16 18 10"/></svg>
-              </button>
-            </span>
+        <div class="accounts-filter-grid">
+          <label class="acc-v2-field acc-v2-field-search">
+            <span>Tìm kiếm</span>
+            <input id="qAccountsV2" type="search" placeholder="Email, token, nguồn, ghi chú…" autocomplete="off">
           </label>
-          <button type="button" class="acc-v2-toggle" id="showArchivedAccountsV2" aria-pressed="false" title="默认只显示未归档账号；开启后单独查看归档账号">查看归档</button>
-          <button type="button" class="acc-v2-toggle" id="showPlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示已开通 Plus 的账号">已开通Plus</button>
-          <label class="acc-v2-inline" title="按账号状态筛选账号">
-            <select id="codexStatusFilterV2">
-              <option value="">全部状态</option>
-              <option value="success">成功</option>
-              <option value="failed">失败</option>
-              <option value="retrying">补跑中</option>
-              <option value="stopped">已停止</option>
-              <option value="skipped">已跳过</option>
-              <option value="deactivated">账号废号</option>
+          <label class="acc-v2-field">
+            <span>Nguồn</span>
+            <select id="accountSourceFilterV2">
+              <option value="">Tất cả nguồn</option>
+              <option value="gmail_api_url">Gmail API URL</option>
+              <option value="qan8_gmail_api">QAN8 Gmail API lazy</option>
+              <option value="paymesh">Paymesh</option>
+              <option value="gmail_123452026">Gmail CDK</option>
+              <option value="outlook">Outlook</option>
+              <option value="generic_api">Generic API</option>
+              <option value="cloudflare">Cloudflare tạm</option>
+              <option value="cloudflare_domain">Domain mailbox</option>
+              <option value="gptmail">GPTMail</option>
+              <option value="mailnest">MailNest</option>
+              <option value="cloudmail">CloudMail</option>
+              <option value="unknown">Chưa xác định</option>
             </select>
           </label>
-          <div class="acc-v2-date-select" id="dateSelectAccountsV2">
-            <button type="button" class="acc-v2-date-select-btn" id="btnDateFilterAccountsV2" title="按注册时间筛选日期范围">📅 日期筛选</button>
-            <div class="acc-v2-date-select-menu" id="dateFilterPanelAccountsV2"></div>
+          <label class="acc-v2-field">
+            <span>Đuôi mail</span>
+            <select id="accountDomainFilterV2" title="Phân loại theo phần domain sau dấu @">
+              <option value="">Tất cả đuôi mail</option>
+              <option value="gmail.com">gmail.com</option>
+              <option value="outlook.com">outlook.com</option>
+              <option value="hotmail.com">hotmail.com</option>
+              <option value="yahoo.com">yahoo.com</option>
+              <option value="unknown">Chưa xác định</option>
+            </select>
+          </label>
+          <label class="acc-v2-field">
+            <span>Gói</span>
+            <select id="accountPlanFilterV2">
+              <option value="">Tất cả gói</option>
+              <option value="free">Free</option>
+              <option value="free_plus">Free + Plus trial</option>
+              <option value="plus">Plus</option>
+              <option value="pro">Pro</option>
+              <option value="team">Team</option>
+              <option value="go">Go</option>
+              <option value="unknown">Chưa kiểm tra</option>
+            </select>
+          </label>
+          <label class="acc-v2-field">
+            <span>2FA</span>
+            <select id="accountTwofaFilterV2" title="Lọc theo trạng thái bật 2FA">
+              <option value="">Tất cả trạng thái</option>
+              <option value="active">Đã bật</option>
+              <option value="failed">Bật thất bại</option>
+              <option value="pending">Đang xử lý</option>
+              <option value="disabled">Chưa bật</option>
+            </select>
+          </label>
+          <label class="acc-v2-field">
+            <span>Trạng thái Codex</span>
+            <select id="codexStatusFilterV2">
+              <option value="">Tất cả trạng thái</option>
+              <option value="success">Đã xác thực</option>
+              <option value="failed">Thất bại</option>
+              <option value="retrying">Đang bổ chạy</option>
+              <option value="stopped">Đã dừng</option>
+              <option value="skipped">Đã bỏ qua</option>
+              <option value="deactivated">OpenAI đã khóa tài khoản</option>
+            </select>
+          </label>
+          <label class="acc-v2-field">
+            <span>Free Plus</span>
+            <select id="freePlusExportFilterV2" title="Lọc trạng thái xuất Free Plus">
+              <option value="">Tất cả</option>
+              <option value="unexported">Chưa xuất</option>
+              <option value="exported">Đã xuất</option>
+            </select>
+          </label>
+          <label class="acc-v2-field acc-v2-field-locale">
+            <span>Locale / country</span>
+            <input id="accountLocaleFilterV2" type="search" placeholder="Ví dụ: jp hoặc JP" autocomplete="off">
+          </label>
+          <div class="acc-v2-field acc-v2-date-field">
+            <span>Ngày tạo</span>
+            <div class="acc-v2-date-select" id="dateSelectAccountsV2">
+              <button type="button" class="acc-v2-date-select-btn" id="btnDateFilterAccountsV2" title="Lọc theo khoảng ngày tạo">Chọn khoảng ngày</button>
+              <div class="acc-v2-date-select-menu" id="dateFilterPanelAccountsV2"></div>
+            </div>
+            <div class="hidden">
+              <input type="date" id="dateFromAccountsV2">
+              <input type="date" id="dateToAccountsV2">
+            </div>
           </div>
-          <div class="hidden">
-            <input type="date" id="dateFromAccountsV2">
-            <input type="date" id="dateToAccountsV2">
+          <div class="accounts-filter-actions">
+            <button type="button" class="acc-v2-toggle" id="showArchivedAccountsV2" aria-pressed="false" title="Mặc định chỉ hiển thị tài khoản chưa lưu trữ">Xem lưu trữ</button>
+            <button type="button" class="jobs-tb-btn" id="btnRefreshAccountsV2" title="Tải lại theo bộ lọc hiện tại">Làm mới</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnImportPlanEmailsV2" title="Đối chiếu từng email với tài khoản trong DB và lọc các tài khoản có gói Free">Lọc tài khoản Free</button>
           </div>
-          <button type="button" class="acc-v2-toggle" id="showFreePlusAccountsOnlyV2" aria-pressed="false" title="只查询/显示可用 Plus 试用的账号">可用Plus试用</button>
-          <select id="freePlusExportFilterV2" title="筛选 Free Plus 导出状态">
-            <option value="">Free Plus 状态</option>
-            <option value="unexported">未导出</option>
-            <option value="exported">已导出</option>
-          </select>
-          <button type="button" class="jobs-tb-btn" id="btnRefreshAccountsV2" title="重新加载当前筛选条件和当前页账号列表">刷新账号</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveTopV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
-
         </div>
       </div>
       <div class="jobs-toolbar-v2" id="accountsToolbarV2">
-        <div class="acc-v2-btn-group">
-          <span class="acc-v2-btn-group-title">套餐/提链</span>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" title="重新登录选中账号；成功且未封号则标记正常，并刷新最新 AT/accessToken">查活</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="查询选中账号当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="给选中的 free(可Plus试用) 账号批量提链，类型按配置 PIX/UPI/KAKAO_PAY/IDEAL">提链</button>
-        </div>
-        <div class="acc-v2-btn-group">
-          <span class="acc-v2-btn-group-title">Codex</span>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnRetrySelectedCodexV2" disabled title="给选中的账号批量补跑 Codex 授权">补跑</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCpaV2" disabled title="从 CPA auth-files 下载选中账号的 Codex JSON，并打包 ZIP">下载CPA</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnStopSelectedCodexV2" disabled title="停止选中账号中正在补跑的 Codex 授权">停止</button>
-        </div>
-        <div class="acc-v2-btn-group">
-          <span class="acc-v2-btn-group-title">批量</span>
-          <label class="acc-v2-inline" title="选择账号整行复制/下载格式">导出格式
-            <select id="accountExportFormatV2">
-              <option value="modern">email | pass | 2fa</option>
-              <option value="legacy">Legacy</option>
+        <div class="accounts-commandbar-head">
+          <div>
+            <span class="accounts-eyebrow">BULK COMMANDS</span>
+            <strong id="accountsBulkSelectionLabelV2">0 tài khoản</strong>
+          </div>
+          <label class="accounts-scope-field">Phạm vi
+            <select id="accountBulkScopeV2" title="Chọn tập tài khoản mà các lệnh hàng loạt sẽ xử lý">
+              <option value="selected">Đã chọn</option>
+              <option value="page">Trang hiện tại</option>
+              <option value="filtered">Toàn bộ kết quả lọc</option>
             </select>
           </label>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusAllV2" title="导出当前筛选结果中尚未导出的 Free Plus 账号，并自动归档">Export Free Plus</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusSelectedV2" disabled title="导出选中的 Free Plus 账号，并自动归档">导出已选 Free Plus</button>
-          <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusExportedV2" disabled title="手动把选中账号标记为已导出，用于校准旧数据">标记已导出</button>
-          <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusUnexportedV2" disabled title="手动把选中账号标记为未导出，用于校准旧数据">标记未导出</button>
-          <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusUnexportedV2" disabled title="手动把选中账号标记为未导出，用于校准旧数据">标记未导出</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnNoteSelectedAccountsV2" disabled title="给选中的账号统一设置备注，留空可清空备注">备注</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLinesV2" disabled title="复制选中账号的完整整行，每个账号一行">复制行</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedTokensV2" disabled title="复制选中账号的 Token，每个账号一行">复制Token</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedEmailsV2" disabled title="复制选中账号的邮箱，每个账号一行">复制邮箱</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedTxtV2" disabled title="把选中账号的完整整行保存为 TXT 文件，每个账号一行">下载TXT</button>
-          <button type="button" class="jobs-tb-btn" id="btnArchiveSelectedAccountsV2" disabled title="归档选中的账号；默认账号列表将不再查询/显示这些账号">归档选中</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedAccountsV2" disabled title="删除选中的本地账号/token记录">删除</button>
+          <label class="acc-v2-inline accounts-workers-field" title="Số luồng cho các tác vụ chạy nền">Luồng
+            <span class="el-input-number">
+              <input id="codexBulkWorkersV2" type="number" min="1" max="16" value="3" inputmode="numeric">
+              <button type="button" class="el-input-number__increase" data-step-for="codexBulkWorkersV2" data-step="1" aria-label="Tăng số luồng"><svg viewBox="0 0 24 24"><polyline points="6 14 12 8 18 14"/></svg></button>
+              <button type="button" class="el-input-number__decrease" data-step-for="codexBulkWorkersV2" data-step="-1" aria-label="Giảm số luồng"><svg viewBox="0 0 24 24"><polyline points="6 10 12 16 18 10"/></svg></button>
+            </span>
+          </label>
+          <span class="accounts-scope-hint" id="accountsBulkScopeHintV2">Chọn checkbox trong bảng</span>
         </div>
-        <div class="acc-v2-btn-group">
-          <span class="acc-v2-btn-group-title">全部</span>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCopyAllTokensV2" title="复制当前页所有 Token，每个账号一行">复制Token</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopyAllLinesV2" title="复制当前页所有账号整行，每个账号一行">复制整行</button>
+        <div class="accounts-commandbar-primary">
+          <span class="accounts-command-label">Xử lý chính</span>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" disabled title="Kiểm tra trạng thái đăng nhập và làm mới accessToken theo phạm vi">Kiểm tra tài khoản</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="Kiểm tra gói hiện tại theo phạm vi">Kiểm tra gói</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="Tạo link cho tài khoản Free có trial theo phạm vi">Tạo link</button>
         </div>
+        <details class="accounts-command-section" open>
+          <summary><span>Codex & Agent</span><small>ủy quyền, Agent Token, tải lên sub2api</small></summary>
+          <div class="accounts-command-items">
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnGenerateSelectedAgentV2" disabled title="Tạo Codex Agent Token theo phạm vi">Tạo Agent</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedAgentV2" disabled title="Tải các Agent Token theo phạm vi thành ZIP">Tải Agent</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnUploadSelectedAgentSub2V2" disabled title="Tải Agent Token lên sub2api theo phạm vi">Đẩy lên sub2</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnLoginFreeNoTrialSub2V2" title="Đăng nhập các tài khoản Free không có trial đã xác nhận">Đăng nhập Free không trial</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnRetrySelectedCodexV2" disabled title="Bổ chạy Codex theo phạm vi">Bổ chạy Codex</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedCpaV2" disabled title="Tải Codex JSON từ CPA theo phạm vi">Tải CPA</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnStopSelectedCodexV2" disabled title="Dừng các tài khoản đang bổ chạy theo phạm vi">Dừng</button>
+          </div>
+        </details>
+        <details class="accounts-command-section">
+          <summary><span>Xuất & sao chép</span><small>file, token, email, Free Plus</small></summary>
+          <div class="accounts-command-items">
+            <label class="accounts-format-field">Định dạng
+              <select id="accountExportFormatV2"><option value="modern">email | pass | 2fa</option><option value="legacy">Legacy</option></select>
+            </label>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusAllV2" title="Xuất các Free Plus chưa xuất trong kết quả lọc và tự lưu trữ">Xuất Free Plus theo filter</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusSelectedV2" disabled title="Xuất Free Plus theo phạm vi đang chọn">Xuất Free Plus</button>
+            <button type="button" class="jobs-tb-btn" id="btnRecoverLatestFreePlusV2" title="Tạo lại bản xuất Free Plus gần nhất">Lấy bản xuất gần nhất</button>
+            <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusExportedV2" disabled title="Đánh dấu đã xuất theo phạm vi">Đánh dấu đã xuất</button>
+            <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusUnexportedV2" disabled title="Đánh dấu chưa xuất theo phạm vi">Đánh dấu chưa xuất</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedLinesV2" disabled title="Sao chép dòng tài khoản theo phạm vi">Sao chép dòng</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedTokensV2" disabled title="Sao chép token theo phạm vi">Sao chép token</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCopySelectedEmailsV2" disabled title="Sao chép email theo phạm vi">Sao chép email</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnDownloadSelectedTxtV2" disabled title="Tải TXT theo phạm vi">Tải TXT</button>
+          </div>
+        </details>
+        <details class="accounts-command-section">
+          <summary><span>Quản trị dữ liệu</span><small>ghi chú, lưu trữ, xoá</small></summary>
+          <div class="accounts-command-items">
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnNoteSelectedAccountsV2" disabled title="Ghi cùng một chú thích theo phạm vi">Ghi chú</button>
+            <button type="button" class="jobs-tb-btn" id="btnArchiveSelectedAccountsV2" disabled title="Lưu trữ hoặc khôi phục theo phạm vi">Lưu trữ</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnDeleteSelectedAccountsV2" disabled title="Xoá bản ghi tài khoản theo phạm vi">Xoá tài khoản</button>
+          </div>
+        </details>
       </div>
       <div class="accounts-table-v2-wrap">
         <table class="accounts-table-v2">
@@ -2369,7 +2638,51 @@
       </h3>
       <div class="log" id="totpLogContent">加载中…</div>
     </div>
+    <div class="body hidden" id="importPlanPanel">
+      <h3>Lọc tài khoản Free theo email
+        <button class="btn" id="btnCloseImportPlan" style="float:right;min-height:28px;">Đóng</button>
+      </h3>
+      <textarea id="importPlanEmails" spellcheck="false" placeholder="email1@example.com&#10;email2@example.com"></textarea>
+      <div class="import-plan-actions">
+        <button type="button" class="btn primary" id="btnStartImportPlan">Bắt đầu kiểm tra</button>
+        <button type="button" class="btn" id="btnCopyFreePlanEmails" disabled>Sao chép email Free</button>
+      </div>
+      <div class="import-plan-summary" id="importPlanSummary" role="status" aria-live="polite">Chờ nhập danh sách email</div>
+      <div class="import-plan-results" id="importPlanResults" hidden>
+        <div class="import-plan-result-toolbar">
+          <label for="importPlanResultFilter">Lọc kết quả</label>
+          <select id="importPlanResultFilter">
+            <option value="all">Tất cả email</option>
+            <option value="free">Tài khoản Free</option>
+            <option value="free_plus_trial">Có Free Trial</option>
+            <option value="free_without_trial">Free, không có Trial</option>
+            <option value="not_free_plan">Không phải Free</option>
+            <option value="needs_live_check">Cần kiểm tra lại</option>
+            <option value="check_failed">Lỗi khi kiểm tra</option>
+            <option value="not_found">Không tìm thấy trong DB</option>
+            <option value="not_checked">Chưa được kiểm tra</option>
+            <option value="pending">Đang kiểm tra</option>
+          </select>
+        </div>
+        <div class="import-plan-table-wrap">
+          <table class="import-plan-table">
+            <thead>
+              <tr>
+                <th class="import-plan-email">Email</th>
+                <th class="import-plan-result">Kết quả</th>
+                <th class="import-plan-plan">Gói hiện tại</th>
+                <th class="import-plan-detail">Chi tiết</th>
+              </tr>
+            </thead>
+            <tbody id="importPlanResultBody"></tbody>
+          </table>
+          <div class="import-plan-empty" id="importPlanResultEmpty" hidden>Không có email thuộc nhóm này</div>
+        </div>
+        </div>
+    </div>
   </div>
+
+  {% include '_email_change_tool.html' %}
 
   <!-- ============ Codex 授权 ============ -->
   <div id="tab-codex" class="hidden">
@@ -2461,6 +2774,7 @@
             <button type="button" class="outlook-v2-select-item is-active" data-value="all" role="option">全部邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="outlook" role="option">Outlook 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="generic_api" role="option">通用 API 邮箱池</button>
+            <button type="button" class="outlook-v2-select-item" data-value="gmail_api_url" role="option">Gmail API URL 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="cloudflare_domain" role="option">域名邮箱池</button>
           </div>
           <input type="hidden" id="poolSourceV2" value="all">
@@ -2501,6 +2815,7 @@
   </div>
 
   {% include '_reserved_test_aliases_tool.html' %}
+  {% include '_roxy_profiles_tool.html' %}
 
   <!-- ============ 配置 ============ -->
   <div id="tab-config" class="hidden">
@@ -2555,7 +2870,7 @@
     <div class="outlook-import-head">
       <div class="outlook-import-head-main">
         <h3 id="outlookImportTitle">导入邮箱素材</h3>
-        <p>Outlook：邮箱----密码----clientId----refreshToken；通用 API：邮箱----取码地址（---- 或 ==== 均可）。默认按「已注册成功账号」导入，方便在账号页补跑 Codex。</p>
+        <p>Outlook：邮箱----密码----clientId----refreshToken；通用 API：邮箱----取码地址；Codex 登录凭据：USER | PASS | 2FA。</p>
       </div>
       <button type="button" class="outlook-import-close" id="btnCloseOutlookImport" aria-label="关闭">×</button>
     </div>
@@ -2568,10 +2883,12 @@
           <div class="outlook-v2-select-menu" role="listbox">
             <button type="button" class="outlook-v2-select-item is-active" data-value="outlook" role="option">Outlook 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="generic_api" role="option">通用 API 取码邮箱</button>
+            <button type="button" class="outlook-v2-select-item" data-value="gmail_api_url" role="option">Gmail API URL 取码邮箱</button>
+            <button type="button" class="outlook-v2-select-item" data-value="credentials" role="option">Codex 登录凭据</button>
           </div>
           <input type="hidden" id="importSourceV2" value="outlook">
         </div>
-        <span class="outlook-import-hint">注册来源可在配置里填多个，例如：outlook,generic_api</span>
+        <span class="outlook-import-hint">注册来源可在配置里填多个，例如：outlook,generic_api,gmail_api_url</span>
       </label>
       <label class="outlook-import-check">
         <input id="importAsRegisteredV2" type="checkbox" checked>
@@ -2579,7 +2896,7 @@
       </label>
       <label class="outlook-import-field">
         <span>邮箱素材</span>
-        <textarea id="importTextV2" placeholder="Outlook: email----password----clientId----refreshToken&#10;通用API: email----取码地址"></textarea>
+        <textarea id="importTextV2" placeholder="Outlook: email----password----clientId----refreshToken&#10;通用API/Gmail API URL: email----取码地址&#10;Codex: USER | PASS | 2FA"></textarea>
       </label>
     </div>
     <div class="outlook-import-foot">
@@ -2608,7 +2925,6 @@ let ACCOUNTS_TOTAL = 0;
 const TOTP_CODE_CACHE = new Map();
 let OUTLOOK_TOTAL = 0;
 let SHOW_ARCHIVED_ACCOUNTS = false;
-let SHOW_PLUS_ACCOUNTS_ONLY = false;
 const ACCOUNT_SELECTED = new Set();
 const OUTLOOK_SELECTED = new Set();
 let JOBS = [];
@@ -2808,12 +3124,12 @@ function debounce(fn, wait=250) {
 
 // ---------- Tab 切换 ----------
 function activateTab(tab, persist=true) {
-  const allowed = ['register','accounts','codex','outlook','tools','config'];
+  const allowed = ['register','accounts','email-change','codex','outlook','tools','roxy-profiles','config'];
   if (!allowed.includes(tab)) tab = 'register';
   $$('nav button').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
   allowed.forEach(t => $('#tab-'+t).classList.toggle('hidden', t !== tab));
   if (persist) localStorage.setItem('gpt_console_active_tab', tab);
-  if (tab === 'accounts') loadAccounts();
+  if (tab === 'accounts') { loadAccountDomainOptions(); loadAccounts(); }
   if (tab === 'codex') loadCodex();
   if (tab === 'outlook') loadOutlook();
   if (tab === 'config') loadConfig();
@@ -2830,22 +3146,43 @@ async function loadSummary() {
     $('#statAvailable').textContent = s.outlook_available;
     $('#statUsed').textContent = s.outlook_used;
     $('#statFailed').textContent = s.outlook_failed;
+    window.GMAIL_API_URL_POOL_AVAILABLE = Number(s.gmail_api_url_available || 0);
+    syncGmailApiUrlCountLabel($('#emailProviderV2'));
   } catch(e) {}
 }
 
 // ---------- 注册 / 任务 ----------
 async function startRegistrationFromInputs(countEl, workersEl, providerEl, startBtn) {
-  const count = parseInt((countEl?.value || '1'), 10);
+  let count = parseInt((countEl?.value || '1'), 10);
   const workers = parseInt((workersEl?.value || '3'), 10);
   const email_source = (providerEl?.value || '').trim();
   const providerPanel = providerEl?.closest('#tab-register')?.querySelector(`[data-provider-input="${email_source}"]`);
   const provider_cdks = parseProviderCdkBatch(providerPanel?.querySelector('[data-cdk-batch-input]')?.value || '');
+  const gmailApiUrlAliasCount = email_source === 'gmail_api_url'
+    ? Math.min(12, Math.max(1, parseInt(providerPanel?.querySelector('#gmailApiUrlAliasCountV2')?.value || '12', 10) || 12))
+    : 1;
+  const qan8AliasCount = email_source === 'qan8_gmail_api'
+    ? Math.min(12, Math.max(1, parseInt(providerPanel?.querySelector('#qan8AliasCountV2')?.value || '12', 10) || 12))
+    : 1;
+  const unusedRecords = gmailApiUrlAvailableCount();
+  if (email_source === 'gmail_api_url') {
+    if (unusedRecords < 1) {
+      const warnEl = $('#regWarnV2');
+      if (warnEl) warnEl.innerHTML = '<div class="banner warn">Kho Gmail API URL không còn bản ghi chưa dùng.</div>';
+      return;
+    }
+    count = Math.min(Math.max(1, count || 1), unusedRecords);
+    if (countEl) countEl.value = String(count);
+  }
+  const submitCount = email_source === 'gmail_api_url' && gmailApiUrlAliasCount > 1
+    ? count * gmailApiUrlAliasCount
+    : count;
   const activeCount = Number(JOB_STATUS_COUNTS.active || 0);
   if (activeCount > 0) {
     const ok = confirm(
       `当前任务表里已有 ${activeCount} 个任务在跑或排队，` +
-      `这次会再加 ${count} 个，合计 ${activeCount + count} 个，确定继续？\n\n` +
-      `（如果只是想跑这 ${count} 个，建议先点"取消所有排队"清掉残留再提交）`
+      `这次会再加 ${submitCount} 个，合计 ${activeCount + submitCount} 个，确定继续？\n\n` +
+      `（如果只是想跑这 ${submitCount} 个，建议先点"取消所有排队"清掉残留再提交）`
     );
     if (!ok) return;
   }
@@ -2867,6 +3204,12 @@ async function startRegistrationFromInputs(countEl, workersEl, providerEl, start
       payload.paymesh_cdks = provider_cdks;
       payload.paymesh_routed_domains = Array.from(providerPanel?.querySelectorAll('[data-paymesh-routed-domain]') || [])
         .map(el => el.value.trim()).filter(Boolean);
+    }
+    if (email_source === 'gmail_api_url') {
+      payload.gmail_api_url_alias_count = gmailApiUrlAliasCount;
+    }
+    if (email_source === 'qan8_gmail_api') {
+      payload.qan8_alias_count = qan8AliasCount;
     }
     if (email_source === 'local_test') {
       payload.local_test_base = providerPanel?.querySelector('[data-local-test-base]')?.value || '';
@@ -2958,6 +3301,8 @@ function bindJobsBodyEvents(bodyEl) {
   if (startV2) startV2.addEventListener('click', () => startRegistrationFromInputs($('#regCountV2'), $('#regWorkersV2'), providerV2, startV2));
   if (providerV2) providerV2.addEventListener('change', () => { syncProviderInputs(providerV2); syncCdkBatchCount(providerV2); });
   if (providerV2) syncProviderInputs(providerV2);
+  const useAllGmailApiUrl = $('#btnUseAllGmailApiUrlV2');
+  if (useAllGmailApiUrl) useAllGmailApiUrl.addEventListener('click', useAllUnusedGmailApiUrlRecords);
   if (cdkBatchV2) cdkBatchV2.addEventListener('input', () => updateCdkBatchCount(cdkBatchV2));
   document.querySelectorAll('[data-gmail-routed-domain], [data-paymesh-routed-domain], #paymeshAccountsPerCdkInline').forEach(input => {
     input.addEventListener('input', () => syncCdkBatchCount(providerV2));
@@ -3025,7 +3370,7 @@ function renderJobs() {
             <button type="button" class="jobs-v2-op jobs-v2-op--view" data-log-job="${esc(j.id)}" title="查看日志">${icons.view}</button>
             ${manualOtp ? `<input class="manual-otp-input manual-otp-input--v2" data-otp-email="${esc(j.email)}" data-otp-job="${esc(j.id)}" placeholder="邮箱验证码" maxlength="8" title="手动模式下，打开邮箱后把 6 位验证码贴这里"><button type="button" class="jobs-v2-op jobs-v2-op--otp" data-submit-otp-job="${esc(j.id)}" data-email="${esc(j.email)}" title="提交验证码">${icons.check}</button>` : ''}
             ${stoppable ? `<button type="button" class="jobs-v2-op jobs-v2-op--stop" data-stop-job="${esc(j.id)}" title="${j.status === 'stopping' ? '停止/修复' : '停止'}">${icons.stop}</button>` : ''}
-            ${j.retryable ? `<button type="button" class="jobs-v2-op jobs-v2-op--retry" data-retry-job="${esc(j.id)}" title="${esc(j.retry_action === 'codex' ? '账号已创建，仅补跑 Codex 授权' : (j.retry_label || '重试'))}">${icons.retry}</button>` : ''}
+            ${j.retryable ? `<button type="button" class="jobs-v2-op jobs-v2-op--retry" data-retry-job="${esc(j.id)}" title="${esc(j.retry_action === 'codex' ? '账号已创建，仅补跑 Codex 授权' : (j.retry_action === '2fa' ? '重新登录已有账号并补做 2FA' : (j.retry_label || '重试')))}">${icons.retry}</button>` : ''}
             <button type="button" class="jobs-v2-op jobs-v2-op--del" data-delete-job="${esc(j.id)}" ${running ? 'disabled title="运行中的任务不能删除；如需删除请先停止"' : 'title="删除"'}>${icons.del}</button>
           </div>
         </td>
@@ -3079,6 +3424,7 @@ function updateModalScrollLock() {
   const opened = !$('#logPanel').classList.contains('hidden')
     || !$('#retryLogPanel').classList.contains('hidden')
     || !$('#liveLogPanel').classList.contains('hidden')
+    || !$('#importPlanPanel').classList.contains('hidden')
     || !$('#qrPanel').classList.contains('hidden')
     || !$('#outlookImportModal').classList.contains('hidden');
   const locked = document.body.classList.contains('modal-open');
@@ -3214,7 +3560,7 @@ async function deleteSelectedJobs() {
 async function retryJob(jobId, btn) {
   const job = JOBS.find(j => Number(j.id) === Number(jobId));
   if (!job || !job.retryable) { showToast('该任务当前不可重试'); return; }
-  const actionText = job.retry_action === 'codex' ? '仅补跑 Codex 授权' : '创建新的完整注册任务';
+  const actionText = job.retry_action === 'codex' ? '仅补跑 Codex 授权' : (job.retry_action === '2fa' ? '重新登录已有账号并补做 2FA' : '创建新的完整注册任务');
   if (!confirm(`确定${job.retry_label || '重试'}任务 #${jobId}？\n\n${actionText}\n原任务记录和日志会保留。`)) return;
   btn.disabled = true;
   try {
@@ -3281,13 +3627,53 @@ async function pollLog() {
 let accountsLoading = false;
 let planStatusLoading = false;
 let planStatusRevision = '';
-let SHOW_FREE_PLUS_ACCOUNTS_ONLY = false;
 function getFreePlusExportFilter() {
   return ($('#freePlusExportFilterV2')?.value || '');
 }
 function getAccountsQuery() {
   const el = document.getElementById('qAccountsV2');
   return (el ? el.value : '').trim();
+}
+function getAccountLocaleFilter() {
+  const el = document.getElementById('accountLocaleFilterV2');
+  return (el ? el.value : '').trim();
+}
+function getAccountSourceFilter() {
+  return ($('#accountSourceFilterV2')?.value || '').trim();
+}
+function getAccountDomainFilter() {
+  return ($('#accountDomainFilterV2')?.value || '').trim();
+}
+let accountDomainOptionsCache = '';
+async function loadAccountDomainOptions(force = false) {
+  const select = $('#accountDomainFilterV2');
+  if (!select) return;
+  const cacheKey = SHOW_ARCHIVED_ACCOUNTS ? 'archived' : 'active';
+  if (!force && accountDomainOptionsCache === cacheKey) return;
+  const current = select.value;
+  try {
+    const result = await api(`/api/accounts/email-domains?archived=${SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0'}`);
+    const options = ['<option value="">Tất cả đuôi mail</option>'];
+    (result.domains || []).forEach(item => {
+      const value = String(item.value || '').trim();
+      if (value) options.push(`<option value="${attrEsc(value)}">${esc(value)} (${Number(item.count || 0)})</option>`);
+    });
+    if (Number(result.unknown_count || 0) > 0) options.push(`<option value="unknown">Chưa xác định (${Number(result.unknown_count)})</option>`);
+    if (current && !options.some(option => option.includes(`value="${attrEsc(current)}"`))) {
+      options.push(`<option value="${attrEsc(current)}">${esc(current)}</option>`);
+    }
+    select.innerHTML = options.join('');
+    select.value = current;
+    accountDomainOptionsCache = cacheKey;
+  } catch (err) {
+    // The static options remain usable when taxonomy refresh is unavailable.
+  }
+}
+function getAccountsPlanFilter() {
+  return ($('#accountPlanFilterV2')?.value || '').trim();
+}
+function getAccountsTwofaFilter() {
+  return ($('#accountTwofaFilterV2')?.value || '').trim();
 }
 function getAccountsCodexFilter() {
   const el = document.getElementById('codexStatusFilterV2');
@@ -3297,24 +3683,65 @@ function getCodexBulkWorkers() {
   const el = document.getElementById('codexBulkWorkersV2');
   return Math.max(1, Math.min(16, Number((el && el.value) || 3)));
 }
+function getAccountFilterQuery() {
+  const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
+  const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
+  return new URLSearchParams({
+    archived: SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0',
+    plan: getAccountsPlanFilter(),
+    twofa_status: getAccountsTwofaFilter(),
+    email_source: getAccountSourceFilter(),
+    email_domain: getAccountDomainFilter(),
+    codex_status: getAccountsCodexFilter(),
+    free_plus_export: getFreePlusExportFilter(),
+    account_locale: getAccountLocaleFilter(),
+    q: getAccountsQuery(),
+    date_from: dateFrom,
+    date_to: dateTo,
+  }).toString();
+}
+function getAccountBulkScope() {
+  return $('#accountBulkScopeV2')?.value || 'selected';
+}
+async function getAccountBulkIds() {
+  try {
+    const scope = getAccountBulkScope();
+    if (scope === 'selected') return Array.from(ACCOUNT_SELECTED).map(Number);
+    if (scope === 'page') return ACCOUNTS.map(row => Number(row.id)).filter(Number.isFinite);
+    const result = await api(`/api/accounts/filtered-ids?${getAccountFilterQuery()}&limit=5001`);
+    if (Number(result.count || 0) >= 5001) {
+      throw new Error('筛选结果超过批量上限 5000，请进一步缩小筛选范围');
+    }
+    return (result.account_ids || []).map(Number).filter(Number.isFinite);
+  } catch (err) {
+    showToast('读取批量范围失败: ' + err.message);
+    return [];
+  }
+}
 async function loadAccounts() {
   if (accountsLoading) return;
   accountsLoading = true;
   try {
     const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
     const codex = getAccountsCodexFilter();
-    const plan = SHOW_FREE_PLUS_ACCOUNTS_ONLY ? 'free_plus' : (SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '');
+    const plan = getAccountsPlanFilter();
+    const twofa = getAccountsTwofaFilter();
+    const emailSource = getAccountSourceFilter();
+    const emailDomain = getAccountDomainFilter();
     const freePlusExport = getFreePlusExportFilter();
     const q = getAccountsQuery();
+    const accountLocale = getAccountLocaleFilter();
     const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
     const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
     const p = PAGERS.accounts;
-    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&twofa_status=${encodeURIComponent(twofa)}&email_source=${encodeURIComponent(emailSource)}&email_domain=${encodeURIComponent(emailDomain)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&account_locale=${encodeURIComponent(accountLocale)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
     ACCOUNTS = res.items || [];
     ACCOUNTS_TOTAL = Number(res.total || ACCOUNTS.length || 0);
     const totalPages = Math.max(1, Math.ceil(ACCOUNTS_TOTAL / p.size));
     if (p.page > totalPages) { p.page = totalPages; accountsLoading = false; return loadAccounts(); }
     renderAccounts();
+    const resultHint = $('#accountsFilterResultV2');
+    if (resultHint) resultHint.textContent = `${ACCOUNTS_TOTAL} kết quả`;
   } catch(e) { showToast('加载账号失败: ' + e.message); }
   finally { accountsLoading = false; }
 }
@@ -3327,10 +3754,14 @@ async function pollAccountPlanStatuses() {
     const q = getAccountsQuery();
     const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
     const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
+    const accountLocale = getAccountLocaleFilter();
     const p = PAGERS.accounts;
-    const plan = SHOW_FREE_PLUS_ACCOUNTS_ONLY ? 'free_plus' : (SHOW_PLUS_ACCOUNTS_ONLY ? 'plus' : '');
+    const plan = getAccountsPlanFilter();
+    const twofa = getAccountsTwofaFilter();
+    const emailSource = getAccountSourceFilter();
+    const emailDomain = getAccountDomainFilter();
     const freePlusExport = getFreePlusExportFilter();
-    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&twofa_status=${encodeURIComponent(twofa)}&email_source=${encodeURIComponent(emailSource)}&email_domain=${encodeURIComponent(emailDomain)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&account_locale=${encodeURIComponent(accountLocale)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
     const items = snapshot.items || [];
     const accountById = new Map(ACCOUNTS.map(r => [Number(r.id), r]));
     const hasUnknown = items.some(item => !accountById.has(Number(item.id)));
@@ -3370,7 +3801,7 @@ function _codexCell(r) {
   if (s === 'stopped') return `<span class="pill status-used"${titleAttr}>已停止</span>`;
   if (s === 'failed') return `<span class="pill status-failed"${titleAttr}>失败</span>`;
   if (s === 'skipped') return `<span class="pill status-used">已跳过</span>`;
-  if (s === 'deactivated') return `<span class="pill status-failed" title="授权记录显示账号异常，建议通过查活确认账号状态">失败</span>`;
+  if (s === 'deactivated') return `<span class="pill status-failed" title="OpenAI đã khóa tài khoản">OpenAI đã khóa tài khoản</span>`;
   return `<span class="muted">-</span>`;
 }
 function _codexCellV2(r) {
@@ -3382,7 +3813,7 @@ function _codexCellV2(r) {
   if (s === 'stopped') return `<span class="acc-v2-codex is-mute"${titleAttr}>已停止</span>`;
   if (s === 'failed') return `<span class="acc-v2-codex is-fail"${titleAttr}>失败</span>`;
   if (s === 'skipped') return `<span class="acc-v2-codex is-skip"${titleAttr}>已跳过</span>`;
-  if (s === 'deactivated') return `<span class="acc-v2-codex is-fail" title="授权记录显示账号异常，建议通过查活确认账号状态">失败</span>`;
+  if (s === 'deactivated') return `<span class="acc-v2-codex is-fail" title="OpenAI đã khóa tài khoản">OpenAI đã khóa tài khoản</span>`;
   return `<span class="acc-v2-muted">-</span>`;
 }
 function _totpCellV2(r) {
@@ -3574,6 +4005,10 @@ function _codexAction(r) {
   const label = s === 'success' ? '重新补跑 Codex' : '补跑 Codex';
   return `<button data-codex-retry="${esc(r.email)}" title="重新跑一次 Codex 授权（会消耗 1 封邮箱 OTP + 1 个接码短信）">${label}</button>`;
 }
+function _twofaReactivateAction(r) {
+  if (!r.twofa_reactivate_available) return '';
+  return `<button type="button" class="good" data-account-twofa-reactivate="${esc(r.id)}" data-email="${esc(r.email || '')}" title="重新登录该账号并补做 2FA">Reactive 2FA</button>`;
+}
 function _tokenCellV2(r) {
   const live = r.live_check_status || '';
   const liveErr = r.live_check_error || '';
@@ -3583,7 +4018,7 @@ function _tokenCellV2(r) {
   if (live === 'live') liveHtml = `<div class="acc-v2-sub" title="${esc([liveAt, liveFp].filter(Boolean).join('\n'))}">查活: 正常${liveFp ? ` · ${esc(liveFp)}` : ''}</div>`;
   else if (live === 'queued') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}" style="color:#e6a23c">查活: 排队</div>`;
   else if (live === 'running') liveHtml = `<div class="acc-v2-sub" title="${esc(liveAt)}" style="color:#e6a23c">查活: 运行中</div>`;
-  else if (live === 'deactivated') liveHtml = `<div class="acc-v2-sub" title="${esc(liveErr || liveAt)}" style="color:#f56c6c">查活: 已废</div>`;
+  else if (live === 'deactivated') liveHtml = `<div class="acc-v2-sub" title="${esc(liveErr || liveAt)}" style="color:#f56c6c">${esc('OpenAI đã khóa tài khoản')}</div>`;
   else if (live === 'failed') liveHtml = `<div class="acc-v2-sub" title="${esc(liveErr || liveAt)}" style="color:#e6a23c">查活: 失败</div>`;
   if (r.has_access_token) {
     return `<button type="button" class="acc-v2-token-copy" data-account-copy-secret="access_token" data-account-id="${esc(r.id)}" title="复制完整 Token">复制</button>${liveHtml}`;
@@ -3636,11 +4071,14 @@ function renderAccounts() {
       <td class="col-id">#${esc(r.id)}</td>
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
+        <div class="acc-v2-domain">${r.email_domain && r.email_domain !== 'unknown' ? '@' + esc(r.email_domain) : 'Đuôi mail chưa xác định'}</div>
         <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
       </td>
       <td class="col-source" title="${esc(r.source_cdk || r.email_source || '')}">
         ${esc(r.email_source || '-')}
         ${r.source_cdk ? `<div class="acc-v2-sub">CDK: ${esc(r.source_cdk)}</div>` : ''}
+        ${r.registration_ip ? `<div class="acc-v2-sub">IP: ${esc(r.registration_ip)}</div>` : ''}
+        ${r.account_locale || r.account_country ? `<div class="acc-v2-sub">Locale: ${esc(r.account_locale || '-')} / ${esc(r.account_country || '-')}</div>` : '<div class="acc-v2-sub">Locale: 未识别</div>'}
       </td>
       <td class="col-token">${_tokenCellV2(r)}</td>
       <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}">${esc(short(r.password, 18))}</span>` : '<span class="acc-v2-muted">-</span>'}</td>
@@ -3652,6 +4090,7 @@ function renderAccounts() {
       <td class="col-actions">
         <div class="acc-v2-actions">
           <button type="button" class="danger" data-account-delete="${esc(r.id)}" data-email="${esc(r.email)}">删除</button>
+          ${_twofaReactivateAction(r)}
           <div class="acc-v2-more">
             <button type="button" class="acc-v2-more-btn" data-acc-more-toggle aria-haspopup="true" aria-expanded="false">更多</button>
             <div class="acc-v2-more-menu" role="menu">${_accountsV2MoreMenu(r)}</div>
@@ -3669,15 +4108,22 @@ function renderAccounts() {
 }
 
 function updateAccountSelectionUi(pageRows = null) {
-  const none = ACCOUNT_SELECTED.size === 0;
+  const scope = getAccountBulkScope();
+  const scopeCount = scope === 'selected' ? ACCOUNT_SELECTED.size : scope === 'page' ? ACCOUNTS.length : ACCOUNTS_TOTAL;
+  const none = scopeCount === 0;
   const hintV2 = $('#accountsSelectedHintV2');
-  if (hintV2) hintV2.textContent = `已选 ${ACCOUNT_SELECTED.size}`;
+  if (hintV2) hintV2.textContent = `Đã chọn ${ACCOUNT_SELECTED.size}`;
+  const bulkLabel = $('#accountsBulkSelectionLabelV2');
+  if (bulkLabel) bulkLabel.textContent = `${scopeCount} tài khoản`;
+  const scopeHint = $('#accountsBulkScopeHintV2');
+  if (scopeHint) scopeHint.textContent = scope === 'selected' ? 'Chọn checkbox trong bảng' : scope === 'page' ? 'Tất cả bản ghi của trang hiện tại' : 'Tất cả bản ghi khớp bộ lọc';
 
   const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
   const v2Ids = [
-    'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
-    'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
+    'btnCheckSelectedLiveV2', 'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
+    'btnGenerateSelectedAgentV2', 'btnDownloadSelectedAgentV2', 'btnUploadSelectedAgentSub2V2',
+    'btnLoginFreeNoTrialSub2V2', 'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
     'btnExportFreePlusSelectedV2', 'btnMarkFreePlusExportedV2', 'btnMarkFreePlusUnexportedV2',
@@ -3796,6 +4242,225 @@ function closeTotpLogModal() {
   totpLogEmail = null;
 }
 $('#btnCloseTotpLog').addEventListener('click', closeTotpLogModal);
+// ---------- Kiểm tra gói theo email ----------
+let importedPlanIds = [];
+let importedPlanTimer = null;
+let importedPlanPrecheckItems = [];
+let importedPlanQueuedItems = [];
+let importedPlanItems = [];
+let importedFreePlanEmails = [];
+
+const IMPORT_PLAN_RESULT_LABELS = {
+  free_plus_trial: 'Có Free Trial',
+  free_without_trial: 'Free, không có Trial',
+  not_free_plan: 'Không phải Free',
+  needs_live_check: 'Cần kiểm tra lại',
+  check_failed: 'Lỗi khi kiểm tra',
+  not_found: 'Không tìm thấy trong DB',
+  not_checked: 'Chưa được kiểm tra',
+  pending: 'Đang kiểm tra',
+};
+
+function importedPlanClassification(item) {
+  return String(item?.classification || 'not_checked');
+}
+function importedPlanLabel(item) {
+  return IMPORT_PLAN_RESULT_LABELS[importedPlanClassification(item)] || 'Chưa phân loại';
+}
+function importedPlanDetail(item) {
+  const classification = importedPlanClassification(item);
+  if (item?.error) return String(item.error);
+  if (classification === 'free_plus_trial') return 'Đã xác nhận Free và có thể đăng ký Free Trial';
+  if (classification === 'free_without_trial') return 'Đã xác nhận Free nhưng không có Free Trial';
+  if (classification === 'not_free_plan') return 'Gói hiện tại không phải Free';
+  if (classification === 'needs_live_check') return 'Token cần được kiểm tra lại hoặc làm mới';
+  if (classification === 'not_found') return 'Không có tài khoản tương ứng trong database';
+  if (classification === 'pending') return 'Worker đang xử lý tài khoản này';
+  return 'Không đưa được email vào lượt kiểm tra';
+}
+function importedPlanPrecheckItem(item, classification, error) {
+  return {
+    id: item?.id ?? null,
+    email: String(item?.email || '').trim(),
+    status: 'not_started',
+    ok: false,
+    plan_type: null,
+    plus_trial_eligible: false,
+    checked_at: null,
+    error: error || null,
+    classification,
+  };
+}
+function importedPlanPrecheckItemsFromResult(result) {
+  const items = [];
+  for (const item of (result.skipped || [])) {
+    const reason = String(item.reason || '');
+    if (reason === 'account_not_found') {
+      items.push(importedPlanPrecheckItem(item, 'not_found'));
+    } else if (reason === 'missing_access_token') {
+      items.push(importedPlanPrecheckItem(item, 'check_failed', 'Tài khoản không có accessToken đã lưu'));
+    } else if (reason === 'busy') {
+      items.push(importedPlanPrecheckItem(item, 'not_checked', 'Tài khoản đang có lượt kiểm tra khác'));
+    } else if (reason === 'duplicate') {
+      items.push(importedPlanPrecheckItem(item, 'not_checked', 'Email trùng trong danh sách nhập vào'));
+    } else {
+      items.push(importedPlanPrecheckItem(item, 'not_checked', reason || 'Bị bỏ qua trước khi kiểm tra'));
+    }
+  }
+  for (const item of (result.failed || [])) {
+    items.push(importedPlanPrecheckItem(item, 'check_failed', String(item.reason || 'Không thể đưa vào hàng đợi')));
+  }
+  return items.filter(item => item.email);
+}
+
+function importedPlanMatchesFilter(item, filter) {
+  const classification = importedPlanClassification(item);
+  if (filter === 'all') return true;
+  if (filter === 'free') return classification === 'free_without_trial' || classification === 'free_plus_trial';
+  return classification === filter;
+}
+function renderImportedPlanRows() {
+  const resultPanel = $('#importPlanResults');
+  const body = $('#importPlanResultBody');
+  const empty = $('#importPlanResultEmpty');
+  if (!resultPanel || !body || !empty) return;
+  const filter = $('#importPlanResultFilter')?.value || 'all';
+  const visibleItems = importedPlanItems.filter(item => importedPlanMatchesFilter(item, filter));
+  body.replaceChildren();
+  for (const item of visibleItems) {
+    const row = document.createElement('tr');
+    const emailCell = document.createElement('td');
+    emailCell.className = 'import-plan-email';
+    emailCell.textContent = String(item.email || 'Không rõ email');
+    const resultCell = document.createElement('td');
+    resultCell.className = 'import-plan-result';
+    const badge = document.createElement('span');
+    badge.className = `import-plan-badge import-plan-badge--${importedPlanClassification(item)}`;
+    badge.textContent = importedPlanLabel(item);
+    resultCell.append(badge);
+    const planCell = document.createElement('td');
+    planCell.className = 'import-plan-plan';
+    planCell.textContent = String(item.plan_type || 'Chưa có dữ liệu');
+    const detailCell = document.createElement('td');
+    detailCell.className = 'import-plan-detail';
+    detailCell.textContent = importedPlanDetail(item);
+    row.append(emailCell, resultCell, planCell, detailCell);
+    body.append(row);
+  }
+  resultPanel.hidden = importedPlanItems.length === 0;
+  empty.hidden = visibleItems.length > 0;
+}
+
+function openImportPlanPanel() {
+  $('#importPlanPanel').classList.remove('hidden');
+  updateModalScrollLock();
+  $('#importPlanEmails').focus();
+}
+function closeImportPlanPanel() {
+  clearInterval(importedPlanTimer);
+  importedPlanTimer = null;
+  importedPlanIds = [];
+  importedPlanPrecheckItems = [];
+  importedPlanQueuedItems = [];
+  importedPlanItems = [];
+  importedFreePlanEmails = [];
+  $('#importPlanResultFilter').value = 'all';
+  renderImportedPlanRows();
+  $('#importPlanPanel').classList.add('hidden');
+  updateModalScrollLock();
+}
+function renderImportPlanStatus(result) {
+  const liveItems = result.items || [];
+  const liveIds = new Set(liveItems.map(item => String(item.id)));
+  const missingQueuedItems = importedPlanQueuedItems
+    .filter(item => !liveIds.has(String(item.id)))
+    .map(item => importedPlanPrecheckItem(item, 'not_found'));
+  importedPlanItems = [
+    ...liveItems,
+    ...importedPlanPrecheckItems,
+    ...missingQueuedItems,
+  ];
+  const freeAccounts = importedPlanItems.filter(item => {
+    const classification = importedPlanClassification(item);
+    return classification === 'free_without_trial' || classification === 'free_plus_trial';
+  });
+  const freeTrialAccounts = importedPlanItems.filter(item => importedPlanClassification(item) === 'free_plus_trial');
+  const freeWithoutTrialAccounts = importedPlanItems.filter(item => importedPlanClassification(item) === 'free_without_trial');
+  const pendingCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'pending').length;
+  const notFreeCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_free_plan').length;
+  const needsLiveCheckCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'needs_live_check').length;
+  const checkFailedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'check_failed').length;
+  const notFoundCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_found').length;
+  const notCheckedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_checked').length;
+  importedFreePlanEmails = freeAccounts.map(item => String(item.email || '').trim()).filter(Boolean);
+  const copyBtn = $('#btnCopyFreePlanEmails');
+  copyBtn.disabled = importedFreePlanEmails.length === 0;
+  $('#importPlanSummary').textContent = pendingCount
+    ? `Đã nhận ${importedPlanItems.length} email; đang kiểm tra ${pendingCount}; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; lỗi ${checkFailedCount}`
+    : `Đã xử lý ${importedPlanItems.length} email; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; không phải Free ${notFreeCount}; cần kiểm tra lại ${needsLiveCheckCount}; lỗi ${checkFailedCount}; không tìm thấy ${notFoundCount}; chưa kiểm tra ${notCheckedCount}`;
+  renderImportedPlanRows();
+}
+async function pollImportedPlanStatus() {
+  if (!importedPlanIds.length) return false;
+  try {
+    const query = importedPlanIds.map(id => encodeURIComponent(id)).join(',');
+    const result = await api(`/api/accounts/check-plan-import-status?account_ids=${query}`);
+    renderImportPlanStatus(result);
+    if (Number(result.pending_count || 0) === 0) {
+      clearInterval(importedPlanTimer);
+      importedPlanTimer = null;
+      await loadAccounts();
+      return false;
+    }
+    return true;
+  } catch (err) {
+    $('#importPlanSummary').textContent = `Đọc trạng thái kiểm tra thất bại: ${err.message}`;
+    return true;
+  }
+}
+async function startImportedPlanCheck() {
+  const text = $('#importPlanEmails').value || '';
+  if (!text.trim()) { showToast('Vui lòng nhập danh sách email'); return; }
+  if (!confirm('Bạn có chắc muốn kiểm tra gói hiện tại theo từng email không?')) return;
+  const btn = $('#btnStartImportPlan');
+  btn.disabled = true;
+  clearInterval(importedPlanTimer);
+  importedPlanIds = [];
+  importedPlanPrecheckItems = [];
+  importedPlanQueuedItems = [];
+  importedPlanItems = [];
+  importedFreePlanEmails = [];
+  $('#importPlanResults').hidden = true;
+  $('#btnCopyFreePlanEmails').disabled = true;
+  try {
+    const result = await api('/api/accounts/check-plan-import', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({emails: text}),
+    });
+    importedPlanPrecheckItems = importedPlanPrecheckItemsFromResult(result);
+    importedPlanIds = (result.started || []).map(item => Number(item.id)).filter(Number.isFinite);
+    importedPlanQueuedItems = (result.started || []).map(item => ({
+      id: Number(item.id),
+      email: String(item.email || '').trim(),
+    })).filter(item => Number.isFinite(item.id) && item.email);
+    $('#importPlanSummary').textContent = `Đã phân tích ${result.parsed_count || 0} dòng; đưa vào hàng đợi ${result.started_count || 0}; bỏ qua ${result.skipped_count || 0}; lỗi khi đưa vào hàng đợi ${result.failed_count || 0}`;
+    if (!importedPlanIds.length) {
+      renderImportPlanStatus({items: []});
+      return;
+    }
+    const pending = await pollImportedPlanStatus();
+    if (pending) importedPlanTimer = setInterval(pollImportedPlanStatus, 1500);
+  } catch (err) {
+    showToast('Kiểm tra gói theo email thất bại: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+$('#btnCloseImportPlan').addEventListener('click', closeImportPlanPanel);
+$('#btnStartImportPlan').addEventListener('click', startImportedPlanCheck);
+$('#importPlanResultFilter').addEventListener('change', renderImportedPlanRows);
+$('#btnCopyFreePlanEmails').addEventListener('click', () => copyText(importedFreePlanEmails.join('\n')));
 
 // 账号操作按钮（事件委托）
 async function onAccountsBodyClick(e) {
@@ -3863,6 +4528,27 @@ async function onAccountsBodyClick(e) {
   const planBtn = e.target.closest('[data-plan-check]');
   if (planBtn) {
     await checkOnePlan(Number(planBtn.dataset.planCheck), planBtn);
+    return;
+  }
+
+  const twofaBtn = e.target.closest('[data-account-twofa-reactivate]');
+  if (twofaBtn) {
+    const id = Number(twofaBtn.dataset.accountTwofaReactivate);
+    const email = twofaBtn.dataset.email || '';
+    if (!confirm(`重新登录并补做 2FA？\n\n${email}`)) return;
+    twofaBtn.disabled = true;
+    try {
+      const result = await api(`/api/accounts/${encodeURIComponent(id)}/twofa/reactivate`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({}),
+      });
+      showToast(result.message || '已开始 Reactive 2FA');
+      await loadAccounts();
+    } catch (err) {
+      showToast('Reactive 2FA 失败: ' + err.message);
+      twofaBtn.disabled = false;
+    }
     return;
   }
 
@@ -4041,14 +4727,7 @@ async function applyAccountsArchivedFilter(on) {
   SHOW_ARCHIVED_ACCOUNTS = !!on;
   setAccountsFilterToggle($('#showArchivedAccountsV2'), SHOW_ARCHIVED_ACCOUNTS);
   ACCOUNT_SELECTED.clear();
-  PAGERS.accounts.page = 1;
-  await loadAccounts();
-  await pollAccountPlanStatuses();
-}
-async function applyAccountsPlusFilter(on) {
-  SHOW_PLUS_ACCOUNTS_ONLY = !!on;
-  setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), SHOW_PLUS_ACCOUNTS_ONLY);
-  ACCOUNT_SELECTED.clear();
+  await loadAccountDomainOptions(true);
   PAGERS.accounts.page = 1;
   await loadAccounts();
   await pollAccountPlanStatuses();
@@ -4078,6 +4757,13 @@ async function refreshAccountsList(btn) {
     PAGERS.accounts.page = 1;
     loadAccounts();
   }, 250));
+  const localeV2 = $('#accountLocaleFilterV2');
+  if (localeV2) localeV2.addEventListener('input', debounce(() => {
+    ACCOUNT_SELECTED.clear();
+    PAGERS.accounts.page = 1;
+    loadAccounts();
+    pollAccountPlanStatuses();
+  }, 250));
   const codexV2 = $('#codexStatusFilterV2');
   if (codexV2) codexV2.addEventListener('change', () => {
     ACCOUNT_SELECTED.clear();
@@ -4085,31 +4771,45 @@ async function refreshAccountsList(btn) {
     loadAccounts();
   });
 
-  const archivedV2 = $('#showArchivedAccountsV2');
-  if (archivedV2) archivedV2.addEventListener('click', () => {
-    applyAccountsArchivedFilter(!SHOW_ARCHIVED_ACCOUNTS);
-  });
-  const plusV2 = $('#showPlusAccountsOnlyV2');
-  if (plusV2) plusV2.addEventListener('click', () => {
-    applyAccountsPlusFilter(!SHOW_PLUS_ACCOUNTS_ONLY);
-  });
-  const freePlusV2 = $('#showFreePlusAccountsOnlyV2');
-  if (freePlusV2) freePlusV2.addEventListener('click', () => {
-    SHOW_FREE_PLUS_ACCOUNTS_ONLY = !SHOW_FREE_PLUS_ACCOUNTS_ONLY;
-    if (SHOW_FREE_PLUS_ACCOUNTS_ONLY) {
-      SHOW_PLUS_ACCOUNTS_ONLY = false;
-      setAccountsFilterToggle($('#showPlusAccountsOnlyV2'), false);
-    }
-    setAccountsFilterToggle(freePlusV2, SHOW_FREE_PLUS_ACCOUNTS_ONLY);
+  const sourceV2 = $('#accountSourceFilterV2');
+  if (sourceV2) sourceV2.addEventListener('change', () => {
     ACCOUNT_SELECTED.clear();
     PAGERS.accounts.page = 1;
     loadAccounts();
     pollAccountPlanStatuses();
   });
+  const domainV2 = $('#accountDomainFilterV2');
+  if (domainV2) domainV2.addEventListener('change', () => {
+    ACCOUNT_SELECTED.clear();
+    PAGERS.accounts.page = 1;
+    loadAccounts();
+    pollAccountPlanStatuses();
+  });
+  const planV2 = $('#accountPlanFilterV2');
+  if (planV2) planV2.addEventListener('change', () => {
+    ACCOUNT_SELECTED.clear();
+    PAGERS.accounts.page = 1;
+    loadAccounts();
+    pollAccountPlanStatuses();
+  });
+  const twofaV2 = $('#accountTwofaFilterV2');
+  if (twofaV2) twofaV2.addEventListener('change', () => {
+    ACCOUNT_SELECTED.clear();
+    PAGERS.accounts.page = 1;
+    loadAccounts();
+    pollAccountPlanStatuses();
+  });
+
+  const archivedV2 = $('#showArchivedAccountsV2');
+  if (archivedV2) archivedV2.addEventListener('click', () => {
+    applyAccountsArchivedFilter(!SHOW_ARCHIVED_ACCOUNTS);
+  });
   const exportAllFreePlus = $('#btnExportFreePlusAllV2');
-  if (exportAllFreePlus) exportAllFreePlus.addEventListener('click', () => exportFreePlus('all_filtered', false));
+  if (exportAllFreePlus) exportAllFreePlus.addEventListener('click', () => exportFreePlus('all_filtered'));
   const exportSelectedFreePlus = $('#btnExportFreePlusSelectedV2');
-  if (exportSelectedFreePlus) exportSelectedFreePlus.addEventListener('click', () => exportFreePlus('selected', false));
+  if (exportSelectedFreePlus) exportSelectedFreePlus.addEventListener('click', () => exportFreePlus('selected'));
+  const recoverLatestFreePlus = $('#btnRecoverLatestFreePlusV2');
+  if (recoverLatestFreePlus) recoverLatestFreePlus.addEventListener('click', recoverLatestFreePlusExport);
   const markExported = $('#btnMarkFreePlusExportedV2');
   if (markExported) markExported.addEventListener('click', () => setFreePlusExportState(true));
   const markUnexported = $('#btnMarkFreePlusUnexportedV2');
@@ -4123,6 +4823,8 @@ async function refreshAccountsList(btn) {
   });
   const refreshV2 = $('#btnRefreshAccountsV2');
   if (refreshV2) refreshV2.addEventListener('click', () => refreshAccountsList(refreshV2));
+  const scopeV2 = $('#accountBulkScopeV2');
+  if (scopeV2) scopeV2.addEventListener('change', () => updateAccountSelectionUi());
 
   bindDateFilterPanel({
     btnId: 'btnDateFilterAccountsV2',
@@ -4138,17 +4840,24 @@ function getAccountExportFormat() {
   return ($('#accountExportFormatV2')?.value || 'modern');
 }
 
-async function exportFreePlus(scope, allowReexport = false) {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
-  if (scope === 'selected' && !ids.length) { showToast('请先选择 Free Plus 账号'); return; }
+async function exportFreePlus(scope) {
+  const ids = scope === 'selected' ? await getAccountBulkIds() : [];
+  if (scope === 'selected' && !ids.length) { showToast('当前批量范围没有账号'); return; }
   const formatName = getAccountExportFormat();
   if (formatName === 'legacy' && !confirm('Legacy 会包含原始邮箱素材和 Access Token，确定继续吗？')) return;
-  if (allowReexport && !confirm('已导出的账号将再次导出并增加导出次数，确定继续吗？')) return;
   try {
-    const body = {scope, account_ids: scope === 'selected' ? ids : undefined, format: formatName, allow_reexport: allowReexport};
+    const body = {scope, account_ids: scope === 'selected' ? ids : undefined, format: formatName};
     if (scope === 'all_filtered') {
       body.archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
       body.free_plus_export = getFreePlusExportFilter();
+      body.account_locale = getAccountLocaleFilter();
+      body.twofa_status = getAccountsTwofaFilter();
+      body.email_source = getAccountSourceFilter();
+      body.email_domain = getAccountDomainFilter();
+      body.codex_status = getAccountsCodexFilter();
+      body.q = getAccountsQuery();
+      body.date_from = document.getElementById('dateFromAccountsV2')?.value || '';
+      body.date_to = document.getElementById('dateToAccountsV2')?.value || '';
     }
     const r = await api('/api/accounts/free-plus/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     if (!r.download_url) throw new Error('服务端未返回下载地址');
@@ -4166,7 +4875,7 @@ async function exportFreePlus(scope, allowReexport = false) {
 }
 
 async function setFreePlusExportState(exported) {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+  const ids = await getAccountBulkIds();
   if (!ids.length) { showToast('请先选择账号'); return; }
   const action = exported ? '已导出' : '未导出';
   if (!confirm(`确定将选中 ${ids.length} 个账号标记为${action}吗？`)) return;
@@ -4235,7 +4944,7 @@ async function setupAccountTotp(id, btn) {
 }
 
 async function copySelectedAccountLines() {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+  const ids = await getAccountBulkIds();
   if (!ids.length) { showToast('请先选择账号'); return; }
   try {
     const formatName = getAccountExportFormat();
@@ -4247,7 +4956,7 @@ async function copySelectedAccountLines() {
 }
 
 async function copySelectedAccountTokens() {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+  const ids = await getAccountBulkIds();
   if (!ids.length) { showToast('请先选择账号'); return; }
   try {
     const lines = await fetchAccountSecrets(ids, 'access_token');
@@ -4393,20 +5102,20 @@ function bindDateFilterPanel({ btnId, panelId, fromId, toId, onApply }) {
   syncBtnText();
 }
 
-function copySelectedAccountEmails() {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+async function copySelectedAccountEmails() {
+  const ids = await getAccountBulkIds();
   if (!ids.length) { showToast('请先选择账号'); return; }
-  const emails = ACCOUNTS
-    .filter(r => ids.includes(Number(r.id)))
-    .map(r => (r.email || '').trim())
-    .filter(Boolean);
+  let emails = [];
+  try {
+    emails = await fetchAccountSecrets(ids, 'email');
+  } catch(err) { showToast('复制邮箱失败: ' + err.message); return; }
   if (!emails.length) { showToast('选中账号没有可复制的邮箱'); return; }
   copyText(emails.join('\n'));
   showToast(`已复制 ${emails.length} 个邮箱`);
 }
 
 async function downloadSelectedAccountTxt() {
-  const ids = Array.from(ACCOUNT_SELECTED).map(Number);
+  const ids = await getAccountBulkIds();
   if (!ids.length) { showToast('请先选择账号'); return; }
   let lines = [];
   try {
@@ -4429,12 +5138,9 @@ async function downloadSelectedAccountTxt() {
 }
 
 async function downloadSelectedCpa() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
-  const selectedAccounts = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
-  const missingCodex = selectedAccounts.filter(a => (a.codex_status || '') !== 'success').length;
-  let msg = `确定从 CPA 下载选中的 ${ids.length} 个账号的 CPA/Codex JSON 吗？\n\n会按账号邮箱匹配 CPA auth-files，成功的文件会打包成 ZIP。`;
-  if (missingCodex) msg += `\n\n其中 ${missingCodex} 个账号本地 Codex 状态不是 success，若 CPA 端没有文件会写入 manifest 错误清单。`;
+  const msg = `确定从 CPA 下载当前批量范围内 ${ids.length} 个账号的 CPA/Codex JSON 吗？\n\n会按账号邮箱匹配 CPA auth-files，成功的文件会打包成 ZIP。`;
   if (!confirm(msg)) return;
   const btn = $('#btnDownloadSelectedCpaV2');
   const old = btn.textContent;
@@ -4516,12 +5222,9 @@ async function extractOneLink(id, btn) {
 }
 
 async function extractSelectedLinks() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
-  const selected = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
-  const eligible = selected.filter(a => (a.current_plan_type || a.plan_type || '').toString().toLowerCase() === 'free' && !!a.plus_trial_eligible);
-  if (!eligible.length) { showToast('选中账号里没有 free(可Plus试用)'); return; }
-  if (!confirm(`确定批量提链 ${eligible.length} 个 free(可Plus试用) 账号吗？\n\n非可试用账号会自动跳过。成功会按账号消耗 CDK 次数。`)) return;
+  if (!confirm(`确定在当前批量范围内提链 ${ids.length} 个账号吗？\n\n仅 free(可Plus试用) 账号会执行，其余由服务端自动跳过。成功会按账号消耗 CDK 次数。`)) return;
   const btn = $('#btnExtractSelectedLinksV2');
   const old = btn.textContent;
   btn.disabled = true;
@@ -4567,12 +5270,9 @@ async function generateOneCodexAgent(id, btn) {
 }
 
 async function generateSelectedCodexAgents() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
-  const selected = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
-  const eligible = selected.filter(a => a.has_access_token);
-  if (!eligible.length) { showToast('选中账号里没有可用 access_token'); return; }
-  if (!confirm(`确定批量生成 ${eligible.length} 个 Codex Agent Token 吗？\n\n缺少 access_token 的账号会自动跳过。`)) return;
+  if (!confirm(`确定在当前批量范围内为 ${ids.length} 个账号生成 Codex Agent Token 吗？\n\n缺少 access_token 的账号会由服务端自动跳过。`)) return;
   const btn = $('#btnGenerateSelectedAgentV2');
   const old = btn.textContent;
   btn.disabled = true;
@@ -4614,12 +5314,9 @@ async function uploadOneCodexAgentSub2(id, btn) {
 }
 
 async function uploadSelectedCodexAgentSub2() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
-  const selected = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
-  const ready = selected.filter(a => (a.codex_agent_status || '') === 'success');
-  if (!ready.length) { showToast('选中账号里没有已生成的 Agent Token'); return; }
-  if (!confirm(`确定上传选中的 ${ready.length} 个 Agent Token 到 sub2api 吗？\n\n未生成成功的账号会自动跳过。`)) return;
+  if (!confirm(`确定上传当前批量范围内 ${ids.length} 个账号的 Agent Token 到 sub2api 吗？\n\n未生成成功的账号会由服务端自动跳过。`)) return;
   const btn = $('#btnUploadSelectedAgentSub2V2');
   const old = btn.textContent;
   btn.disabled = true;
@@ -4667,13 +5364,10 @@ function downloadOneCodexAgent(id) {
   showToast('已提交 Agent Token 下载');
 }
 
-function downloadSelectedCodexAgents() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+async function downloadSelectedCodexAgents() {
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
-  const selected = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
-  const ready = selected.filter(a => (a.codex_agent_status || '') === 'success');
-  if (!ready.length) { showToast('选中账号里没有已生成的 Agent Token'); return; }
-  if (!confirm(`确定下载选中的 ${ready.length} 个 Codex Agent Token 吗？\n\n未生成成功的账号会自动跳过，文件会打包 ZIP。`)) return;
+  if (!confirm(`确定下载当前批量范围内 ${ids.length} 个账号的 Codex Agent Token 吗？\n\n未生成成功的账号会由服务端自动跳过，文件会打包 ZIP。`)) return;
   const btn = $('#btnDownloadSelectedAgentV2');
   const old = btn.textContent;
   btn.disabled = true;
@@ -4706,7 +5400,7 @@ function downloadSelectedCodexAgents() {
 }
 
 async function checkSelectedPlans() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
   const workers = getCodexBulkWorkers();
   const btn = $('#btnCheckSelectedPlansV2');
@@ -4733,7 +5427,7 @@ async function checkSelectedPlans() {
 }
 
 async function checkSelectedLive(idsArg = null, btnArg = null) {
-  const ids = idsArg || Array.from(ACCOUNT_SELECTED);
+  const ids = idsArg || await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
   const workers = getCodexBulkWorkers();
   const msg = idsArg ? `确定查活这个账号并刷新最新 AT/accessToken 吗？` : `确定查活选中的 ${ids.length} 个账号吗？
@@ -4812,7 +5506,7 @@ async function archiveOneAccount(id, archived, btn) {
 }
 
 async function archiveSelectedAccounts() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
   const archived = !SHOW_ARCHIVED_ACCOUNTS;
   const action = archived ? '归档' : '恢复';
@@ -4840,7 +5534,7 @@ async function archiveSelectedAccounts() {
 }
 
 async function deleteSelectedAccounts() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
   if (!confirm(`确定删除选中的 ${ids.length} 个账号吗？\n\n会从本地账号列表、注册成功邮箱和 token 文件中移除。`)) return;
   const _delBtn = $('#btnDeleteSelectedAccountsV2'); if (_delBtn) _delBtn.disabled = true;
@@ -4882,7 +5576,7 @@ async function editAccountNote(id, btn) {
 }
 
 async function noteSelectedAccounts() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
   const note = prompt(`给选中的 ${ids.length} 个账号设置统一备注（留空可清空）`, '');
   if (note === null) return;
@@ -4907,12 +5601,9 @@ async function noteSelectedAccounts() {
 
 
 async function stopSelectedCodex() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
-  const selectedAccounts = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
-  const retrying = selectedAccounts.filter(a => (a.codex_status || '') === 'retrying');
-  if (retrying.length === 0) { showToast('选中账号里没有正在补跑的 Codex'); return; }
-  if (!confirm(`确定停止选中的 ${retrying.length} 个 Codex 补跑吗？\n\n会发送停止信号，并将状态标记为“已停止”。`)) return;
+  if (!confirm(`确定停止当前批量范围内 ${ids.length} 个账号的 Codex 补跑吗？\n\n未处于补跑中的账号会由服务端自动跳过。`)) return;
   const btn = $('#btnStopSelectedCodexV2');
   if (!btn) return;
   btn.disabled = true;
@@ -4920,7 +5611,7 @@ async function stopSelectedCodex() {
     const r = await api('/api/codex/stop-bulk', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({account_ids: retrying.map(a => a.id)}),
+      body: JSON.stringify({account_ids: ids}),
     });
     const skippedCount = (r.skipped || []).length;
     showToast(skippedCount ? `已停止 ${r.stopped_count || 0} 个，跳过 ${skippedCount} 个` : `已停止 ${r.stopped_count || 0} 个`);
@@ -4933,22 +5624,16 @@ async function stopSelectedCodex() {
 }
 
 async function retrySelectedCodex() {
-  const ids = Array.from(ACCOUNT_SELECTED);
+  const ids = await getAccountBulkIds();
   if (ids.length === 0) { showToast('请先选择账号'); return; }
   const workers = getCodexBulkWorkers();
   const workersElV2 = $('#codexBulkWorkersV2');
   if (workersElV2) workersElV2.value = workers;
-  const selectedAccounts = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
-  const retryingCount = selectedAccounts.filter(a => (a.codex_status || '') === 'retrying').length;
-  const deactivatedCount = selectedAccounts.filter(a => (a.live_check_status || '') === 'deactivated').length;
-  let msg = `批量补跑选中的 ${ids.length} 个账号 Codex 授权？
+  const msg = `批量补跑当前批量范围内 ${ids.length} 个账号的 Codex 授权？
 
 并发线程数：${workers}
 
 将按账号消耗邮箱 OTP 和接码短信。`;
-  if (retryingCount || deactivatedCount) msg += `
-
-其中：补跑中 ${retryingCount} 个、已废号 ${deactivatedCount} 个会自动跳过。`;
   if (!confirm(msg)) return;
   const btn = $('#btnRetrySelectedCodexV2');
   if (!btn) return;
@@ -4972,26 +5657,89 @@ async function retrySelectedCodex() {
   }
 }
 
-async function copyCurrentPageTokens() {
-  const ids = ACCOUNTS.filter(r => r.has_access_token).map(r => Number(r.id));
-  if (!ids.length) { showToast('当前页没有 Token'); return; }
-  try { copyText((await fetchAccountSecrets(ids, 'access_token')).join('\n')); } catch(e) { showToast('复制失败: ' + e.message); }
-}
-async function copyCurrentPageLines() {
-  const ids = ACCOUNTS.map(r => Number(r.id));
-  if (!ids.length) { showToast('当前页没有账号'); return; }
+async function recoverLatestFreePlusExport() {
+  const formatName = getAccountExportFormat();
+  if (formatName === 'legacy' && !confirm('Legacy 会包含原始邮箱素材和 Access Token，确定继续吗？')) return;
   try {
-    const formatName = getAccountExportFormat();
-    copyText((await fetchAccountSecrets(ids, 'copy_line', formatName)).join('\n'));
-  } catch(e) { showToast('复制失败: ' + e.message); }
+    const r = await api('/api/accounts/free-plus/recover-latest', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({format: formatName}),
+    });
+    const a = document.createElement('a');
+    a.href = r.download_url;
+    a.download = r.filename || '';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => a.remove(), 1000);
+    showToast(`已取回最近导出 ${r.count} 个账号`);
+  } catch (err) {
+    showToast('取回 Free Plus 导出失败: ' + err.message);
+  }
 }
+
+async function loginAllFreeNoTrialToSub2() {
+  const btn = $('#btnLoginFreeNoTrialSub2V2');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const scopeIds = await getAccountBulkIds();
+    if (!scopeIds.length) {
+      showToast('当前批量范围没有账号');
+      return;
+    }
+    const preview = await api('/api/codex/sub2-free-no-trial-targets');
+    const scopeSet = new Set(scopeIds.map(Number));
+    const targetIds = (preview.account_ids || [])
+      .map(Number)
+      .filter(id => scopeSet.has(id));
+    if (!targetIds.length) {
+      showToast('当前批量范围内没有已确认的 Free 无试用账号');
+      return;
+    }
+    const workers = getCodexBulkWorkers();
+    const workersElV2 = $('#codexBulkWorkersV2');
+    if (workersElV2) workersElV2.value = workers;
+    const msg = `登录当前批量范围内 ${targetIds.length} 个已确认 Free 且无 Plus 试用资格的账号到 sub2api？
+
+并发线程数：${workers}
+
+将按账号消耗邮箱 OTP 和接码短信。`;
+    if (!confirm(msg)) return;
+
+    const result = await api('/api/codex/retry-bulk', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({account_ids: targetIds, workers}),
+    });
+    const skippedCount = (result.skipped || []).length;
+    showToast(skippedCount
+      ? `已开始登录 ${result.started_count || 0} 个，跳过 ${skippedCount} 个`
+      : `已开始登录 ${result.started_count || 0} 个 Free 无试用账号到 sub2api`);
+    loadAccounts();
+    const first = (result.started || [])[0];
+    if (first && first.email) openRetryLog(first.email);
+    const poll = setInterval(loadAccounts, 5000);
+    setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
+  } catch(err) {
+    showToast('登录 Free 无试用账号失败: ' + err.message);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 (function bindAccountsToolbarV2() {
   const bind = (id, fn) => {
     const el = document.getElementById(id);
     if (el) el.addEventListener('click', fn);
   };
   bind('btnCheckSelectedPlansV2', checkSelectedPlans);
+  bind('btnImportPlanEmailsV2', openImportPlanPanel);
   bind('btnExtractSelectedLinksV2', extractSelectedLinks);
+  bind('btnGenerateSelectedAgentV2', generateSelectedCodexAgents);
+  bind('btnDownloadSelectedAgentV2', downloadSelectedCodexAgents);
+  bind('btnUploadSelectedAgentSub2V2', uploadSelectedCodexAgentSub2);
+  bind('btnLoginFreeNoTrialSub2V2', loginAllFreeNoTrialToSub2);
   bind('btnRetrySelectedCodexV2', retrySelectedCodex);
   bind('btnDownloadSelectedCpaV2', downloadSelectedCpa);
   bind('btnStopSelectedCodexV2', stopSelectedCodex);
@@ -4999,8 +5747,6 @@ async function copyCurrentPageLines() {
   bind('btnCopySelectedLinesV2', copySelectedAccountLines);
   bind('btnCopySelectedTokensV2', copySelectedAccountTokens);
   bind('btnCopySelectedEmailsV2', copySelectedAccountEmails);
-  bind('btnCopyAllTokensV2', copyCurrentPageTokens);
-  bind('btnCopyAllLinesV2', copyCurrentPageLines);
   bind('btnDownloadSelectedTxtV2', downloadSelectedAccountTxt);
   bind('btnArchiveSelectedAccountsV2', archiveSelectedAccounts);
   bind('btnDeleteSelectedAccountsV2', deleteSelectedAccounts);
@@ -5015,6 +5761,7 @@ const POOL_SOURCE_LABELS = {
   all: '全部邮箱池',
   outlook: 'Outlook 邮箱池',
   generic_api: '通用 API 邮箱池',
+  gmail_api_url: 'Gmail API URL 邮箱池',
   cloudflare_domain: '域名邮箱池',
 };
 function setPoolSourceV2(val) {
@@ -5037,7 +5784,7 @@ function getOutlookQuery() {
 }
 function poolKey(r) { return `${r.source || getPoolSource() || 'outlook'}|${r.email || ''}`; }
 function poolLabel(src) {
-  return ({outlook:'Outlook', generic_api:'通用API', cloudflare_domain:'域名邮箱'})[src] || src || '-';
+  return ({outlook:'Outlook', generic_api:'通用API', gmail_api_url:'Gmail API URL', cloudflare_domain:'域名邮箱'})[src] || src || '-';
 }
 async function loadOutlook() {
   try {
@@ -5153,7 +5900,7 @@ function onPoolSourceChange(el) {
   PAGERS.outlook.page = 1;
   OUTLOOK_SELECTED.clear();
   const val = el ? el.value : getPoolSource();
-  if (val === 'outlook' || val === 'generic_api') setImportSourceV2(val);
+  if (val === 'outlook' || val === 'generic_api' || val === 'gmail_api_url') setImportSourceV2(val);
   loadOutlook();
 }
 function syncOutlookSelectAll(checked) {
@@ -5264,6 +6011,8 @@ async function onOutlookBodyClick(e) {
 const IMPORT_SOURCE_LABELS = {
   outlook: 'Outlook 邮箱池',
   generic_api: '通用 API 取码邮箱',
+  gmail_api_url: 'Gmail API URL 取码邮箱',
+  credentials: 'Codex 登录凭据',
 };
 function setImportSourceV2(val) {
   const hidden = document.getElementById('importSourceV2');
@@ -5278,6 +6027,18 @@ function setImportSourceV2(val) {
       item.classList.toggle('is-active', item.dataset.value === next);
     });
   }
+  const credentialMode = next === 'credentials';
+  const registered = document.getElementById('importAsRegisteredV2');
+  if (registered) {
+    if (credentialMode) registered.checked = true;
+    registered.disabled = credentialMode;
+  }
+  const text = document.getElementById('importTextV2');
+  if (text) {
+    text.placeholder = credentialMode
+      ? 'USER | PASS | 2FA'
+      : 'Outlook: email----password----clientId----refreshToken\n通用API/Gmail API URL: email----取码地址';
+  }
 }
 function openOutlookImportModal() {
   const modal = $('#outlookImportModal');
@@ -5285,7 +6046,7 @@ function openOutlookImportModal() {
   const result = $('#importResultV2');
   if (result) result.innerHTML = '';
   const pool = getPoolSource();
-  if (pool === 'outlook' || pool === 'generic_api') setImportSourceV2(pool);
+  if (pool === 'outlook' || pool === 'generic_api' || pool === 'gmail_api_url') setImportSourceV2(pool);
   else setImportSourceV2('outlook');
   modal.classList.remove('hidden');
   updateModalScrollLock();
@@ -5354,13 +6115,13 @@ async function doImportOutlook() {
     const as_registered = registeredEl ? !!registeredEl.checked : true;
     const r = await api('/api/outlook/import', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text, source, as_registered}) });
     const mode = r.as_registered ? '已注册账号' : '邮箱池素材';
-    const msg = `按 ${mode} 导入：解析 ${r.parsed} 行，新增 ${r.inserted}，跳过 ${r.skipped}${r.as_registered ? '；可到“账号”页选择后批量补跑 Codex' : ''}`;
+    const msg = `按 ${mode} 导入：解析 ${r.parsed} 行，新增 ${r.inserted}，更新 ${r.updated || 0}，跳过 ${r.skipped}${r.as_registered ? '；可到“账号”页选择后批量补跑 Codex' : ''}`;
     if (resultEl) resultEl.innerHTML = `<div class="banner info">${esc(msg)}</div>`;
     if (textEl) textEl.value = '';
-    setPoolSourceV2(source);
+    if (source !== 'credentials') setPoolSourceV2(source);
     setImportSourceV2(source);
     loadOutlook(); loadAccounts(); loadSummary();
-    showToast(`导入完成：新增 ${r.inserted}，跳过 ${r.skipped}`);
+    showToast(`导入完成：新增 ${r.inserted}，更新 ${r.updated || 0}，跳过 ${r.skipped}`);
     setTimeout(closeOutlookImportModal, 600);
   } catch(e) {
     if (resultEl) resultEl.innerHTML = `<div class="banner warn">${esc(e.message)}</div>`;
@@ -5811,6 +6572,7 @@ async function codexDeleteBulk() {
 let CONFIG_EMAIL_ACTIVE_SECTION_V2 = '通用邮箱 / OTP';
 let CONFIG_SMS_ACTIVE_SECTION_V2 = '通用接码';
 let CONFIG_CODEX_ACTIVE_SECTION_V2 = '基础配置';
+let CONFIG_PROXY_ACTIVE_SECTION_V2 = '代理池';
 const CONFIG_PENDING_UPDATES = {};
 
 function configGroups() {
@@ -5824,9 +6586,11 @@ function emailConfigSectionForKey(key) {
     return ['通用邮箱 / OTP', '邮箱来源选择、OTP 等待参数、手动邮箱等通用设置'];
   }
   if (key.startsWith('GMAIL_123452026_')) return ['Gmail CDK', 'Gmail provider API、quota 和 HTTP 安全设置；batch CDK 请在注册任务页输入'];
+  if (key.startsWith('QAN8_')) return ['QAN8 Gmail API', 'QAN8 API、SKU 和 lazy source lane 配置'];
   if (key.startsWith('GPTMAIL_')) return ['GPTMail', 'GPTMail 临时邮箱 API 配置'];
   if (key.startsWith('MAIL_NEST_')) return ['MailNest', 'MailNest / 迈巢临时邮箱 API 配置'];
   if (key.startsWith('CLOUDMAIL_')) return ['CloudMail', 'CloudMail 域名随机邮箱、Token 和收信 API 配置'];
+  if (key.startsWith('TINYHOST_')) return ['TinyHost', 'TinyHost 随机域名临时邮箱 API 配置'];
   if (key.startsWith('OUTLOOK_')) return ['Outlook 邮箱池', 'Outlook 邮箱池和取件模式配置'];
   if (key.startsWith('CLOUDFLARE_')) return ['Cloudflare 临时邮箱', 'Cloudflare Worker 临时邮箱 API、鉴权与路径配置'];
   if (['EMAIL_DOMAIN','QQ_EMAIL','QQ_IMAP_PASSWORD'].includes(key)) return ['Cloudflare 域名邮箱', 'Cloudflare 转发到 QQ 邮箱后的 IMAP 收信配置'];
@@ -5835,12 +6599,21 @@ function emailConfigSectionForKey(key) {
 
 function smsConfigSectionForKey(key) {
   if (['SMS_PROVIDER','SMS_COUNTRY','SMS_SERVICE','SMS_MAX_RETRIES','SMS_CODE_WAIT'].includes(key)) {
-    return ['通用接码', '接码通道选择、国家/服务代码、等待和重试参数；H 通道可复用 SMS_SERVICE/SMS_COUNTRY 作为 projectId/country'];
+    return ['通用接码', '接码通道选择、国家/服务代码、等待和重试参数；HeroSMS auto 按实时 cost 从低到高扫描'];
   }
   if (key === 'SMS_API_KEY') return ['GrizzlySMS', 'GrizzlySMS 平台 API Key 配置'];
+  if (key.startsWith('HERO_SMS_')) return ['HeroSMS', 'HeroSMS API、OpenAI dr 服务和实时 cost / sticky country 配置'];
+  if (key.startsWith('VIOTP_')) return ['ViOTP', 'ViOTP API、Token、serviceId、国家和运营商配置'];
   if (key.startsWith('H_')) return ['H 接码', 'H_API.md 本地 H 取号服务配置；项目ID/国家留空时复用通用字段'];
   if (key.startsWith('L_')) return ['L 接码', 'L_API.md 本地 L 取号服务配置'];
   return ['其他接码配置', ''];
+}
+
+function proxyConfigSectionForKey(key) {
+  if (String(key || '').startsWith('ROTATING_PROXY_')) {
+    return ['Proxy.vn 代理旋转', 'Proxy.vn keyxoay、出口代理和 lane lease 配置'];
+  }
+  return ['代理池', '静态代理池与套餐/Agent 的代理策略配置'];
 }
 
 function codexConfigSectionForKey(key) {
@@ -5853,8 +6626,8 @@ function codexConfigSectionForKey(key) {
   if (['SUB2API_API_BASE','SUB2API_API_KEY','SUB2API_API_TIMEOUT'].includes(key)) {
     return ['sub2api通用', 'sub2api 共用 API 基址、鉴权和超时配置；Agent Token 和 OAuth 都复用这里'];
   }
-  if (['SUB2API_AUTO_EXPORT','SUB2API_SYNC_MODE','SUB2API_OUTPUT_PATH','SUB2API_PROXY_KEY'].includes(key)) {
-    return ['sub2api Agent Token', 'Codex Agent Token 生成后的 sub2api 同步、上传路径、本地文件和代理键配置'];
+  if (['SUB2API_AUTO_EXPORT','SUB2API_SYNC_MODE','SUB2API_OUTPUT_PATH','SUB2API_PROXY_KEY','SUB2API_GROUP_IDS','SUB2API_PRIORITY','SUB2API_MODEL'].includes(key)) {
+    return ['sub2api Agent Token', 'Codex Agent Token、OAuth 和补跑导出的同步、分组、优先级及模型配置'];
   }
   return ['基础配置', ''];
 }
@@ -5939,7 +6712,7 @@ function configSectionIntro(name) {
   if (name === '接码平台') return '接码通道、国家代码与本地取号服务参数。';
   if (name === '人工节奏') return '注册流程中的随机停顿节奏。';
   if (name === '浏览器画像') return '浏览器语言、时区与出口 IP 画像。';
-  if (name === '代理池') return '代理列表与套餐/Agent 网络模式。';
+  if (name === '代理池') return '静态代理池、Proxy.vn 代理旋转与套餐/Agent 网络模式。';
   if (name === '提链') return '提链服务地址、CDK 与并发参数。';
   return '';
 }
@@ -6008,6 +6781,15 @@ function getAutoPlanCheckValue() {
   const fv = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, f.key) ? CONFIG_PENDING_UPDATES[f.key] : f.value;
   return !!fv;
 }
+function getAutoCodexForFreeField() {
+  return (CONFIG || []).find(f => f.key === 'AUTO_CODEX_FOR_FREE_AFTER_REGISTER') || null;
+}
+function getAutoCodexForFreeValue() {
+  const f = getAutoCodexForFreeField();
+  if (!f) return false;
+  const fv = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, f.key) ? CONFIG_PENDING_UPDATES[f.key] : f.value;
+  return !!fv;
+}
 function registrationDriverLabel(value) {
   const cur = String(value || '').trim().toLowerCase();
   const hit = registrationDriverChoices().find(c => String(c.value) === cur);
@@ -6061,7 +6843,7 @@ function renderRegistrationDriverCard() {
     labelEl.textContent = label;
     labelEl.classList.toggle('is-placeholder', !label || label === '—');
   }
-  if (hintEl) hintEl.textContent = `驱动标识: ${cur} · 自动查套餐: ${getAutoPlanCheckValue() ? '开' : '关'}`;
+  if (hintEl) hintEl.textContent = `驱动标识: ${cur} · 自动查套餐: ${getAutoPlanCheckValue() ? '开' : '关'} · Free无Plus自动Codex: ${getAutoCodexForFreeValue() ? '开' : '关'}`;
 }
 function renderRegistrationDriverField(f) {
   return `
@@ -6075,11 +6857,13 @@ function renderRegistrationDriverField(f) {
 function renderRegistrationSettingsSection(fields) {
   const driver = fields.find(f => f.key === 'REGISTRATION_DRIVER') || fields[0];
   const autoPlan = fields.find(f => f.key === 'AUTO_PLAN_CHECK_AFTER_REGISTER');
+  const autoCodex = fields.find(f => f.key === 'AUTO_CODEX_FOR_FREE_AFTER_REGISTER');
+  const switches = [autoPlan, autoCodex].filter(Boolean);
   return `
     <div class="config-section-v2-body config-section-v2-body--single">
       ${driver ? renderRegistrationDriverField(driver) : '<div class="banner warn">未找到注册方式配置项</div>'}
     </div>
-    ${autoPlan ? `<div class="config-switches-v2" style="margin-top:14px;">${renderFeatureSwitchField(autoPlan, { withIcon: false })}</div>` : ''}
+    ${switches.length ? `<div class="config-switches-v2" style="margin-top:14px;">${switches.map(f => renderFeatureSwitchField(f, { withIcon: false })).join('')}</div>` : ''}
   `;
 }
 function renderFeatureSwitchField(f, opts = {}) {
@@ -6220,6 +7004,30 @@ function renderSectionedConfigSectionV2(name, fields, sectionForKey, preferred, 
   let extra = '';
   if (name === '邮箱 / OTP' && active === 'CloudMail') {
     extra = renderCloudMailTokenToolsV2();
+  }
+  if (name === '接码平台' && active === 'ViOTP') {
+    extra = `
+      <div class="roxy-workspace-box" style="margin-top:18px;">
+        <div>
+          <b>ViOTP OpenAI serviceId</b>
+          <div class="hint">按 JNMBrowser 逻辑从 /service/getv2 自动选择 OpenAI / ChatGPT 服务，并填入数字 ID。</div>
+        </div>
+        <div class="action-cell">
+          <button class="btn" type="button" id="btnLoadViOtpServiceV2">自动获取服务 ID</button>
+        </div>
+        <div id="viOtpServiceStatusV2" class="muted" style="font-size:12px;">默认 ID 1234 · OpenAI | ChatGPT</div>
+        </div>`;
+  }
+  if (name === '代理池' && active === 'Proxy.vn 代理旋转') {
+    extra = `
+      <div class="nordvpn-status-v2 is-muted" id="rotatingProxyStatusV2" aria-live="polite">
+        <div class="nordvpn-status-v2-title">Proxy.vn 代理旋转状态</div>
+        <div class="nordvpn-status-v2-meta" id="rotatingProxyStatusMetaV2">正在读取本地 key/lease 状态…</div>
+        <div class="nordvpn-status-v2-actions">
+          <button type="button" class="btn" id="btnRefreshRotatingProxyV2">刷新 key 列表</button>
+        </div>
+        <div id="rotatingProxyKeysV2"></div>
+      </div>`;
   }
   return `
     <section class="config-section-v2" id="${esc(slug)}" data-config-section="${esc(name)}">
@@ -6423,12 +7231,22 @@ function renderConfigSectionV2(name, fields) {
   if (name === 'Codex') {
     return renderCodexSectionV2(fields);
   }
+  if (name === '代理池') {
+    return renderSectionedConfigSectionV2(
+      name,
+      fields,
+      proxyConfigSectionForKey,
+      ['代理池', 'Proxy.vn 代理旋转'],
+      { get: () => CONFIG_PROXY_ACTIVE_SECTION_V2, set: v => { CONFIG_PROXY_ACTIVE_SECTION_V2 = v; } },
+      'proxy-section-v2'
+    );
+  }
   if (name === '邮箱 / OTP') {
     return renderSectionedConfigSectionV2(
       name,
       fields,
       emailConfigSectionForKey,
-      ['通用邮箱 / OTP', 'Gmail CDK', 'GPTMail', 'MailNest', 'CloudMail', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
+      ['通用邮箱 / OTP', 'Gmail CDK', 'GPTMail', 'MailNest', 'CloudMail', 'TinyHost', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
       { get: () => CONFIG_EMAIL_ACTIVE_SECTION_V2, set: v => { CONFIG_EMAIL_ACTIVE_SECTION_V2 = v; } },
       'email-section-v2'
     );
@@ -6438,7 +7256,7 @@ function renderConfigSectionV2(name, fields) {
       name,
       fields,
       smsConfigSectionForKey,
-      ['通用接码', 'GrizzlySMS', 'H 接码', 'L 接码', '其他接码配置'],
+      ['通用接码', 'GrizzlySMS', 'ViOTP', 'HeroSMS', 'H 接码', 'L 接码', '其他接码配置'],
       { get: () => CONFIG_SMS_ACTIVE_SECTION_V2, set: v => { CONFIG_SMS_ACTIVE_SECTION_V2 = v; } },
       'sms-section-v2'
     );
@@ -6469,6 +7287,7 @@ function renderConfigLayoutV2() {
   if (sectionMount) renderRegistrationEpSelect(sectionMount, 'configRegistrationSelectV2');
   bindRoxyWorkspaceToolsV2();
   bindCloudMailToolsV2();
+  bindRotatingProxyToolsV2();
 }
 function scrollToConfigSection(slug) {
   const el = document.getElementById(slug);
@@ -6547,6 +7366,13 @@ function bindConfigLayoutV2() {
         renderConfigLayoutV2();
         return;
       }
+      const proxyTab = e.target.closest('[data-proxy-section-v2]');
+      if (proxyTab) {
+        e.preventDefault();
+        CONFIG_PROXY_ACTIVE_SECTION_V2 = proxyTab.dataset.proxySectionV2;
+        renderConfigLayoutV2();
+        return;
+      }
       const emailTab = e.target.closest('[data-email-section-v2]');
       if (emailTab) {
         e.preventDefault();
@@ -6559,6 +7385,7 @@ function bindConfigLayoutV2() {
         e.preventDefault();
         CONFIG_SMS_ACTIVE_SECTION_V2 = smsTab.dataset.smsSectionV2;
         renderConfigLayoutV2();
+        bindViOtpServiceToolsV2();
         return;
       }
       const toggle = e.target.closest('[data-ep-toggle]');
@@ -6604,11 +7431,110 @@ function bindConfigLayoutV2() {
   }
 }
 
+async function loadViOtpOpenAiServiceV2() {
+  const button = $('#btnLoadViOtpServiceV2');
+  const status = $('#viOtpServiceStatusV2');
+  const tokenInput = document.querySelector('[data-key="VIOTP_API_TOKEN"]');
+  const countryInput = document.querySelector('[data-key="VIOTP_COUNTRY"]');
+  const serviceInput = document.querySelector('[data-key="VIOTP_SERVICE_ID"]');
+  if (!serviceInput) return;
+  if (button) button.disabled = true;
+  if (status) status.textContent = 'Đang lấy danh sách dịch vụ ViOTP...';
+  try {
+    const result = await api('/api/viotp/openai-service', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        token: tokenInput?.value?.trim() || '',
+        country: countryInput?.value?.trim() || 'vn',
+      }),
+    });
+    const service = result.service || {};
+    if (!service.id) throw new Error('ViOTP không trả về serviceId hợp lệ');
+    serviceInput.value = String(service.id);
+    CONFIG_PENDING_UPDATES.VIOTP_SERVICE_ID = String(service.id);
+    if (status) status.textContent = `ID ${service.id} · ${service.name || 'OpenAI'}${service.price != null ? ` · ${service.price}` : ''}`;
+  } catch (e) {
+    if (status) status.textContent = `Không thể tự lấy ID: ${e.message}. Giữ ID hiện tại ${serviceInput.value || '1234'}.`;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindViOtpServiceToolsV2() {
+  const button = $('#btnLoadViOtpServiceV2');
+  if (!button || button.dataset.bound) return;
+  button.dataset.bound = '1';
+  button.addEventListener('click', () => loadViOtpOpenAiServiceV2());
+  void loadViOtpOpenAiServiceV2();
+}
+
+function rotatingProxyDateV2(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return '未知';
+  return new Date(timestamp * 1000).toLocaleString();
+}
+
+function renderRotatingProxyStatusV2(data) {
+  const status = $('#rotatingProxyStatusV2');
+  const meta = $('#rotatingProxyStatusMetaV2');
+  const list = $('#rotatingProxyKeysV2');
+  if (!status || !meta || !list) return;
+  status.classList.toggle('is-ready', !!data.enabled && !!data.configured);
+  status.classList.toggle('is-warning', !!data.enabled && !data.configured);
+  status.classList.toggle('is-muted', !data.enabled || !data.configured);
+  meta.textContent = data.enabled
+    ? (data.configured ? `已启用 · ${data.keys?.length || 0} 个本地 key · ${data.leases?.length || 0} 个 lane lease` : '已开启但未配置 API Key')
+    : '未启用';
+  const keys = Array.isArray(data.keys) ? data.keys : [];
+  const leases = Array.isArray(data.leases) ? data.leases : [];
+  if (!keys.length && !leases.length) {
+    list.innerHTML = '<div class="config-section-v2-subhelp">暂无本地 key/lease</div>';
+    return;
+  }
+  list.innerHTML = `
+    <div class="config-section-v2-subhelp">Key 列表</div>
+    <div class="mono" style="display:grid;gap:4px;margin-top:6px;">
+      ${keys.map(item => `<div>${esc(item.key)} · 到期 ${esc(rotatingProxyDateV2(item.expires_at))} · lane ${esc((item.assignments || []).map(one => `${one.scope}:${one.lane_id}`).join(', ') || '未分配')}</div>`).join('')}
+    </div>
+    ${leases.length ? `<div class="config-section-v2-subhelp" style="margin-top:12px;">当前 lane lease</div>
+      <div class="mono" style="display:grid;gap:4px;margin-top:6px;">
+        ${leases.map(item => `<div>${esc(item.scope || 'registration')}:${esc(item.lane_id)} · ${esc(item.key)} · ${esc(item.proxy)} · 到期 ${esc(rotatingProxyDateV2(item.proxy_expires_at))}</div>`).join('')}
+      </div>` : ''}
+  `;
+}
+
+async function loadRotatingProxyStatusV2(refresh = false) {
+  const meta = $('#rotatingProxyStatusMetaV2');
+  const button = $('#btnRefreshRotatingProxyV2');
+  if (button) button.disabled = true;
+  try {
+    const result = await api(refresh ? '/api/proxy/rotating/refresh' : '/api/proxy/rotating', {
+      method: refresh ? 'POST' : 'GET',
+    });
+    renderRotatingProxyStatusV2(result);
+  } catch (e) {
+    if (meta) meta.textContent = `读取失败: ${e.message}`;
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function bindRotatingProxyToolsV2() {
+  const button = $('#btnRefreshRotatingProxyV2');
+  if (button && !button.dataset.bound) {
+    button.dataset.bound = '1';
+    button.addEventListener('click', () => loadRotatingProxyStatusV2(true));
+  }
+  void loadRotatingProxyStatusV2();
+}
+
 async function loadConfig() {
   try {
     CONFIG = await api('/api/config');
     renderConfigLayoutV2();
     bindConfigLayoutV2();
+    if (CONFIG_SMS_ACTIVE_SECTION_V2 === 'ViOTP') bindViOtpServiceToolsV2();
   } catch(e) {
     showToast('加载配置失败: ' + e.message);
   }
@@ -6685,12 +7611,58 @@ function readConfigElementValue(el, f) {
   return isPlaceholderEmpty(el.value) ? '' : el.value.trim();
 }
 
+function gmailApiUrlAvailableCount() {
+  return Math.max(0, Number(window.GMAIL_API_URL_POOL_AVAILABLE || 0));
+}
+
+function clampGmailApiUrlRecordCount() {
+  const countEl = $('#regCountV2');
+  const available = gmailApiUrlAvailableCount();
+  if (!countEl) return;
+  const current = parseInt(countEl.value || '1', 10) || 1;
+  const max = Math.max(1, available || 1);
+  countEl.max = String(max);
+  if (available > 0 && current > available) countEl.value = String(available);
+}
+
+function useAllUnusedGmailApiUrlRecords() {
+  const countEl = $('#regCountV2');
+  const available = gmailApiUrlAvailableCount();
+  if (!countEl || available < 1) return;
+  countEl.max = String(available);
+  countEl.value = String(available);
+  countEl.dispatchEvent(new Event('input', { bubbles: true }));
+  countEl.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function syncGmailApiUrlCountLabel(providerEl) {
+  const field = $('#regCountFieldV2');
+  const availableEl = $('#gmailApiUrlPoolAvailableV2');
+  const useAllBtn = $('#btnUseAllGmailApiUrlV2');
+  const available = gmailApiUrlAvailableCount();
+  const isGmailApiUrl = (providerEl?.value || '') === 'gmail_api_url';
+  if (field) {
+    const first = field.childNodes[0];
+    if (first && first.nodeType === Node.TEXT_NODE) {
+      first.textContent = isGmailApiUrl ? 'Số bản ghi chưa dùng' : '注册数量';
+    }
+  }
+  if (availableEl) availableEl.textContent = String(available);
+  if (useAllBtn) useAllBtn.disabled = !isGmailApiUrl || available < 1;
+  if (isGmailApiUrl) clampGmailApiUrlRecordCount();
+  else {
+    const countEl = $('#regCountV2');
+    if (countEl) countEl.max = '1000';
+  }
+}
+
 function syncProviderInputs(providerEl) {
   const root = providerEl?.closest('#tab-register') || document;
   const selected = providerEl?.value || '';
   root.querySelectorAll('[data-provider-input]').forEach(panel => {
     panel.classList.toggle('hidden', panel.dataset.providerInput !== selected);
   });
+  syncGmailApiUrlCountLabel(providerEl);
 }
 
 function parseProviderCdkBatch(value) {
@@ -6728,7 +7700,7 @@ function syncCdkBatchCount(providerEl) {
     .map(el => el.value.trim().toLowerCase().replace(/\.+$/, '')).filter(Boolean))];
   const isPaymesh = providerEl.value === 'paymesh';
   const multiplier = isPaymesh ? 1 + routedDomains.length : (routedDomains.length ? 2 : 1);
-  const count = Math.min(200, cdks.length * perCdk * multiplier);
+  const count = Math.min(1000, cdks.length * perCdk * multiplier);
   const countEl = panel.querySelector('[data-cdk-count]');
   if (countEl) countEl.textContent = `${cdks.length} CDK · 最多 ${count} 账号`;
   const hintEl = panel.querySelector('[data-cdk-batch-hint]');
@@ -6763,7 +7735,7 @@ function trackConfigFieldChange(e) {
   const f = CONFIG.find(x => x.key === el.dataset.key);
   if (!f) return;
   CONFIG_PENDING_UPDATES[f.key] = readConfigElementValue(el, f);
-  if (f.key === 'AUTO_PLAN_CHECK_AFTER_REGISTER') renderRegistrationDriverCard();
+  if (['AUTO_PLAN_CHECK_AFTER_REGISTER', 'AUTO_CODEX_FOR_FREE_AFTER_REGISTER'].includes(f.key)) renderRegistrationDriverCard();
 }
 $('#tab-config').addEventListener('input', trackConfigFieldChange);
 $('#tab-config').addEventListener('change', trackConfigFieldChange);
@@ -6809,7 +7781,9 @@ jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidd
 setInterval(loadSummary, 30000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 10000);
 </script>
-<script src="{{ url_for('static', filename='reserved_test_aliases.js') }}"></script>
-<script src="{{ url_for('static', filename='vi.js') }}"></script>
+  <script src="{{ url_for('static', filename='reserved_test_aliases.js') }}"></script>
+  <script src="{{ url_for('static', filename='roxy_profiles.js') }}"></script>
+  <script src="{{ url_for('static', filename='email_change.js') }}"></script>
+  <script src="{{ url_for('static', filename='vi.js') }}"></script>
 </body>
 </html>

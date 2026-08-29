@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import random
+import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from urllib.parse import unquote, urljoin, urlparse
 
@@ -14,6 +16,12 @@ import requests
 from config import roxybrowser as _cfg
 
 logger = logging.getLogger(__name__)
+
+_PROFILE_CREATE_LOCK = threading.Lock()
+_RETRYABLE_PROFILE_CREATE_MESSAGES = (
+    "creating, please wait",
+    "insufficient profile quota",
+)
 
 
 @dataclass
@@ -52,8 +60,11 @@ def _proxy_url_to_roxy_info(proxy_url: str) -> dict:
       https://user:pass@host:port
       socks5://user:pass@host:port
       socks5h://user:pass@host:port  -> Roxy 侧按 SOCKS5 处理
+      host:port:user:pass             -> 按 HTTP 代理处理
     """
-    text = str(proxy_url or "").strip()
+    from config.proxy import normalize_proxy_url
+
+    text = normalize_proxy_url(proxy_url)
     if not text:
         raise ValueError("代理为空")
     parsed = urlparse(text)
@@ -374,7 +385,17 @@ class RoxyBrowserClient:
 
         return {"ok": False, "items": [], "errors": errors}
 
-    def create_profile(self, payload: dict | None = None) -> str:
+    @staticmethod
+    def _is_retryable_profile_create_error(exc: Exception) -> bool:
+        text = str(exc or "").lower()
+        return any(message in text for message in _RETRYABLE_PROFILE_CREATE_MESSAGES)
+
+    def create_profile(
+        self,
+        payload: dict | None = None,
+        *,
+        stop_check: Callable[[], None] | None = None,
+    ) -> str:
         body = dict(getattr(_cfg, "ROXY_PROFILE_CREATE_PAYLOAD", {}) or {})
         if payload:
             body.update(payload)
@@ -434,7 +455,37 @@ class RoxyBrowserClient:
             body.get("osVersion") or "-",
             random_os_enabled,
         )
-        result = self.request(_cfg.ROXY_CREATE_METHOD, _cfg.ROXY_CREATE_PATH, json_body=body)
+        attempt = 0
+        base_delay = max(0.5, float(getattr(_cfg, "ROXY_API_RETRY_DELAY", 2) or 2))
+        while True:
+            attempt += 1
+            if stop_check is not None:
+                stop_check()
+            try:
+                # Roxy serializes profile creation internally. Keeping the local
+                # request boundary single-file avoids avoidable busy responses.
+                with _PROFILE_CREATE_LOCK:
+                    if stop_check is not None:
+                        stop_check()
+                    result = self.request(
+                        _cfg.ROXY_CREATE_METHOD,
+                        _cfg.ROXY_CREATE_PATH,
+                        json_body=body,
+                    )
+                break
+            except (RuntimeError, requests.RequestException) as exc:
+                if not self._is_retryable_profile_create_error(exc):
+                    raise
+                delay = min(30.0, base_delay * min(attempt, 5))
+                logger.warning(
+                    "[Roxy] 创建环境暂不可用，保留当前任务并在 %.1fs 后重试：attempt=%s error=%s",
+                    delay,
+                    attempt,
+                    exc,
+                )
+                if stop_check is not None:
+                    stop_check()
+                time.sleep(delay)
         profile_id = _first(result, [
             ("id",), ("dirId",), ("dir_id",), ("profile_id",), ("profileId",), ("browser_id",),
             ("data", "id"), ("data", "dirId"), ("data", "dir_id"),
@@ -452,10 +503,44 @@ class RoxyBrowserClient:
             return ""
         return text
 
+    def _verify_profile_proxy(self, profile_id: str, expected: dict) -> None:
+        """确认 Roxy 在打开浏览器前已持久化本轮显式代理。"""
+        payload = self.request(
+            "GET",
+            "/browser/detail",
+            params={
+                "workspaceId": _workspace_id_value(),
+                "dirId": int(profile_id) if str(profile_id).isdigit() else profile_id,
+            },
+        )
+        rows = _dig(payload, "data", "rows") or []
+        detail = rows[0] if isinstance(rows, list) and rows else _dig(payload, "data")
+        actual = detail.get("proxyInfo") if isinstance(detail, dict) else None
+        if not isinstance(actual, dict):
+            raise RuntimeError("Roxy 环境详情未返回 proxyInfo，拒绝在未验证代理时打开浏览器")
+        actual_protocol = str(actual.get("protocol") or "").upper()
+        actual_host = str(actual.get("host") or "").strip().lower()
+        actual_port = str(actual.get("port") or "").strip()
+        expected_protocol = str(expected.get("protocol") or "").upper()
+        expected_host = str(expected.get("host") or "").strip().lower()
+        expected_port = str(expected.get("port") or "").strip()
+        if (
+            actual_protocol != expected_protocol
+            or actual_host != expected_host
+            or actual_port != expected_port
+        ):
+            raise RuntimeError(
+                "Roxy 环境代理配置不匹配: "
+                f"expected={expected_protocol}://{expected_host}:{expected_port}, "
+                f"actual={actual_protocol}://{actual_host}:{actual_port}"
+            )
+
     def open_profile(
         self,
         profile_id: str | None = None,
         proxy: str | None = None,
+        *,
+        stop_check: Callable[[], None] | None = None,
     ) -> RoxyOpenResult:
         one_profile = bool(getattr(_cfg, "ROXY_ONE_PROFILE_PER_ACCOUNT", True))
         configured_pid = self._normalize_profile_id(profile_id if profile_id is not None else getattr(_cfg, "ROXY_PROFILE_ID", ""))
@@ -475,6 +560,7 @@ class RoxyBrowserClient:
         try:
             if not pid:
                 create_payload = None
+                proxy_info = None
                 if proxy:
                     proxy_info = _proxy_url_to_roxy_info(proxy)
                     create_payload = {"proxyInfo": proxy_info}
@@ -485,16 +571,25 @@ class RoxyBrowserClient:
                         proxy_info.get("host"),
                         proxy_info.get("port"),
                     )
-                pid = self.create_profile(create_payload)
+                pid = self.create_profile(create_payload, stop_check=stop_check)
                 created_by_run = True
                 logger.info("[Roxy] 已创建临时环境：%s", pid)
+                if proxy_info is not None:
+                    self._verify_profile_proxy(pid, proxy_info)
 
             path = str(_cfg.ROXY_OPEN_PATH).format(profile_id=pid)
             params = dict(getattr(_cfg, "ROXY_OPEN_EXTRA_PARAMS", {}) or {})
+            args = list(params.get("args") or [])
+            if proxy and getattr(proxy, "tunnel", None) is not None:
+                proxy_arg = f"--proxy-server={str(proxy)}"
+                if proxy_arg not in args:
+                    args.append(proxy_arg)
+                if "--proxy-bypass-list=<-loopback>" not in args:
+                    args.append("--proxy-bypass-list=<-loopback>")
             # Roxy 官方 /browser/open body: {workspaceId, dirId, args, forceOpen, headless}
             params.setdefault("workspaceId", _workspace_id_value())
             params.setdefault("dirId", int(pid) if str(pid).isdigit() else pid)
-            params.setdefault("args", [])
+            params["args"] = args
             params.setdefault("forceOpen", True)
             # ROXY_OPEN_HEADLESS 是显式开关，优先级应高于 ROXY_OPEN_EXTRA_PARAMS，
             # 否则 extra 里残留 headless=False 会导致 WebUI 保存无头后仍弹窗口。

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from core import nordvpn_wireguard as wg
+from core.registration_network_identity import NetworkIdentityError
 
 
 def _write_conf(directory: Path, name: str, body: str = "") -> Path:
@@ -141,6 +142,15 @@ class ProxyPoolTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.dir = Path(self._tmp.name)
+        self._probe_patch = mock.patch(
+            "core.registration_network_identity.probe_socks_public_ip",
+            side_effect=lambda proxy_url, **kwargs: f"8.8.8.{proxy_url.rsplit(':', 1)[-1][-1]}",
+        )
+        self._probe_patch.start()
+        self.addCleanup(self._probe_patch.stop)
+        self._port_free_patch = mock.patch.object(wg, "_is_port_free", return_value=True)
+        self._port_free_patch.start()
+        self.addCleanup(self._port_free_patch.stop)
 
     def _pool(self, **kwargs) -> wg.WireGuardProxyPool:
         return wg.WireGuardProxyPool(
@@ -149,6 +159,10 @@ class ProxyPoolTests(unittest.TestCase):
             port_start=kwargs.get("port_start", 25000),
             port_end=kwargs.get("port_end", 25001),
             connect_timeout=kwargs.get("connect_timeout", 1.0),
+            lease_store=kwargs.get(
+                "lease_store",
+                wg.NordVPNWireGuardLeaseStore(self.dir / "leases.sqlite3"),
+            ),
         )
 
     def test_acquire_no_configs_raises(self) -> None:
@@ -185,6 +199,32 @@ class ProxyPoolTests(unittest.TestCase):
                 pool.acquire()
         self.assertEqual(pool._used_ports, set())
         self.assertEqual(pool._active, {})
+
+    def test_acquire_fails_closed_when_egress_probe_fails(self) -> None:
+        _write_conf(self.dir, "us1.conf")
+        pool = self._pool()
+        process = mock.MagicMock()
+        fake_proxy = wg.WireGuardProxy(
+            port=25000,
+            process=process,
+            conf_path="us1.conf",
+            temp_conf="/tmp/x.conf",
+            proxy_url="socks5://127.0.0.1:25000",
+        )
+        with mock.patch.object(pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
+             mock.patch.object(wg, "_spawn_wireproxy", return_value=fake_proxy), \
+             mock.patch(
+                 "core.registration_network_identity.probe_socks_public_ip",
+                 side_effect=NetworkIdentityError("egress unavailable"),
+             ), \
+             mock.patch.object(wg.os, "unlink"):
+            with self.assertRaisesRegex(wg.WireGuardProxyError, "egress probe failed"):
+                pool.acquire()
+
+        process.terminate.assert_called_once()
+        self.assertEqual(pool._used_ports, set())
+        self.assertEqual(pool._active, {})
+        self.assertEqual(pool._active_sources, set())
 
     def test_acquire_passes_country_filter(self) -> None:
         _write_conf(self.dir, "us1.conf")
@@ -260,6 +300,140 @@ class ProxyPoolTests(unittest.TestCase):
         self.assertEqual(pool._active, {})
         self.assertEqual(pool._used_ports, set())
 
+    def test_concurrent_acquisitions_use_distinct_ports_and_sources(self) -> None:
+        _write_conf(self.dir, "us1.conf")
+        _write_conf(self.dir, "us2.conf")
+        pool = self._pool()
+
+        def spawn(*, conf_path, port, **_kwargs):
+            return wg.WireGuardProxy(
+                port=port,
+                process=mock.MagicMock(),
+                conf_path=conf_path,
+                temp_conf=f"/tmp/{port}.conf",
+                proxy_url=f"socks5://127.0.0.1:{port}",
+            )
+
+        with mock.patch.object(pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
+             mock.patch.object(wg, "_spawn_wireproxy", side_effect=spawn), \
+             mock.patch.object(wg.random, "choice", side_effect=lambda values: values[0]):
+            first = pool.acquire()
+            second = pool.acquire()
+
+        self.assertEqual({first.port, second.port}, {25000, 25001})
+        self.assertNotEqual(first.source_label, second.source_label)
+
+    def test_persistent_store_prevents_source_reuse_across_pool_instances(self) -> None:
+        _write_conf(self.dir, "us1.conf")
+        _write_conf(self.dir, "us2.conf")
+        store = wg.NordVPNWireGuardLeaseStore(self.dir / "shared-leases.sqlite3")
+        first_pool = self._pool(port_start=35100, port_end=35101, lease_store=store)
+        second_pool = self._pool(port_start=35100, port_end=35101, lease_store=store)
+
+        def spawn(*, conf_path, port, **_kwargs):
+            return wg.WireGuardProxy(
+                port=port,
+                process=mock.MagicMock(),
+                conf_path=conf_path,
+                temp_conf=f"/tmp/{port}.conf",
+                proxy_url=f"socks5://127.0.0.1:{port}",
+            )
+
+        with mock.patch.object(first_pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
+             mock.patch.object(second_pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
+             mock.patch.object(wg, "_spawn_wireproxy", side_effect=spawn), \
+             mock.patch.object(wg, "_is_port_free", return_value=True), \
+             mock.patch.object(wg.random, "shuffle", side_effect=lambda values: None):
+            first = first_pool.acquire(owner_id="job-1")
+            second = second_pool.acquire(owner_id="job-2")
+
+        self.assertNotEqual(first.source_label, second.source_label)
+        self.assertEqual(
+            {row["owner_id"] for row in store.list_active()},
+            {"job-1", "job-2"},
+        )
+
+    def test_profile_binding_is_persisted_and_unique(self) -> None:
+        _write_conf(self.dir, "us1.conf")
+        _write_conf(self.dir, "us2.conf")
+        pool = self._pool(port_start=35100, port_end=35101)
+
+        def spawn(*, conf_path, port, **_kwargs):
+            return wg.WireGuardProxy(
+                port=port,
+                process=mock.MagicMock(),
+                conf_path=conf_path,
+                temp_conf=f"/tmp/{port}.conf",
+                proxy_url=f"socks5://127.0.0.1:{port}",
+            )
+
+        with mock.patch.object(pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
+             mock.patch.object(wg, "_spawn_wireproxy", side_effect=spawn), \
+             mock.patch.object(wg, "_is_port_free", return_value=True), \
+             mock.patch.object(wg.random, "shuffle", side_effect=lambda values: None):
+            first = pool.acquire(owner_id="job-1")
+            second = pool.acquire(owner_id="job-2")
+            pool.bind_profile(first, "roxy-1")
+            with self.assertRaisesRegex(wg.WireGuardProxyError, "Browser profile/session.*绑定其它"):
+                pool.bind_profile(second, "roxy-1")
+
+        lease = pool._lease_store.get_owner_lease("job-1")
+        self.assertEqual(lease["profile_id"], "roxy-1")
+        pool.release(first)
+        pool.release(second)
+
+    def test_released_port_and_source_can_be_reused_sequentially(self) -> None:
+        _write_conf(self.dir, "us1.conf")
+        pool = self._pool(port_start=25000, port_end=25000)
+
+        def spawn(*, conf_path, port, **_kwargs):
+            return wg.WireGuardProxy(
+                port=port,
+                process=mock.MagicMock(),
+                conf_path=conf_path,
+                temp_conf=f"/tmp/{port}.conf",
+                proxy_url=f"socks5://127.0.0.1:{port}",
+            )
+
+        with mock.patch.object(pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
+             mock.patch.object(wg, "_spawn_wireproxy", side_effect=spawn), \
+             mock.patch.object(wg.os, "unlink"):
+            first = pool.acquire()
+            pool.release(first)
+            second = pool.acquire()
+
+        self.assertEqual(first.port, 25000)
+        self.assertEqual(second.port, 25000)
+
+    def test_duplicate_active_egress_fails_and_rolls_back(self) -> None:
+        _write_conf(self.dir, "us1.conf")
+        _write_conf(self.dir, "us2.conf")
+        pool = self._pool()
+
+        def spawn(*, conf_path, port, **_kwargs):
+            return wg.WireGuardProxy(
+                port=port,
+                process=mock.MagicMock(),
+                conf_path=conf_path,
+                temp_conf=f"/tmp/{port}.conf",
+                proxy_url=f"socks5://127.0.0.1:{port}",
+            )
+
+        with mock.patch.object(pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
+             mock.patch.object(wg, "_spawn_wireproxy", side_effect=spawn), \
+             mock.patch.object(wg.random, "choice", side_effect=lambda values: values[0]), \
+             mock.patch(
+                 "core.registration_network_identity.probe_socks_public_ip",
+                 return_value="8.8.8.8",
+             ), mock.patch.object(wg.os, "unlink"):
+            first = pool.acquire()
+            with self.assertRaisesRegex(wg.WireGuardProxyError, "出口 IP 重复"):
+                pool.acquire()
+
+        self.assertEqual(set(pool._active), {first.port})
+        self.assertEqual(pool._used_ports, {first.port})
+        self.assertEqual(pool._active_egress_ips, {"8.8.8.8"})
+
     def test_acquire_from_conf_text_tracks_source_temp_file(self) -> None:
         pool = self._pool()
         fake_proxy = wg.WireGuardProxy(
@@ -308,6 +482,7 @@ class SpawnWireproxyTests(unittest.TestCase):
     def test_spawn_success_returns_ready_proxy(self) -> None:
         conf = _write_conf(self.dir, "us1.conf")
         proc = mock.MagicMock()
+        proc.poll.return_value = None
         with mock.patch.object(wg.subprocess, "Popen", return_value=proc), \
              mock.patch.object(wg, "_wait_for_port"), \
              mock.patch.object(wg, "_build_wireproxy_config", return_value="/tmp/t.conf"):
@@ -352,6 +527,23 @@ class SpawnWireproxyTests(unittest.TestCase):
                 )
         proc.terminate.assert_called_once()
         unlink.assert_called_once_with("/tmp/t.conf")
+    def test_spawn_detects_child_exit_after_listener_ready(self) -> None:
+        conf = _write_conf(self.dir, "us1.conf")
+        proc = mock.MagicMock()
+        proc.poll.return_value = 1
+        proc.returncode = 1
+        with mock.patch.object(wg.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(wg, "_wait_for_port"), \
+             mock.patch.object(wg, "_build_wireproxy_config", return_value="/tmp/t.conf"), \
+             mock.patch.object(wg.os, "unlink"):
+            with self.assertRaisesRegex(wg.WireGuardProxyError, "已退出"):
+                wg._spawn_wireproxy(
+                    conf_path=str(conf),
+                    port=25000,
+                    wireproxy_exe="wireproxy.exe",
+                    connect_timeout=1.0,
+                )
+        proc.terminate.assert_called_once()
 
 
 class TerminateProcessTests(unittest.TestCase):
@@ -384,6 +576,12 @@ class ProxyForRegistrationTests(unittest.TestCase):
         with self._enabled_patch(False):
             with wg.proxy_for_registration() as proxy_url:
                 self.assertIsNone(proxy_url)
+
+    def test_disabled_setting_overrides_configured_access_token(self) -> None:
+        with mock.patch.object(wg, "_cfg_attr", return_value=False), mock.patch(
+            "config.nordvpn_account.NORDVPN_ACCESS_TOKEN", "configured-token"
+        ):
+            self.assertFalse(wg.is_per_profile_proxy_enabled())
 
     def test_enabled_yields_url_and_releases(self) -> None:
         pool = mock.MagicMock()
@@ -477,7 +675,63 @@ class ProxyForRegistrationTests(unittest.TestCase):
         pool.acquire_from_conf_text.assert_called_once_with(
             account_client.build_config.return_value.text,
             source_label="jp749.nordvpn.com",
+            server_country=None,
+            server_load=None,
         )
+        pool.release.assert_called_once_with(proxy)
+
+    def test_forwards_explicit_owner_to_lease_acquisition(self) -> None:
+        pool = mock.MagicMock()
+        proxy = wg.WireGuardProxy(
+            port=25000,
+            process=mock.MagicMock(),
+            conf_path="dynamic.conf",
+            temp_conf="/tmp/x.conf",
+            proxy_url="socks5://127.0.0.1:25000",
+        )
+        pool.acquire_from_conf_text.return_value = proxy
+        account_client = mock.MagicMock(configured=True)
+        account_client.build_config.return_value = mock.Mock(
+            text="[Interface]\nPrivateKey = a\n[Peer]\nPublicKey = b\n",
+            server=mock.Mock(hostname="jp1.nordvpn.com"),
+        )
+
+        with self._enabled_patch(True), \
+             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):
+            with wg.proxy_for_registration(pool=pool, owner_id="registration-job:42"):
+                pass
+
+        self.assertEqual(
+            pool.acquire_from_conf_text.call_args.kwargs["owner_id"],
+            "registration-job:42",
+        )
+    def test_retries_duplicate_egress_with_another_dynamic_server(self) -> None:
+        pool = mock.MagicMock()
+        proxy = wg.WireGuardProxy(
+            port=25001,
+            process=mock.MagicMock(),
+            conf_path="dynamic.conf",
+            temp_conf="/tmp/x.conf",
+            proxy_url="socks5://127.0.0.1:25001",
+            tunnel_egress_ip="1.1.1.1",
+        )
+        pool.acquire_from_conf_text.side_effect = [
+            wg.WireGuardProxyError("出口 IP 重复"),
+            proxy,
+        ]
+        account_client = mock.MagicMock(configured=True)
+        account_client.build_config.side_effect = [
+            mock.Mock(text="[Interface]\nPrivateKey = a\n[Peer]\nPublicKey = b\n", server=mock.Mock(hostname="jp1")),
+            mock.Mock(text="[Interface]\nPrivateKey = c\n[Peer]\nPublicKey = d\n", server=mock.Mock(hostname="jp2")),
+        ]
+
+        with self._enabled_patch(True), \
+             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):
+            with wg.proxy_for_registration(pool=pool) as proxy_url:
+                self.assertEqual(proxy_url, proxy.proxy_url)
+
+        self.assertEqual(account_client.build_config.call_count, 2)
+        self.assertEqual(pool.acquire_from_conf_text.call_count, 2)
         pool.release.assert_called_once_with(proxy)
 
 
@@ -524,6 +778,21 @@ class GetPoolTests(unittest.TestCase):
             second = wg.get_pool()
         self.assertIsNot(first, second)
         self.assertEqual(second._port_end, 26000)
+
+    def test_reuses_token_mode_pool_when_configs_dir_is_blank(self) -> None:
+        def _cfg(name, default):
+            return {
+                "NORDVPN_WG_CONFIGS_DIR": "",
+                "NORDVPN_WG_WIREPROXY_EXE": "wireproxy.exe",
+                "NORDVPN_WG_PORT_START": 25000,
+                "NORDVPN_WG_PORT_END": 25099,
+                "NORDVPN_WG_CONNECT_TIMEOUT": 10.0,
+            }.get(name, default)
+
+        with mock.patch.object(wg, "_cfg_attr", side_effect=_cfg):
+            first = wg.get_pool()
+            second = wg.get_pool()
+        self.assertIs(first, second)
 
     def test_reuses_pool_when_config_unchanged(self) -> None:
         def _cfg(name, default):

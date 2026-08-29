@@ -39,8 +39,11 @@ SECRET_ENV_KEYS: dict[str, str] = {
     "CPA_MANAGEMENT_KEY": "CPA 管理接口密钥",
     "EXTRACT_LINK_CDK": "提链服务 CDK",
     "SUB2API_API_KEY": "sub2api 管理接口 API Key",
+    "SUB2API_AUTOMATION_CALLBACK_SECRET": "sub2api 自动化回调 Secret",
     "SUB2API_API_TOKEN": "sub2api 管理接口鉴权 Token（旧配置名，兼容）",
     "SMS_API_KEY": "接码平台 API Key（如 GrizzlySMS）",
+    "HERO_SMS_API_KEY": "HeroSMS API Key",
+    "VIOTP_API_TOKEN": "ViOTP API Token",
     "L_ADMIN_AUTH_CODE": "本地 L 接码服务 ADMIN_AUTH_CODE",
     "H_ADMIN_AUTH_CODE": "本地 H 接码服务 ADMIN_AUTH_CODE",
 }

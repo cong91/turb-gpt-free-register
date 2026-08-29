@@ -80,7 +80,7 @@ class ReservedTestAliasTests(unittest.TestCase):
             with self.subTest(base=base):
                 with self.assertRaises(ReservedTestAliasError):
                     generate_reserved_test_aliases(base, ["mail.test"], limit=6)
-        for limit in (0, 201, "invalid"):
+        for limit in (0, 1001, "invalid"):
             with self.subTest(limit=limit):
                 with self.assertRaises(ReservedTestAliasError):
                     generate_reserved_test_aliases("abcdef", ["mail.test"], limit=limit)

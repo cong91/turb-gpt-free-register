@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 import requests
 
+from core.app_state_db import APP_STATE_DB_PATH, PROJECT_ROOT
 from core.gmail_aliases import (
     GmailAliasError,
     build_gmail_alias_plan,
@@ -113,9 +114,7 @@ def _otp_store():
 
         from core.otp_identity_store import OtpIdentityStore
 
-        _OTP_STORE = OtpIdentityStore(
-            Path(__file__).resolve().parent.parent / "otp_identity.sqlite3"
-        )
+        _OTP_STORE = OtpIdentityStore(APP_STATE_DB_PATH)
     return _OTP_STORE
 
 
@@ -135,7 +134,7 @@ def poll_verification_code(
     account: Gmail123452026Account,
     *,
     max_wait: int,
-    poll_interval: int = 3,
+    poll_interval: int = 2,
     session=None,
     api_base: str = DEFAULT_API_BASE,
     timeout: int = 30,
@@ -227,13 +226,9 @@ def _config_values() -> tuple[str, int, int, bool]:
 def _ledger():
     global _LEDGER
     if _LEDGER is None:
-        from pathlib import Path
-
         from core.gmail_cdk_ledger import GmailCdkLedger
 
-        _LEDGER = GmailCdkLedger(
-            Path(__file__).resolve().parent.parent / "gmail_cdk_ledger.json"
-        )
+        _LEDGER = GmailCdkLedger(APP_STATE_DB_PATH)
         from core import db
 
         def account_exists(email: str) -> bool:
@@ -260,7 +255,7 @@ def _inventory_store(store_path=None):
         path = (
             Path(store_path)
             if store_path
-            else Path(__file__).resolve().parent.parent / "cdk_inventory.sqlite3"
+            else APP_STATE_DB_PATH
         )
         _INVENTORY_STORE = CdkInventoryStore(path)
     return _INVENTORY_STORE
@@ -274,7 +269,7 @@ def _batch_store():
         from core.gmail_cdk_batch_store import GmailCdkBatchStore
 
         _BATCH_STORE = GmailCdkBatchStore(
-            Path(__file__).resolve().parent.parent / "gmail_cdk_batches.sqlite3"
+            APP_STATE_DB_PATH
         )
     return _BATCH_STORE
 

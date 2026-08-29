@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from core import codex_retry_service, db
+from core.openai_auth import account_unusable_message
 from core.registration_maintenance_barrier import RegistrationMaintenanceBarrier
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,7 @@ _JOB_EMAIL_INPUTS_LOCK = threading.Lock()
 _MAINTENANCE_BARRIER = RegistrationMaintenanceBarrier()
 _rotation_pending = False
 _ROTATION_LOCK = threading.Lock()
+_SUPPORTED_BROWSER_TWOFA_DRIVERS = frozenset({"roxy", "cloak", "browser_use", "skyvern"})
 
 
 class StopRequested(RuntimeError):
@@ -57,6 +59,9 @@ def _set_job_email_inputs(
     email_source: str | None = None,
     paymesh_inventory_id: str | None = None,
     paymesh_routed_domains: list[str] | None = None,
+    gmail_api_url_batch_id: str | None = None,
+    qan8_gmail_api_batch_id: str | None = None,
+    qan8_gmail_api_lane_id: int | None = None,
 ) -> None:
     with _JOB_EMAIL_INPUTS_LOCK:
         _JOB_EMAIL_INPUTS[int(job_id)] = {
@@ -64,6 +69,11 @@ def _set_job_email_inputs(
             "gmail_cdks": list(gmail_cdks or []),
             "gmail_routed_domains": list(gmail_routed_domains or []),
             "gmail_batch_id": str(gmail_batch_id or "").strip() or None,
+            "gmail_api_url_batch_id": str(gmail_api_url_batch_id or "").strip() or None,
+            "qan8_gmail_api_batch_id": str(qan8_gmail_api_batch_id or "").strip() or None,
+            "qan8_gmail_api_lane_id": (
+                int(qan8_gmail_api_lane_id) if qan8_gmail_api_lane_id is not None else None
+            ),
             "paymesh_cdks": list(paymesh_cdks or []),
             "paymesh_inventory_id": str(paymesh_inventory_id or "").strip() or None,
             "paymesh_routed_domains": list(paymesh_routed_domains or []),
@@ -76,6 +86,7 @@ def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
         "gmail_cdks": [],
         "gmail_routed_domains": [],
         "gmail_batch_id": None,
+        "gmail_api_url_batch_id": None,
         "paymesh_cdks": [],
         "paymesh_routed_domains": [],
     }
@@ -89,9 +100,13 @@ def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
                 "gmail_cdks": list(context.get("gmail_cdks") or []),
                 "gmail_routed_domains": list(context.get("gmail_routed_domains") or []),
                 "gmail_batch_id": context.get("gmail_batch_id"),
+                "gmail_api_url_batch_id": context.get("gmail_api_url_batch_id"),
                 "paymesh_cdks": list(context.get("paymesh_cdks") or []),
                 "paymesh_routed_domains": list(context.get("paymesh_routed_domains") or []),
             }
+            if context.get("qan8_gmail_api_batch_id"):
+                result["qan8_gmail_api_batch_id"] = context["qan8_gmail_api_batch_id"]
+                result["qan8_gmail_api_lane_id"] = context.get("qan8_gmail_api_lane_id")
             if context.get("paymesh_inventory_id"):
                 result["paymesh_inventory_id"] = context["paymesh_inventory_id"]
             return result
@@ -104,9 +119,14 @@ def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
         "gmail_cdks": [],
         "gmail_routed_domains": list(persisted.get("gmail_routed_domains") or []),
         "gmail_batch_id": str(persisted.get("gmail_batch_id") or "").strip() or None,
+        "gmail_api_url_batch_id": str(persisted.get("gmail_api_url_batch_id") or "").strip() or None,
         "paymesh_cdks": [],
         "paymesh_routed_domains": list(persisted.get("paymesh_routed_domains") or []),
     }
+    qan8_batch_id = str(persisted.get("qan8_gmail_api_batch_id") or "").strip()
+    if qan8_batch_id:
+        result["qan8_gmail_api_batch_id"] = qan8_batch_id
+        result["qan8_gmail_api_lane_id"] = persisted.get("qan8_gmail_api_lane_id")
     paymesh_inventory_id = str(persisted.get("paymesh_inventory_id") or "").strip()
     if paymesh_inventory_id:
         result["paymesh_inventory_id"] = paymesh_inventory_id
@@ -195,6 +215,12 @@ def _deactivate_job(job_id: int) -> None:
             _ROTATION_LOCK.release()
 
 
+def is_job_active(job_id: int) -> bool:
+    """Return whether this process still owns a live registration worker."""
+    with _STOP_LOCK:
+        return int(job_id) in _ACTIVE_JOBS
+
+
 def is_stop_requested(job_id: int | None = None) -> bool:
     if job_id is None:
         job_id = getattr(_THREAD_CTX, "job_id", None)
@@ -275,6 +301,13 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
                     acquire_kwargs["gmail_cdks"] = email_inputs["gmail_cdks"]
                 if email_inputs["gmail_routed_domains"]:
                     acquire_kwargs["gmail_routed_domains"] = email_inputs["gmail_routed_domains"]
+            elif source == "gmail_api_url":
+                # Multi-alias batch: mọi alias share code_url của email gốc.
+                if email_inputs.get("gmail_api_url_batch_id"):
+                    acquire_kwargs["gmail_api_url_batch_id"] = email_inputs["gmail_api_url_batch_id"]
+            elif source == "qan8_gmail_api":
+                acquire_kwargs["qan8_gmail_api_batch_id"] = email_inputs["qan8_gmail_api_batch_id"]
+                acquire_kwargs["qan8_gmail_api_lane_id"] = email_inputs["qan8_gmail_api_lane_id"]
             elif source == "paymesh":
                 if email_inputs.get("paymesh_inventory_id"):
                     acquire_kwargs["paymesh_inventory_id"] = email_inputs["paymesh_inventory_id"]
@@ -317,6 +350,36 @@ def _release_unconsumed_job_email(email: str | None, reason: str) -> None:
         logger.exception("[Service] 回收未消耗邮箱失败: %s", email)
 
 
+def _consume_recoverable_twofa_assignment(email: str | None, reason: str) -> bool:
+    """消费已创建账号的邮箱 alias，同时释放其 provider lane。"""
+    if not email:
+        return False
+    try:
+        from core.email_provider import mark_email_consumed, resolve_email_source
+
+        source = resolve_email_source(email)
+        if source not in {"qan8_gmail_api", "gmail_api_url"}:
+            return False
+        changed = bool(mark_email_consumed(email))
+        if changed:
+            logger.info(
+                "[Service] 已消费 2FA 可恢复账号的邮箱 assignment: source=%s email=%s reason=%s",
+                source,
+                email,
+                reason[:180],
+            )
+        else:
+            logger.warning(
+                "[Service] 消费 2FA 可恢复账号邮箱 assignment 未发生状态变化: source=%s email=%s",
+                source,
+                email,
+            )
+        return changed
+    except Exception:
+        logger.exception("[Service] 消费 2FA 可恢复账号邮箱 assignment 失败: %s", email)
+        return False
+
+
 
 
 def _is_final_session_access_token_timeout(error: object) -> bool:
@@ -339,8 +402,23 @@ def _should_disable_failed_registration_email(error: object) -> bool:
     text = str(error or "")
     if not text:
         return False
+    unsupported_email = "about-you 提交失败" in text and any(marker in text.lower() for marker in (
+        "this email is not supported",
+        "email is not supported",
+        "email address is not supported",
+        "email domain is not supported",
+        "unsupported email",
+        "email not supported",
+        "email is unsupported",
+        "email isn't supported",
+    ))
     return (
-        _is_final_session_access_token_timeout(text)
+        unsupported_email
+        or "AccountUnusableError" in text
+        or "account_deactivated" in text
+        or "account_deleted" in text
+        or "account_banned" in text
+        or _is_final_session_access_token_timeout(text)
         or "邮箱提交后进入登录密码页" in text
         or "auth.openai.com/log-in/password" in text
         or "/log-in/password" in text
@@ -400,6 +478,13 @@ def effective_registration_workers(max_workers: int | None) -> int:
             )
         return 1
     return requested
+
+
+def qan8_batch_status(batch_id: str) -> dict:
+    """Return non-secret operational counters for a QAN8 registration batch."""
+    from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
+
+    return Qan8GmailApiAllocator().status(str(batch_id or "").strip())
 
 
 def get_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
@@ -526,11 +611,18 @@ class _JobLogContext:
         # 仅给本线程过滤 —— 用 thread name 做区分，避免污染其他任务的日志
         thread_name = threading.current_thread().name
         self.handler.addFilter(lambda r: r.threadName == thread_name)
-        logging.getLogger().addHandler(self.handler)
+
+        # Ensure root logger is configured and at INFO level
+        root_logger = logging.getLogger()
+        if root_logger.level == logging.NOTSET or root_logger.level > logging.INFO:
+            root_logger.setLevel(logging.INFO)
+
+        root_logger.addHandler(self.handler)
         return self
 
     def __exit__(self, exc_type, exc, tb):
         if self.handler is not None:
+            self.handler.flush()
             self.handler.close()
             logging.getLogger().removeHandler(self.handler)
 
@@ -579,6 +671,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
     log_logger = logging.getLogger(__name__)
     if not _activate_job(job_id):
         log_logger.info(f"[Job {job_id}] 被维护屏障阻止，跳过执行")
+        _notify_sub2api_automation_job(job_id)
         return
 
 
@@ -588,10 +681,12 @@ def _run_one_job(job_id: int, log_file: str) -> None:
     if not current:
         log_logger.info(f"[Job {job_id}] 任务记录已删除，跳过执行")
         _deactivate_job(job_id)
+        _notify_sub2api_automation_job(job_id)
         return
     if current.get("status") == "cancelled":
         log_logger.info(f"[Job {job_id}] 已被用户取消，跳过执行")
         _deactivate_job(job_id)
+        _notify_sub2api_automation_job(job_id)
         return
 
     db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
@@ -605,6 +700,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             )
         finally:
             _deactivate_job(job_id)
+            _notify_sub2api_automation_job(job_id)
         return
 
     email: str | None = None
@@ -615,23 +711,52 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             email, name, birthday = _prepare_registration_args(job_id=job_id)
             db.update_job(job_id, email=email)
             check_stop_requested()
-            result = run_registration(email=email, name=name, birthday=birthday)
+            provider_context = current.get("provider_context") or {}
+            proxy_lane_id = provider_context.get("proxy_lane_id")
+            result = run_registration(
+                email=email,
+                name=name,
+                birthday=birthday,
+                proxy_lane_id=proxy_lane_id,
+                lease_owner_id=f"registration-job:{job_id}",
+            )
             if is_stop_requested(job_id):
-                _release_unconsumed_job_email(email, "用户手动停止")
+                result_dict = result if isinstance(result, dict) else {}
+                recoverable_twofa = bool(
+                    result_dict.get("account_id")
+                    and str(result_dict.get("twofa_status") or "").lower() in {"pending", "failed"}
+                )
+                if recoverable_twofa:
+                    _consume_recoverable_twofa_assignment(
+                        email,
+                        str(result_dict.get("error") or "用户手动停止"),
+                    )
+                else:
+                    _release_unconsumed_job_email(email, "用户手动停止")
                 db.update_job(
                     job_id,
                     status="stopped",
+                    email=result_dict.get("email") or email,
+                    account_id=result_dict.get("account_id") if recoverable_twofa else None,
                     error="用户手动停止",
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 log_logger.warning(f"[Job {job_id}] 已按用户请求停止")
                 return
             if isinstance(result, dict) and result.get("success"):
+                try:
+                    from core.email_provider import mark_email_consumed, resolve_email_source
+
+                    if resolve_email_source(email or "") == "qan8_gmail_api":
+                        mark_email_consumed(email or "")
+                except Exception:
+                    logger.exception("[Job %s] consume QAN8 alias after success failed", job_id)
                 db.update_job(
                     job_id,
                     status="success",
                     email=result.get("email"),
                     account_id=result.get("account_id"),
+                    network_identity=result.get("network_identity"),
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
@@ -659,35 +784,66 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     status="failed",
                     email=result_email,
                     account_id=(result or {}).get("account_id") if isinstance(result, dict) else None,
+                    network_identity=(result or {}).get("network_identity") if isinstance(result, dict) else None,
                     error=str(err)[:500],
                     completed_at=datetime.now().isoformat(timespec="seconds"),
                 )
                 email_to_handle = str(result_email or email or "").strip()
-                if _should_disable_failed_registration_email(err):
+                recoverable_twofa = bool(
+                    (result or {}).get("account_id")
+                    and str((result or {}).get("twofa_status") or "").lower() in {"pending", "failed"}
+                ) if isinstance(result, dict) else False
+                if not recoverable_twofa and _should_disable_failed_registration_email(err):
                     _disable_job_email(email_to_handle, str(err))
-                else:
+                elif not recoverable_twofa:
                     _release_unconsumed_job_email(email_to_handle, str(err))
+                elif email_to_handle:
+                    _consume_recoverable_twofa_assignment(email_to_handle, str(err))
+                    log_logger.info(
+                        "[Job %s] 账号已持久化为 2FA 可恢复状态，已消费本次 alias 并释放 lane: account_id=%s",
+                        job_id,
+                        (result or {}).get("account_id"),
+                    )
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
     except StopRequested as exc:
-        _release_unconsumed_job_email(email, str(exc))
+        linked_account = _account_for_job(db.get_job(job_id) or {})
+        recoverable_twofa = bool(
+            linked_account
+            and str(linked_account.get("twofa_status") or "").lower() in {"pending", "failed"}
+        )
+        if not recoverable_twofa:
+            _release_unconsumed_job_email(email, str(exc))
+        elif email:
+            _consume_recoverable_twofa_assignment(email, str(exc))
         log_logger.warning(f"[Job {job_id}] 已停止: {exc}")
         db.update_job(
             job_id,
             status="stopped",
+            email=email,
+            account_id=(linked_account or {}).get("id") if recoverable_twofa else None,
             error="用户手动停止",
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
     except Exception as exc:
         err_text = f"{type(exc).__name__}: {exc}"
-        if _should_disable_failed_registration_email(err_text):
+        linked_account = _account_for_job(db.get_job(job_id) or {})
+        recoverable_twofa = bool(
+            linked_account
+            and str(linked_account.get("twofa_status") or "").lower() in {"pending", "failed"}
+        )
+        if not recoverable_twofa and _should_disable_failed_registration_email(err_text):
             _disable_job_email(email, err_text)
-        else:
+        elif not recoverable_twofa:
             _release_unconsumed_job_email(email, err_text)
+        elif email:
+            _consume_recoverable_twofa_assignment(email, err_text)
         if is_stop_requested(job_id):
             log_logger.warning(f"[Job {job_id}] 停止中捕获异常，按停止处理: {type(exc).__name__}: {exc}")
             db.update_job(
                 job_id,
                 status="stopped",
+                email=email,
+                account_id=(linked_account or {}).get("id") if recoverable_twofa else None,
                 error="用户手动停止",
                 completed_at=datetime.now().isoformat(timespec="seconds"),
             )
@@ -696,30 +852,159 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         db.update_job(
             job_id,
             status="failed",
+            email=email,
+            account_id=(linked_account or {}).get("id") if recoverable_twofa else None,
             error=f"{type(exc).__name__}: {exc}"[:500],
             completed_at=datetime.now().isoformat(timespec="seconds"),
         )
     finally:
         _deactivate_job(job_id)
+        _notify_sub2api_automation_job(job_id)
 
 
-def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int) -> None:
+def _notify_sub2api_automation_job(job_id: int) -> None:
+    """Notify sub2api after an automation-owned job reaches a terminal state."""
+    try:
+        from core.sub2api_automation import notify_job_completion
+
+        notify_job_completion(job_id)
+    except Exception:
+        logger.exception("[Job %s] sub2api automation callback failed", job_id)
+
+
+def _run_twofa_retry_job(
+    job_id: int,
+    log_file: str,
+    email: str,
+    account_id: int,
+    proxy_lane_id: int | None = None,
+) -> None:
+    """重新登录已有账号并补做 2FA，不进入完整注册流程。"""
+    if not _activate_job(job_id):
+        return
+    current = db.get_job(job_id)
+    if not current or current.get("status") == "cancelled":
+        _deactivate_job(job_id)
+        return
+    db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+    try:
+        account = db.get_account(account_id)
+        if not account:
+            raise RuntimeError("目标账号不存在，无法补做 2FA")
+        with _JobLogContext(log_file):
+            result = _run_configured_twofa_retry(account, proxy_lane_id=proxy_lane_id)
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        if is_stop_requested(job_id):
+            db.update_job(
+                job_id,
+                status="stopped",
+                email=email,
+                account_id=account_id,
+                error="用户手动停止",
+                completed_at=now_iso,
+            )
+        elif result.get("ok"):
+            db.update_job(
+                job_id,
+                status="success",
+                email=email,
+                account_id=account_id,
+                completed_at=now_iso,
+            )
+        else:
+            db.update_job(
+                job_id,
+                status="failed",
+                email=email,
+                account_id=account_id,
+                error=str(result.get("message") or "2FA 补做失败")[:500],
+                completed_at=now_iso,
+            )
+    except Exception as exc:
+        db.update_job(
+            job_id,
+            status="failed",
+            email=email,
+            account_id=account_id,
+            error=f"{type(exc).__name__}: {exc}"[:500],
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+        )
+        logger.exception("[Job %s] 2FA 补做异常", job_id)
+    finally:
+        _deactivate_job(job_id)
+
+
+def _run_codex_retry_job(
+    job_id: int,
+    log_file: str,
+    email: str,
+    account_id: int,
+    proxy_lane_id: int | None = None,
+) -> None:
     """把 Codex 补跑作为标准任务执行，并复用任务状态、日志和停止入口。"""
     if not _activate_job(job_id):
         codex_retry_service.release(email)
+        _notify_sub2api_automation_job(job_id)
         return
     current = db.get_job(job_id)
     if not current or current.get("status") == "cancelled":
         codex_retry_service.release(email)
         _deactivate_job(job_id)
+        _notify_sub2api_automation_job(job_id)
         return
+
+    provider_context = current.get("provider_context") or {}
+    trigger = str(provider_context.get("trigger") or "").strip()
+    if trigger == "registration_auto_free":
+        from core.registration_auto_codex import (
+            account_registration_driver,
+            registration_driver_uses_live_browser,
+        )
+
+        account = db.get_account(account_id) or {}
+        registration_driver = str(
+            provider_context.get("registration_driver")
+            or account_registration_driver(account)
+        ).strip().lower()
+        if registration_driver_uses_live_browser(registration_driver):
+            reason = (
+                f"旧的 registration_auto_free Codex 任务来自 {registration_driver} 注册，"
+                "没有注册 browser 可复用，已跳过，禁止另起浏览器；"
+                "新注册必须由 registration worker 同步执行"
+            )
+            db.update_account_codex_status(email, "skipped", reason)
+            db.update_job(
+                job_id,
+                status="cancelled",
+                email=email,
+                account_id=account_id,
+                error=reason,
+                completed_at=datetime.now().isoformat(timespec="seconds"),
+            )
+            logger.warning("[Job %s] %s: %s", job_id, reason, email)
+            codex_retry_service.release(email)
+            _deactivate_job(job_id)
+            _notify_sub2api_automation_job(job_id)
+            return
 
     db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
     try:
+        sub2_callback_context = None
+        if provider_context.get("sub2api_automation_kind") == "reauthorization":
+            sub2_callback_context = {
+                "path": provider_context.get("sub2api_callback_path"),
+                "request_id": provider_context.get("sub2api_automation_request_id"),
+                "event_id": provider_context.get("sub2api_callback_event_id"),
+                "account_id": provider_context.get("sub2api_account_id"),
+                "email": provider_context.get("sub2api_automation_email"),
+            }
         result = codex_retry_service.run_worker(
             email,
             clear_log=False,
             target_log_path=log_file,
+            proxy_lane_id=proxy_lane_id,
+            lease_owner_id=f"codex-retry-job:{job_id}",
+            sub2_callback_context=sub2_callback_context,
         )
         now_iso = datetime.now().isoformat(timespec="seconds")
         if is_stop_requested(job_id) or result.get("status") == "stopped":
@@ -752,6 +1037,102 @@ def _run_codex_retry_job(job_id: int, log_file: str, email: str, account_id: int
         logger.exception("[Job %s] Codex 补跑异常", job_id)
     finally:
         _deactivate_job(job_id)
+        _notify_sub2api_automation_job(job_id)
+
+
+def submit_codex_retry_for_account(
+    *,
+    account_id: int,
+    email: str,
+    access_token: str,
+    trigger: str = "manual",
+    workers: int | None = None,
+    registration_driver: str | None = None,
+    automation_context: dict | None = None,
+) -> dict:
+    """Create and queue a standalone Codex retry for an existing account."""
+    account_id = int(account_id)
+    email = str(email or "").strip()
+    if not email or not str(access_token or "").strip():
+        return {"accepted": False, "busy": False, "error": "账号缺少 email 或 access_token"}
+    account = db.get_account(account_id) or {}
+    current_status = str(account.get("codex_status") or "").strip().lower()
+    automation_reauthorization = (
+        isinstance(automation_context, dict)
+        and automation_context.get("sub2api_automation_kind") == "reauthorization"
+    )
+    if current_status == "success" and not automation_reauthorization:
+        return {"accepted": False, "busy": False, "reason": "already_success"}
+    if current_status == "deactivated" and not automation_reauthorization:
+        return {"accepted": False, "busy": False, "reason": "deactivated"}
+    if not codex_retry_service.reserve(email):
+        return {"accepted": False, "busy": True, "error": "该账号正在补跑 Codex，请稍候"}
+
+    provider_context = {
+        "trigger": str(trigger or "manual"),
+        **(
+            {"registration_driver": str(registration_driver).strip().lower()}
+            if str(registration_driver or "").strip()
+            else {}
+        ),
+    }
+    if isinstance(automation_context, dict):
+        for key in (
+            "sub2api_automation_request_id",
+            "sub2api_automation_kind",
+            "sub2api_callback_url",
+            "sub2api_callback_path",
+            "sub2api_callback_event_id",
+            "sub2api_account_id",
+            "sub2api_automation_email",
+        ):
+            value = str(automation_context.get(key) or "").strip()
+            if value:
+                provider_context[key] = value
+
+    job = None
+    try:
+        job = db.create_job(
+            email_source=str(account.get("email_source") or "unknown"),
+            job_type="codex_retry",
+            email=email,
+            account_id=account_id,
+            provider_context=provider_context,
+        )
+        db.update_account_codex_status(email, "retrying", None)
+        effective_workers = workers if workers is not None else get_executor_workers()
+        proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers))
+        with _executor_lock:
+            executor = get_executor(max_workers=effective_workers)
+            executor.submit(
+                _run_codex_retry_job,
+                job["id"],
+                job["log_file"],
+                email,
+                account_id,
+                proxy_lane_id,
+            )
+    except Exception as exc:
+        codex_retry_service.release(email)
+        if job is not None:
+            db.update_job(
+                int(job["id"]),
+                status="failed",
+                error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
+                completed_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        db.update_account_codex_status(email, "failed", f"队列提交失败：{type(exc).__name__}: {exc}"[:500])
+        logger.exception("[Service] 自动 Codex 补跑任务提交失败: %s", email)
+        return {"accepted": False, "busy": False, "error": f"队列提交失败：{type(exc).__name__}: {exc}"[:500]}
+
+    return {
+        "accepted": True,
+        "busy": False,
+        "job_id": int(job["id"]),
+        "account_id": account_id,
+        "email": email,
+        "trigger": str(trigger or "manual"),
+    }
 
 
 # ============================================================
@@ -767,6 +1148,9 @@ def submit_registration(
     gmail_routed_domains: list[str] | None = None,
     gmail_batch_id: str | None = None,
     paymesh_routed_domains: list[str] | None = None,
+    gmail_api_url_aliases_per_email: int | None = None,
+    qan8_aliases_per_source: int | None = None,
+    automation_context: dict | None = None,
 ) -> list[dict]:
     """
     创建 N 个注册任务并提交到线程池。
@@ -786,6 +1170,22 @@ def submit_registration(
             gmail_cdks,
             routed_domains=gmail_routed_domains or [],
         )
+
+    # Gmail API URL multi-alias batch: 1 email gốc → nhiều alias share code_url.
+    # Chỉ kích hoạt khi có nhiều alias mỗi email (aliases_per_email > 1);
+    # nếu = 1 thì mỗi job claim 1 email gốc như luồng thường (không cần batch).
+    gmail_api_url_batch_id: str | None = None
+    aliases_per_email = int(gmail_api_url_aliases_per_email or 1)
+    if email_source == "gmail_api_url" and aliases_per_email > 1:
+        from core.gmail_api_url_client import create_registration_batch as create_gmail_api_url_batch
+
+        gmail_api_url_batch_id = create_gmail_api_url_batch(
+            count, aliases_per_email=aliases_per_email
+        )
+        logger.info(
+            "Đã tạo Gmail API URL batch %s: %d alias, mỗi email ≤%d",
+            gmail_api_url_batch_id, count, aliases_per_email,
+        )
     paymesh_assignments: list[str] = []
     if paymesh_cdks:
         from config import email as _email_cfg
@@ -804,8 +1204,25 @@ def submit_registration(
             "gmail_batch_id": gmail_batch_id,
             "gmail_routed_domains": list(gmail_routed_domains or []),
         }
+    if gmail_api_url_batch_id:
+        provider_context["gmail_api_url_batch_id"] = gmail_api_url_batch_id
     if paymesh_routed_domains:
         provider_context["paymesh_routed_domains"] = list(paymesh_routed_domains)
+    if isinstance(automation_context, dict):
+        for key in (
+            "sub2api_automation_request_id",
+            "sub2api_automation_kind",
+            "sub2api_callback_url",
+        ):
+            value = str(automation_context.get(key) or "").strip()
+            if value:
+                provider_context[key] = value
+    if provider_context.get("sub2api_automation_kind") == "registration":
+        provider_context["sub2api_automation_requested_count"] = int(count)
+    from config import proxy as _proxy_cfg
+    rotating_proxy_enabled = bool(
+        getattr(_proxy_cfg, "ROTATING_PROXY_ENABLED", False)
+    )
 
     effective_workers = effective_registration_workers(workers)
     # 创建/切换线程池和提交本批任务必须整体串行化：否则另一请求在本批提交中途
@@ -813,9 +1230,35 @@ def submit_registration(
     with _executor_lock:
         executor = get_executor(max_workers=effective_workers)
         effective_workers = get_executor_workers()
+        qan8_batch_id: str | None = None
+        from config import email as _email_cfg
+        qan8_aliases = int(
+            qan8_aliases_per_source
+            if qan8_aliases_per_source is not None
+            else getattr(_email_cfg, "QAN8_ALIASES_PER_SOURCE", 12)
+        )
+        if email_source == "qan8_gmail_api":
+            if not 1 <= qan8_aliases <= 12:
+                raise ValueError("qan8_aliases_per_source must be between 1 and 12")
+            from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
+
+            qan8_batch = Qan8GmailApiAllocator().create_batch(
+                count,
+                requested_workers=effective_workers,
+                aliases_per_source=qan8_aliases,
+            )
+            qan8_batch_id = str(qan8_batch["batch_id"])
+            provider_context["qan8_gmail_api_batch_id"] = qan8_batch_id
+            provider_context["qan8_aliases_per_source"] = qan8_aliases
         jobs = []
         for index in range(count):
             job_provider_context = dict(provider_context)
+            if rotating_proxy_enabled:
+                job_provider_context["proxy_lane_id"] = index % effective_workers
+            qan8_lane_id = None
+            if qan8_batch_id:
+                qan8_lane_id = index % effective_workers
+                job_provider_context["qan8_gmail_api_lane_id"] = qan8_lane_id
             paymesh_inventory_id = (
                 paymesh_assignments[index] if paymesh_assignments else None
             )
@@ -831,6 +1274,9 @@ def submit_registration(
                 paymesh_cdks=(None if paymesh_inventory_id else paymesh_cdks),
                 gmail_routed_domains=gmail_routed_domains,
                 gmail_batch_id=gmail_batch_id,
+                gmail_api_url_batch_id=gmail_api_url_batch_id,
+                qan8_gmail_api_batch_id=qan8_batch_id,
+                qan8_gmail_api_lane_id=qan8_lane_id,
                 email_source=requested_email_source,
                 paymesh_inventory_id=paymesh_inventory_id,
                 paymesh_routed_domains=paymesh_routed_domains,
@@ -902,6 +1348,60 @@ def _account_for_job(job: dict) -> dict | None:
     return db.get_account_by_email(email) if email else None
 
 
+def _configured_twofa_retry_driver() -> str:
+    """Return the browser/provider selected in the live WebUI settings."""
+    from config import roxybrowser as _driver_cfg
+
+    raw = str(getattr(_driver_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+    aliases = {
+        "roxybrowser": "roxy",
+        "fingerprint": "roxy",
+        "browser": "roxy",
+        "cloakbrowser": "cloak",
+        "browseruse": "browser_use",
+        "browser-use": "browser_use",
+        "bu": "browser_use",
+        "sv": "skyvern",
+        "api": "protocol",
+        "http": "protocol",
+    }
+    return aliases.get(raw, raw)
+
+
+def _run_configured_twofa_retry(
+    account: dict,
+    *,
+    proxy_lane_id: int | None = None,
+) -> dict:
+    """Run the shared reactive 2FA flow for a supported browser provider."""
+    driver = _configured_twofa_retry_driver()
+    if driver in _SUPPORTED_BROWSER_TWOFA_DRIVERS:
+        from core.browser_twofa_retry import run_twofa_retry
+
+        if proxy_lane_id is None:
+            return run_twofa_retry(account)
+        return run_twofa_retry(
+            account,
+            proxy_lane_id=proxy_lane_id,
+            lease_owner_id=f"twofa-retry-job:{account.get('id')}",
+        )
+    return {
+        "ok": False,
+        "status": "failed",
+        "message": (
+            f"当前注册驱动 {driver!r} 暂不支持账号列表 reactive 2FA；"
+            "请切换 Settings → 注册驱动 为受支持的浏览器，或使用该驱动对应的登录流程"
+        ),
+    }
+
+
+def _account_supports_twofa_retry(account: dict) -> bool:
+    """判断账号是否具备当前设置的 provider 所需的登录密码。"""
+    if not str(account.get("registration_password") or "").strip():
+        return False
+    return _configured_twofa_retry_driver() in _SUPPORTED_BROWSER_TWOFA_DRIVERS
+
+
 def get_retry_info(job: dict) -> dict:
     """返回给 API/UI 的重试能力描述，不依赖前端猜测错误阶段。"""
     status = str(job.get("status") or "")
@@ -929,9 +1429,21 @@ def get_retry_info(job: dict) -> dict:
         info["display_status"] = "success" if (account.get("codex_status") or "") == "success" else "partial_success"
 
     if account:
+        twofa_status = str(account.get("twofa_status") or "").strip().lower()
+        if twofa_status in {"pending", "failed"}:
+            if not _account_supports_twofa_retry(account):
+                info["retry_reason"] = "账号缺少当前注册驱动所需的 OpenAI 密码，或该驱动不支持 reactive 2FA，不能自动补做 2FA"
+                return info
+            info.update({
+                "retryable": True,
+                "retry_action": "2fa",
+                "retry_label": "重新登录并补做 2FA",
+                "retry_reason": account.get("twofa_error") or "账号已创建但 2FA 尚未完成",
+            })
+            return info
         codex_status = str(account.get("codex_status") or "")
         if codex_status == "deactivated":
-            info["retry_reason"] = "账号已废号，不能补跑 Codex"
+            info["retry_reason"] = f"{account_unusable_message('account_deactivated')}, không thể chạy bù Codex"
             return info
         if codex_status == "success":
             info["retry_reason"] = "账号和 Codex 授权均已完成"
@@ -951,13 +1463,34 @@ def get_retry_info(job: dict) -> dict:
     return info
 
 
-def retry_job(job_id: int, workers: int | None = None) -> dict:
+def retry_job(
+    job_id: int,
+    workers: int | None = None,
+    *,
+    allow_success_twofa: bool = False,
+) -> dict:
     """智能重试终态任务：未生成账号则重新注册，已有账号则仅补跑 Codex。"""
     source = db.get_job(job_id)
     if source is None:
         return {"ok": False, "error": "任务不存在", "status": 404}
 
     retry_info = get_retry_info(source)
+    if allow_success_twofa and source.get("status") == "success":
+        account_for_twofa = _account_for_job(source)
+        twofa_status = str((account_for_twofa or {}).get("twofa_status") or "").strip().lower()
+        if twofa_status in {"disabled", "pending", "failed"}:
+            if not account_for_twofa or not _account_supports_twofa_retry(account_for_twofa):
+                retry_info = {
+                    "retryable": False,
+                    "retry_action": "2fa",
+                    "retry_reason": "账号缺少当前注册驱动所需的 OpenAI 密码，或该驱动不支持 reactive 2FA，不能自动补做 2FA",
+                }
+            else:
+                retry_info = {
+                    "retryable": True,
+                    "retry_action": "2fa",
+                    "retry_reason": account_for_twofa.get("twofa_error") or "账号尚未完成 2FA",
+                }
     if not retry_info["retryable"]:
         reason = retry_info.get("retry_reason") or f"当前状态不支持重试：{source.get('status')}"
         return {"ok": False, "error": reason, "status": 409}
@@ -967,9 +1500,10 @@ def retry_job(job_id: int, workers: int | None = None) -> dict:
     email = str((account or {}).get("email") or source.get("email") or "").strip()
     account_id = int(account["id"]) if account and account.get("id") is not None else None
     reserved_codex = False
-    if action == "codex":
+    if action in {"codex", "2fa"}:
         if not email or account_id is None:
-            return {"ok": False, "error": "已注册账号信息不完整，无法补跑 Codex", "status": 409}
+            return {"ok": False, "error": "已注册账号信息不完整，无法执行账号恢复操作", "status": 409}
+    if action == "codex":
         if not codex_retry_service.reserve(email):
             return {"ok": False, "error": "该账号正在补跑 Codex，请稍候", "status": 409}
         reserved_codex = True
@@ -977,10 +1511,11 @@ def retry_job(job_id: int, workers: int | None = None) -> dict:
     try:
         job, created = db.create_retry_job(
             int(job_id),
-            job_type="codex_retry" if action == "codex" else "registration",
+            job_type=("codex_retry" if action == "codex" else "twofa_retry" if action == "2fa" else "registration"),
             email_source=str(source.get("email_source") or "outlook"),
-            email=email if action == "codex" else None,
-            account_id=account_id if action == "codex" else None,
+            email=email if action in {"codex", "2fa"} else None,
+            account_id=account_id if action in {"codex", "2fa"} else None,
+            allow_success_for_twofa=allow_success_twofa and action == "2fa",
         )
     except LookupError as exc:
         if reserved_codex:
@@ -1008,12 +1543,29 @@ def retry_job(job_id: int, workers: int | None = None) -> dict:
         if action == "codex":
             db.update_account_codex_status(email, "retrying", None)
         effective_workers = (
-            workers if action == "codex" else effective_registration_workers(workers)
+            workers if action in {"codex", "2fa"} else effective_registration_workers(workers)
         )
+        proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers))
         with _executor_lock:
             executor = get_executor(max_workers=effective_workers)
             if action == "codex":
-                executor.submit(_run_codex_retry_job, job["id"], job["log_file"], email, int(account_id))
+                executor.submit(
+                    _run_codex_retry_job,
+                    job["id"],
+                    job["log_file"],
+                    email,
+                    int(account_id),
+                    proxy_lane_id,
+                )
+            elif action == "2fa":
+                executor.submit(
+                    _run_twofa_retry_job,
+                    job["id"],
+                    job["log_file"],
+                    email,
+                    int(account_id),
+                    proxy_lane_id,
+                )
             else:
                 executor.submit(_run_one_job, job["id"], job["log_file"])
     except Exception as exc:
@@ -1033,11 +1585,37 @@ def retry_job(job_id: int, workers: int | None = None) -> dict:
         "ok": True,
         "created": True,
         "reused": False,
-        "message": f"已创建重试任务 #{job['id']}（{'Codex 补跑' if action == 'codex' else '完整注册'}）",
+        "message": f"已创建重试任务 #{job['id']}（{'Codex 补跑' if action == 'codex' else '重新登录并补做 2FA' if action == '2fa' else '完整注册'}）",
         "source_job_id": int(job_id),
         "retry_action": action,
         "job": job,
     }
+
+
+def retry_account_twofa(account_id: int, workers: int | None = None) -> dict:
+    """从账号列表直接触发已有账号的 2FA 补做动作。"""
+    try:
+        account = db.get_account(int(account_id))
+    except (TypeError, ValueError):
+        account = None
+    if account is None:
+        return {"ok": False, "error": "账号不存在", "status": 404}
+    status = str(account.get("twofa_status") or ("active" if account.get("totp_secret") else "disabled")).strip().lower()
+    if status == "active":
+        return {"ok": False, "error": "该账号的 2FA 已启用", "status": 409}
+    if not _account_supports_twofa_retry(account):
+        return {
+            "ok": False,
+            "error": (
+                "账号缺少当前注册驱动所需的 OpenAI 登录密码，"
+                "或当前 Settings 注册驱动不支持 reactive 2FA，不能自动补做 2FA"
+            ),
+            "status": 409,
+        }
+    source = db.get_latest_job_for_account(int(account_id)) or db.get_latest_job_for_email(account.get("email"))
+    if source is None:
+        return {"ok": False, "error": "找不到该账号对应的注册任务，无法执行 2FA 重试", "status": 409}
+    return retry_job(int(source["id"]), workers=workers, allow_success_twofa=True)
 
 
 def cancel_pending_jobs() -> int:

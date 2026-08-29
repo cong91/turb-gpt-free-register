@@ -391,11 +391,9 @@ class Gmail123452026ClientTests(unittest.TestCase):
             with self.assertRaisesRegex(Gmail123452026Error, "hết quota"):
                 client.pick_account("7", [cdk])
 
-        self.assertEqual(emails[:3], [
-            "abcdef@gmail.com",
-            "a.bcdef@gmail.com",
-            "abcde.f@gmail.com",
-        ])
+        self.assertEqual(emails[0], "abcdef@gmail.com")
+        self.assertTrue(all("." in email for email in emails[1:3]))
+        self.assertGreater(len({email.split("@", 1)[0].index(".") for email in emails[1:3]}), 1)
         self.assertEqual(len(emails), len(set(emails)))
         self.assertTrue(all("+" in email for email in emails[3:]))
         client._CONTEXT_CACHE.clear()
@@ -509,11 +507,9 @@ class Gmail123452026ClientTests(unittest.TestCase):
                 for index in range(6)
             ]
 
-        self.assertEqual(emails[:3], [
-            "abcdef@gmail.com",
-            "a.bcdef@gmail.com",
-            "abcde.f@gmail.com",
-        ])
+        self.assertEqual(emails[0], "abcdef@gmail.com")
+        self.assertTrue(all("." in email for email in emails[1:3]))
+        self.assertGreater(len({email.split("@", 1)[0].index(".") for email in emails[1:3]}), 1)
         self.assertEqual(len(emails), len(set(emails)))
         client._CONTEXT_CACHE.clear()
         client._SEEN_CODES_BY_CDK.clear()

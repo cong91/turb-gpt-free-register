@@ -87,10 +87,16 @@ class PaymeshIntegrationTests(unittest.TestCase):
             email="user@example.com",
             access_token="token",
             email_source="paymesh",
+            registration_ip="8.8.8.8",
+            extra={"network_identity": {"verified": True}},
         )
 
         self.assertEqual(row_id, 23)
         self.assertEqual(insert_account.call_args.kwargs["source_cdk"], "MAIL-EXACT")
+        self.assertEqual(insert_account.call_args.kwargs["registration_ip"], "8.8.8.8")
+        self.assertTrue(
+            insert_account.call_args.kwargs["extra"]["network_identity"]["verified"]
+        )
         mark_consumed.assert_called_once_with("user@example.com")
 
     def test_registration_form_exposes_paymesh_card_input(self):

@@ -104,6 +104,10 @@ class EmailSourceValidationTests(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("IP", err)
 
+    def test_tinyhost_has_no_card_prerequisite(self):
+        config = SimpleNamespace(TINYHOST_API_BASE="https://tinyhost.shop")
+        self.assertIsNone(validate_email_sources(["tinyhost"], config))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from core import app_state_db
+
 
 SCHEMA_VERSION = 2
 _MAX_CONFIGURED_LIMIT = 6
@@ -234,6 +236,8 @@ class CdkInventoryStore:
             connection.execute(f"PRAGMA busy_timeout = {self.busy_timeout_ms}")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA synchronous = FULL")
+            if app_state_db.is_app_state_path(self.path):
+                app_state_db.ensure_schema(connection)
             journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
             if journal_mode == "wal":
                 raise CdkInventorySchemaError(
@@ -247,7 +251,12 @@ class CdkInventoryStore:
     def initialize(self) -> None:
         connection = self._connect()
         try:
-            current = int(connection.execute("PRAGMA user_version").fetchone()[0])
+            central = app_state_db.is_app_state_path(self.path)
+            current = (
+                app_state_db.get_component_version(connection, "cdk_inventory")
+                if central
+                else int(connection.execute("PRAGMA user_version").fetchone()[0])
+            )
             if current > SCHEMA_VERSION:
                 raise CdkInventorySchemaError(
                     f"Unsupported future CDK inventory schema version: {current}"
@@ -259,7 +268,10 @@ class CdkInventoryStore:
                     "VALUES (?, CURRENT_TIMESTAMP)",
                     (SCHEMA_VERSION,),
                 )
-                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                if central:
+                    app_state_db.set_component_version(connection, "cdk_inventory", SCHEMA_VERSION)
+                else:
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             elif current == 1:
                 connection.execute("BEGIN IMMEDIATE")
                 inventory_columns = {
@@ -289,7 +301,10 @@ class CdkInventoryStore:
                     "VALUES (?, CURRENT_TIMESTAMP)",
                     (SCHEMA_VERSION,),
                 )
-                connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                if central:
+                    app_state_db.set_component_version(connection, "cdk_inventory", SCHEMA_VERSION)
+                else:
+                    connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 connection.commit()
             elif current == SCHEMA_VERSION:
                 connection.executescript(_SCHEMA_SQL)
@@ -299,7 +314,11 @@ class CdkInventoryStore:
             connection.close()
 
     def _require_initialized(self, connection: sqlite3.Connection) -> None:
-        version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        version = (
+            app_state_db.get_component_version(connection, "cdk_inventory")
+            if app_state_db.is_app_state_path(self.path)
+            else int(connection.execute("PRAGMA user_version").fetchone()[0])
+        )
         if version != SCHEMA_VERSION:
             raise CdkInventorySchemaError(f"Unsupported CDK inventory schema version: {version}")
 

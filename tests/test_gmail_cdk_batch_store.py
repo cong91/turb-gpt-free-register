@@ -21,7 +21,7 @@ class GmailCdkBatchStoreTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def test_claims_initial_workers_in_input_order_and_skips_failed_cdk(self):
+    def test_claims_initial_workers_in_input_order_and_allows_retry_after_fail(self):
         first = self.store.claim(self.batch_id, "job-1")
         second = self.store.claim(self.batch_id, "job-2")
         third = self.store.claim(self.batch_id, "job-3")
@@ -31,13 +31,16 @@ class GmailCdkBatchStoreTests(unittest.TestCase):
             ["inventory-1", "inventory-2", "inventory-3"],
         )
 
+        # fail() frees the assignment but keeps item active for retry
         self.store.fail(second.assignment_id, reason="redeem failed")
-        fourth = self.store.claim(self.batch_id, "job-4")
-        fifth = self.store.claim(self.batch_id, "job-2-retry")
 
-        self.assertEqual(fourth.inventory_id, "inventory-4")
-        self.assertEqual(fifth.inventory_id, "inventory-5")
-        self.assertNotEqual(fifth.inventory_id, second.inventory_id)
+        # Next claim reuses inventory-2 (round-robin with least usage)
+        fourth = self.store.claim(self.batch_id, "job-4")
+        self.assertEqual(fourth.inventory_id, "inventory-2")
+
+        # Next claim gets inventory-4
+        fifth = self.store.claim(self.batch_id, "job-5")
+        self.assertEqual(fifth.inventory_id, "inventory-4")
 
     def test_release_keeps_cdk_active_and_complete_exhausts_capacity(self):
         assignment = self.store.claim(self.batch_id, "job-1")
@@ -58,8 +61,9 @@ class GmailCdkBatchStoreTests(unittest.TestCase):
         reopened = GmailCdkBatchStore(self.store.path)
         next_assignment = reopened.claim(self.batch_id, "job-2")
 
-        self.assertEqual(next_assignment.inventory_id, "inventory-2")
-        self.assertEqual(reopened.get_item(self.batch_id, "inventory-1").state, "failed")
+        # After fail(), item stays active for retry, so next claim reuses inventory-1
+        self.assertEqual(next_assignment.inventory_id, "inventory-1")
+        self.assertEqual(reopened.get_item(self.batch_id, "inventory-1").state, "active")
 
 
 if __name__ == "__main__":

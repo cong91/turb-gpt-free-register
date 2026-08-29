@@ -23,6 +23,7 @@ import pyotp
 
 from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
 from core import free_plus_export
+from core.openai_auth import account_unusable_message
 from webui.auth import init_auth, register_auth_routes
 from core import registration_service as svc
 from webui import config_editor
@@ -34,7 +35,7 @@ def _pool_source_arg(default: str = "outlook") -> str:
     if not src and request.method == "POST":
         data = request.get_json(silent=True) or {}
         src = (data.get("source") or data.get("type") or "").strip()
-    return src if src in ("all", "outlook", "generic_api", "cloudflare_domain") else default
+    return src if src in ("all", "outlook", "generic_api", "gmail_api_url", "cloudflare_domain") else default
 
 
 
@@ -93,6 +94,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "has_access_token": bool(str(row.get("access_token") or "").strip()),
         "totp_enabled": twofa_status == "active" and bool(row.get("totp_secret")),
         "twofa_status": twofa_status,
+        "twofa_reactivate_available": twofa_status != "active",
         "codex_agent_has_token": bool(str(row.get("codex_agent_token") or "").strip()),
     }
 
@@ -115,7 +117,7 @@ def _compact_account_for_list(row: dict) -> dict:
 
     # 这些是列表固定列直接展示字段。
     for key in (
-        "user_name", "email_source", "source_cdk", "note", "archived", "created_at",
+        "user_name", "email_source", "email_domain", "source_cdk", "registration_ip", "account_locale", "account_country", "account_locale_source", "note", "archived", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "codex_agent_status",
         "totp_setup_status",
@@ -185,7 +187,9 @@ def _account_secret_value(row: dict, field: str, format_name: str = "modern") ->
         elif isinstance(extra_raw, dict):
             extra = extra_raw
         return str(extra.get("registration_password") or row.get("registration_password") or "未设置")
-    raise ValueError("field 仅支持 access_token/copy_line/codex_agent_token/totp_secret/totp_code/password")
+    if field == "email":
+        return str(row.get("email") or "")
+    raise ValueError("field 仅支持 email/access_token/copy_line/codex_agent_token/totp_secret/totp_code/password")
 
 
 def _compact_job_for_list(row: dict) -> dict:
@@ -197,7 +201,7 @@ def _compact_job_for_list(row: dict) -> dict:
     for key in (
         "job_type", "email_source", "parent_job_id", "retry_attempt", "email",
         "started_at", "completed_at", "display_status", "retryable",
-        "retry_action", "retry_label", "manual_otp_required",
+        "retry_action", "retry_label", "manual_otp_required", "network_identity",
     ):
         value = row.get(key)
         if value is not None and value != "" and value is not False:
@@ -242,9 +246,8 @@ def create_app(auth_code: str | None = None) -> Flask:
     def _compress_json_response(response: Response):
         """默认对 JSON API 响应启用 gzip，减少本地前端拉取大列表的传输体积。"""
         accept_encoding = (request.headers.get("Accept-Encoding") or "").lower()
-        # 默认开启 gzip：浏览器会自动带 gzip；本地脚本未带 Accept-Encoding 时也压缩。
-        # 只有客户端明确声明 identity 且没有 gzip 时，才按明文返回。
-        gzip_allowed = ("gzip" in accept_encoding) or (not accept_encoding)
+        # 只有客户端明确声明 gzip 时才压缩；缺少 Accept-Encoding 不等于支持 gzip。
+        gzip_allowed = "gzip" in accept_encoding
         if (
             response.direct_passthrough
             or response.headers.get("Content-Encoding")
@@ -319,6 +322,9 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     init_auth(app, auth_code=auth_code)
     register_auth_routes(app)
+    from webui.sub2api_automation_api import register_sub2api_automation_routes
+
+    register_sub2api_automation_routes(app)
     recovered_plan_checks = db.recover_interrupted_plan_checks()
     if recovered_plan_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
@@ -356,18 +362,22 @@ def create_app(auth_code: str | None = None) -> Flask:
                 continue
             one = (
                 db.generic_api_email_pool_summary() if src == "generic_api"
+                else db.gmail_api_url_email_pool_summary() if src == "gmail_api_url"
                 else db.domain_email_pool_summary() if src == "cloudflare_domain"
                 else db.outlook_pool_summary()
             )
             for k in pool:
                 pool[k] += int(one.get(k, 0) or 0)
         domain_pool = db.domain_email_pool_summary()
+        gmail_api_url_pool = db.gmail_api_url_email_pool_summary()
         return jsonify({
             "accounts": db.count_accounts(),
             "outlook_total": pool.get("total", 0),
             "outlook_available": pool.get("available", 0),
             "outlook_used": pool.get("used", 0),
             "outlook_failed": pool.get("failed", 0),
+            "gmail_api_url_total": gmail_api_url_pool.get("total", 0),
+            "gmail_api_url_available": gmail_api_url_pool.get("available", 0),
             "domain_total": domain_pool.get("total", 0),
             "domain_available": domain_pool.get("available", 0),
             "domain_used": domain_pool.get("used", 0),
@@ -382,10 +392,14 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=500, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
         codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
+        account_locale_filter = str(request.args.get("account_locale", default="") or "").strip().lower()
+        email_source_filter = str(request.args.get("email_source", default="") or "").strip().lower()
+        email_domain_filter = str(request.args.get("email_domain", default="") or "").strip().lower()
         free_plus_export_filter = str(request.args.get("free_plus_export", default="") or "").lower()
         # 新分页接口：传 page/page_size 或 paged=1 时返回 {items,total,page,page_size,...}
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
@@ -400,11 +414,15 @@ def create_app(auth_code: str | None = None) -> Flask:
                 offset=offset,
                 archived=archived,
                 plan_filter=plan_filter,
+                twofa_filter=twofa_filter,
                 codex_filter=codex_filter,
                 q=q,
                 free_plus_export_filter=free_plus_export_filter,
                 date_from=date_from,
                 date_to=date_to,
+                account_locale_filter=account_locale_filter,
+                email_source_filter=email_source_filter,
+                email_domain_filter=email_domain_filter,
             )
             result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
             result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
@@ -413,12 +431,72 @@ def create_app(auth_code: str | None = None) -> Flask:
             limit=limit,
             archived=archived,
             plan_filter=plan_filter,
+            twofa_filter=twofa_filter,
             codex_filter=codex_filter,
             q=q,
             free_plus_export_filter=free_plus_export_filter,
             date_from=date_from,
             date_to=date_to,
+            account_locale_filter=account_locale_filter,
+            email_source_filter=email_source_filter,
+            email_domain_filter=email_domain_filter,
         ))
+
+    @app.get("/api/accounts/filtered-ids")
+    def api_accounts_filtered_ids():
+        """Return IDs matching exactly the current account filters for bulk actions."""
+        limit = request.args.get("limit", default=5001, type=int)
+        archived = str(request.args.get("archived", default="0") or "0").lower()
+        plan_filter = str(request.args.get("plan", default="") or "").lower()
+        twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
+        codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
+        q = str(request.args.get("q", default="") or "").strip()
+        date_from = str(request.args.get("date_from", default="") or "").strip() or None
+        date_to = str(request.args.get("date_to", default="") or "").strip() or None
+        account_locale_filter = str(request.args.get("account_locale", default="") or "").strip().lower()
+        email_source_filter = str(request.args.get("email_source", default="") or "").strip().lower()
+        email_domain_filter = str(request.args.get("email_domain", default="") or "").strip().lower()
+        free_plus_export_filter = str(request.args.get("free_plus_export", default="") or "").lower()
+        normalized_limit = max(1, min(5001, int(limit or 5001)))
+        rows = db.list_accounts(
+            limit=normalized_limit,
+            archived=archived,
+            plan_filter=plan_filter,
+            twofa_filter=twofa_filter,
+            codex_filter=codex_filter,
+            q=q,
+            free_plus_export_filter=free_plus_export_filter,
+            date_from=date_from,
+            date_to=date_to,
+            account_locale_filter=account_locale_filter,
+            email_source_filter=email_source_filter,
+            email_domain_filter=email_domain_filter,
+        )
+        return jsonify({
+            "ok": True,
+            "account_ids": [int(row["id"]) for row in rows if row.get("id") is not None],
+            "count": len(rows),
+            "limit": normalized_limit,
+        })
+
+    @app.get("/api/accounts/email-domains")
+    def api_accounts_email_domains():
+        """Return the non-sensitive email-domain taxonomy used by the account filter."""
+        from collections import Counter
+
+        archived = str(request.args.get("archived", default="0") or "0").lower()
+        rows = db.list_accounts(limit=5001, archived=archived)
+        counts = Counter(str(row.get("email_domain") or "unknown").lower() for row in rows)
+        domains = [
+            {"value": domain, "count": count}
+            for domain, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+            if domain != "unknown"
+        ]
+        return jsonify({
+            "ok": True,
+            "domains": domains,
+            "unknown_count": counts.get("unknown", 0),
+        })
 
     @app.get("/api/accounts/plan-check-status")
     def api_account_plan_check_status():
@@ -426,23 +504,69 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=5000, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
         codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
         free_plus_export_filter = str(request.args.get("free_plus_export", default="") or "").lower()
+        date_from = str(request.args.get("date_from", default="") or "").strip() or None
+        date_to = str(request.args.get("date_to", default="") or "").strip() or None
+        account_locale_filter = str(request.args.get("account_locale", default="") or "").strip().lower()
+        email_source_filter = str(request.args.get("email_source", default="") or "").strip().lower()
+        email_domain_filter = str(request.args.get("email_domain", default="") or "").strip().lower()
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
         if page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            snapshot = db.list_account_plan_check_statuses(limit=page_size, offset=offset, archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to)
+            snapshot = db.list_account_plan_check_statuses(
+                limit=page_size,
+                offset=offset,
+                archived=archived,
+                plan_filter=plan_filter,
+                twofa_filter=twofa_filter,
+                codex_filter=codex_filter,
+                q=q,
+                free_plus_export_filter=free_plus_export_filter,
+                date_from=date_from,
+                date_to=date_to,
+                account_locale_filter=account_locale_filter,
+                email_source_filter=email_source_filter,
+                email_domain_filter=email_domain_filter,
+            )
             snapshot.update({"page": page, "page_size": page_size})
         else:
-            snapshot = db.list_account_plan_check_statuses(limit=max(1, min(5000, limit)), archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to)
+            snapshot = db.list_account_plan_check_statuses(
+                limit=max(1, min(5000, limit)),
+                archived=archived,
+                plan_filter=plan_filter,
+                twofa_filter=twofa_filter,
+                codex_filter=codex_filter,
+                q=q,
+                free_plus_export_filter=free_plus_export_filter,
+                date_from=date_from,
+                date_to=date_to,
+                account_locale_filter=account_locale_filter,
+                email_source_filter=email_source_filter,
+                email_domain_filter=email_domain_filter,
+            )
         snapshot["queue"] = plan_check_service.queue_settings()
         return jsonify(snapshot)
+
+    @app.post("/api/accounts/<int:acc_id>/twofa/reactivate")
+    def api_account_twofa_reactivate(acc_id: int):
+        """从账号列表重新登录并补做 2FA。"""
+        data = request.get_json(silent=True) or {}
+        try:
+            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+        result = svc.retry_account_twofa(acc_id, workers=workers)
+        if not result.get("ok"):
+            return jsonify(result), int(result.get("status") or 400)
+        return jsonify(result)
 
 
     @app.get("/api/accounts/<int:acc_id>/secret")
@@ -504,27 +628,31 @@ def create_app(auth_code: str | None = None) -> Flask:
                 scope=data.get("scope") or "selected",
                 account_ids=data.get("account_ids") or data.get("ids"),
                 format_name=data.get("format") or "modern",
-                allow_reexport=bool(data.get("allow_reexport")),
                 archived=data.get("archived") or "all",
                 q=data.get("q") or "",
+                codex_filter=data.get("codex_status") or "",
+                date_from=data.get("date_from") or "",
+                date_to=data.get("date_to") or "",
+                account_locale_filter=data.get("account_locale") or "",
+                email_source_filter=data.get("email_source") or "",
+                email_domain_filter=data.get("email_domain") or "",
+                twofa_filter=data.get("twofa_status") or "",
             )
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 
-        def _mark_downloaded():
-            updated, skipped = db.mark_accounts_free_plus_exported(
-                prepared["account_ids"],
-                format_name=prepared["format"],
-            )
-            if len(updated) != len(prepared["account_ids"]):
-                details = "; ".join(str(item.get("reason") or item.get("id")) for item in skipped)
-                raise RuntimeError(details or "部分账号状态未更新")
+        updated, skipped = db.mark_accounts_free_plus_exported(
+            prepared["account_ids"],
+            format_name=prepared["format"],
+        )
+        if len(updated) != len(prepared["account_ids"]):
+            details = "; ".join(str(item.get("reason") or item.get("id")) for item in skipped)
+            return jsonify({"ok": False, "error": details or "部分账号状态未更新", "skipped": skipped}), 409
 
         download_id = _put_prepared_download(
             prepared["content"],
             prepared["filename"],
             "text/plain; charset=utf-8",
-            on_download=_mark_downloaded,
         )
         return jsonify({
             "ok": True,
@@ -559,6 +687,29 @@ def create_app(auth_code: str | None = None) -> Flask:
             "updated_count": len(updated),
             "skipped": skipped,
             "skipped_count": len(skipped),
+        })
+
+    @app.post("/api/accounts/free-plus/recover-latest")
+    def api_accounts_free_plus_recover_latest():
+        data = request.get_json(silent=True) or {}
+        try:
+            prepared = free_plus_export.prepare_recovery_export(
+                format_name=data.get("format") or None,
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        download_id = _put_prepared_download(
+            prepared["content"],
+            prepared["filename"],
+            "text/plain; charset=utf-8",
+        )
+        return jsonify({
+            "ok": True,
+            "download_url": f"/api/downloads/{download_id}",
+            "filename": prepared["filename"],
+            "format": prepared["format"],
+            "exported_at": prepared["exported_at"],
+            "count": prepared["count"],
         })
 
     @app.post("/api/accounts/<int:acc_id>/archive")
@@ -886,6 +1037,60 @@ def create_app(auth_code: str | None = None) -> Flask:
             "skipped": skipped,
             "skipped_count": len(skipped),
         }), 202
+
+    @app.post("/api/accounts/check-plan-import")
+    def api_accounts_check_plan_import():
+        """Đối chiếu email với tài khoản trong DB và kiểm tra gói bằng token đã lưu."""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "Body phải là một đối tượng JSON"}), 400
+        emails = data.get("emails")
+        if not isinstance(emails, str) or not emails.strip():
+            return jsonify({"ok": False, "error": "emails phải chứa danh sách email, mỗi dòng một email"}), 400
+        if len(emails) > 256_000:
+            return jsonify({"ok": False, "error": "Nội dung quá lớn, mỗi lần tối đa 256 KB"}), 413
+
+        from core import account_plan_import
+
+        try:
+            result = account_plan_import.queue_imported_plan_checks(
+                emails,
+                get_account_by_email=db.get_account_by_email,
+                enqueue=plan_check_service.enqueue_account_plan_check,
+            )
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        if result.get("parsed_count", 0) == 0:
+            return jsonify({"ok": False, "error": "Không tìm thấy dòng email hợp lệ"}), 400
+        return jsonify(result), 202
+
+    @app.get("/api/accounts/check-plan-import-status")
+    def api_accounts_check_plan_import_status():
+        """Trả về trạng thái kiểm tra và các tài khoản có gói Free."""
+        raw_ids = request.args.get("account_ids") or request.args.get("ids") or ""
+        raw_values = [value.strip() for value in str(raw_ids).split(",") if value.strip()]
+        if not raw_values:
+            return jsonify({"ok": False, "error": "account_ids phải là danh sách ID, ngăn cách bằng dấu phẩy"}), 400
+        if len(raw_values) > 500:
+            return jsonify({"ok": False, "error": "Mỗi lần chỉ được kiểm tra tối đa 500 tài khoản"}), 400
+
+        account_ids: list[int] = []
+        seen: set[int] = set()
+        for raw in raw_values:
+            try:
+                account_id = int(raw)
+            except (TypeError, ValueError):
+                return jsonify({"ok": False, "error": f"account_id không hợp lệ: {raw}"}), 400
+            if account_id not in seen:
+                seen.add(account_id)
+                account_ids.append(account_id)
+
+        from core import account_plan_import
+
+        rows = [row for account_id in account_ids if (row := db.get_account(account_id))]
+        result = account_plan_import.build_import_plan_status(rows)
+        result["not_found_count"] = len(account_ids) - len(rows)
+        return jsonify(result)
 
     @app.get("/api/extract-link/cdk")
     def api_extract_link_cdk():
@@ -1507,6 +1712,24 @@ def create_app(auth_code: str | None = None) -> Flask:
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
+        # Gmail API URL remains a legacy JSON-backed pool; the all-source view
+        # merges it with the SQLite-backed pools until that store is migrated.
+        if source in ("all", "gmail_api_url"):
+            fetch_limit = 1_000_000 if (paged or q) else limit
+            if source == "all":
+                rows = []
+                rows += _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
+                rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
+                rows += _with_pool_source(db.list_gmail_api_url_email_pool(status=status, limit=fetch_limit), "gmail_api_url")
+                rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
+                rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
+            else:
+                rows = _with_pool_source(db.list_gmail_api_url_email_pool(status=status, limit=fetch_limit), "gmail_api_url")
+            if q:
+                rows = [r for r in rows if _matches_query(r, q)]
+            if paged or page_arg is not None or page_size_arg is not None:
+                return jsonify(_paginate_items(rows, page=page_arg or 1, page_size=page_size_arg or limit or 50))
+            return jsonify(rows[:max(1, int(limit or 1))])
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
@@ -1528,54 +1751,70 @@ def create_app(auth_code: str | None = None) -> Flask:
         粘贴文本导入邮箱素材。
         Outlook：email----password----clientId----refreshToken
         通用 API：email----code_url
+        Gmail API URL：email----code_url
         分隔符兼容 ---- 与 ====。
         """
         data = request.get_json(silent=True) or {}
         source = (data.get("source") or data.get("type") or "").strip()
-        if source not in ("outlook", "generic_api"):
-            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook 或 通用 API"}), 400
+        if source not in ("outlook", "generic_api", "gmail_api_url", "credentials"):
+            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API、Gmail API URL 或 Codex 凭据"}), 400
         text = data.get("text") or ""
         as_registered = bool(data.get("as_registered", False))
-        records = []
-        for line in text.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            parts = line.split("----") if "----" in line else line.split("====")
-            parts = [p.strip() for p in parts]
-            if source == "generic_api":
-                if len(parts) < 2:
+        if source == "credentials":
+            from core.codex_account_import import parse_credential_lines
+
+            records = parse_credential_lines(text)
+        else:
+            records = []
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("----") if "----" in line else line.split("====")
+                parts = [p.strip() for p in parts]
+                if source in ("generic_api", "gmail_api_url"):
+                    if len(parts) < 2:
+                        continue
+                    records.append({
+                        "email": parts[0],
+                        "code_url": parts[1],
+                    })
+                    continue
+                if len(parts) < 4:
                     continue
                 records.append({
                     "email": parts[0],
-                    "code_url": parts[1],
-                    "access_token": parts[2] if len(parts) > 2 else "",
-                    "totp_secret": parts[3] if len(parts) > 3 else "",
+                    "password": parts[1],
+                    "client_id": parts[2],
+                    "refresh_token": parts[3],
+                    "access_token": parts[4] if len(parts) > 4 else "",
+                    "totp_secret": parts[5] if len(parts) > 5 else "",
                 })
-                continue
-            if len(parts) < 4:
-                continue
-            records.append({
-                "email": parts[0],
-                "password": parts[1],
-                "client_id": parts[2],
-                "refresh_token": parts[3],
-                "access_token": parts[4] if len(parts) > 4 else "",
-                "totp_secret": parts[5] if len(parts) > 5 else "",
-            })
         if not records:
-            need = "2 段：邮箱----取码地址" if source == "generic_api" else "4 段：email----password----clientId----refreshToken"
-            return jsonify({"ok": False, "error": f"未解析到有效邮箱行（需 {need}，---- 或 ==== 分隔）"}), 400
-        if as_registered:
+            if source == "credentials":
+                need = "USER | PASS | 2FA"
+                delimiter = "| 分隔"
+            else:
+                need = "2 段：邮箱----取码地址" if source in ("generic_api", "gmail_api_url") else "4 段：email----password----clientId----refreshToken"
+                delimiter = "---- 或 ==== 分隔"
+            return jsonify({"ok": False, "error": f"未解析到有效邮箱行（需 {need}，{delimiter}）"}), 400
+        updated = 0
+        if source == "credentials":
+            inserted, updated, skipped = db.import_codex_credential_accounts(records)
+            as_registered = True
+        elif as_registered:
             inserted, skipped = db.import_registered_email_accounts(records, source=source)
         elif source == "generic_api":
             inserted, skipped = db.import_generic_api_emails(records)
+        elif source == "gmail_api_url":
+            inserted, skipped = db.import_gmail_api_url_emails(records)
         else:
             inserted, skipped = db.import_outlook_accounts(records)
         return jsonify({
             "ok": True,
             "inserted": inserted,
             "skipped": skipped,
+            "updated": updated,
             "parsed": len(records),
             "as_registered": as_registered,
         })
@@ -1593,6 +1832,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             source = "outlook"
         if source == "generic_api":
             db.release_generic_api_email(email, status=status, note=data.get("note"))
+        elif source == "gmail_api_url":
+            db.release_gmail_api_url_email(email, status=status, note=data.get("note"))
         elif source == "cloudflare_domain":
             db.release_domain_email(email, status=status, note=data.get("note"))
         else:
@@ -1636,6 +1877,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             try:
                 if item_source == "generic_api":
                     db.release_generic_api_email(email, status=status, note=note)
+                elif item_source == "gmail_api_url":
+                    db.release_gmail_api_url_email(email, status=status, note=note)
                 elif item_source == "cloudflare_domain":
                     db.release_domain_email(email, status=status, note=note)
                 else:
@@ -1663,6 +1906,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         deleted = (
             db.delete_generic_api_email(email)
             if source == "generic_api"
+            else db.delete_gmail_api_url_email(email)
+            if source == "gmail_api_url"
             else db.delete_domain_email(email)
             if source == "cloudflare_domain"
             else db.delete_outlook(email)
@@ -1702,6 +1947,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             deleted_ok = (
                 db.delete_generic_api_email(email)
                 if item_source == "generic_api"
+                else db.delete_gmail_api_url_email(email)
+                if item_source == "gmail_api_url"
                 else db.delete_domain_email(email)
                 if item_source == "cloudflare_domain"
                 else db.delete_outlook(email)
@@ -2060,9 +2307,20 @@ def create_app(auth_code: str | None = None) -> Flask:
     def _release_codex_retry(email: str) -> None:
         codex_retry_service.release(email)
 
-    def _run_codex_retry_worker(email: str, *, batch_label: str | None = None, clear_log: bool = True) -> None:
+    def _run_codex_retry_worker(
+        email: str,
+        *,
+        batch_label: str | None = None,
+        clear_log: bool = True,
+        proxy_lane_id: int | None = None,
+    ) -> None:
         """执行一个账号的 Codex 补跑。调用前必须已经 reserve。"""
-        codex_retry_service.run_worker(email, batch_label=batch_label, clear_log=clear_log)
+        codex_retry_service.run_worker(
+            email,
+            batch_label=batch_label,
+            clear_log=clear_log,
+            proxy_lane_id=proxy_lane_id,
+        )
 
 
     @app.post("/api/codex/stop")
@@ -2172,14 +2430,14 @@ def create_app(auth_code: str | None = None) -> Flask:
         if acc is None:
             return jsonify({"ok": False, "error": f"账号不存在: {email}"}), 404
         if (acc.get("live_check_status") or "") == "deactivated":
-            return jsonify({"ok": False, "error": "账号已废号，不能补跑 Codex"}), 409
+            return jsonify({"ok": False, "error": f"{account_unusable_message('account_deactivated')}, không thể chạy bù Codex"}), 409
         if not _reserve_codex_retry(email):
             return jsonify({"ok": False, "error": "该账号正在补跑中，请稍候"}), 409
 
         db.update_account_codex_status(email, "retrying", None)
         threading.Thread(
             target=_run_codex_retry_worker,
-            kwargs={"email": email, "clear_log": True},
+            kwargs={"email": email, "clear_log": True, "proxy_lane_id": 0},
             name=f"codex-retry-{email}",
             daemon=True,
         ).start()
@@ -2224,7 +2482,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 skipped.append({"id": acc_id, "reason": "邮箱为空"})
                 continue
             if (acc.get("live_check_status") or "") == "deactivated":
-                skipped.append({"id": acc_id, "email": email, "reason": "账号已废号"})
+                skipped.append({"id": acc_id, "email": email, "reason": account_unusable_message("account_deactivated")})
                 continue
             if not _reserve_codex_retry(email):
                 skipped.append({"id": acc_id, "email": email, "reason": "正在补跑中"})
@@ -2248,7 +2506,16 @@ def create_app(auth_code: str | None = None) -> Flask:
         def _bulk_runner(items: list[dict], max_workers: int, batch: str):
             logger.info(f"[Codex 批量补跑] 启动 batch={batch} count={len(items)} workers={max_workers}")
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"codex-bulk-{batch}") as ex:
-                futures = [ex.submit(_run_codex_retry_worker, it["email"], batch_label=f"{batch} #{idx}/{len(items)}", clear_log=False) for idx, it in enumerate(items, 1)]
+                futures = [
+                    ex.submit(
+                        _run_codex_retry_worker,
+                        it["email"],
+                        batch_label=f"{batch} #{idx}/{len(items)}",
+                        clear_log=False,
+                        proxy_lane_id=(idx - 1) % max_workers,
+                    )
+                    for idx, it in enumerate(items, 1)
+                ]
                 for fut in as_completed(futures):
                     try:
                         fut.result()
@@ -2332,20 +2599,28 @@ def create_app(auth_code: str | None = None) -> Flask:
         manual_otp_required = not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
         fetch_limit = 1_000_000 if (paged or page_arg is not None or page_size_arg is not None) else limit
         rows = db.list_jobs(limit=fetch_limit)
+        if paged or page_arg is not None or page_size_arg is not None:
+            page = max(1, int(page_arg or 1))
+            page_size = max(1, min(500, int(page_size_arg or limit or 50)))
+            status_counts = _job_status_counts(rows)
+            result = _paginate_items(rows, page=page, page_size=page_size)
+            page_rows = result.get("items") or []
+            for row in page_rows:
+                row["manual_otp_required"] = (
+                    manual_otp_required
+                    and str(row.get("job_type") or "registration") != "local_test"
+                )
+                row.update(svc.get_retry_info(row))
+            result["items"] = [_compact_job_for_list(r) for r in page_rows]
+            result["status_counts"] = status_counts
+            result["compact"] = True
+            return jsonify(result)
         for row in rows:
             row["manual_otp_required"] = (
                 manual_otp_required
                 and str(row.get("job_type") or "registration") != "local_test"
             )
             row.update(svc.get_retry_info(row))
-        if paged or page_arg is not None or page_size_arg is not None:
-            page = max(1, int(page_arg or 1))
-            page_size = max(1, min(500, int(page_size_arg or limit or 50)))
-            result = _paginate_items(rows, page=page, page_size=page_size)
-            result["items"] = [_compact_job_for_list(r) for r in (result.get("items") or [])]
-            result["status_counts"] = _job_status_counts(rows)
-            result["compact"] = True
-            return jsonify(result)
         return jsonify(rows)
 
     @app.post("/api/jobs")
@@ -2359,6 +2634,17 @@ def create_app(auth_code: str | None = None) -> Flask:
             database=db,
         )
         return jsonify(payload), status_code
+
+    @app.get("/api/qan8/batches/<batch_id>")
+    def api_qan8_batch_status(batch_id: str):
+        """Return QAN8 lane/source counters without credentials or code URLs."""
+        try:
+            status = svc.qan8_batch_status(batch_id)
+        except Exception as exc:
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+        if not status.get("target_count"):
+            return jsonify({"ok": False, "error": "QAN8 batch không tồn tại"}), 404
+        return jsonify({"ok": True, **status})
 
     @app.get("/api/manual-otp/waiting")
     def api_manual_otp_waiting():
@@ -2627,6 +2913,38 @@ def create_app(auth_code: str | None = None) -> Flask:
             logger.exception("获取 CloudMail 域名失败")
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
 
+    @app.post("/api/viotp/openai-service")
+    def api_viotp_openai_service():
+        data = request.get_json(silent=True) or {}
+        token = str(data.get("token") or "").strip()
+        country = str(data.get("country") or "vn").strip().lower() or "vn"
+        try:
+            from config import codex as codex_config
+            from core import sms_provider, viotp_sms_client
+
+            token = token or str(codex_config.VIOTP_API_TOKEN or "").strip()
+            http = sms_provider._http()
+            try:
+                service = viotp_sms_client.select_openai_service(
+                    http,
+                    api_base=codex_config.VIOTP_API_BASE,
+                    token=token,
+                    country=country,
+                )
+            finally:
+                http.close()
+            return jsonify({
+                "ok": True,
+                "service": {
+                    "id": int(service["id"]),
+                    "name": str(service.get("name") or ""),
+                    "price": service.get("price"),
+                },
+            })
+        except Exception as exc:
+            logger.exception("获取 ViOTP OpenAI 服务失败")
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+
     @app.post("/api/config")
     def api_config_set():
         data = request.get_json(silent=True) or {}
@@ -2665,9 +2983,17 @@ def create_app(auth_code: str | None = None) -> Flask:
     from webui.nordvpn_rotation_api import register_nordvpn_rotation_routes
     from webui.nordvpn_status_api import register_nordvpn_status_routes
     from webui.reserved_test_aliases_api import register_reserved_test_alias_routes
+    from webui.roxy_profiles_api import register_roxy_profile_routes
+    from webui.codex_sub2_api import register_codex_sub2_routes
+    from webui.email_change_api import register_email_change_routes
+    from webui.rotating_proxy_api import register_rotating_proxy_routes
 
+    register_codex_sub2_routes(app)
+    register_email_change_routes(app)
     register_nordvpn_rotation_routes(app)
     register_nordvpn_status_routes(app)
     register_reserved_test_alias_routes(app)
+    register_roxy_profile_routes(app)
+    register_rotating_proxy_routes(app)
 
     return app

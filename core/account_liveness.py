@@ -18,6 +18,7 @@ from core.openai_auth import (
     validate_email_otp,
     EmailOtpInvalidError,
     AccountUnusableError,
+    account_unusable_message,
     detect_account_unusable_text,
 )
 from core.account_export import (
@@ -423,12 +424,16 @@ def is_checking(email: str) -> bool:
 
 def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: float, max_otp_attempts: int = 3) -> dict:
     current_otp = None
+    previous_submitted_otp = None
     last_exc: Exception | None = None
     for attempt in range(1, max_otp_attempts + 1):
         try:
             if current_otp is None:
                 logger.info("[查活] 等待登录 OTP：%s（第 %s/%s 次）", email, attempt, max_otp_attempts)
-                current_otp = wait_for_otp(email, after_ts=otp_after_ts)
+                wait_kwargs = {"after_ts": otp_after_ts}
+                if previous_submitted_otp:
+                    wait_kwargs["before_code"] = previous_submitted_otp
+                current_otp = wait_for_otp(email, **wait_kwargs)
             result = validate_email_otp(session, current_otp, sentinel_header=None, so_header=None)
             return result
         except EmailOtpInvalidError as exc:
@@ -436,6 +441,7 @@ def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: floa
             if attempt >= max_otp_attempts:
                 break
             logger.warning("[查活] OTP 无效/过期，重新发送后再取：%s", str(exc)[:180])
+            previous_submitted_otp = current_otp
             send_email_otp(session)
             # 以“重新发送请求完成后”为新基准，避免刚刚失败的上一封旧码再次被 after 容忍窗口命中。
             otp_after_ts = time.time()
@@ -451,6 +457,7 @@ def _validate_with_retry(session: BrowserSession, email: str, otp_after_ts: floa
                 send_email_otp(session)
             except Exception:
                 raise
+            previous_submitted_otp = current_otp
             otp_after_ts = time.time()
             current_otp = None
             time.sleep(1)
@@ -474,6 +481,10 @@ def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: b
     email = str(email or "").strip()
     if not email:
         raise ValueError("email 不能为空")
+
+    from core.rotating_proxy_runtime import LIVE_CHECK_PROXY_SCOPE, resolve_rotating_proxy
+
+    proxy = resolve_rotating_proxy(proxy, scope=LIVE_CHECK_PROXY_SCOPE)
 
     checked_at = _now()
     key = email.lower()
@@ -551,13 +562,15 @@ def check_account_liveness(email: str, proxy: str | None = None, *, clear_log: b
         }
     except AccountUnusableError as exc:
         code = getattr(exc, "error_code", "") or detect_account_unusable_text(str(exc)) or "account_deactivated"
-        logger.warning("[查活] 已废号：%s %s", email, code)
-        return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": code}
+        message = account_unusable_message(code)
+        logger.warning("[查活] %s：%s %s", message, email, code)
+        return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": message}
     except Exception as exc:
         code = detect_account_unusable_text(_exception_response_text(exc)) or detect_account_unusable_text(str(exc))
         if code:
-            logger.warning("[查活] 已废号：%s %s", email, code)
-            return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": code}
+            message = account_unusable_message(code)
+            logger.warning("[查活] %s：%s %s", message, email, code)
+            return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": message}
         logger.warning("[查活] 失败：%s %s: %s", email, type(exc).__name__, str(exc)[:260])
         return {"ok": False, "status": "failed", "checked_at": checked_at, "error": f"{type(exc).__name__}: {str(exc)[:500]}"}
     finally:

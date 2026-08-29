@@ -49,7 +49,7 @@ class ReservedTestAliasWebUiTests(unittest.TestCase):
         for payload in (
             {"base": "abcdef", "domains": ["gmail.com"], "limit": 6},
             {"base": "abcdef", "domains": ["mail.test"], "limit": 0},
-            {"base": "abcdef", "domains": ["mail.test"], "limit": 201},
+            {"base": "abcdef", "domains": ["mail.test"], "limit": 1001},
             {"base": "abcdef", "domains": "mail.test", "limit": 6},
             {
                 "base": "abcdef",

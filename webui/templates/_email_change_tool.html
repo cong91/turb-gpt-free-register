@@ -1,0 +1,104 @@
+<!-- ============ Thông tin cá nhân ============ -->
+<div id="tab-email-change" class="hidden">
+  <div class="personal-info-shell">
+    <header class="personal-info-head">
+      <div>
+        <p class="personal-info-eyebrow">ACCOUNT OPERATIONS</p>
+        <h1 class="personal-info-title">Thông tin cá nhân</h1>
+        <p class="personal-info-subtitle">Cập nhật email đăng nhập hoặc thay khóa xác thực cho các tài khoản đã lưu.</p>
+      </div>
+      <div class="personal-info-head-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 3 5 6v5c0 4.6 2.9 8.4 7 10 4.1-1.6 7-5.4 7-10V6l-7-3Z"/>
+          <path d="m9 12 2 2 4-4"/>
+        </svg>
+      </div>
+    </header>
+
+    <div class="personal-info-modebar" role="tablist" aria-label="Thao tác thông tin cá nhân">
+      <button type="button" class="personal-info-mode is-active" data-personal-mode="email" role="tab" aria-selected="true">
+        <span class="personal-info-mode-icon" aria-hidden="true">@</span>
+        <span>Đổi email</span>
+      </button>
+      <button type="button" class="personal-info-mode" data-personal-mode="twofa" role="tab" aria-selected="false">
+        <span class="personal-info-mode-icon" aria-hidden="true">••</span>
+        <span>Đổi 2FA</span>
+      </button>
+    </div>
+
+    <form id="emailChangeForm" class="personal-info-form">
+      <section class="personal-info-workspace" data-personal-panel="email" role="tabpanel">
+        <div class="personal-info-form-head">
+          <div>
+            <p class="personal-info-kicker">EMAIL LOGIN</p>
+            <h2>Thay địa chỉ đăng nhập</h2>
+          </div>
+          <span class="personal-info-form-state">OTP qua Gmail API</span>
+        </div>
+        <div class="personal-info-input-grid">
+          <label class="personal-info-field">
+            <span>Tài khoản hiện tại <b>USER | PASS | 2FA</b></span>
+            <textarea id="credentials" name="credentials" required spellcheck="false" autocomplete="off" placeholder="user@example.com|password|TOTP_SECRET"></textarea>
+          </label>
+          <label class="personal-info-field">
+            <span>Email mới <b>EMAIL----URL GET OTP</b></span>
+            <textarea id="gmailApi" name="gmail_api" required spellcheck="false" autocomplete="off" placeholder="new@example.com----https://provider.example/otp"></textarea>
+          </label>
+        </div>
+        <div class="personal-info-actionbar">
+          <label class="personal-info-number">Quota / Gmail API <input id="quota" type="number" min="1" max="6" value="1"></label>
+          <label class="personal-info-number">Worker <input id="workers" type="number" min="1" max="4" value="1"></label>
+          <button class="personal-info-primary" id="submit" type="submit">Chạy đổi email</button>
+        </div>
+      </section>
+
+      <section class="personal-info-workspace is-hidden" data-personal-panel="twofa" role="tabpanel" aria-hidden="true">
+        <div class="personal-info-form-head">
+          <div>
+            <p class="personal-info-kicker">AUTHENTICATOR KEY</p>
+            <h2>Tạo khóa 2FA mới</h2>
+          </div>
+          <span class="personal-info-form-state">Deactivate → Enroll → Activate</span>
+        </div>
+        <div class="personal-info-twofa-layout">
+          <label class="personal-info-field personal-info-field-wide">
+            <span>Tài khoản cần đổi <b>USER | PASS | 2FA HIỆN TẠI</b></span>
+            <textarea id="twofaCredentials" name="twofa_credentials" spellcheck="false" autocomplete="off" placeholder="user@example.com|password|CURRENT_TOTP_SECRET"></textarea>
+          </label>
+          <div class="personal-info-sequence" aria-label="Trạng thái quy trình 2FA">
+            <div><span>01</span><p>Đăng nhập bằng khóa cũ</p></div>
+            <div><span>02</span><p>Tắt MFA hiện tại</p></div>
+            <div><span>03</span><p>Enroll và lưu khóa mới</p></div>
+          </div>
+        </div>
+        <div class="personal-info-actionbar">
+          <label class="personal-info-number">Worker <input id="twofaWorkers" type="number" min="1" max="4" value="1"></label>
+          <button class="personal-info-primary" id="twofaSubmit" type="button">Chạy đổi 2FA</button>
+        </div>
+      </section>
+
+      <section id="personalInfoResults" class="personal-info-results" hidden>
+        <div class="personal-info-results-head">
+          <div>
+            <p class="personal-info-kicker">RUN RESULTS</p>
+            <h2>Kết quả xử lý</h2>
+          </div>
+          <button id="exportChangedAccounts" class="personal-info-export" type="button" disabled>Xuất tài khoản đã đổi</button>
+        </div>
+        <p id="status" class="personal-info-status" role="status" aria-live="polite"></p>
+        <div class="personal-info-summary" aria-label="Tóm tắt kết quả">
+          <div><span>Đã gửi</span><strong id="personalSubmitted">0</strong></div>
+          <div class="is-success"><span>Thành công</span><strong id="personalSucceeded">0</strong></div>
+          <div class="is-failed"><span>Lỗi</span><strong id="personalFailed">0</strong></div>
+        </div>
+        <div class="personal-info-result-table-wrap">
+          <table class="personal-info-result-table">
+            <thead><tr><th>Tài khoản</th><th>Thao tác</th><th>Trạng thái</th><th>Chi tiết</th></tr></thead>
+            <tbody id="personalResultBody"></tbody>
+          </table>
+          <div id="personalResultEmpty" class="personal-info-empty">Chưa có kết quả</div>
+        </div>
+      </section>
+    </form>
+  </div>
+</div>

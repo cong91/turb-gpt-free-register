@@ -1,25 +1,122 @@
-# -*- coding: utf-8 -*-
 """CloakBrowser 的 Selenium 风格轻量适配层。"""
 from __future__ import annotations
 
 import logging
-import re
 import time
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from config import cloakbrowser as _cfg
 
 logger = logging.getLogger(__name__)
 
 
+def _is_navigation_context_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "execution context was destroyed" in message
+        or "most likely because of a navigation" in message
+        or "cannot find context with specified id" in message
+    )
+
+
+def _is_illegal_invocation_error(exc: Exception) -> bool:
+    return "illegal invocation" in str(exc or "").lower()
+
+
+def _is_transient_navigation_error(exc: Exception) -> bool:
+    """Return whether Chromium can reasonably retry the failed navigation."""
+    message = str(exc or "").lower()
+    return any(
+        marker in message
+        for marker in (
+            "err_empty_response",
+            "err_connection_reset",
+            "err_connection_closed",
+            "err_connection_refused",
+            "err_timed_out",
+            "err_network_changed",
+            "err_proxy_connection_failed",
+        )
+    )
+
+
+def _is_navigation_timeout_error(exc: Exception) -> bool:
+    """Recognize Playwright's page.goto timeout without importing Playwright types."""
+    message = str(exc or "").lower()
+    return "page.goto:" in message and "timeout" in message
+
+
+def _has_usable_navigation_document(page, target_url: str) -> bool:
+    """Return whether a timed-out navigation left a usable auth-domain document."""
+    try:
+        current_url = str(getattr(page, "url", "") or "")
+        target_host = (urlsplit(str(target_url or "")).hostname or "").lower()
+        current_host = (urlsplit(current_url).hostname or "").lower()
+    except (TypeError, ValueError):
+        return False
+
+    if not target_host or not current_host or current_host == "about:blank":
+        return False
+    if current_host != target_host and {current_host, target_host} != {
+        "chatgpt.com",
+        "auth.openai.com",
+    }:
+        return False
+
+    try:
+        state = page.evaluate(
+            "() => ({readyState: document.readyState, hasBody: !!document.body})"
+        ) or {}
+    except Exception:
+        return False
+    return bool(state.get("hasBody")) and state.get("readyState") in {
+        "loading",
+        "interactive",
+        "complete",
+    }
+
+
+_SELENIUM_KEY_NAMES = {
+    "\ue003": "Backspace",
+    "\ue004": "Tab",
+    "\ue005": "Clear",
+    "\ue006": "Return",
+    "\ue007": "Enter",
+    "\ue008": "Shift",
+    "\ue009": "Control",
+    "\ue00a": "Alt",
+    "\ue00b": "Pause",
+    "\ue00c": "Escape",
+    "\ue00d": "Space",
+    "\ue00e": "PageUp",
+    "\ue00f": "PageDown",
+    "\ue010": "End",
+    "\ue011": "Home",
+    "\ue012": "ArrowLeft",
+    "\ue013": "ArrowUp",
+    "\ue014": "ArrowRight",
+    "\ue015": "ArrowDown",
+    "\ue016": "Insert",
+    "\ue017": "Delete",
+    "\ue031": "Meta",
+    "\ue03d": "Meta",
+}
+_SELENIUM_MODIFIERS = {"Shift", "Control", "Alt", "Meta"}
+
+
 @dataclass
 class CloakOpenResult:
-    profile_id: str = "cloakbrowser"
+    # Cloak launches an isolated session rather than a reusable Roxy profile.
+    profile_id: str = field(
+        default_factory=lambda: f"cloakbrowser:{uuid.uuid4().hex}"
+    )
     raw: dict | None = None
 
 
-class CloakElement:
+class BrowserElement:
     def __init__(self, page, locator=None, handle=None):
         self.page = page
         self.locator = locator
@@ -83,28 +180,46 @@ class CloakElement:
         except Exception:
             return ""
 
-    def send_keys(self, *values: str) -> None:
-        # 兼容 Selenium: el.send_keys(Keys.COMMAND, 'a')。
-        text = "".join(str(v or "") for v in values)
-        lower = text.lower()
-        try:
-            self.click()
-        except Exception:
-            pass
-        if "\ue03d" in text or "\ue009" in text or "command" in lower or "control" in lower:
-            # Selenium Keys.CONTROL/COMMAND 编码可能传入私有区字符；这里按全选处理。
-            try:
-                self.page.keyboard.press("Meta+A")
-            except Exception:
-                self.page.keyboard.press("Control+A")
-            return
+    @property
+    def text(self) -> str:
+        """Selenium-compatible visible text used by resend/profile helpers."""
         try:
             if self.locator is not None:
-                self.locator.fill(text, timeout=10000)
-            else:
-                self.handle.fill(text, timeout=10000)
+                return str(self.locator.inner_text(timeout=1000) or "")
+            return str(self.handle.inner_text(timeout=1000) or "")
         except Exception:
-            self.page.keyboard.type(text, delay=35)
+            try:
+                return str(self._eval("el => el.innerText || el.textContent || ''") or "")
+            except Exception:
+                return ""
+
+    def send_keys(self, *values: str) -> None:
+        """发送 Selenium 风格按键，同时保留逐字符调用的累积输入。"""
+        if self.locator is not None:
+            self.locator.focus(timeout=10000)
+        else:
+            self.handle.focus()
+        index = 0
+        while index < len(values):
+            token = str(values[index] or "")
+            if token in _SELENIUM_MODIFIERS:
+                index += 1
+                continue
+            if token in _SELENIUM_KEY_NAMES:
+                key = _SELENIUM_KEY_NAMES[token]
+                if key in _SELENIUM_MODIFIERS and index + 1 < len(values):
+                    next_token = str(values[index + 1] or "")
+                    if next_token and next_token not in _SELENIUM_KEY_NAMES:
+                        self.page.keyboard.press(f"{key}+{next_token}")
+                        index += 2
+                        continue
+                self.page.keyboard.press(key)
+                index += 1
+                continue
+            # Cloak humanize may click again inside locator.press_sequentially,
+            # moving the caret. Focus is stable, then page keyboard preserves it.
+            self.page.keyboard.type(token, delay=25)
+            index += 1
 
     def get_attribute(self, name: str) -> str | None:
         try:
@@ -116,21 +231,27 @@ class CloakElement:
 
 
 class _SwitchTo:
-    def __init__(self, driver: "CloakSeleniumDriver"):
+    def __init__(self, driver: BrowserSeleniumDriver):
         self._driver = driver
 
     def window(self, handle: str) -> None:
         self._driver._switch_window(handle)
 
 
-class CloakSeleniumDriver:
-    """只实现本项目 Roxy Selenium 流程实际用到的 WebDriver 子集。"""
+class BrowserSeleniumDriver:
+    """实现本项目页面流程实际用到的 Selenium WebDriver 子集。"""
+
+    _registration_log_prefix: str
+    _registration_timeout: int
 
     def __init__(self, browser: Any, context: Any | None, page: Any):
         self.browser = browser
         self.context = context
         self.page = page
+        self._registration_log_prefix = ""
+        self._registration_timeout = 90
         self._page_load_timeout_ms = int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90) * 1000
+        self._script_timeout_ms = self._page_load_timeout_ms
         self.switch_to = _SwitchTo(self)
 
     @property
@@ -174,14 +295,71 @@ class CloakSeleniumDriver:
         except Exception:
             pass
 
+    @property
+    def script_timeout(self) -> int:
+        return max(1, int(self._script_timeout_ms / 1000))
+
+    def set_script_timeout(self, seconds: int) -> None:
+        self._script_timeout_ms = max(1, int(seconds)) * 1000
+
+    def get_cookie(self, name: str) -> dict | None:
+        """Return a Selenium-shaped cookie from the active Playwright context."""
+        try:
+            cookies = self.context.cookies(["https://chatgpt.com", "https://auth.openai.com"])
+            for cookie in cookies:
+                if cookie.get("name") == name:
+                    return dict(cookie)
+        except Exception:
+            pass
+        return None
+
     def get(self, url: str) -> None:
-        self.page.goto(url, wait_until="domcontentloaded", timeout=self._page_load_timeout_ms)
+        max_attempts = max(1, int(getattr(_cfg, "CLOAK_NAVIGATION_RETRIES", 3) or 3))
+        base_delay = max(0.0, float(getattr(_cfg, "CLOAK_NAVIGATION_RETRY_DELAY", 1.5) or 1.5))
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.page.goto(url, wait_until="domcontentloaded", timeout=self._page_load_timeout_ms)
+                if attempt > 1:
+                    logger.info("[Cloak] 页面导航重试成功：attempt=%s/%s", attempt, max_attempts)
+                return
+            except Exception as exc:
+                timeout_error = _is_navigation_timeout_error(exc)
+                if timeout_error and _has_usable_navigation_document(self.page, url):
+                    logger.warning(
+                        "[Cloak] 页面导航超时但认证域 DOM 已可用，交给上层继续等待：url=%s attempt=%s/%s",
+                        url,
+                        attempt,
+                        max_attempts,
+                    )
+                    return
+                retryable = timeout_error or _is_transient_navigation_error(exc)
+                if attempt >= max_attempts or not retryable:
+                    raise
+                delay = base_delay * attempt
+                logger.warning(
+                    "[Cloak] 页面导航遇到临时错误，将重试：attempt=%s/%s delay=%.1fs error=%s",
+                    attempt,
+                    max_attempts,
+                    delay,
+                    str(exc)[:180],
+                )
+                try:
+                    self.page.goto("about:blank", wait_until="commit", timeout=min(self._page_load_timeout_ms, 10000))
+                except Exception:
+                    pass
+                if delay:
+                    time.sleep(delay)
 
     def back(self) -> None:
         self.page.go_back(wait_until="domcontentloaded", timeout=self._page_load_timeout_ms)
 
     def refresh(self) -> None:
         self.page.reload(wait_until="domcontentloaded", timeout=self._page_load_timeout_ms)
+
+    def save_screenshot(self, filename: str) -> bool:
+        """Save the active Playwright page using Selenium's screenshot contract."""
+        self.page.screenshot(path=str(filename), full_page=False)
+        return True
 
     def quit(self) -> None:
         try:
@@ -194,15 +372,15 @@ class CloakSeleniumDriver:
         except Exception:
             pass
 
-    def find_elements(self, by: Any, selector: str) -> list[CloakElement]:
+    def find_elements(self, by: Any, selector: str) -> list[BrowserElement]:
         loc = self._locator(by, selector)
         try:
             count = min(int(loc.count()), 200)
         except Exception:
             count = 0
-        return [CloakElement(self.page, loc.nth(i)) for i in range(count)]
+        return [BrowserElement(self.page, loc.nth(i)) for i in range(count)]
 
-    def find_element(self, by: Any, selector: str) -> CloakElement:
+    def find_element(self, by: Any, selector: str) -> BrowserElement:
         els = self.find_elements(by, selector)
         if not els:
             raise RuntimeError(f"找不到页面元素: {selector}")
@@ -229,19 +407,19 @@ class CloakSeleniumDriver:
             logger.debug("[Cloak] CDP 命令失败 %s: %s", cmd, exc)
             return None
 
-    def _serialize_args(self, args: tuple[Any, ...]) -> tuple[CloakElement | None, list[Any]]:
+    def _serialize_args(self, args: tuple[Any, ...]) -> tuple[BrowserElement | None, list[Any]]:
         """拆分 Selenium 脚本参数。
 
         Playwright 的 JSHandle/ElementHandle 不能可靠地嵌在 dict/list payload 中跨
         page.evaluate 传递；Selenium 脚本最常见模式是 `arguments[0]` 为元素，
-        因此这里把第一个 CloakElement 作为真实 DOM `el` 传入，其它参数保持
+        因此这里把第一个 BrowserElement 作为真实 DOM `el` 传入，其它参数保持
         JSON 可序列化。
         """
-        first_el = args[0] if args and isinstance(args[0], CloakElement) else None
+        first_el = args[0] if args and isinstance(args[0], BrowserElement) else None
         rest = list(args[1:] if first_el else args)
         cleaned = []
         for item in rest:
-            if isinstance(item, CloakElement):
+            if isinstance(item, BrowserElement):
                 # 极少数脚本会传多个元素；用真实 handle 直接会在嵌套 payload 中失效，
                 # 这里退化为 None，比把错误对象传进 JS 更安全。
                 cleaned.append(None)
@@ -256,13 +434,31 @@ class CloakSeleniumDriver:
         except Exception:
             element = None
         if element is not None:
-            return CloakElement(page, handle=element)
+            return BrowserElement(page, handle=element)
         try:
-            return handle.json_value()
+            value = handle.json_value()
+            properties = handle.get_properties()
+            if not properties:
+                return value
+            if isinstance(value, dict):
+                result = dict(value)
+                for name, child in properties.items():
+                    result[name] = BrowserSeleniumDriver._unwrap_js_result(page, child)
+                return result
+            if isinstance(value, list):
+                result = list(value)
+                for name, child in properties.items():
+                    try:
+                        index = int(name)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= index < len(result):
+                        result[index] = BrowserSeleniumDriver._unwrap_js_result(page, child)
+                return result
+            return value
         except Exception as exc:
-            msg = str(exc)
-            if "Execution context was destroyed" in msg or "navigation" in msg.lower():
-                logger.info("[Cloak] JS 执行后页面发生跳转，忽略返回值读取失败：%s", msg[:160])
+            if _is_navigation_context_error(exc):
+                logger.info("[Cloak] JS 执行期间页面发生跳转，忽略本次临时结果")
                 return {"ok": True, "reason": "navigation_after_script"}
             raise
         finally:
@@ -291,10 +487,16 @@ class CloakSeleniumDriver:
                 try { fn(...args, __cloak_done); } catch (e) { clearTimeout(timer); resolve({ok:false, error:String(e)}); }
               });
             }"""
-            if first_el is not None:
-                result = first_el._eval(element_wrapper, {"script": script, "args": serial_args})
-            else:
-                result = self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+            try:
+                if first_el is not None:
+                    result = first_el._eval(element_wrapper, {"script": script, "args": serial_args})
+                else:
+                    result = self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+            except Exception as exc:
+                if _is_navigation_context_error(exc):
+                    logger.info("[Cloak] 异步 JS 执行期间页面发生跳转，忽略本次临时结果")
+                    return {"ok": True, "reason": "navigation_after_script"}
+                raise
             if isinstance(result, dict) and result.get("__cloak_timeout"):
                 raise TimeoutError("execute_async_script timeout")
             return result
@@ -309,15 +511,28 @@ class CloakSeleniumDriver:
           const fn = new Function(...args.map((_, i) => 'a' + i), payload.script);
           return fn(...args);
         }"""
-        if first_el is not None:
-            handle = first_el._eval_handle(element_wrapper, {"script": script, "args": serial_args})
-        else:
-            handle = self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
+        try:
+            if first_el is not None:
+                handle = first_el._eval_handle(element_wrapper, {"script": script, "args": serial_args})
+            else:
+                handle = self.page.evaluate_handle(wrapper, {"script": script, "args": serial_args})
+        except Exception as exc:
+            if _is_navigation_context_error(exc):
+                logger.info("[Cloak] JS 执行期间页面发生跳转，忽略本次临时结果")
+                return {"ok": True, "reason": "navigation_after_script"}
+            if _is_illegal_invocation_error(exc):
+                logger.warning("[Cloak] evaluate_handle 出现 Illegal invocation，改用 evaluate 兼容执行")
+                if first_el is not None:
+                    return first_el._eval(element_wrapper, {"script": script, "args": serial_args})
+                return self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+            raise
         return self._unwrap_js_result(self.page, handle)
 
 
 def _normalize_proxy(proxy: str | None) -> str | None:
-    proxy = str(proxy or "").strip()
+    from config.proxy import normalize_proxy_url
+
+    proxy = normalize_proxy_url(proxy)
     if not proxy:
         return None
     return proxy.replace("socks5h://", "socks5://")
@@ -392,7 +607,7 @@ def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
     return {k: v for k, v in out.items() if v}
 
 
-def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, CloakOpenResult]:
+def build_cloak_driver(proxy: str | None = None) -> tuple[BrowserSeleniumDriver, CloakOpenResult]:
     """启动 CloakBrowser 并返回 Selenium 风格 driver。
 
     proxy=None  时按 config.proxy.PROXY_POOL 随机抽取；
@@ -400,11 +615,19 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
     proxy="..." 时使用指定代理。
     """
     if proxy is None and bool(getattr(_cfg, "CLOAK_USE_PROXY", True)):
-        try:
-            from config.proxy import pick_proxy
-            proxy = pick_proxy()
-        except Exception:
-            proxy = None
+        from config.proxy import pick_proxy
+
+        # Probe every configured entry so a dead random prefix cannot hide a
+        # healthy proxy later in the pool.
+        proxy = pick_proxy(
+            probe_url="https://chatgpt.com/auth/login",
+            probe_timeout=4.0,
+        )
+        if not proxy:
+            raise RuntimeError(
+                "Cloak registration requires a proxy that can reach chatgpt.com; "
+                "all PROXY_POOL entries failed"
+            )
     try:
         from cloakbrowser import launch, launch_persistent_context
     except ImportError as exc:
@@ -462,9 +685,10 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[CloakSeleniumDriver, C
         context = browser.new_context(**context_kwargs)
         page = context.new_page()
 
-    driver = CloakSeleniumDriver(browser=browser, context=context, page=page)
+    driver = BrowserSeleniumDriver(browser=browser, context=context, page=page)
     # Roxy/Cloak 共用部分页面操作函数；给共享函数一个显式日志前缀，
     # 避免 Cloak 注册流程里出现 `[Roxy注册]`。
     driver._registration_log_prefix = "[Cloak注册]"
+    driver._registration_timeout = int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90)
     driver.set_page_load_timeout(int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90))
     return driver, CloakOpenResult(raw={"driver": "cloakbrowser", "proxy": proxy_url, "locale": locale_opts, "options": {k: v for k, v in opts.items() if k != "license_key"}})
