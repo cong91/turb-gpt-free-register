@@ -76,7 +76,10 @@ class WireproxyRuntimeTests(unittest.TestCase):
 
     def test_extracts_wireproxy_executable_only(self):
         executable = b"wireproxy-binary"
-        self.assertEqual(runtime._extract_executable(_archive(executable)), executable)
+        self.assertEqual(
+            runtime._extract_executable(_archive(executable), "wireproxy.exe"),
+            executable,
+        )
 
     def test_installs_pinned_release_and_reuses_verified_manifest(self):
         archive = _archive()
