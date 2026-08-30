@@ -11,7 +11,6 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 APP_STATE_DB_PATH = PROJECT_ROOT / "app_state.sqlite3"
 _SCHEMA_SQL = """
@@ -44,6 +43,7 @@ def connect(path: str | Path | None = None, *, busy_timeout_ms: int = 5000) -> s
     )
     connection.row_factory = sqlite3.Row
     connection.execute(f"PRAGMA busy_timeout = {max(1, int(busy_timeout_ms))}")
+    connection.execute("PRAGMA journal_mode = DELETE")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA synchronous = FULL")
     return connection
