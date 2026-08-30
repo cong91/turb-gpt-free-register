@@ -21,7 +21,7 @@ class MailNestConfigTests(unittest.TestCase):
         key_field = next(item for item in EDITABLE_FIELDS if item["key"] == "MAIL_NEST_API_KEY")
         self.assertEqual(key_field["group"], "邮箱 / OTP")
         self.assertTrue(key_field["secret"])
-        self.assertEqual(key_field["storage"], "env")
+        self.assertEqual(key_field["storage"], "sqlite")
         project_field = next(item for item in EDITABLE_FIELDS if item["key"] == "MAIL_NEST_PROJECT_CODE")
         self.assertEqual(project_field["type"], "str")
 

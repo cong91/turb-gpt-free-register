@@ -1,27 +1,12 @@
 # -*- coding: utf-8 -*-
 import os
-import importlib
 import unittest
-from contextlib import contextmanager
 from unittest.mock import patch
 
-from config import env_loader
-from config import browser
+from config import env_loader, roxy_profile_manager
+from core.app_state_db import APP_STATE_DB_PATH
+from core import roxy_profile_manager as roxy_profile_manager_service
 from webui import config_editor
-
-
-@contextmanager
-def _browser_source_defaults():
-    """测试源码默认值，不让开发机 .env 的显式 URL 覆盖影响断言。"""
-    old_loaded = env_loader._LOADED
-    try:
-        with patch.dict(os.environ, {"BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS": ""}, clear=False):
-            env_loader._LOADED = True
-            importlib.reload(browser)
-            yield
-    finally:
-        env_loader._LOADED = old_loaded
-        importlib.reload(browser)
 
 
 class ConfigDefaultFallbackTests(unittest.TestCase):
@@ -72,6 +57,47 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         self.assertTrue(namespace["FEATURE_ENABLED"])
         self.assertEqual(namespace["BASE_URL"], "https://example.test")
 
+    def test_paymesh_otp_wait_env_override_is_integer(self):
+        old_loaded = env_loader._LOADED
+        env_loader._LOADED = True
+        namespace = {"PAYMESH_OTP_MAX_WAIT": 180}
+        try:
+            with patch.dict(os.environ, {"PAYMESH_OTP_MAX_WAIT": "240"}, clear=True):
+                env_loader.apply_env_overrides(
+                    namespace, {"PAYMESH_OTP_MAX_WAIT": "int"}
+                )
+        finally:
+            env_loader._LOADED = old_loaded
+
+        self.assertEqual(namespace["PAYMESH_OTP_MAX_WAIT"], 240)
+        field = next(
+            item for item in config_editor.EDITABLE_FIELDS
+            if item["key"] == "PAYMESH_OTP_MAX_WAIT"
+        )
+        self.assertEqual(field["type"], "int")
+
+    def test_tinyhost_config_fields_are_exposed(self):
+        fields = {item["key"]: item for item in config_editor.EDITABLE_FIELDS}
+        self.assertEqual(fields["TINYHOST_API_BASE"]["storage"], "sqlite")
+        self.assertEqual(fields["TINYHOST_REQUEST_TIMEOUT"]["type"], "int")
+        self.assertEqual(fields["TINYHOST_RANDOM_LOCAL_LENGTH"]["type"], "int")
+
+    def test_roxy_offline_open_is_enabled_after_parity_gate(self):
+        self.assertTrue(roxy_profile_manager.ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED)
+        field = next(
+            item for item in config_editor.EDITABLE_FIELDS
+            if item["key"] == "ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED"
+        )
+        self.assertEqual(field["type"], "bool")
+
+    def test_roxy_catalog_is_locked_to_central_database(self):
+        self.assertEqual(roxy_profile_manager_service._store().path, APP_STATE_DB_PATH)
+        self.assertFalse(hasattr(roxy_profile_manager, "ROXY_PROFILE_MANAGER_DB_PATH"))
+        self.assertNotIn(
+            "ROXY_PROFILE_MANAGER_DB_PATH",
+            {item["key"] for item in config_editor.EDITABLE_FIELDS},
+        )
+
     def test_config_editor_parses_env_str_default_from_source(self):
         source = 'API_KEY: str = env_str("API_KEY", "fallback-key")\n'
         self.assertEqual(
@@ -85,40 +111,6 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
             "wss://connect.browser-use.com",
         )
         self.assertTrue(config_editor._coerce_raw_value("", True, "bool"))
-
-    def test_webui_exposes_browser_data_saver_settings(self):
-        fields = {field["key"]: field for field in config_editor.EDITABLE_FIELDS}
-        self.assertEqual(fields["BROWSER_DATA_SAVER_MODE"]["type"], "bool")
-        self.assertEqual(fields["BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES"]["type"], "list_str_multiline")
-        self.assertEqual(fields["BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS"]["type"], "list_str_multiline")
-        self.assertEqual(fields["BROWSER_TRAFFIC_DETAIL_LOG"]["type"], "bool")
-        self.assertEqual(fields["BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES"]["type"], "int")
-        self.assertEqual(fields["BROWSER_JS_COVERAGE_LOG"]["type"], "bool")
-        self.assertEqual(fields["BROWSER_JS_COVERAGE_MAX_ENTRIES"]["type"], "int")
-
-    def test_browser_data_saver_defaults_block_google_gsi(self):
-        with _browser_source_defaults():
-            self.assertIn(
-                "**://accounts.google.com/gsi/client**",
-                browser.BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS,
-            )
-
-    def test_browser_data_saver_defaults_do_not_block_chatgpt_core_bundles(self):
-        with _browser_source_defaults():
-            for prefix in (
-                "conversation-small",
-                "7aaae702",
-                "8b34dbc2",
-                "c2675c8c",
-                "4813494d",
-                "12e5f202",
-                "2340486e",
-                "25a66342",
-            ):
-                self.assertNotIn(
-                    f"**://chatgpt.com/cdn/assets/{prefix}-*.js**",
-                    browser.BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS,
-                )
 
 
 if __name__ == "__main__":

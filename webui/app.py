@@ -2859,7 +2859,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/cloudmail/gen-token")
     def api_cloudmail_gen_token():
-        """手动生成 CloudMail Authorization Token，并把本次填写的 CloudMail 配置一并写入 .env。"""
+        """手动生成 CloudMail Authorization Token，并保存本次 CloudMail 配置。"""
         data = request.get_json(silent=True) or {}
         try:
             from core.cloudmail_client import gen_token
@@ -2904,7 +2904,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/cloudmail/domains")
     def api_cloudmail_domains():
-        """从 CloudMail 平台获取域名列表，并可写入 .env 作为本地缓存。"""
+        """从 CloudMail 平台获取域名列表，并写入 SQLite 作为本地缓存。"""
         data = request.get_json(silent=True) or {}
         try:
             from core.cloudmail_client import fetch_domains

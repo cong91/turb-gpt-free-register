@@ -10,6 +10,12 @@ class AutoFreeCodexTests(unittest.TestCase):
         self._rotating_proxy = patch("core.account_network.resolve_rotating_proxy", return_value=None)
         self._rotating_proxy.start()
         self.addCleanup(self._rotating_proxy.stop)
+        self._wireguard_proxy = patch(
+            "core.nordvpn_wireguard.is_per_profile_proxy_enabled",
+            return_value=False,
+        )
+        self._wireguard_proxy.start()
+        self.addCleanup(self._wireguard_proxy.stop)
 
     @patch("core.plan_check_service.enqueue_account_plan_check", return_value={"accepted": True})
     @patch("core.email_provider.mark_email_consumed", return_value=True)

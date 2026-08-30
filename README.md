@@ -156,6 +156,12 @@ build context or as a GitHub Actions log value. Set `WEBUI_SECURE_COOKIE=True`
 and keep `NORDVPN_WG_ENABLED=False` until a valid NordVPN access token is
 configured.
 
+The secret file is read-only bootstrap input. WebUI configuration saves are
+stored in the `runtime_config` document inside the persistent `turb.sqlite3`
+volume, so the WebUI never tries to rewrite `/run/secrets/turb.env`. On a new
+server, the first save of each configuration section moves its current values
+into SQLite; no local database dump is needed.
+
 The GitHub Actions workflow runs the deployment gate tests, builds and smoke
 tests the Docker image including CloakBrowser and Linux `wireproxy`, then
 pushes an immutable commit-tagged image to GHCR. The server-side deploy script
@@ -194,7 +200,9 @@ cp .env.example .env
 - `L_ADMIN_AUTH_CODE`
 - `H_ADMIN_AUTH_CODE`
 
-WebUI 配置页保存这些字段时会写入 `.env`（不是 config 源码）。
+WebUI 配置页保存这些字段时会写入 `turb.sqlite3` 的 `runtime_config`（不是
+config 源码，也不会改写只读 `.env`）。未保存的值仍可从 `.env` bootstrap
+读取；SQLite 中已有值优先。
 
 ---
 
