@@ -730,6 +730,11 @@ EDITABLE_FIELDS = [
         "label": "sub2 API Key", "help": "sub2api 管理接口 API Key；请求头使用 x-api-key；为空则不带鉴权头", "storage": "env", "secret": True,
     },
     {
+        "key": "SUB2API_AUTOMATION_CALLBACK_SECRET", "file": "sub2api.py", "type": "str", "group": "Codex",
+        "label": "sub2 自动化回调 Secret", "help": "Turb 完成 provisioning 或 reauthorization 后回调 sub2api 时使用；必须与 sub2api 的 callback secret 一致，保存到 SQLite",
+        "storage": "env", "secret": True,
+    },
+    {
         "key": "SUB2API_API_TIMEOUT", "file": "sub2api.py", "type": "int", "group": "Codex",
         "label": "sub2 超时", "help": "sub2api 请求超时秒数",
     },

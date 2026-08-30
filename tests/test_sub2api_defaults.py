@@ -70,6 +70,14 @@ class Sub2APIDefaultsTests(unittest.TestCase):
         self.assertEqual(fields["SUB2API_PRIORITY"]["type"], "int")
         self.assertEqual(fields["SUB2API_MODEL"]["type"], "list_str_multiline")
 
+    def test_sub2api_callback_secret_is_exposed_as_a_persisted_secret_setting(self):
+        fields = {field["key"]: field for field in config_editor.EDITABLE_FIELDS}
+
+        callback_secret = fields["SUB2API_AUTOMATION_CALLBACK_SECRET"]
+        self.assertEqual(callback_secret["type"], "str")
+        self.assertEqual(callback_secret["storage"], "sqlite")
+        self.assertTrue(callback_secret["secret"])
+
     def test_agent_account_entry_uses_configured_group_priority_and_model(self):
         with patch.dict(
             vars(sub2api_config),

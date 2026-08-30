@@ -6660,7 +6660,7 @@ function codexConfigSectionForKey(key) {
   if (key.startsWith('CPA_')) {
     return ['CPA配置', 'CPA 授权链接生成、回调上传和管理接口配置'];
   }
-  if (['SUB2API_API_BASE','SUB2API_API_KEY','SUB2API_API_TIMEOUT'].includes(key)) {
+  if (['SUB2API_API_BASE','SUB2API_API_KEY','SUB2API_AUTOMATION_CALLBACK_SECRET','SUB2API_API_TIMEOUT'].includes(key)) {
     return ['sub2api通用', 'sub2api 共用 API 基址、鉴权和超时配置；Agent Token 和 OAuth 都复用这里'];
   }
   if (['SUB2API_AUTO_EXPORT','SUB2API_SYNC_MODE','SUB2API_OUTPUT_PATH','SUB2API_PROXY_KEY','SUB2API_GROUP_IDS','SUB2API_PRIORITY','SUB2API_MODEL'].includes(key)) {
