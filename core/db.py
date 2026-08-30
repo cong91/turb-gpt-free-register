@@ -499,9 +499,19 @@ def _pool_summary_sql(collection: str) -> dict:
     return out
 
 
+def _is_project_runtime_document(path: Path) -> bool:
+    """Return whether *path* is a root-level runtime export without dereferencing it.
+
+    Docker maps these files from the writable runtime volume back into `/app`
+    as symlinks. Resolving first would make a project-owned document appear to
+    live outside the project and bypass the canonical SQLite store.
+    """
+    return path.absolute().parent == _PROJECT_ROOT.absolute()
+
+
 def _read_json(path: Path, default: Any) -> Any:
     _ensure_storage()
-    if path.resolve().parent == _PROJECT_ROOT.resolve():
+    if _is_project_runtime_document(path):
         return app_state_db.get_document(path, default)
     if not path.exists():
         return default
@@ -513,7 +523,7 @@ def _read_json(path: Path, default: Any) -> Any:
 
 def _write_json(path: Path, data: Any) -> None:
     _ensure_storage()
-    if path.resolve().parent == _PROJECT_ROOT.resolve():
+    if _is_project_runtime_document(path):
         app_state_db.set_document(path, data)
         return
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -980,16 +990,19 @@ render();
 </body>
 </html>
 """
-    tmp = _VIEWER_HTML.with_suffix(".html.tmp")
-    tmp.write_text(html_text, encoding="utf-8")
+    # The Docker image links this compatibility export from /app into
+    # /var/lib/turb. Create the atomic-write temp file beside its real target.
+    export_target = _VIEWER_HTML.resolve()
+    tmp = export_target.with_suffix(".html.tmp")
     try:
-        tmp.replace(_VIEWER_HTML)
+        tmp.write_text(html_text, encoding="utf-8")
+        tmp.replace(export_target)
         return _VIEWER_HTML
     except PermissionError:
         # Windows 下如果目标 HTML 正被浏览器或编辑器短暂占用，原子替换可能失败。
         # 先尝试直接覆盖；仍失败时写一个时间戳快照，避免注册流程被查看页刷新阻断。
         try:
-            _VIEWER_HTML.write_text(html_text, encoding="utf-8")
+            export_target.write_text(html_text, encoding="utf-8")
             try:
                 tmp.unlink()
             except OSError:
