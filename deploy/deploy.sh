@@ -29,23 +29,6 @@ docker compose config --quiet
 docker volume create turb_gpt_runtime >/dev/null
 docker volume create turb_gpt_cloak_cache >/dev/null
 
-if [[ -n "$(docker compose ps --status running -q web)" ]]; then
-  docker compose exec -T web python -c '
-import sqlite3
-from datetime import datetime, timezone
-from pathlib import Path
-
-source = Path("/var/lib/turb/turb.sqlite3")
-backup = Path("/var/lib/turb/backups") / (
-    "turb-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + ".sqlite3"
-)
-backup.parent.mkdir(parents=True, exist_ok=True)
-with sqlite3.connect(source) as source_connection, sqlite3.connect(backup) as backup_connection:
-    source_connection.backup(backup_connection)
-print("SQLite backup created")
-'
-fi
-
 docker compose pull web
 docker run --rm --user 0:0 --entrypoint /bin/chown \
   -v turb_gpt_runtime:/var/lib/turb \
