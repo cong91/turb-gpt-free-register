@@ -85,7 +85,7 @@ jobs:
             docker pull "${IMAGE_REF}"
           fi
           docker run --rm "${IMAGE_REF}" wireproxy --version
-          docker run --rm "${IMAGE_REF}" python -c "import cloakbrowser; from cloakbrowser import download; print(cloakbrowser.__version__); print(download.get_binary_path())"
+          docker run --rm "${IMAGE_REF}" python -c "from cloakbrowser import launch; browser=launch(headless=True, humanize=False, geoip=False); page=browser.new_page(); page.goto('data:text/html,<title>cloak-ok</title>'); print('cloak', page.title()); browser.close()"
 
   deploy:
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'

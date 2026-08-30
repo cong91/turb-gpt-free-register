@@ -15,6 +15,7 @@ services:
       TURB_ENV_FILE: /run/secrets/turb.env
       WEBUI_SECURE_COOKIE: "True"
       CLOAKBROWSER_CACHE_DIR: /opt/cloakbrowser
+      CLOAK_EXTRA_ARGS: --disable-crashpad-for-testing
       NORDVPN_WG_WIREPROXY_EXE: wireproxy
       NORDVPN_WG_CONFIGS_DIR: /var/lib/turb/nordvpn-wireguard
     volumes:
