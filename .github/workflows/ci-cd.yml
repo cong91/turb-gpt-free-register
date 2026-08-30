@@ -38,6 +38,7 @@ jobs:
         run: >-
           python -m unittest -v
           tests.test_app_state_db
+          tests.test_read_only_runtime_exports
           tests.test_sqlite_state_migration
           tests.test_wireproxy_runtime
           tests.test_webui_auth

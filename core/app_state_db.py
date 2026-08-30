@@ -79,6 +79,19 @@ def get_document(path: str | Path, default: Any = None) -> Any:
         return default
 
 
+def _write_compatibility_export(target: Path, payload: str) -> None:
+    """Atomically refresh an export at its physical filesystem target."""
+    # Docker exposes compatibility exports under /app as symlinks into the
+    # writable runtime volume. Resolve before creating the sibling temp file,
+    # otherwise an atomic write tries to create /app/<file>.tmp on the
+    # read-only application filesystem.
+    export_target = target.resolve()
+    export_target.parent.mkdir(parents=True, exist_ok=True)
+    temp = export_target.with_suffix(export_target.suffix + ".tmp")
+    temp.write_text(payload, encoding="utf-8")
+    temp.replace(export_target)
+
+
 def set_document(path: str | Path, value: Any) -> None:
     """Persist a JSON document in SQLite and refresh its compatibility export."""
     target = Path(path)
@@ -94,10 +107,7 @@ def set_document(path: str | Path, value: Any) -> None:
             "WHERE app_documents.payload_json <> excluded.payload_json",
             (key, payload),
         )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temp = target.with_suffix(target.suffix + ".tmp")
-    temp.write_text(payload, encoding="utf-8")
-    temp.replace(target)
+    _write_compatibility_export(target, payload)
 
 
 def get_named_document(document_key: str, default: Any = None) -> Any:
