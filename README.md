@@ -110,10 +110,60 @@ ROTATING_PROXY_WHITELIST=
 
 ### 数据存储
 
-- 账号、邮箱库、任务及 Codex 凭证运行时统一存储在项目根目录 `turb.sqlite3`，按业务拆分为 `accounts`、`email_pool`（邮箱库）、`registration_jobs`、`codex_accounts` 和 `codex_agent_accounts` 五张表。
-- 数据库启用 WAL、超时等待和常用字段索引，WebUI 的账号、套餐状态、邮箱库、Codex 和任务分页直接执行 SQLite `COUNT(*) + LIMIT/OFFSET`，不再先读取全量数据后由 Python 切片。
-- 首次启动会自动把现有 JSON/历史 SQLite 数据迁移到新数据库；迁移完成后不再读写账号、任务、邮箱池和 Codex 凭证 JSON/TXT 文件。
-- `turb.sqlite3*` 属于运行时数据，已加入 `.gitignore`，请纳入备份策略。
+- 迁移完成后，账号、邮箱库、任务、Codex 凭证以及 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 运行时统一存储在项目根目录 `app_state.sqlite3`。核心业务表包括 `accounts`、`email_pool`、`registration_jobs`、`codex_accounts` 和 `codex_agent_accounts`。
+- 中央数据库使用 rollback journal（`journal_mode=DELETE`）、`synchronous=FULL`、超时等待和常用字段索引，以兼容 CDK/Gmail CDK 等 provider store。WebUI 的账号、套餐状态、邮箱池、Codex 和任务分页直接执行 SQLite `COUNT(*) + LIMIT/OFFSET`。
+- `turb.sqlite3` 是迁移前 origin 的离线输入，不是迁移后的运行时 source of truth。应用启动不会再从旧 SQLite、JSON、TXT 或 Codex credential 文件隐式导入状态。
+- `app_state.sqlite3*` 和 `turb.sqlite3*` 属于运行时/迁移数据，已加入 `.gitignore`，必须纳入备份策略；迁移完成后仍应保留原始 `turb.sqlite3` 和 SQLite snapshot，直到 smoke test 通过。
+
+#### Split SQLite migration runbook
+
+迁移只在停止所有写入进程后执行，并且不会修改两个 source 文件。先在项目根目录运行只读 audit：
+
+```powershell
+python -m core.sqlite_state_migration audit `
+  --app-state .\app_state.sqlite3 `
+  --turb .\turb.sqlite3
+```
+
+Sau đó chạy rehearsal không ghi file bằng `--dry-run`:
+
+```powershell
+python -m core.sqlite_state_migration migrate `
+  --app-state .\app_state.sqlite3 `
+  --turb .\turb.sqlite3 `
+  --target .\app_state.migrated.sqlite3 `
+  --backup-dir .\migration-backups `
+  --dry-run
+```
+
+Khi audit đúng, tạo target mới và snapshot trong một thư mục backup mới hoặc trống; không dùng target trùng với source và không ghi đè snapshot đã tồn tại:
+
+```powershell
+python -m core.sqlite_state_migration migrate `
+  --app-state .\app_state.sqlite3 `
+  --turb .\turb.sqlite3 `
+  --target .\app_state.migrated.sqlite3 `
+  --backup-dir .\migration-backups
+```
+
+Service dùng SQLite backup API để snapshot, giữ nguyên toàn bộ bảng của `app_state.sqlite3`, rồi chỉ merge năm bảng authoritative từ `turb.sqlite3`. Duplicate cùng khóa và cùng nội dung được bỏ qua; schema hoặc row khác nội dung sẽ dừng và xóa target sinh ra. Kết quả có integrity check, foreign-key check, schema/count/digest verification và migration marker `migration:application_state:1`, không chứa payload row.
+
+Sau khi target validation thành công, giữ nguyên source và snapshot. Dừng application, giữ lại app-state cũ rồi promote target; các lệnh PowerShell sau cố ý không dùng `-Force`:
+
+```powershell
+if (Test-Path .\app_state.sqlite3.pre-unified) { throw "rollback copy already exists" }
+Move-Item -LiteralPath .\app_state.sqlite3 -Destination .\app_state.sqlite3.pre-unified
+Move-Item -LiteralPath .\app_state.migrated.sqlite3 -Destination .\app_state.sqlite3
+```
+
+Sau đó mới khởi động smoke test; marker trong target khiến core repository chuyển sang `app_state.sqlite3`. Nếu smoke test lỗi, dừng application và rollback bằng cách giữ target lỗi để điều tra rồi khôi phục bản cũ:
+
+```powershell
+Move-Item -LiteralPath .\app_state.sqlite3 -Destination .\app_state.sqlite3.failed-unified
+Move-Item -LiteralPath .\app_state.sqlite3.pre-unified -Destination .\app_state.sqlite3
+```
+
+Không xóa source hoặc snapshot. `turb.sqlite3` chỉ được archive sau khi đã xác nhận runtime đọc đúng `app_state.sqlite3`.
 
 ---
 
@@ -817,8 +867,9 @@ WebUI 配置页保存后会调用热加载；Roxy、Codex、邮箱、代理、�
 
 | 路径 | 内容 |
 |---|---|
-| `turb.sqlite3` | 账号、邮箱库、任务、Codex 和 Agent 凭证全部数据 |
-| 旧 JSON/TXT/Codex 文件 | 仅用于首次迁移，运行期间不再读写 |
+| `app_state.sqlite3` | 迁移后的唯一运行时数据库，包含核心业务表和 provider state |
+| `turb.sqlite3` | 迁移前 origin；仅作为受控离线 migration input，保留作 rollback 证据 |
+| 旧 JSON/TXT/Codex 文件 | 导出或 legacy 输入；central runtime 不会隐式导入 |
 | `注册日志/` | 注册任务日志、Codex 补跑日志 |
 
 ---
@@ -959,7 +1010,7 @@ ENABLE_CODEX_AUTO = False
 │   ├── cf_temp_mail_client.py      # Cloudflare Worker 临时邮箱
 │   ├── sms_provider.py             # 接码平台
 │   ├── account_export.py           # 注册后处理与 SQLite 保存
-│   └── db.py                       # SQLite 数据库与一次性迁移
+│   └── db.py                       # SQLite 数据库 persistence layer
 ├── webui/
 │   ├── app.py                      # Flask API
 │   ├── config_editor.py            # 配置读写/热加载
