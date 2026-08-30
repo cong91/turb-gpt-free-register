@@ -1,5 +1,8 @@
 name: CI/CD
 
+permissions:
+  contents: read
+
 on:
   pull_request:
   push:
@@ -43,19 +46,55 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_ref: ${{ steps.image-ref.outputs.value }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build and smoke-test image
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set image reference
+        id: image-ref
+        run: echo "value=ghcr.io/cong91/turb-gpt-free-register:sha-${GITHUB_SHA}" >> "${GITHUB_OUTPUT}"
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: |
+            ghcr.io/cong91/turb-gpt-free-register:sha-${{ github.sha }}
+            ghcr.io/cong91/turb-gpt-free-register:main
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Smoke-test image
+        env:
+          IMAGE_REF: ghcr.io/cong91/turb-gpt-free-register:sha-${{ github.sha }}
         run: |
-          docker build --pull --tag turb-gpt-free-register:ci .
-          docker run --rm turb-gpt-free-register:ci wireproxy --version
-          docker run --rm turb-gpt-free-register:ci python -c "import cloakbrowser; print(cloakbrowser.__version__)"
+          set -Eeuo pipefail
+          if [[ "${{ github.event_name }}" != "pull_request" ]]; then
+            docker pull "${IMAGE_REF}"
+          fi
+          docker run --rm "${IMAGE_REF}" wireproxy --version
+          docker run --rm "${IMAGE_REF}" python -c "import cloakbrowser; from cloakbrowser import download; print(cloakbrowser.__version__); print(download.get_binary_path())"
 
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     needs: image
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: read
     environment: production
     steps:
       - uses: actions/checkout@v4
@@ -74,11 +113,14 @@ jobs:
         env:
           OVH_HOST: ${{ secrets.OVH_HOST }}
           OVH_USER: ${{ secrets.OVH_USER }}
-        run: >-
-          ssh -i "${RUNNER_TEMP}/turb-ssh/id_ed25519"
-          -o BatchMode=yes
-          -o IdentitiesOnly=yes
-          -o StrictHostKeyChecking=yes
-          -o UserKnownHostsFile="${RUNNER_TEMP}/turb-ssh/known_hosts"
-          "${OVH_USER}@${OVH_HOST}"
-          'cd /srv/turb-gpt-free-register && bash deploy/deploy.sh'
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_REF: ${{ needs.image.outputs.image_ref }}
+        run: |
+          set -Eeuo pipefail
+          printf '%s' "${GHCR_TOKEN}" | ssh -i "${RUNNER_TEMP}/turb-ssh/id_ed25519" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o UserKnownHostsFile="${RUNNER_TEMP}/turb-ssh/known_hosts" \
+            "${OVH_USER}@${OVH_HOST}" \
+            "set -Eeuo pipefail; trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT; docker login ghcr.io --username '${{ github.actor }}' --password-stdin; TURB_IMAGE='${IMAGE_REF}' bash /srv/turb-gpt-free-register/deploy/deploy.sh"

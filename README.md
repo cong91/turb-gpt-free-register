@@ -199,11 +199,12 @@ and keep `NORDVPN_WG_ENABLED=False` until a valid NordVPN access token is
 configured.
 
 The GitHub Actions workflow runs the deployment gate tests, builds and smoke
-tests the Docker image including CloakBrowser and Linux `wireproxy`, then SSHs
-to `ovh-sing` with a pinned `known_hosts` entry. The server-side deploy script
-creates a SQLite backup before replacing the container. Configure these
-repository secrets without placing their values in source: `OVH_HOST`,
-`OVH_USER`, `OVH_SSH_PRIVATE_KEY`, and `OVH_KNOWN_HOSTS`.
+tests the Docker image including CloakBrowser and Linux `wireproxy`, then
+pushes an immutable commit-tagged image to GHCR. The server-side deploy script
+only logs in for the deployment, pulls that image, creates a SQLite backup,
+and replaces the container with `--no-build`; the server never builds from
+source. Configure these repository secrets without placing their values in
+source: `OVH_HOST`, `OVH_USER`, `OVH_SSH_PRIVATE_KEY`, and `OVH_KNOWN_HOSTS`.
 
 The public endpoint is intentionally not published by Docker. Nginx must
 terminate HTTPS for `gpt-acc.v-claw.org` and proxy to `127.0.0.1:5057`; do not
