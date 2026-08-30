@@ -44,5 +44,7 @@ services:
 volumes:
   turb_runtime:
     name: turb_gpt_runtime
+    external: true
   turb_cloak_cache:
     name: turb_gpt_cloak_cache
+    external: true
