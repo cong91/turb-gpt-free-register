@@ -8,7 +8,8 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from core import db
-from core.rotating_proxy_runtime import CODEX_RETRY_PROXY_SCOPE, resolve_rotating_proxy
+from core.account_network import preferred_account_proxy
+from core.rotating_proxy_runtime import CODEX_RETRY_PROXY_SCOPE
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +268,9 @@ def run_worker(
         logger.info("[Codex 补跑] 开始：%s", email)
         check_stop_requested(email)
         account = db.get_account_by_email(email)
-        oauth_kwargs = {"force": True}
+        # Retry is an independent OAuth attempt. It must never restore the
+        # registration browser or a globally configured shared profile.
+        oauth_kwargs = {"force": True, "fresh_browser_profile": True}
         if oauth_driver:
             oauth_kwargs["oauth_driver"] = str(oauth_driver).strip()
         login_mode = str((account or {}).get("codex_login_mode") or "").strip().lower()
@@ -286,21 +289,12 @@ def run_worker(
         from config import codex as codex_cfg
         max_attempts = max(1, int(getattr(codex_cfg, "CODEX_RETRY_NETWORK_ATTEMPTS", 2) or 2))
         retry_delay = max(0.0, float(getattr(codex_cfg, "CODEX_RETRY_NETWORK_DELAY", 3.0) or 3.0))
-        from core.nordvpn_wireguard import is_per_profile_proxy_enabled, proxy_for_registration
-
-        rotating_proxy = resolve_rotating_proxy(
+        proxy_context = preferred_account_proxy(
             proxy,
-            scope=CODEX_RETRY_PROXY_SCOPE,
+            rotating_scope=CODEX_RETRY_PROXY_SCOPE,
             lane_id=proxy_lane_id,
+            lease_owner_id=lease_owner_id,
         )
-        if rotating_proxy is None and is_per_profile_proxy_enabled():
-            proxy_context = (
-                proxy_for_registration(owner_id=lease_owner_id)
-                if lease_owner_id is not None
-                else proxy_for_registration()
-            )
-        else:
-            proxy_context = nullcontext(rotating_proxy)
         callback_scope = (
             sub2_callback_override(
                 str(sub2_callback_context.get("path") or ""),
@@ -315,15 +309,15 @@ def run_worker(
             else nullcontext()
         )
         with callback_scope:
-            with proxy_context as active_proxy:
+            with proxy_context as (active_proxy, network_mode):
                 if active_proxy:
                     oauth_kwargs["proxy"] = active_proxy
-                    if rotating_proxy is not None:
+                    if network_mode == "rotating_proxy":
                         logger.info(
                             "[Codex 补跑] 使用 rotating proxy lease，lane=%s",
                             proxy_lane_id if proxy_lane_id is not None else "thread",
                         )
-                    else:
+                    elif network_mode == "nordvpn_wireguard":
                         logger.info("[Codex 补跑] 使用 NordVPN WireGuard SOCKS5 lease，OAuth 不使用 PROXY_POOL")
                 result = run_codex_oauth(email, **oauth_kwargs)
                 for attempt in range(2, max_attempts + 1):

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from core import db
@@ -12,11 +12,12 @@ from core.account_export import (
     save_account_data,
     setup_2fa_in_page,
 )
+from core.account_network import preferred_account_proxy
 from core.browser_profile import open_browser_profile
 from core.browser_twofa_login import _login_existing_account
 from core.email_provider import resolve_email_source
 from core.humanize import delay as human_delay
-from core.rotating_proxy_runtime import TWOFA_RETRY_PROXY_SCOPE, resolve_rotating_proxy
+from core.rotating_proxy_runtime import TWOFA_RETRY_PROXY_SCOPE
 
 logger = logging.getLogger(__name__)
 
@@ -45,21 +46,17 @@ def _failure_result(account_id: int, email: str, error: str) -> dict[str, object
 def _retry_browser_profile(
     proxy: str | None,
     *,
+    proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
 ) -> Iterator[tuple[object, str | None]]:
     """Open the retry browser with an explicit proxy lease when configured."""
-    if proxy is None:
-        from core.nordvpn_wireguard import proxy_for_registration
-
-        proxy_context = (
-            proxy_for_registration(owner_id=lease_owner_id)
-            if lease_owner_id is not None
-            else proxy_for_registration()
-        )
-    else:
-        proxy_context = nullcontext(proxy)
-
-    with proxy_context as active_proxy:
+    with preferred_account_proxy(
+        proxy,
+        rotating_scope=TWOFA_RETRY_PROXY_SCOPE,
+        lane_id=proxy_lane_id,
+        lease_owner_id=lease_owner_id,
+    ) as (active_proxy, network_mode):
+        logger.info("[Browser 2FA] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
         profile = None
         try:
             profile = open_browser_profile(proxy=active_proxy)
@@ -102,13 +99,9 @@ def run_twofa_retry(
     account_id, email, password = credentials
     last_error = ""
     try:
-        active_proxy_input = resolve_rotating_proxy(
-            proxy,
-            scope=TWOFA_RETRY_PROXY_SCOPE,
-            lane_id=proxy_lane_id,
-        )
         with _retry_browser_profile(
-            active_proxy_input,
+            proxy,
+            proxy_lane_id=proxy_lane_id,
             lease_owner_id=lease_owner_id,
         ) as (profile, active_proxy):
             attempts = max(1, int(max_attempts))
@@ -149,10 +142,10 @@ def run_twofa_retry(
                             from core.codex_login_credentials import (
                                 CodexLoginCredentials,
                             )
+                            from core.codex_oauth import run_codex_oauth
                             from core.registration_auto_codex import (
                                 run_registration_auto_codex,
                             )
-                            from core.roxy_codex_oauth import run_roxy_codex_oauth
 
                             credentials_for_codex = CodexLoginCredentials(
                                 email=email,
@@ -168,14 +161,34 @@ def run_twofa_retry(
                                 _existing_opened=existing_opened,
                                 _credentials=credentials_for_codex,
                             ) -> dict:
-                                return run_roxy_codex_oauth(
+                                cloud_provider = profile.provider in {"browser_use", "skyvern"}
+                                existing_driver = None if cloud_provider else profile.driver
+                                existing_browser = (
+                                    getattr(profile.driver, "browser", None)
+                                    if cloud_provider
+                                    else None
+                                )
+                                existing_context = (
+                                    getattr(profile.driver, "context", None)
+                                    if cloud_provider
+                                    else None
+                                )
+                                existing_page = (
+                                    getattr(profile.driver, "page", None)
+                                    if cloud_provider
+                                    else None
+                                )
+                                return run_codex_oauth(
                                     email,
-                                    existing_driver=profile.driver,
-                                    existing_opened=_existing_opened,
-                                    reuse_existing_profile=True,
+                                    oauth_driver=profile.provider,
                                     force=True,
-                                    clear_existing_state=True,
                                     credentials=_credentials,
+                                    existing_driver=existing_driver,
+                                    existing_opened=(None if cloud_provider else _existing_opened),
+                                    existing_browser=existing_browser,
+                                    existing_context=existing_context,
+                                    existing_page=existing_page,
+                                    existing_session_info=(profile.session_info if cloud_provider else None),
                                 )
 
                             auto_codex = run_registration_auto_codex(

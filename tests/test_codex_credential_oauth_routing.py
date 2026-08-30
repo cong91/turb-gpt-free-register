@@ -16,9 +16,126 @@ class CodexCredentialOAuthRoutingTests(unittest.TestCase):
             password="openai-password",
             totp_secret="JBSWY3DPEHPK3PXP",
         )
+        self._rotating_proxy = patch(
+            "core.rotating_proxy_runtime.resolve_rotating_proxy",
+            return_value=None,
+        )
+        self._rotating_proxy.start()
+        self.addCleanup(self._rotating_proxy.stop)
 
     def test_oauth_entrypoint_accepts_credential_context(self):
         self.assertIn("credentials", inspect.signature(run_codex_oauth).parameters)
+        self.assertIn("existing_driver", inspect.signature(run_codex_oauth).parameters)
+        self.assertIn("existing_browser", inspect.signature(run_codex_oauth).parameters)
+        self.assertIn("fresh_browser_profile", inspect.signature(run_codex_oauth).parameters)
+
+    @patch("core.roxy_codex_oauth.run_roxy_codex_oauth")
+    def test_fresh_retry_profile_bypasses_reusable_context_and_fixed_profile(self, run_roxy):
+        run_roxy.return_value = {"ok": True, "status": "success"}
+
+        with patch.object(codex_config, "CODEX_OAUTH_DRIVER", "roxy"):
+            result = run_codex_oauth(
+                "user@example.com",
+                force=True,
+                fresh_browser_profile=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(run_roxy.call_args.kwargs["fresh_profile"])
+        self.assertIsNone(run_roxy.call_args.kwargs["existing_driver"])
+        self.assertIsNone(run_roxy.call_args.kwargs["existing_opened"])
+        self.assertFalse(run_roxy.call_args.kwargs["reuse_existing_profile"])
+
+    @patch("core.roxy_codex_oauth.run_roxy_codex_oauth")
+    def test_fresh_retry_rejects_an_existing_registration_context(self, run_roxy):
+        with patch.object(codex_config, "CODEX_OAUTH_DRIVER", "roxy"):
+            result = run_codex_oauth(
+                "user@example.com",
+                force=True,
+                fresh_browser_profile=True,
+                existing_driver=Mock(),
+                existing_opened=Mock(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("不能复用", result["message"])
+        run_roxy.assert_not_called()
+
+    def test_roxy_reuses_existing_profile_without_acquiring_a_new_proxy(self):
+        driver = Mock()
+        opened = Mock()
+        run_result = {"ok": True, "status": "success"}
+
+        with (
+            patch("core.roxy_codex_oauth.run_roxy_codex_oauth", return_value=run_result) as run_roxy,
+            patch("core.rotating_proxy_runtime.resolve_rotating_proxy") as resolve_proxy,
+            patch.object(codex_config, "CODEX_OAUTH_DRIVER", "roxy"),
+        ):
+            result = run_codex_oauth(
+                "user@example.com",
+                force=True,
+                existing_driver=driver,
+                existing_opened=opened,
+            )
+
+        self.assertEqual(result, run_result)
+        resolve_proxy.assert_not_called()
+        run_roxy.assert_called_once_with(
+            "user@example.com",
+            otp_provider=None,
+            proxy=None,
+            force=True,
+            credentials=None,
+            existing_driver=driver,
+            existing_opened=opened,
+            reuse_existing_profile=True,
+        )
+
+    def test_reuse_context_does_not_fall_back_to_a_new_protocol_session(self):
+        with (
+            patch.object(codex_config, "CODEX_OAUTH_DRIVER", "protocol"),
+            patch("core.codex_oauth.BrowserSession") as browser_session,
+        ):
+            result = run_codex_oauth(
+                "user@example.com",
+                force=True,
+                existing_driver=Mock(),
+                existing_opened=Mock(),
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("没有可复用的 browser profile", result["message"])
+        browser_session.assert_not_called()
+
+    def test_browser_use_reuses_existing_session_context(self):
+        browser = Mock()
+        session_info = Mock()
+        run_result = {"ok": True, "status": "success"}
+
+        with (
+            patch("core.browser_use_codex_oauth.run_browser_use_codex_oauth", return_value=run_result) as run_browser,
+            patch.object(codex_config, "CODEX_OAUTH_DRIVER", "browser_use"),
+        ):
+            result = run_codex_oauth(
+                "user@example.com",
+                force=True,
+                existing_browser=browser,
+                existing_session_info=session_info,
+            )
+
+        self.assertEqual(result, run_result)
+        run_browser.assert_called_once_with(
+            "user@example.com",
+            otp_provider=None,
+            proxy=None,
+            force=True,
+            credentials=None,
+            existing_browser=browser,
+            existing_context=None,
+            existing_page=None,
+            existing_session_info=session_info,
+        )
 
     @patch("core.cloakbrowser_driver.build_cloak_driver")
     @patch("core.roxy_codex_oauth.run_roxy_codex_oauth")

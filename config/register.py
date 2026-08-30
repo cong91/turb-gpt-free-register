@@ -21,8 +21,8 @@ REGISTER_NAME = ""
 # 浏览器驱动会在当前注册窗口内同步完成查询；协议驱动仍使用后台查询队列。
 AUTO_PLAN_CHECK_AFTER_REGISTER = False
 
-# 注册后查到明确 Free 且没有 Free Plus 试用资格时，在当前注册浏览器内自动运行 Codex。
-# 浏览器驱动不会关闭并重开 session；协议驱动没有可复用的浏览器时使用后台补跑队列。
+# 注册后查到明确 Free 且没有 Free Plus 试用资格时，自动执行 Codex OAuth。
+# 浏览器驱动复用当前注册浏览器；协议驱动在当前 plan worker 中直接执行 OAuth。
 AUTO_CODEX_FOR_FREE_AFTER_REGISTER = False
 
 # 注册成功并拿到 accessToken 后，在浏览器里随机停留一段时间再关闭连接。

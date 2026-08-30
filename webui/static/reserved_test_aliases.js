@@ -78,7 +78,7 @@
       copyAllButton.disabled = aliases.length === 0;
       setStatus(`已生成 ${aliases.length} 个测试别名`, false);
     } catch (error) {
-      setStatus(error.message || '生成失败', true);
+      setStatus(error.message || 'Tạo thất bại', true);
     } finally {
       generateButton.disabled = false;
     }

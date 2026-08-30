@@ -38,10 +38,13 @@ class SkyvernConfigTests(unittest.TestCase):
         get.return_value.json.return_value = {"browser_session_id": "bs_123", "browser_address": "http://127.0.0.1:9222"}
 
         client = SkyvernClient(api_key="key-123", api_base="https://api.example.test")
-        session = client.open_session()
+        with patch("config.skyvern.SKYVERN_BROWSER_PROFILE_ID", "saved-profile"):
+            session = client.open_session(fresh_profile=True)
 
         self.assertEqual(session.session_id, "bs_123")
         self.assertEqual(session.connect_url, "http://127.0.0.1:9222")
+        self.assertEqual(session.profile_id, "")
+        self.assertNotIn("browser_profile_id", post.call_args.kwargs["json"])
         post.assert_called_once()
         get.assert_called_once()
 

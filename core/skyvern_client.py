@@ -102,11 +102,11 @@ class SkyvernClient:
         }
         return aliases.get(text, text)
 
-    def create_browser_session(self) -> dict[str, Any]:
+    def create_browser_session(self, *, fresh_profile: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "timeout": max(1, int(getattr(_cfg, "SKYVERN_BROWSER_SESSION_TIMEOUT", 60) or 60)),
         }
-        profile_id = str(getattr(_cfg, "SKYVERN_BROWSER_PROFILE_ID", "") or "").strip()
+        profile_id = "" if fresh_profile else str(getattr(_cfg, "SKYVERN_BROWSER_PROFILE_ID", "") or "").strip()
         if profile_id:
             payload["browser_profile_id"] = profile_id
         proxy_location = self._normalize_proxy_location(str(getattr(_cfg, "SKYVERN_PROXY_LOCATION", "") or ""))
@@ -167,13 +167,17 @@ class SkyvernClient:
             raise RuntimeError(f"Skyvern close browser session HTTP {resp.status_code}: {data}")
         return data if isinstance(data, dict) else {"ok": True, "data": data}
 
-    def open_session(self, proxy: str | None = None) -> SkyvernSession:
+    def open_session(self, proxy: str | None = None, *, fresh_profile: bool = False) -> SkyvernSession:
         if proxy is not None:
             raise RuntimeError(
                 "Skyvern Cloud hiện không hỗ trợ custom rotating proxy cho browser session; "
                 "hãy dùng Browser Use Cloud hoặc tắt rotating proxy."
             )
-        data = self.create_browser_session()
+        data = (
+            self.create_browser_session(fresh_profile=True)
+            if fresh_profile
+            else self.create_browser_session()
+        )
         session_id = self._session_id(data)
         address = self._browser_address(data)
         # create 响应有时先返回 session_id，browser_address 需要 get session 才出现。
@@ -193,7 +197,7 @@ class SkyvernClient:
         if not address:
             raise RuntimeError(f"Skyvern browser session 缺少 browser_address/cdp_url: {data}")
         proxy_location = str(getattr(_cfg, "SKYVERN_PROXY_LOCATION", "") or "").strip()
-        profile_id = str(getattr(_cfg, "SKYVERN_BROWSER_PROFILE_ID", "") or "").strip()
+        profile_id = "" if fresh_profile else str(getattr(_cfg, "SKYVERN_BROWSER_PROFILE_ID", "") or "").strip()
         safe_raw = dict(data)
         logger.info("[Skyvern] browser session 已创建：session_id=%s browser_address=%s", session_id or "-", address)
         return SkyvernSession(

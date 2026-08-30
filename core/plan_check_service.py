@@ -6,27 +6,31 @@ import logging
 import random
 import threading
 import time
-from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from config import proxy as proxy_cfg
 from core import db
+from core.account_network import preferred_account_proxy
 from core.chatgpt_plan import check_account_plan
-from core.rotating_proxy_runtime import PLAN_CHECK_PROXY_SCOPE, resolve_rotating_proxy
+from core.rotating_proxy_runtime import (
+    PLAN_CHECK_PROXY_SCOPE,
+    prepare_rotating_proxy_lanes,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _enqueue_auto_codex_for_free_account(
+def _run_auto_codex_oauth_for_free_account(
     *,
     account_id: int,
     email: str,
     access_token: str,
     trigger: str,
     result: dict,
+    proxy: str | None = None,
 ) -> dict:
-    """Queue Codex only after a confirmed Free/no-trial plan result."""
+    """Run Codex OAuth directly after a confirmed Free/no-trial plan result."""
     from config import register as register_cfg
 
     if not bool(getattr(register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)):
@@ -60,15 +64,39 @@ def _enqueue_auto_codex_for_free_account(
             ),
         }
 
-    from core.registration_service import submit_codex_retry_for_account
+    account_status = str(account.get("codex_status") or "").strip().lower()
+    if account_status == "success":
+        return {"accepted": False, "reason": "already_success"}
+    if account_status == "deactivated":
+        return {"accepted": False, "reason": "deactivated"}
 
-    return submit_codex_retry_for_account(
-        account_id=int(account_id),
-        email=email,
-        access_token=access_token,
-        trigger="registration_auto_free",
-        registration_driver=registration_driver,
+    from core.codex_oauth import run_codex_oauth
+
+    oauth_result = run_codex_oauth(email, proxy=proxy, force=True)
+    oauth_status = str(
+        oauth_result.get("status")
+        or ("success" if oauth_result.get("ok") else "failed")
     )
+    db.update_account_codex_status(
+        email,
+        "success" if oauth_result.get("ok") else oauth_status,
+        oauth_result.get("message"),
+    )
+    if oauth_result.get("ok"):
+        return {
+            "accepted": True,
+            "status": "success",
+            "email": email,
+            "oauth": oauth_result,
+        }
+    return {
+        "accepted": False,
+        "reason": "oauth_failed",
+        "status": oauth_status,
+        "email": email,
+        "error": oauth_result.get("message") or "Codex OAuth failed",
+        "oauth": oauth_result,
+    }
 
 
 def _int_setting(name: str, default: int, lower: int, upper: int) -> int:
@@ -162,26 +190,13 @@ def _run_plan_check(
         if not db.mark_account_plan_check_running(account_id):
             return {"ok": False, "error": "账号已删除或套餐查询状态已被重置"}
 
-        selected_proxy = resolve_rotating_proxy(
+        with preferred_account_proxy(
             proxy,
-            scope=PLAN_CHECK_PROXY_SCOPE,
+            rotating_scope=PLAN_CHECK_PROXY_SCOPE,
             lane_id=proxy_lane_id,
-        )
-        if selected_proxy is None:
-            from core.nordvpn_wireguard import is_per_profile_proxy_enabled, proxy_for_registration
-
-            if is_per_profile_proxy_enabled():
-                proxy_context = (
-                    proxy_for_registration(owner_id=lease_owner_id)
-                    if lease_owner_id is not None
-                    else proxy_for_registration()
-                )
-            else:
-                proxy_context = nullcontext(None)
-        else:
-            proxy_context = nullcontext(selected_proxy)
-
-        with proxy_context as active_proxy:
+            lease_owner_id=lease_owner_id,
+        ) as (active_proxy, network_mode):
+            logger.info("[Plan] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
             _wait_for_rate_slot()
             result = check_account_plan(
                 access_token,
@@ -220,19 +235,20 @@ def _run_plan_check(
                         recheck_result.get("error") or "未知错误",
                     )
 
-        db.update_account_plan_check(acc_id=account_id, result=result)
-        auto_codex = _enqueue_auto_codex_for_free_account(
-            account_id=account_id,
-            email=email,
-            access_token=access_token,
-            trigger=trigger,
-            result=result,
-        )
+            db.update_account_plan_check(acc_id=account_id, result=result)
+            auto_codex = _run_auto_codex_oauth_for_free_account(
+                account_id=account_id,
+                email=email,
+                access_token=access_token,
+                trigger=trigger,
+                result=result,
+                proxy=active_proxy,
+            )
         if auto_codex.get("accepted"):
-            logger.info("[Codex] Free 无 Plus 试用账号已自动排队补跑: %s", email)
+            logger.info("[Codex] Free 无 Plus 试用账号已自动执行 Codex OAuth: %s", email)
         elif auto_codex.get("reason") == "live_browser_required":
             logger.info(
-                "[Codex] 已跳过独立补跑 worker：registration_driver=%s，"
+                "[Codex] 已跳过独立 OAuth：registration_driver=%s，"
                 "Codex 必须在注册 worker 内复用当前 browser: %s",
                 auto_codex.get("registration_driver") or "browser",
                 email,
@@ -241,7 +257,7 @@ def _run_plan_check(
             "disabled", "trigger", "free_plus_or_unknown", "not_free",
             "already_success", "deactivated", "live_browser_required",
         }:
-            logger.warning("[Codex] Free 账号自动补跑入队失败: %s, %s", email, auto_codex)
+            logger.warning("[Codex] Free 账号自动 OAuth 失败: %s, %s", email, auto_codex)
         if result.get("ok"):
             logger.info(
                 "[Plan] 后台查询成功: %s, plan=%s, plus_trial=%s, trigger=%s",
@@ -302,6 +318,8 @@ def enqueue_account_plan_check(
     executor_to_shutdown = None
     try:
         with _EXECUTOR_LOCK:
+            if _EXECUTOR is None:
+                prepare_rotating_proxy_lanes(_WORKERS, scope=PLAN_CHECK_PROXY_SCOPE)
             executor = _get_executor_locked()
             _ACTIVE_TASKS += 1
             task_counted = True

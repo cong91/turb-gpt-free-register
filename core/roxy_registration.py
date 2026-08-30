@@ -12,7 +12,12 @@ from pathlib import Path
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
 from core import db
-from core.account_export import checkpoint_account_data, save_account_data, post_register_dwell
+from core.account_export import (
+    BrowserPageTransport,
+    checkpoint_account_data,
+    post_register_dwell,
+    save_account_data,
+)
 from core.email_provider import wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
@@ -2423,22 +2428,63 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         }
         try:
             from config import codex as _codex_cfg
-            if bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)):
-                # 注册流程本身已创建 Roxy 一号一环境。这里不能再新建第二个 Roxy 环境；
-                # 复用当前注册窗口，先清理 Cookie/session/localStorage/cache，再开始 Codex 授权。
-                from core.roxy_codex_oauth import run_roxy_codex_oauth
-                logger.info("[Roxy注册][Codex] ENABLE_CODEX_AUTO=True，复用当前注册 Roxy 窗口执行 Codex 授权，不创建新环境")
+            from config import register as _register_cfg
+            from core.codex_oauth import run_codex_oauth
+
+            free_codex_auto_enabled = bool(
+                getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+            )
+            codex_auto_enabled = bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False))
+            codex_credentials = None
+            if openai_password and totp_secret:
+                from core.codex_login_credentials import CodexLoginCredentials
+
+                codex_credentials = CodexLoginCredentials(
+                    email=email,
+                    password=openai_password,
+                    totp_secret=totp_secret,
+                )
+
+            def _run_codex_in_current_browser() -> dict:
+                login_mode = (
+                    "密码 + authenticator TOTP"
+                    if codex_credentials
+                    else "邮箱 OTP fallback（注册密码或 TOTP 不完整）"
+                )
+                logger.info(
+                    "[Roxy注册][Codex] 复用当前注册 Roxy 窗口执行 OAuth，不创建新环境，登录方式=%s",
+                    login_mode,
+                )
                 _check_manual_stop()
-                codex_result = run_roxy_codex_oauth(
+                return run_codex_oauth(
                     email,
-                    reuse_existing_profile=True,
+                    oauth_driver="roxy",
+                    force=True,
+                    credentials=codex_credentials,
                     existing_driver=driver,
                     existing_opened=opened,
-                    force=True,
-                    clear_existing_state=True,
                 )
+
+            post_auth_automation_enabled = bool(
+                getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
+                or free_codex_auto_enabled
+                or codex_auto_enabled
+            )
+            if post_auth_automation_enabled:
+                from core.registration_auto_codex import run_registration_auto_codex
+
+                auto_codex = run_registration_auto_codex(
+                    account_id=account_id,
+                    email=email,
+                    access_token=access_token,
+                    proxy=proxy,
+                    browser_transport=BrowserPageTransport(driver),
+                    run_codex=_run_codex_in_current_browser,
+                    twofa_status=twofa_status,
+                )
+                codex_result = auto_codex["codex"]
             else:
-                logger.info("[Roxy注册][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
+                logger.info("[Roxy注册][Codex] 注册后自动 Plan/Codex 流程已关闭")
         except Exception as exc:
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 

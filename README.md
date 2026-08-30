@@ -18,7 +18,7 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 
 ### Runtime state database
 
-应用业务状态统一保存在根目录的 `turb.sqlite3`：origin 的账号、邮箱池、注册任务、Codex 凭证以及 fork 新增的 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 都以它为 source of truth。`app_state.sqlite3` 只作为 fork state 的离线 migration source，不是运行时数据库。JSON/TXT/HTML、Codex credential 文件以及 Roxy archive/log 仅作为导出或 artefact；运行时不会从旧版 SQLite、JSON、TXT 或 ledger 文件隐式导入状态。
+应用业务状态统一保存在根目录的 `turb.sqlite3`：origin 的账号、邮箱池、注册任务、Codex 凭证以及 fork 新增的 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 都以它为 source of truth。旧的 fork SQLite source 已在迁移校验后删除，不是运行时数据库。JSON/TXT/HTML、Codex credential 文件以及 Roxy archive/log 仅作为导出或 artefact；运行时不会从旧版 SQLite、JSON、TXT 或 ledger 文件隐式导入状态。
 
 ---
 
@@ -67,7 +67,8 @@ EMAIL_SOURCE = "outlook,generic_api,gmail_api_url"
 ### Codex OAuth
 
 - 注册成功后可自动跑 Codex OAuth。
-- 可在 WebUI 配置开启 `AUTO_CODEX_FOR_FREE_AFTER_REGISTER`：注册后先查套餐，只有确认是 Free 且 `plus_trial_eligible` 明确为 `False`（不是 Free Plus）才会自动创建 Codex 补跑任务；该选项会自动开启注册后套餐查询。
+- 可在 WebUI 配置开启 `AUTO_CODEX_FOR_FREE_AFTER_REGISTER`：注册后先查套餐，只有确认是 Free 且 `plus_trial_eligible` 明确为 `False`（不是 Free Plus）才会直接执行 Codex OAuth；该选项会自动开启注册后套餐查询。它不是手动“补跑 Codex”任务。
+- 自动 Codex OAuth 在浏览器注册流程中复用当前注册 browser/profile/session；手动“Codex 补跑”是独立授权流程，每次都创建新的 browser profile/session，不恢复注册时 profile，也忽略 Browser Use/Skyvern/Roxy 的固定 profile ID。
 - Codex 授权驱动可选：
   - `CODEX_OAUTH_DRIVER = "protocol"`
   - `CODEX_OAUTH_DRIVER = "roxy"`
@@ -110,60 +111,17 @@ ROTATING_PROXY_WHITELIST=
 
 ### 数据存储
 
-- 迁移完成后，账号、邮箱库、任务、Codex 凭证以及 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 运行时统一存储在项目根目录 `turb.sqlite3`。它保留 origin 的全部表和数据，并补充 `app_state.sqlite3` 中 fork 独有的表。
+- 迁移完成后，账号、邮箱库、任务、Codex 凭证以及 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 运行时统一存储在项目根目录 `turb.sqlite3`。它保留 origin 的全部表和数据，并补充一次性 fork migration source 中的独有表。
 - 中央数据库使用 rollback journal（`journal_mode=DELETE`）、`synchronous=FULL`、超时等待和常用字段索引，以兼容 CDK/Gmail CDK 等 provider store。WebUI 的账号、套餐状态、邮箱池、Codex 和任务分页直接执行 SQLite `COUNT(*) + LIMIT/OFFSET`。
-- `app_state.sqlite3` 是 fork 的离线 migration input；如果某个表同时存在于两边，`turb.sqlite3` 的 schema 和 rows 优先，任何不一致都会中止 migration，绝不静默覆盖 origin。
-- `app_state.sqlite3*` 和 `turb.sqlite3*` 属于运行时/迁移数据，已加入 `.gitignore`，必须纳入备份策略；迁移完成后仍应保留 app-state source、原始 turb snapshot 和 rollback copy，直到 smoke test 通过。
+- `app_state.sqlite3` 曾是 fork 的一次性离线 migration input。`migration:fork_state_into_turb:1` 已写入 `turb.sqlite3`，完整性校验已通过，因此旧 source 已删除；runtime 不再读取或创建该文件。
+- 运行时和备份策略只针对 `turb.sqlite3*` 及明确的 rollback snapshot；如果以后需要离线迁移，必须显式提供独立的备份文件作为输入。
 
-#### Split SQLite migration runbook
+#### Split SQLite migration history
 
-迁移只在停止所有写入进程后执行，并且不会修改两个 source 文件。先在项目根目录运行只读 audit：
-
-```powershell
-python -m core.sqlite_state_migration audit `
-  --app-state .\app_state.sqlite3 `
-  --turb .\turb.sqlite3
-```
-
-Sau đó chạy rehearsal không ghi file bằng `--dry-run`:
-
-```powershell
-python -m core.sqlite_state_migration migrate `
-  --app-state .\app_state.sqlite3 `
-  --turb .\turb.sqlite3 `
-  --target .\turb.migrated.sqlite3 `
-  --backup-dir .\migration-backups `
-  --dry-run
-```
-
-Khi audit đúng, tạo target mới và snapshot trong một thư mục backup mới hoặc trống; không dùng target trùng với source và không ghi đè snapshot đã tồn tại:
-
-```powershell
-python -m core.sqlite_state_migration migrate `
-  --app-state .\app_state.sqlite3 `
-  --turb .\turb.sqlite3 `
-  --target .\turb.migrated.sqlite3 `
-  --backup-dir .\migration-backups
-```
-
-Service dùng SQLite backup API để snapshot, khởi tạo target từ toàn bộ `turb.sqlite3`, rồi copy tất cả bảng chỉ có trong `app_state.sqlite3`. Bảng trùng tên phải có schema và row giống nhau; nếu khác, migration dừng và xóa target sinh ra để giữ nguyên origin. Kết quả có integrity check, foreign-key check, schema/count/digest verification và migration marker `migration:fork_state_into_turb:1`, không chứa payload row.
-
-Sau khi target validation thành công, giữ nguyên source và snapshot. Dừng application, giữ lại origin `turb.sqlite3` rồi promote target; các lệnh PowerShell sau cố ý không dùng `-Force`:
-
-```powershell
-if (Test-Path .\turb.sqlite3.pre-fork-merge) { throw "rollback copy already exists" }
-Move-Item -LiteralPath .\turb.sqlite3 -Destination .\turb.sqlite3.pre-fork-merge
-Move-Item -LiteralPath .\turb.migrated.sqlite3 -Destination .\turb.sqlite3
-```
-
-Sau đó mới khởi động smoke test; core repository luôn đọc `turb.sqlite3`, không cần marker để đổi database. Nếu smoke test lỗi, dừng application và rollback bằng cách giữ target lỗi để điều tra rồi khôi phục bản cũ:
-
-```powershell
-Move-Item -LiteralPath .\turb.sqlite3 -Destination .\turb.sqlite3.failed-fork-merge
-Move-Item -LiteralPath .\turb.sqlite3.pre-fork-merge -Destination .\turb.sqlite3
-```
-
-Không xóa `app_state.sqlite3` source hoặc snapshot. Chỉ archive rollback copy sau khi đã xác nhận runtime đọc đúng `turb.sqlite3`.
+Migration split SQLite đã hoàn tất trước khi runtime hiện tại chạy. Công cụ
+`core.sqlite_state_migration` và bộ test vẫn giữ khả năng kiểm tra một source
+backup được truyền tường minh, nhưng không có đường khởi động nào tự tìm,
+import hoặc fallback sang `app_state.sqlite3`.
 
 ---
 
@@ -201,9 +159,9 @@ configured.
 The GitHub Actions workflow runs the deployment gate tests, builds and smoke
 tests the Docker image including CloakBrowser and Linux `wireproxy`, then
 pushes an immutable commit-tagged image to GHCR. The server-side deploy script
-only logs in for the deployment, pulls that image, creates a SQLite backup,
-and replaces the container with `--no-build`; the server never builds from
-source. Configure these repository secrets without placing their values in
+only logs in for the deployment, pulls that image, and replaces the container
+with `--no-build`; the named runtime volume remains the data source and the
+server never builds from source. Configure these repository secrets without placing their values in
 source: `OVH_HOST`, `OVH_USER`, `OVH_SSH_PRIVATE_KEY`, and `OVH_KNOWN_HOSTS`.
 
 The public endpoint is intentionally not published by Docker. Nginx must
@@ -896,7 +854,7 @@ WebUI 配置页保存后会调用热加载；Roxy、Codex、邮箱、代理、�
 | 路径 | 内容 |
 |---|---|
 | `turb.sqlite3` | origin 与 fork state 合并后的唯一运行时数据库 |
-| `app_state.sqlite3` | fork state 的离线 migration input；迁移后不再由 runtime 读取 |
+| `app_state.sqlite3` | legacy migration source đã xóa sau khi hợp nhất; không phải runtime database |
 | 旧 JSON/TXT/Codex 文件 | 导出或 legacy 输入；central runtime 不会隐式导入 |
 | `注册日志/` | 注册任务日志、Codex 补跑日志 |
 

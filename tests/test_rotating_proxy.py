@@ -1,12 +1,15 @@
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 from unittest.mock import Mock, patch
 
+import requests
 from flask import Flask
 
+from config import browser_use as browser_use_config
 from config import proxy as proxy_config
-from core.rotating_proxy_client import RotatingProxyClient
+from core.rotating_proxy_client import RotatingProxyApiError, RotatingProxyClient
 from core.rotating_proxy_manager import RotatingProxyManager
 from core.rotating_proxy_store import RotatingProxyStore
 from webui.config_editor import EDITABLE_FIELDS
@@ -42,6 +45,15 @@ class _FakeRotatingProxyClient:
         key = {"key": f"purchased-{self.purchase_calls}", "expires_at": None}
         self.keys.append(key)
         return key
+
+    def purchase_keys(self, quantity):
+        self.purchase_calls += 1
+        purchased = []
+        for index in range(int(quantity)):
+            key = {"key": f"purchased-{self.purchase_calls}-{index + 1}", "expires_at": None}
+            self.keys.append(key)
+            purchased.append(key)
+        return purchased
 
     def renew_key(self, key):
         self.renew_calls.append(key)
@@ -110,6 +122,50 @@ class RotatingProxyManagerTests(unittest.TestCase):
             {("registration", 0), ("codex_retry", 0)},
         )
 
+    def test_releases_completed_lane_for_another_workflow(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        registration = manager.acquire(0, scope="registration")
+        manager.release(0, scope="registration")
+        codex_retry = manager.acquire(0, scope="codex_retry")
+
+        self.assertEqual(registration.key, "key-1")
+        self.assertEqual(codex_retry.key, "key-1")
+        self.assertEqual(client.purchase_calls, 0)
+        self.assertEqual(manager.status()["leases"], [{
+            "scope": "codex_retry",
+            "lane_id": 0,
+            "key": "ke...-1",
+            "proxy": "http://198.51.100.2:8080",
+            "proxy_expires_at": 160.0,
+        }])
+
+    def test_expired_proxy_lease_does_not_block_key_reuse(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        manager.acquire(0, scope="registration")
+        self.now[0] = 161.0
+        codex_retry = manager.acquire(0, scope="codex_retry")
+
+        self.assertEqual(codex_retry.key, "key-1")
+        self.assertEqual(client.purchase_calls, 0)
+
+    def test_stale_release_does_not_remove_replacement_lease(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        first = manager.acquire(0)
+        self.now[0] = 161.0
+        replacement = manager.acquire(0)
+        manager.release(0, proxy_url=first.proxy_url)
+
+        current = self.store.get_lease(0)
+        self.assertEqual(replacement.proxy_url, "http://198.51.100.2:8080")
+        self.assertIsNotNone(current)
+        self.assertEqual(current["proxy_url"], replacement.proxy_url)
+
     def test_claim_race_retries_with_a_different_key(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
         manager = self._manager(client)
@@ -132,6 +188,91 @@ class RotatingProxyManagerTests(unittest.TestCase):
             100.0 + 24 * 60 * 60,
         )
 
+    def test_expired_key_inventory_falls_through_to_daily_purchase(self):
+        http = Mock()
+        http.get.side_effect = [
+            _FakeResponse({"status": 101, "comen": "expired"}),
+            _FakeResponse({"status": 100, "keyxoay": "purchased-key"}),
+            _FakeResponse({
+                "status": 100,
+                "message": "proxy nay se die sau 60s",
+                "proxyhttp": "203.0.113.30:8080",
+            }),
+        ]
+        client = RotatingProxyClient(http)
+        manager = self._manager(client)
+
+        with patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"):
+            lease = manager.acquire(0)
+
+        self.assertEqual(lease.key, "purchased-key")
+        self.assertEqual(http.get.call_count, 3)
+
+    def test_ensure_key_inventory_buys_missing_keys_in_one_batch(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        inventory = manager.ensure_key_inventory(3, scope="registration")
+
+        self.assertEqual(len(inventory), 3)
+        self.assertEqual(client.purchase_calls, 1)
+        self.assertEqual(
+            [item["rotating_key"] for item in inventory],
+            ["key-1", "purchased-1-1", "purchased-1-2"],
+        )
+
+    def test_ensure_key_inventory_excludes_keys_claimed_by_another_scope(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+        manager.acquire(0, scope="codex_retry")
+
+        inventory = manager.ensure_key_inventory(2, scope="registration")
+
+        self.assertEqual(client.purchase_calls, 1)
+        self.assertEqual(len(inventory), 2)
+        self.assertNotIn("key-1", [item["rotating_key"] for item in inventory])
+
+    def test_expired_inventory_buys_as_many_keys_as_requested_lanes(self):
+        http = Mock()
+        http.get.side_effect = [
+            _FakeResponse({"status": 101, "comen": "expired"}),
+            _FakeResponse(
+                text=(
+                    '{"status":100,"keyxoay":"key-a"}'
+                    '{"status":100,"keyxoay":"key-b"}'
+                    '{"status":100,"keyxoay":"key-c"}'
+                    '{"status":100,"comen":"successful transaction 3 key xoay","soluong":3}'
+                )
+            ),
+        ]
+        manager = self._manager(RotatingProxyClient(http))
+
+        with patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"):
+            inventory = manager.ensure_key_inventory(3, scope="registration")
+
+        self.assertEqual([item["rotating_key"] for item in inventory], ["key-a", "key-b", "key-c"])
+        self.assertEqual(http.get.call_args_list[1].kwargs["params"]["soluong"], 3)
+
+    def test_expired_inventory_invalidates_stale_local_keys_before_acquire(self):
+        client = _FakeRotatingProxyClient([])
+        manager = self._manager(client)
+        self.store.upsert_key("stale-key", None)
+
+        manager.ensure_key_inventory(1, scope="registration")
+        lease = manager.acquire(0, scope="registration")
+
+        self.assertEqual(lease.key, "purchased-1")
+
+    def test_refresh_expires_local_keys_missing_from_provider_inventory(self):
+        client = _FakeRotatingProxyClient([{"key": "active-key", "expires_at": 1000.0}])
+        manager = self._manager(client)
+        self.store.upsert_key("stale-key", None)
+
+        manager.refresh_keys()
+        lease = manager.acquire(0, scope="registration")
+
+        self.assertEqual(lease.key, "active-key")
+
     def test_fetches_a_new_proxy_after_ttl_expiration(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
         manager = self._manager(client)
@@ -143,43 +284,19 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertNotEqual(first.proxy_url, second.proxy_url)
         self.assertEqual(client.get_calls, ["key-1", "key-1"])
 
-    def test_renews_expired_key_before_fetching_proxy(self):
+    def test_creates_a_new_key_when_existing_key_expires(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 160.0}])
         manager = self._manager(client)
 
-        manager.acquire(0)
+        first = manager.acquire(0)
         self.now[0] = 161.0
-        manager.acquire(0)
+        second = manager.acquire(0)
 
-        self.assertEqual(client.renew_calls, ["key-1"])
-        self.assertEqual(client.get_calls, ["key-1", "key-1"])
-
-    def test_successful_renewal_without_expiry_does_not_renew_on_every_request(self):
-        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 160.0}])
-        client.renew_key = lambda key: (client.renew_calls.append(key) or {"key": key, "expires_at": None})
-        manager = self._manager(client)
-
-        manager.acquire(0)
-        self.now[0] = 161.0
-        manager.acquire(0)
-        self.now[0] = 162.0
-        manager.acquire(0)
-
-        self.assertEqual(client.get_calls, ["key-1", "key-1"])
-        self.assertEqual(client.renew_calls, ["key-1"])
-
-    def test_renewal_without_expiry_gets_daily_expiry_for_next_cycle(self):
-        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 160.0}])
-        client.renew_key = lambda key: (client.renew_calls.append(key) or {"key": key, "expires_at": None})
-        manager = self._manager(client)
-
-        manager.acquire(0)
-        self.now[0] = 161.0
-        manager.acquire(0)
-        self.now[0] = 161.0 + 24 * 60 * 60 + 1
-        manager.acquire(0)
-
-        self.assertEqual(client.renew_calls, ["key-1", "key-1"])
+        self.assertEqual(first.key, "key-1")
+        self.assertEqual(second.key, "purchased-1")
+        self.assertEqual(client.renew_calls, [])
+        self.assertEqual(client.purchase_calls, 1)
+        self.assertEqual(client.get_calls, ["key-1", "purchased-1"])
 
     def test_status_masks_secret_material_and_reports_lane_assignments(self):
         client = _FakeRotatingProxyClient([{"key": "key-123456", "expires_at": 1000.0}])
@@ -243,6 +360,70 @@ class RotatingProxyClientTests(unittest.TestCase):
         self.assertEqual([item["key"] for item in keys], ["key-a", "key-b"])
         self.assertIsInstance(keys[0]["expires_at"], float)
 
+    def test_list_keys_treats_expired_inventory_as_empty(self):
+        http = Mock()
+        http.get.return_value = _FakeResponse({"status": 101, "comen": "expired"})
+        client = RotatingProxyClient(http)
+
+        with patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"):
+            keys = client.list_keys()
+
+        self.assertEqual(keys, [])
+
+    def test_purchase_keys_requests_the_exact_missing_quantity(self):
+        http = Mock()
+        http.get.return_value = _FakeResponse(
+            text=(
+                '{"status":100,"keyxoay":"key-a"}'
+                '{"status":100,"keyxoay":"key-b"}'
+                '{"status":100,"comen":"successful transaction 2 key xoay","soluong":2}'
+            )
+        )
+        client = RotatingProxyClient(http)
+
+        with patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"):
+            keys = client.purchase_keys(2)
+
+        self.assertEqual([item["key"] for item in keys], ["key-a", "key-b"])
+        self.assertEqual(http.get.call_args.kwargs["params"]["key"], "configured-key")
+        self.assertEqual(http.get.call_args.kwargs["params"]["thoigian"], 1)
+        self.assertEqual(http.get.call_args.kwargs["params"]["soluong"], 2)
+
+    def test_purchase_does_not_call_provider_without_settings_api_key(self):
+        http = Mock()
+        client = RotatingProxyClient(http)
+
+        with (
+            patch.object(proxy_config, "ROTATING_PROXY_API_KEY", ""),
+            self.assertRaisesRegex(RotatingProxyApiError, "ROTATING_PROXY_API_KEY"),
+        ):
+            client.purchase_key()
+
+        http.get.assert_not_called()
+
+    def test_http_error_preserves_status_and_endpoint_without_secret(self):
+        http = Mock()
+        response = Mock(status_code=404)
+        response.raise_for_status.side_effect = requests.HTTPError(response=response)
+        http.get.return_value = response
+        client = RotatingProxyClient(http)
+
+        with (
+            patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"),
+            self.assertRaisesRegex(RotatingProxyApiError, r"HTTP 404.*apimuangngay\.php") as caught,
+        ):
+            client.purchase_key()
+
+        self.assertNotIn("configured-key", str(caught.exception))
+
+    def test_list_keys_treats_status_101_as_empty_inventory(self):
+        http = Mock()
+        http.get.return_value = _FakeResponse({"status": 101, "comen": "key does not exist"})
+        client = RotatingProxyClient(http)
+
+        with patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"):
+            self.assertEqual(client.list_keys(), [])
+
 
 class RotatingProxyConfigTests(unittest.TestCase):
     def test_settings_expose_rotating_proxy_option_and_provider_controls(self):
@@ -272,7 +453,9 @@ class RotatingProxyConfigTests(unittest.TestCase):
         ) as get_manager, patch(
             "core.roxy_registration.run_roxy_registration",
             return_value={"success": True},
-        ) as run_roxy:
+        ) as run_roxy, patch(
+            "core.rotating_proxy_runtime.release_rotating_proxy",
+        ) as release_proxy:
             get_manager.return_value.acquire.return_value = lease
             result = main.run_registration(
                 "user@example.com",
@@ -284,6 +467,11 @@ class RotatingProxyConfigTests(unittest.TestCase):
         self.assertTrue(result["success"])
         get_manager.return_value.acquire.assert_called_once_with(3)
         self.assertEqual(run_roxy.call_args.kwargs["proxy"], lease.proxy_url)
+        release_proxy.assert_called_once_with(
+            scope="registration",
+            lane_id=3,
+            proxy_url=lease.proxy_url,
+        )
 
     def test_cli_batch_assigns_a_stable_lane_id_to_each_worker_slot(self):
         import main
@@ -299,6 +487,23 @@ class RotatingProxyConfigTests(unittest.TestCase):
 
 
 class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
+    def test_preferred_account_proxy_releases_rotating_lease_after_context(self):
+        from core.account_network import preferred_account_proxy
+
+        with (
+            patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=False),
+            patch("core.account_network.resolve_rotating_proxy", return_value="http://203.0.113.55:8080"),
+            patch("core.account_network.release_rotating_proxy") as release,
+        ):
+            with preferred_account_proxy(None, rotating_scope="codex_retry", lane_id=6) as route:
+                self.assertEqual(route, ("http://203.0.113.55:8080", "rotating_proxy"))
+
+        release.assert_called_once_with(
+            scope="codex_retry",
+            lane_id=6,
+            proxy_url="http://203.0.113.55:8080",
+        )
+
     def test_browser_use_cloud_session_receives_custom_rotating_proxy(self):
         from core.browser_use_client import BrowserUseClient
 
@@ -319,12 +524,27 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
         self.assertNotIn("username", session.raw["custom_proxy"])
         self.assertNotIn("password", session.raw["custom_proxy"])
 
+    def test_browser_use_fresh_profile_ignores_configured_profile_ids(self):
+        from core.browser_use_client import BrowserUseClient
+
+        client = BrowserUseClient(api_key="browser-api-key")
+        with (
+            patch.object(browser_use_config, "BROWSER_USE_PROFILE_ID", "saved-profile"),
+            patch.object(browser_use_config, "BROWSER_USE_EXTRA_QUERY", {"profileId": "extra-profile"}),
+        ):
+            session = client.build_connect_url(fresh_profile=True)
+
+        query = parse_qs(urlparse(session.connect_url).query)
+        self.assertNotIn("profileId", query)
+        self.assertEqual(session.profile_id, "")
+
     def test_codex_oauth_resolves_a_rotating_proxy_for_standalone_login(self):
-        import core.codex_oauth as codex_oauth
+        from core import codex_oauth
 
         lease = Mock(proxy_url="http://203.0.113.30:8080")
         with (
             patch("core.rotating_proxy_runtime.resolve_rotating_proxy", return_value=lease.proxy_url) as resolve,
+            patch("core.rotating_proxy_runtime.release_rotating_proxy") as release,
             patch("core.roxy_codex_oauth.run_roxy_codex_oauth", return_value={"ok": True, "status": "success"}) as run_roxy,
             patch.object(codex_oauth._cfg, "ENABLE_CODEX_AUTO", True),
             patch.object(codex_oauth._cfg, "CODEX_OAUTH_DRIVER", "roxy"),
@@ -338,12 +558,13 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         resolve.assert_called_once_with(None, scope="codex_oauth", lane_id=4)
         self.assertEqual(run_roxy.call_args.kwargs["proxy"], lease.proxy_url)
+        release.assert_called_once_with(scope="codex_oauth", lane_id=4, proxy_url=lease.proxy_url)
 
     def test_plan_check_resolves_a_rotating_proxy_for_a_worker(self):
         from core import plan_check_service
 
         with (
-            patch.object(plan_check_service, "resolve_rotating_proxy", return_value="http://203.0.113.40:8080") as resolve,
+            patch("core.account_network.resolve_rotating_proxy", return_value="http://203.0.113.40:8080") as resolve,
             patch.object(plan_check_service, "check_account_plan", return_value={"ok": True}) as check_plan,
             patch.object(plan_check_service.db, "mark_account_plan_check_running", return_value=True),
             patch.object(plan_check_service.db, "update_account_plan_check"),
@@ -364,6 +585,60 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         resolve.assert_called_once_with(None, scope="plan_check", lane_id=2)
         self.assertEqual(check_plan.call_args.kwargs["proxy"], "http://203.0.113.40:8080")
+
+    def test_retry_proxy_inventory_is_not_prepared_when_wireguard_is_enabled(self):
+        from core.rotating_proxy_runtime import prepare_rotating_proxy_lanes
+
+        with (
+            patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True),
+            patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=True),
+            patch("core.rotating_proxy_manager.get_rotating_proxy_manager") as get_manager,
+        ):
+            prepare_rotating_proxy_lanes(3, scope="twofa_retry")
+            prepare_rotating_proxy_lanes(3, scope="codex_retry")
+            prepare_rotating_proxy_lanes(3, scope="plan_check")
+
+        get_manager.assert_not_called()
+
+    def test_totp_setup_prepares_rotating_proxy_lanes(self):
+        from core import twofa_service
+
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+            twofa_service, "_PROXY_INVENTORY_READY", False
+        ), patch.object(twofa_service, "prepare_rotating_proxy_lanes") as prepare:
+            twofa_service._prepare_proxy_inventory()
+
+        prepare.assert_called_once_with(2, scope="twofa_setup")
+
+    def test_totp_setup_worker_uses_rotating_proxy_lease(self):
+        from core import twofa_service
+
+        session = Mock(proxy="http://203.0.113.80:8080", device_id="device-1")
+        session.fingerprint_summary_text.return_value = "fingerprint"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_file = Path(temp_dir) / "twofa.log"
+            with patch.object(twofa_service, "log_path", return_value=log_file), patch.object(
+                twofa_service.db, "mark_account_totp_setup_running", return_value=True
+            ), patch.object(twofa_service.db, "update_account_totp_secret"), patch.object(
+                twofa_service, "resolve_rotating_proxy", return_value=session.proxy
+            ) as resolve, patch.object(twofa_service, "release_rotating_proxy") as release, patch.object(
+                twofa_service, "BrowserSession", return_value=session
+            ) as browser, patch.object(
+                twofa_service, "setup_2fa", return_value="SECRET1234"
+            ), patch.object(twofa_service._QUEUE_SLOTS, "release"):
+                result = twofa_service._run_twofa(
+                    account_id=1,
+                    email="user@example.com",
+                    access_token="token",
+                    proxy=None,
+                    trigger="manual",
+                    proxy_lane_id=3,
+                )
+
+        self.assertTrue(result["ok"])
+        resolve.assert_called_once_with(None, scope="twofa_setup", lane_id=3)
+        browser.assert_called_once_with(proxy=session.proxy, fingerprint_seed="account:user@example.com")
+        release.assert_called_once_with(scope="twofa_setup", lane_id=3, proxy_url=session.proxy)
 
     def test_extract_link_worker_routes_create_request_through_rotating_proxy(self):
         from core import extract_link_service
@@ -411,6 +686,7 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
                 "_iter_sse_events",
                 return_value=iter([("result", {"result": {"ok": True}})]),
             ) as events,
+            patch.object(extract_link_service, "release_rotating_proxy") as release,
             patch.object(extract_link_service.db, "update_account_extract"),
             patch.object(extract_link_service._QUEUE_SLOTS, "release"),
         ):
@@ -428,6 +704,7 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
         resolve.assert_called_once_with(None, scope="extract_link", lane_id=4)
         self.assertEqual(create.call_args.kwargs["proxy"], active_proxy)
         self.assertEqual(events.call_args.kwargs["proxy"], active_proxy)
+        release.assert_called_once_with(scope="extract_link", lane_id=4, proxy_url=active_proxy)
 
 
 class RotatingProxyWebUiTests(unittest.TestCase):

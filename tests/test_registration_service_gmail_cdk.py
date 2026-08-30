@@ -120,9 +120,9 @@ class GmailCdkRegistrationServiceTests(unittest.TestCase):
             def submit(self, fn, *args):
                 submitted.append((fn, args))
 
-        with patch.object(registration_service, "get_executor", return_value=ImmediateExecutor()), patch.object(
-            registration_service, "get_executor_workers", return_value=3
-        ):
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", False), patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(registration_service, "get_executor_workers", return_value=3):
             jobs = registration_service.submit_registration(
                 count=2,
                 workers=3,
@@ -151,7 +151,9 @@ class GmailCdkRegistrationServiceTests(unittest.TestCase):
             def submit(self, fn, *args):
                 submitted.append((fn, args))
 
-        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch(
+            "core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"
+        ) as prepare, patch.object(
             registration_service, "get_executor", return_value=ImmediateExecutor()
         ), patch.object(registration_service, "get_executor_workers", return_value=2):
             jobs = registration_service.submit_registration(
@@ -160,6 +162,7 @@ class GmailCdkRegistrationServiceTests(unittest.TestCase):
                 email_source="outlook",
             )
 
+        prepare.assert_called_once_with(2, scope="registration")
         self.assertEqual(len(submitted), 4)
         self.assertEqual(
             [db.get_job(job["id"])["provider_context"]["proxy_lane_id"] for job in jobs],

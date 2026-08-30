@@ -13,7 +13,12 @@ from urllib.parse import urlparse
 
 from config import proxy as proxy_cfg
 from core import db
-from core.rotating_proxy_runtime import CODEX_AGENT_PROXY_SCOPE, resolve_rotating_proxy
+from core.rotating_proxy_runtime import (
+    CODEX_AGENT_PROXY_SCOPE,
+    prepare_rotating_proxy_lanes,
+    release_rotating_proxy,
+    resolve_rotating_proxy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +59,18 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="codex-a
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
 _RATE_LOCK = threading.Lock()
 _NEXT_REQUEST_AT = 0.0
+_PROXY_INVENTORY_LOCK = threading.Lock()
+_PROXY_INVENTORY_READY = False
+
+
+def _prepare_proxy_inventory() -> None:
+    global _PROXY_INVENTORY_READY
+    if not bool(getattr(proxy_cfg, "ROTATING_PROXY_ENABLED", False)):
+        return
+    with _PROXY_INVENTORY_LOCK:
+        if not _PROXY_INVENTORY_READY:
+            prepare_rotating_proxy_lanes(_WORKERS, scope=CODEX_AGENT_PROXY_SCOPE)
+            _PROXY_INVENTORY_READY = True
 
 
 def _float_setting(name: str, default: float, lower: float, upper: float) -> float:
@@ -125,6 +142,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
     timeout_seconds = 0.0
     attempts = 0
     attempt_count = 0
+    rotating_proxy: str | None = None
     try:
         if not db.mark_account_codex_agent_running(account_id):
             return {"ok": False, "error": "账号已删除或 Codex Agent 状态已被重置"}
@@ -138,6 +156,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
             None,
             scope=CODEX_AGENT_PROXY_SCOPE,
         )
+        rotating_proxy = selected_proxy
         route = resolve_plan_check_route(selected_proxy)
         route_meta = {k: v for k, v in route.items() if k != "proxy"}
         timeout_seconds, attempts, retry_delay = _agent_request_settings()
@@ -300,6 +319,11 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
         logger.exception("[CodexAgent] 生成失败: %s", email)
         return result
     finally:
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=CODEX_AGENT_PROXY_SCOPE,
+                proxy_url=rotating_proxy,
+            )
         if env is not None:
             try:
                 env.session.close()
@@ -315,6 +339,7 @@ def enqueue_account_codex_agent(*, account_id: int, email: str, access_token: st
         if not db.claim_account_codex_agent(account_id, trigger=trigger):
             _QUEUE_SLOTS.release()
             return {"accepted": False, "busy": True, "error": "该账号正在生成 Codex Agent Token"}
+        _prepare_proxy_inventory()
         fut = _EXECUTOR.submit(
             _run_generate,
             account_id=account_id,

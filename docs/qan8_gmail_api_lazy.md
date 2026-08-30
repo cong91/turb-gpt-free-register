@@ -71,7 +71,7 @@ failure.
 ## Order recovery and failure
 
 Order intents, order numbers, source groups, aliases, leases, and assignments
-are stored in `app_state.sqlite3`. If the create response is unknown, the
+are stored in the canonical `turb.sqlite3`. If the create response is unknown, the
 intent becomes `unknown` and later attempts use order lookup only. The client
 does not blindly POST another order with the same lane.
 

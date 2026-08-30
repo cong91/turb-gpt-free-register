@@ -32,7 +32,10 @@ class LocalTestRegistrationWebUiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.json["ok"])
-        self.assertIn("dry-run", response.json["warning"])
+        self.assertEqual(
+            response.json["warning"],
+            "Kiểm thử cục bộ dry-run: không gọi OpenAI, trình duyệt, OTP hoặc nhà cung cấp email.",
+        )
         submit_local_test_registration.assert_called_once()
         aliases = submit_local_test_registration.call_args.kwargs["aliases"]
         self.assertEqual(aliases[:2], ["sampleuser@mail.test", "sampleuser@inbox.invalid"])
