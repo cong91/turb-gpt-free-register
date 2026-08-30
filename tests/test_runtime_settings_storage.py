@@ -102,8 +102,7 @@ class RuntimeSettingsStorageTests(unittest.TestCase):
             ):
                 env_loader._LOADED = False
                 env_loader.load_env(override=True)
-
-            self.assertEqual(os.environ.get("NORDVPN_WG_ENABLED"), "True")
+                self.assertEqual(os.environ.get("NORDVPN_WG_ENABLED"), "True")
 
     @patch("config.env_loader.read_runtime_settings", return_value={"NORDVPN_WG_ENABLED": "True"})
     @patch("config.env_loader.read_env_file", return_value={"NORDVPN_WG_ENABLED": "False"})
