@@ -151,6 +151,18 @@ class CloakAdapterContractTests(unittest.TestCase):
 
 
 class BrowserSeleniumDriverTests(unittest.TestCase):
+    @patch("core.browser_registration._find_any")
+    def test_browser_registration_returns_native_email_element_for_cloak(self, find_any):
+        from core.browser_registration import _wait_for_email_input
+
+        driver = type("BrowserSeleniumDriver", (), {})()
+        expected_element = object()
+        find_any.return_value = expected_element
+
+        result = _wait_for_email_input(driver, timeout=1)
+
+        self.assertIs(result, expected_element)
+
     @patch("config.proxy.pick_proxy", return_value="")
     @patch("core.cloakbrowser_driver._cfg.CLOAK_USE_PROXY", True)
     def test_build_fails_before_browser_when_no_proxy_reaches_chatgpt(self, pick_proxy):
@@ -174,6 +186,22 @@ class BrowserSeleniumDriverTests(unittest.TestCase):
                 "https://auth.openai.com/oauth/authorize?state=test",
                 "about:blank",
                 "https://auth.openai.com/oauth/authorize?state=test",
+            ],
+        )
+
+    def test_get_retries_aborted_navigation(self):
+        page = _AbortedNavigationPage()
+        driver = BrowserSeleniumDriver(browser=None, context=None, page=page)
+        driver.set_page_load_timeout(5)
+
+        driver.get("https://chatgpt.com/auth/login")
+
+        self.assertEqual(
+            page.urls,
+            [
+                "https://chatgpt.com/auth/login",
+                "about:blank",
+                "https://chatgpt.com/auth/login",
             ],
         )
 
@@ -283,6 +311,16 @@ class _TimeoutNavigationPage:
             raise TimeoutError(
                 'Page.goto: Timeout 45000ms exceeded. navigating to "https://chatgpt.com/auth/login"'
             )
+
+
+class _AbortedNavigationPage:
+    def __init__(self):
+        self.urls = []
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.urls.append(url)
+        if url != "about:blank" and len(self.urls) == 1:
+            raise RuntimeError("Page.goto: net::ERR_ABORTED")
 
 
 class _UsableAfterTimeoutPage:

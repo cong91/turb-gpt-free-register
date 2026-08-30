@@ -652,7 +652,7 @@ def _wait_for_email_input(driver, timeout: int | None = None):
         if driver.__class__.__name__ == "BrowserSeleniumDriver":
             try:
                 el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)
-                return
+                return el
             except Exception as exc:
                 last_state = {"native_locator_error": f"{type(exc).__name__}: {exc}"}
         else:
