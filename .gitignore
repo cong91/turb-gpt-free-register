@@ -93,6 +93,12 @@ tools/_*.html
 tools/_*.py
 !tools/test_codex_oauth.py
 
+# Local browser/protocol captures and derived reports
+are-capture-*.jsonl
+Default-all-domains-*.json
+docs/protocol_har_summary.json
+*.har
+
 # Sentinel runner 临时 challenge 文件
 sentinel-challenge-*.json
 
