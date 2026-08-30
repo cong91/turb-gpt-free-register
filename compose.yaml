@@ -14,6 +14,7 @@ services:
     environment:
       TURB_ENV_FILE: /run/secrets/turb.env
       WEBUI_SECURE_COOKIE: "True"
+      TZ: Asia/Ho_Chi_Minh
       CLOAKBROWSER_CACHE_DIR: /opt/cloakbrowser
       CLOAK_EXTRA_ARGS: '["--disable-crashpad-for-testing", "--single-process"]'
       NORDVPN_WG_WIREPROXY_EXE: wireproxy
