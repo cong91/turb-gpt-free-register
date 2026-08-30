@@ -2,6 +2,14 @@
 set -Eeuo pipefail
 
 app_dir="${TURB_APP_DIR:-/srv/turb-gpt-free-register}"
+image_ref="${TURB_IMAGE:-ghcr.io/cong91/turb-gpt-free-register:main}"
+
+if [[ ! "${image_ref}" =~ ^ghcr\.io/cong91/turb-gpt-free-register:(main|sha-[0-9a-f]{40})$ ]]; then
+  echo "Refusing deploy: unsupported image reference" >&2
+  exit 1
+fi
+
+export TURB_IMAGE="${image_ref}"
 cd -- "${app_dir}"
 
 test -f secrets/.env
@@ -38,16 +46,16 @@ print("SQLite backup created")
 '
 fi
 
-docker compose build --pull
+docker compose pull web
 docker run --rm --user 0:0 --entrypoint /bin/chown \
   -v turb_gpt_runtime:/var/lib/turb \
-  turb-gpt-free-register:local \
+  "${image_ref}" \
   -R 1000:1000 /var/lib/turb
 docker run --rm --user 0:0 --entrypoint /bin/chown \
   -v turb_gpt_cloak_cache:/opt/cloakbrowser \
-  turb-gpt-free-register:local \
+  "${image_ref}" \
   -R 1000:1000 /opt/cloakbrowser
-docker compose up -d --remove-orphans
+docker compose up -d --no-build --remove-orphans
 
 for attempt in {1..30}; do
   if curl --fail --silent --show-error http://127.0.0.1:5057/login >/dev/null; then
