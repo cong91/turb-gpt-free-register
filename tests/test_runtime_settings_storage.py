@@ -86,6 +86,40 @@ class RuntimeSettingsStorageTests(unittest.TestCase):
                 "NORDVPN_WG_ENABLED=old\n",
             )
 
+    def test_sub2api_callback_secret_round_trips_through_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env_path = Path(tmp) / "turb.env"
+            database = Path(tmp) / "turb.sqlite3"
+
+            with (
+                patch.object(env_loader, "_ENV_PATH", env_path),
+                patch.object(app_state_db, "APP_STATE_DB_PATH", database),
+                patch.object(env_loader, "load_env"),
+            ):
+                result = config_editor.update_config(
+                    {"SUB2API_AUTOMATION_CALLBACK_SECRET": "callback-secret"}
+                )
+
+                self.assertEqual(
+                    result["updated"],
+                    ["SUB2API_AUTOMATION_CALLBACK_SECRET"],
+                )
+                self.assertEqual(
+                    app_state_db.get_named_document(
+                        env_loader.RUNTIME_SETTINGS_DOCUMENT_KEY,
+                        {},
+                    )["SUB2API_AUTOMATION_CALLBACK_SECRET"],
+                    "callback-secret",
+                )
+                fields = {
+                    item["key"]: item
+                    for item in config_editor.get_config()
+                }
+                self.assertEqual(
+                    fields["SUB2API_AUTOMATION_CALLBACK_SECRET"]["value"],
+                    "callback-secret",
+                )
+
     def test_load_env_prefers_persisted_runtime_setting_over_read_only_env_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             env_path = Path(tmp) / "turb.env"
