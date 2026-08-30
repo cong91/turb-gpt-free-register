@@ -5,25 +5,33 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import nullcontext
 from urllib.parse import urlparse
 
 from config import browser_use as _cfg
 from config import roxybrowser as _roxy_cfg
 from core import sms_provider
+from core import codex_oauth as _codex_proto
 from core.browser_use_client import BrowserUseClient
-from core.openai_auth import AccountUnusableError, detect_account_unusable_response_body
 from core.browser_use_registration import (
-    _timeout_ms,
-    _page_url,
-    _fill_first,
-    _click_first,
-    _maybe_accept_cookies,
-    _type_otp,
     _clear_otp_inputs,
-    _wait_after_otp,
+    _click_first,
     _click_passwordless_signup_if_present,
+    _maybe_accept_cookies,
+    _page_url,
+    _quick_auth_state,
+    _timeout_ms,
+    _type_otp,
 )
+from core.codex_login_credentials import CodexLoginCredentials, generate_totp_code
 from core.humanize import delay as human_delay
+from core.openai_auth import (
+    AccountUnusableError,
+    account_unusable_error_message,
+    account_unusable_message,
+    detect_account_unusable_response_body,
+    detect_account_unusable_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -359,6 +367,216 @@ def _looks_next_step_after_login(page) -> bool:
     )
 
 
+def _classify_credential_login_state(page) -> str:
+    """识别 Browser Use/Skyvern 的密码、TOTP、授权或账号停用页面。"""
+    info = _quick_auth_state(page)
+    url = str(info.get("url") or _page_url(page) or "").lower()
+    body = _body_snippet(page, 1600)
+    if not body:
+        body = str(info.get("textPreview") or "")
+    body = body.lower()
+    dead_code = detect_account_unusable_text(body)
+    if dead_code:
+        return f"deactivated:{dead_code}"
+
+    if _is_callback_url(url) or any(
+        marker in url for marker in ("/add-phone", "/phone-verification", "/workspace", "/consent", "localhost:1455")
+    ):
+        return "accepted"
+
+    email_markers = (
+        "email-verification",
+        "email_otp",
+        "sent a code to your email",
+        "check your inbox",
+        "邮箱验证码",
+        "電子メールに送信",
+    )
+    if any(marker in url or marker in body for marker in email_markers):
+        return "email_otp"
+
+    totp_markers = (
+        "/mfa",
+        "/totp",
+        "authenticator",
+        "two-factor",
+        "two factor",
+        "2fa",
+        "动态验证码",
+        "身份验证器",
+        "認証アプリ",
+    )
+    is_totp = any(marker in url or marker in body for marker in totp_markers)
+    rejection_markers = ("incorrect", "invalid", "expired", "try again", "错误", "无效", "过期")
+    if is_totp and any(marker in body for marker in rejection_markers):
+        return "totp_invalid"
+
+    state = str(info.get("state") or "")
+    if state in ("password", "login_password") or "/log-in/password" in url:
+        if any(marker in body for marker in rejection_markers):
+            return "password_invalid"
+        return "password"
+    if is_totp:
+        return "totp"
+
+    for frame in _all_frames(page):
+        try:
+            if _visible_locator_any_frame(frame, ["input[type='password']"], timeout_ms=500) is not None:
+                return "password"
+            if _visible_locator_any_frame(
+                frame,
+                [
+                    "input[autocomplete='one-time-code']",
+                    "input[name='code']",
+                    "input[inputmode='numeric']",
+                    "input[type='tel']",
+                ],
+                timeout_ms=500,
+            ) is not None:
+                return "totp"
+        except Exception:
+            continue
+    if any(marker in body for marker in ("allow access", "authorize codex", "continue to codex", "consent")):
+        return "accepted"
+    return "unknown"
+
+
+def _wait_for_credential_login_state(
+    page,
+    timeout: float = 35.0,
+    *,
+    ignored_states: set[str] | None = None,
+) -> str:
+    ignored_states = {str(state).strip().lower() for state in (ignored_states or set())}
+    end = time.time() + max(0.0, float(timeout))
+    last_ignored = ""
+    while time.time() < end:
+        state = _classify_credential_login_state(page)
+        if state != "unknown" and state not in ignored_states:
+            return state
+        if state in ignored_states:
+            last_ignored = state
+        time.sleep(0.4 if _fast_mode() else 0.6)
+    return last_ignored or "unknown"
+
+
+def _credential_login_error(state: str) -> Exception:
+    if state.startswith("deactivated:"):
+        error_code = state.split(":", 1)[1] or "account_deactivated"
+        return AccountUnusableError(account_unusable_error_message(error_code), error_code=error_code)
+    if state == "email_otp":
+        return RuntimeError("Codex credential login unexpectedly requires email OTP")
+    if state == "password_invalid":
+        return RuntimeError("Codex credential login password was rejected")
+    if state == "totp_invalid":
+        return RuntimeError("Codex credential login TOTP was rejected")
+    if state == "password":
+        return RuntimeError("Codex credential login stayed on the password page after submit")
+    if state == "totp":
+        return RuntimeError("Codex credential login stayed on the authenticator page after submit")
+    return RuntimeError(f"Codex credential login did not reach the OAuth flow: state={state}")
+
+
+def _login_with_credentials(page, credentials: CodexLoginCredentials, auth_url: str) -> None:
+    """Authenticate Browser Use/Skyvern with password and authenticator TOTP."""
+    page.goto(
+        auth_url,
+        wait_until="domcontentloaded",
+        timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)),
+    )
+    try:
+        page.wait_for_load_state("load", timeout=5000)
+    except Exception:
+        pass
+    _wait_auth_page_ready(page, timeout=2)
+    _bu_delay("navigate")
+    _maybe_accept_cookies(page)
+    _fill_email_for_codex(page, credentials.email)
+    state = _wait_for_credential_login_state(page)
+    if state == "accepted":
+        return
+    if state != "password":
+        raise _credential_login_error(state)
+
+    if not _fill_first_any_frame(
+        page,
+        [
+            "input[type='password']",
+            "input[name*='password' i]",
+            "input[autocomplete='current-password']",
+        ],
+        credentials.password,
+        timeout_ms=10000,
+    ):
+        raise RuntimeError("Codex credential login password input not found")
+    if not _click_first_any_frame(
+        page,
+        [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Continue')",
+            "button:has-text('Log in')",
+            "button:has-text('Sign in')",
+            "button:has-text('继续')",
+            "button:has-text('登录')",
+            "form button",
+        ],
+        timeout_ms=5000,
+    ):
+        try:
+            page.keyboard.press("Enter")
+        except Exception:
+            pass
+    _bu_delay("form")
+    state = _wait_for_credential_login_state(page, ignored_states={"password"})
+    if state == "accepted":
+        return
+    if state != "totp":
+        raise _credential_login_error(state)
+
+    previous_code = None
+    for attempt in range(2):
+        code = generate_totp_code(credentials.totp_secret, previous_code=previous_code)
+        previous_code = code
+        if not _fill_first_any_frame(
+            page,
+            [
+                "input[autocomplete='one-time-code']",
+                "input[name='code']",
+                "input[name='otp']",
+                "input[inputmode='numeric']",
+                "input[type='tel']",
+            ],
+            code,
+            timeout_ms=8000,
+        ):
+            raise RuntimeError("Codex credential login authenticator input not found")
+        if not _click_first_any_frame(
+            page,
+            [
+                "button[type='submit']",
+                "input[type='submit']",
+                "button:has-text('Continue')",
+                "button:has-text('Verify')",
+                "button:has-text('Submit')",
+                "button:has-text('继续')",
+                "button:has-text('验证')",
+                "form button",
+            ],
+            timeout_ms=5000,
+        ):
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+        _bu_delay("otp_input")
+        state = _wait_for_credential_login_state(page, ignored_states={"totp"})
+        if state == "accepted":
+            return
+        if state != "totp_invalid" or attempt >= 1:
+            raise _credential_login_error(state)
+
+
 
 def _click_email_entry_fast(page) -> bool:
     script = r"""
@@ -556,9 +774,13 @@ def _fill_email_for_codex(page, email: str) -> None:
 
 def _looks_email_otp_page(page) -> bool:
     url = _page_url(page).lower()
+    if "/mfa-challenge" in url:
+        return False
     if "email-verification" in url or "email_otp" in url or ("verify" in url and "email" in url):
         return True
     try:
+        if page.locator("form[action*='/mfa-challenge' i]").count() > 0:
+            return False
         return page.locator("input[autocomplete='one-time-code'], input[name='code'], input[inputmode='numeric']").count() > 0
     except Exception:
         return False
@@ -582,7 +804,7 @@ def _install_account_dead_response_tracker(page) -> dict:
                 if code:
                     tracker["code"] = code
                     tracker["text"] = text[:500]
-                    logger.warning("[Codex][BrowserUse] email-otp/validate 响应识别账号已废：%s", code)
+                    logger.warning("[Codex][BrowserUse] email-otp/validate phản hồi: OpenAI đã khóa tài khoản (%s)", code)
             except Exception:
                 pass
         page.on("response", _on_response)
@@ -596,6 +818,10 @@ def _wait_after_email_submit(page, timeout: int = 45, dead_tracker: dict | None 
     while time.time() < end:
         if dead_tracker and dead_tracker.get("code"):
             return f"deactivated:{dead_tracker.get('code')}"
+        body = _body_snippet(page, 1600).lower()
+        dead_code = detect_account_unusable_text(body)
+        if dead_code:
+            return f"deactivated:{dead_code}"
         url = _page_url(page).lower()
         if _is_callback_url(url):
             return "callback"
@@ -603,11 +829,6 @@ def _wait_after_email_submit(page, timeout: int = 45, dead_tracker: dict | None 
             return "accepted"
         if not _looks_email_otp_page(page) and ("auth.openai.com" in url or "chatgpt.com" in url):
             return "accepted"
-        body = ""
-        try:
-            body = (page.locator("body").inner_text(timeout=1000) or "").lower()
-        except Exception:
-            pass
         if any(x in body for x in ("incorrect", "invalid", "expired", "错误", "过期", "无效")):
             return "invalid"
         time.sleep(0.5)
@@ -648,6 +869,153 @@ def _maybe_click_passwordless_after_email(page, email: str, timeout: int = 18) -
         logger.info("[Codex][BrowserUse] 已点击一次性验证码入口，未立即检测到 OTP 页，继续后续 OTP 轮询")
 
 
+def _account_password_for_email(email: str) -> str:
+    try:
+        return _codex_proto._account_registration_password(email)
+    except Exception:
+        return ""
+
+
+def _account_totp_code_for_email(email: str) -> str:
+    try:
+        return _codex_proto._account_totp_code(email)
+    except Exception:
+        return ""
+
+
+def _looks_mfa_challenge_page(page) -> bool:
+    url = _page_url(page).lower()
+    if "/mfa-challenge/" in url or "/mfa-challenge" in url:
+        return True
+    try:
+        return bool(page.locator('form[action*="/mfa-challenge" i] input[name="code"]').count())
+    except Exception:
+        return False
+
+
+def _fill_mfa_challenge_if_present(page, email: str, timeout: int = 15) -> bool:
+    code = _account_totp_code_for_email(email)
+    if not code:
+        return False
+    end = time.time() + timeout
+    while time.time() < end:
+        if not _looks_mfa_challenge_page(page):
+            time.sleep(0.4)
+            continue
+        try:
+            ok = _fill_first(
+                page,
+                [
+                    'form[action*="/mfa-challenge" i] input[name="code"]',
+                    'form[action*="/mfa-challenge" i] input[autocomplete="one-time-code"]',
+                    'form[action*="/mfa-challenge" i] input[maxlength="6"]',
+                ],
+                code,
+                timeout_ms=5000,
+            )
+            if not ok:
+                time.sleep(0.4)
+                continue
+            time.sleep(1.2)
+            if not _click_first(
+                page,
+                [
+                    'form[action*="/mfa-challenge" i] button[type="submit"]',
+                    'button[data-dd-action-name="Continue"]',
+                    'button:has-text("Continue")',
+                    'button:has-text("続行")',
+                    'form button',
+                ],
+                timeout_ms=5000,
+            ):
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:
+                    pass
+            logger.info("[Codex][BrowserUse] 已填写并提交 MFA 验证码：%s", email)
+            wait_end = time.time() + 12
+            while time.time() < wait_end:
+                if not _looks_mfa_challenge_page(page):
+                    return True
+                time.sleep(0.4)
+            return True
+        except Exception as exc:
+            logger.debug("[Codex][BrowserUse] MFA challenge 处理失败：%s", str(exc)[:160])
+            time.sleep(0.5)
+    return False
+
+
+def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str | None:
+    """Codex OAuth 若账号有密码，优先在登录密码页输入密码。返回 next_step / email_otp / None。"""
+    password = _account_password_for_email(email)
+    if not password:
+        return None
+    end = time.time() + timeout
+    while time.time() < end:
+        if _looks_mfa_challenge_page(page):
+            _fill_mfa_challenge_if_present(page, email, timeout=15)
+            return "next_step"
+        if _looks_email_otp_page(page):
+            return "email_otp"
+        if not _looks_next_step_after_login(page):
+            try:
+                if "/log-in/password" not in _page_url(page).lower():
+                    time.sleep(0.4)
+                    continue
+            except Exception:
+                time.sleep(0.4)
+                continue
+        ok = _fill_first(
+            page,
+            [
+                "input[type='password']",
+                "input[name*='password' i]",
+                "input[autocomplete='current-password']",
+            ],
+            password,
+            timeout_ms=8000,
+        )
+        if not ok:
+            logger.info("[Codex][BrowserUse] 登录密码页未找到输入框，继续等待")
+            time.sleep(0.5)
+            continue
+        time.sleep(1.6)
+        if not _click_first(
+            page,
+            [
+                "button[type='submit']",
+                "button[data-dd-action-name='Continue']",
+                "button[data-login-web-auth-control='true'][type='submit']",
+                "button:has-text('Continue')",
+                "button:has-text('続行')",
+                "button:has-text('Submit')",
+                "form button",
+            ],
+            timeout_ms=5000,
+        ):
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+        logger.info("[Codex][BrowserUse] 已填写并提交登录密码：%s", email)
+        wait_end = time.time() + 12
+        while time.time() < wait_end:
+            if _looks_mfa_challenge_page(page):
+                _fill_mfa_challenge_if_present(page, email, timeout=15)
+                return "next_step"
+            if _looks_email_otp_page(page):
+                return "email_otp"
+            if not _looks_next_step_after_login(page):
+                try:
+                    if "/log-in/password" not in _page_url(page).lower():
+                        return "next_step"
+                except Exception:
+                    return "next_step"
+            time.sleep(0.5)
+        return "next_step"
+    return None
+
+
 def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_tracker: dict | None = None) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][BrowserUse] 打开授权地址")
@@ -668,7 +1036,18 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
         _fill_email_for_codex(page, email)
         _t_email.done()
         logger.info("[Codex][BrowserUse] 已提交邮箱：%s", email)
-        _maybe_click_passwordless_after_email(page, email, timeout=18)
+        pw_result = _fill_login_password_if_present(page, email, timeout=18)
+        if pw_result == "next_step":
+            if _looks_mfa_challenge_page(page):
+                _fill_mfa_challenge_if_present(page, email, timeout=15)
+            logger.info("[Codex][BrowserUse] 账号已用密码完成登录，直接进入后续步骤")
+            return
+        if pw_result != "email_otp":
+            if _looks_mfa_challenge_page(page):
+                _fill_mfa_challenge_if_present(page, email, timeout=15)
+                logger.info("[Codex][BrowserUse] 密码后进入 MFA 验证，已完成 2FA")
+                return
+            _maybe_click_passwordless_after_email(page, email, timeout=18)
     except Exception as exc:
         if _looks_next_step_after_login(page):
             logger.info("[Codex][BrowserUse] 未检测到邮箱输入框，但页面已进入后续授权步骤：%s", _current_state_for_log(page))
@@ -692,7 +1071,18 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
                 return
             _fill_email_for_codex(page, email)
             logger.info("[Codex][BrowserUse] 已重新提交邮箱触发 OTP")
-            _maybe_click_passwordless_after_email(page, email, timeout=12)
+            pw_result = _fill_login_password_if_present(page, email, timeout=12)
+            if pw_result == "next_step":
+                if _looks_mfa_challenge_page(page):
+                    _fill_mfa_challenge_if_present(page, email, timeout=15)
+                logger.info("[Codex][BrowserUse] 重新提交邮箱后已用密码完成登录，进入后续步骤")
+                return
+            if pw_result != "email_otp":
+                if _looks_mfa_challenge_page(page):
+                    _fill_mfa_challenge_if_present(page, email, timeout=15)
+                    logger.info("[Codex][BrowserUse] 重新提交邮箱后进入 MFA 验证，已完成 2FA")
+                    return
+                _maybe_click_passwordless_after_email(page, email, timeout=12)
         except Exception as exc:
             logger.warning("[Codex][BrowserUse] 重新提交邮箱失败，继续按当前页面轮询：%s", str(exc)[:180])
         _bu_delay("api")
@@ -744,9 +1134,12 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
         outcome = _wait_after_email_submit(page, timeout=30 if _fast_mode() else 45, dead_tracker=dead_tracker)
         _t_otp_submit.done(f"state={outcome}")
         logger.info("[Codex][BrowserUse] 邮箱 OTP 提交后状态：%s", outcome)
+        if _looks_mfa_challenge_page(page):
+            _fill_mfa_challenge_if_present(page, email, timeout=15)
+            return
         if str(outcome).startswith("deactivated:"):
             error_code = str(outcome).split(":", 1)[1] or "account_deactivated"
-            raise AccountUnusableError(f"账号已废（{error_code}）", error_code=error_code)
+            raise AccountUnusableError(account_unusable_error_message(error_code), error_code=error_code)
         if outcome in ("accepted", "callback", "unknown"):
             return
         if attempt >= 3:
@@ -1197,7 +1590,10 @@ def _do_phone_verification_if_present(page) -> None:
                 raise RuntimeError("无法回到手机号输入页，暂不取新号")
             _t_phone_ready.done()
             logger.info("[Codex][BrowserUse] 需要手机验证，开始取号（%s/%s）", attempt, max_retries)
-            activation_id, phone = sms_provider.acquire_number(http)
+            activation_id, phone = sms_provider.acquire_number(
+                http,
+                lane_key=sms_provider.default_lane_key(),
+            )
             logger.info("[Codex][BrowserUse] 已取号：%s activation=%s", phone, activation_id)
             _t_phone_send = _StepTimer(f"填写并提交手机号 attempt={attempt}")
             phone_e164 = _fill_phone(page, phone)
@@ -1276,7 +1672,18 @@ def _finish_consent_workspace(context, page) -> str:
     return _wait_for_callback(context, page, timeout=5)
 
 
-def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:
+def _run_browser_use_codex_oauth_once(
+    email: str,
+    otp_provider=None,
+    proxy: str | None = None,
+    force: bool = False,
+    cloud_provider: str = "browser_use",
+    credentials: CodexLoginCredentials | None = None,
+    existing_browser=None,
+    existing_context=None,
+    existing_page=None,
+    existing_session_info=None,
+) -> dict:
     from core import codex_oauth as proto
     if not force and not proto._cfg.ENABLE_CODEX_AUTO:
         return proto._codex_result(status="skipped", message="ENABLE_CODEX_AUTO=False")
@@ -1285,23 +1692,34 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
     if otp_provider is None:
         from core.email_provider import wait_for_otp as otp_provider
 
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        return proto._codex_result(status="failed", email=email, message="缺少 playwright，请执行 pip install playwright")
-
     provider = str(cloud_provider or "browser_use").strip().lower()
+    reusing_existing_session = existing_browser is not None
     if provider in ("skyvern", "sv"):
         from core.skyvern_client import SkyvernClient
+
         provider_label = "Skyvern"
-        client = SkyvernClient()
+        client = None if reusing_existing_session else SkyvernClient()
     else:
         provider_label = "BrowserUse"
-        client = BrowserUseClient()
+        client = None if reusing_existing_session else BrowserUseClient()
+
+    if reusing_existing_session:
+        if existing_session_info is None:
+            return proto._codex_result(status="failed", email=email, message="缺少可复用的 BrowserUse session 信息")
+        session_info = existing_session_info
+    else:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            return proto._codex_result(status="failed", email=email, message="缺少 playwright，请执行 pip install playwright")
+        session_info = (
+            client.open_session(proxy=proxy)
+            if proxy is not None
+            else client.open_session()
+        )
 
     _set_log_provider_label(provider_label)
     _t_all = _StepTimer(f"Codex {provider_label} 全流程")
-    session_info = client.open_session()
     browser = None
     context = None
     page = None
@@ -1332,20 +1750,30 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             session_info.profile_id or "-",
             "yes" if proxy else "no",
         )
-        with sync_playwright() as p:
-            _t_cdp = _StepTimer("连接 Browser Use CDP")
-            connect_kwargs = {}
-            if provider in ("skyvern", "sv") and hasattr(client, "cdp_headers"):
-                connect_kwargs["headers"] = client.cdp_headers()
-            browser = p.chromium.connect_over_cdp(session_info.connect_url, **connect_kwargs)
-            _t_cdp.done()
-            context = browser.contexts[0] if browser.contexts else browser.new_context()
-            page = context.pages[0] if context.pages else context.new_page()
+        playwright_scope = nullcontext() if reusing_existing_session else sync_playwright()
+        with playwright_scope as p:
+            if reusing_existing_session:
+                browser = existing_browser
+                context = existing_context or (browser.contexts[0] if browser.contexts else browser.new_context())
+                page = existing_page or (context.pages[0] if context.pages else context.new_page())
+                logger.info("[Codex][%s] 复用注册阶段 BrowserUse session，不重新连接/创建浏览器", provider_label)
+            else:
+                _t_cdp = _StepTimer("连接 Browser Use CDP")
+                connect_kwargs = {}
+                if provider in ("skyvern", "sv") and hasattr(client, "cdp_headers"):
+                    connect_kwargs["headers"] = client.cdp_headers()
+                browser = p.chromium.connect_over_cdp(session_info.connect_url, **connect_kwargs)
+                _t_cdp.done()
+                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                page = context.pages[0] if context.pages else context.new_page()
             page.set_default_timeout(_timeout_ms())
             page.set_default_navigation_timeout(_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
             dead_tracker = _install_account_dead_response_tracker(page)
 
-            _fill_email_and_otp(page, email, otp_provider, auth_url, dead_tracker=dead_tracker)
+            if credentials is None:
+                _fill_email_and_otp(page, email, otp_provider, auth_url, dead_tracker=dead_tracker)
+            else:
+                _login_with_credentials(page, credentials, auth_url)
             _do_phone_verification_if_present(page)
             logger.info("[Codex][BrowserUse] 手机验证处理完成/无需处理，等待授权确认和 callback")
             _t_callback = _StepTimer("等待 consent/workspace/callback")
@@ -1404,11 +1832,12 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
             _t_all.done("success")
             return proto._codex_result(status="success", ok=True, email=email, file_path=str(path), callback_url=callback_url)
     except AccountUnusableError as exc:
-        logger.warning("[Codex][BrowserUse] 账号已废：%s，%s", email, exc.error_code)
+        message = account_unusable_message(exc.error_code)
+        logger.warning("[Codex][BrowserUse] %s：%s，%s", message, email, exc.error_code)
         return proto._codex_result(
             status="deactivated",
             email=email,
-            message=f"账号已废（{exc.error_code or 'account_deactivated'}）",
+            message=message,
         )
     except Exception as exc:
         logger.error("[Codex][BrowserUse] 授权失败：%s: %s", type(exc).__name__, exc)
@@ -1422,7 +1851,7 @@ def _run_browser_use_codex_oauth_once(email: str, otp_provider=None, proxy: str 
                 keep_open = bool(getattr(_skyvern_cfg, "SKYVERN_KEEP_BROWSER_OPEN", False))
             except Exception:
                 keep_open = False
-        if not keep_open:
+        if not keep_open and not reusing_existing_session:
             try:
                 if browser is not None:
                     browser.close()
@@ -1474,7 +1903,18 @@ def _run_in_isolated_thread(fn, *args, **kwargs):
     return result_box.get("value")
 
 
-def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:
+def _run_browser_use_codex_oauth_impl(
+    email: str,
+    otp_provider=None,
+    proxy: str | None = None,
+    force: bool = False,
+    cloud_provider: str = "browser_use",
+    credentials: CodexLoginCredentials | None = None,
+    existing_browser=None,
+    existing_context=None,
+    existing_page=None,
+    existing_session_info=None,
+) -> dict:
     """Browser Use Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
 
@@ -1488,7 +1928,18 @@ def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str 
                 max_rounds,
                 email,
             )
-        result = _run_browser_use_codex_oauth_once(email=email, otp_provider=otp_provider, proxy=proxy, force=force, cloud_provider=cloud_provider)
+        result = _run_browser_use_codex_oauth_once(
+            email=email,
+            otp_provider=otp_provider,
+            proxy=proxy,
+            force=force,
+            cloud_provider=cloud_provider,
+            credentials=credentials,
+            existing_browser=existing_browser,
+            existing_context=existing_context,
+            existing_page=existing_page,
+            existing_session_info=existing_session_info,
+        )
         last_result = result
         if result.get("ok"):
             return result
@@ -1502,13 +1953,24 @@ def _run_browser_use_codex_oauth_impl(email: str, otp_provider=None, proxy: str 
     return proto._codex_result(status="failed", email=email, message="CPA callback 超时，重新授权失败")
 
 
-def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None = None, force: bool = False, cloud_provider: str = "browser_use") -> dict:
+def run_browser_use_codex_oauth(
+    email: str,
+    otp_provider=None,
+    proxy: str | None = None,
+    force: bool = False,
+    cloud_provider: str = "browser_use",
+    credentials: CodexLoginCredentials | None = None,
+    existing_browser=None,
+    existing_context=None,
+    existing_page=None,
+    existing_session_info=None,
+) -> dict:
     """Browser Use Codex OAuth 入口。
 
     如果当前线程已经有 Playwright/asyncio loop（典型场景：BrowserUse 注册成功后
     自动触发 Codex），则切到独立线程执行，避免 sync_playwright 嵌套报错。
     """
-    if _has_running_asyncio_loop():
+    if _has_running_asyncio_loop() and existing_browser is None:
         logger.info("[Codex][BrowserUse] 检测到当前线程已有 Playwright/asyncio loop，切换到隔离线程执行 Codex")
         return _run_in_isolated_thread(
             _run_browser_use_codex_oauth_impl,
@@ -1517,5 +1979,21 @@ def run_browser_use_codex_oauth(email: str, otp_provider=None, proxy: str | None
             proxy=proxy,
             force=force,
             cloud_provider=cloud_provider,
+            credentials=credentials,
+            existing_browser=existing_browser,
+            existing_context=existing_context,
+            existing_page=existing_page,
+            existing_session_info=existing_session_info,
         )
-    return _run_browser_use_codex_oauth_impl(email=email, otp_provider=otp_provider, proxy=proxy, force=force, cloud_provider=cloud_provider)
+    return _run_browser_use_codex_oauth_impl(
+        email=email,
+        otp_provider=otp_provider,
+        proxy=proxy,
+        force=force,
+        cloud_provider=cloud_provider,
+        credentials=credentials,
+        existing_browser=existing_browser,
+        existing_context=existing_context,
+        existing_page=existing_page,
+        existing_session_info=existing_session_info,
+    )

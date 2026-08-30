@@ -57,6 +57,26 @@ AGENT_HARNESS_ID = "codex-cli"
 RUNNING_LOCATION = "local"
 
 
+class AgentIdentityRegistrationError(RuntimeError):
+    """Lỗi có cấu trúc từ Agent Identity bootstrap."""
+
+    def __init__(
+        self,
+        status_code: int,
+        error_code: str,
+        message: str,
+        response_text: str = "",
+    ) -> None:
+        self.status_code = int(status_code)
+        self.error_code = str(error_code or "").strip()
+        self.response_text = str(response_text or "")
+        if self.error_code == "agent_registry_not_enabled":
+            detail = "Agent Registry chưa được bật cho account/workspace này"
+        else:
+            detail = message or self.response_text or "Agent Identity registration failed"
+        super().__init__(f"Agent Identity registration failed: {self.status_code} {detail}")
+
+
 # ============================================================
 #  日志
 # ============================================================
@@ -244,22 +264,19 @@ def register_agent(
 
     :param access_token: ChatGPT session JWT
     :param public_key_ssh: SSH 格式的 Ed25519 公钥
+    :param display_name: 保留旧调用方参数；当前 Agent API 不接受名称字段。
     :return: agent_runtime_id
     """
-    name = str(display_name or "").strip() or _random_agent_display_name()
+    del display_name
     payload = {
         "abom": {
             "agent_version": AGENT_VERSION,
             "agent_harness_id": AGENT_HARNESS_ID,
             "running_location": RUNNING_LOCATION,
-            # OpenAI Agent 场景也使用本轮随机名称，避免固定同一个展示名。
-            "display_name": name,
-            "agent_name": name,
         },
         "agent_public_key": public_key_ssh,
-        "display_name": name,
-        "agent_name": name,
-        "name": name,
+        "capabilities": ["responsesapi"],
+        "ttl": None,
     }
 
     r = _agent_post(
@@ -270,26 +287,22 @@ def register_agent(
         payload=payload,
     )
 
-    # 兼容 OpenAI 接口严格校验未知字段的情况：如果命名字段不被接受，回退到原始协议。
-    if r.status_code == 400 and any(x in (r.text or "").lower() for x in ("unknown", "unrecognized", "extra", "invalid")):
-        _log("Step 3", f"OpenAI Agent 注册接口不接受名称字段，回退原始 payload: {r.text[:180]}", "WARN")
-        r = _agent_post(
-            f"{AUTHAPI_BASE}/v1/agent/register",
-            access_token=access_token,
-            env=env,
-            timeout=timeout,
-            payload={
-                "abom": {
-                    "agent_version": AGENT_VERSION,
-                    "agent_harness_id": AGENT_HARNESS_ID,
-                    "running_location": RUNNING_LOCATION,
-                },
-                "agent_public_key": public_key_ssh,
-            },
+    if not 200 <= r.status_code < 300:
+        error_code = ""
+        message = ""
+        try:
+            error = r.json().get("error")
+            if isinstance(error, dict):
+                error_code = str(error.get("code") or "").strip()
+                message = str(error.get("message") or "").strip()
+        except (TypeError, ValueError, AttributeError):
+            pass
+        raise AgentIdentityRegistrationError(
+            r.status_code,
+            error_code,
+            message,
+            r.text,
         )
-
-    if r.status_code != 200:
-        raise RuntimeError(f"Agent registration failed: {r.status_code} {r.text}")
 
     data = r.json()
     agent_runtime_id = data.get("agent_runtime_id")
@@ -345,7 +358,13 @@ def register_task(
         raise RuntimeError(f"Task registration failed: {r.status_code} {r.text}")
 
     data = r.json()
-    return data.get("encrypted_task_id", "")
+    return (
+        data.get("task_id")
+        or data.get("taskId")
+        or data.get("encrypted_task_id")
+        or data.get("encryptedTaskId")
+        or ""
+    )
 
 
 # ============================================================
@@ -421,6 +440,9 @@ def build_sub2api_account_entry(
     plan_type = str(identity.get("plan_type") or "free").strip() or "free"
     if not agent_runtime_id or not agent_private_key:
         raise ValueError("agent_identity 缺少 agent_runtime_id/agent_private_key")
+    from config import sub2api as _sub2_cfg
+    sub2_defaults = _sub2_cfg.get_sub2api_account_defaults()
+    model_mapping = dict(sub2_defaults["model_mapping"] or {})
 
     entry = {
         "name": display_name,
@@ -447,10 +469,13 @@ def build_sub2api_account_entry(
             "source": "codex_agent",
         },
         "concurrency": 10,
-        "priority": 1,
+        "priority": int(sub2_defaults["priority"]),
+        "group_ids": list(sub2_defaults["group_ids"]),
         "rate_multiplier": 1,
         "auto_pause_on_expired": True,
     }
+    if model_mapping:
+        entry["credentials"]["model_mapping"] = model_mapping
     if proxy_key:
         entry["proxy_key"] = str(proxy_key)
     return entry
@@ -506,8 +531,8 @@ def upsert_sub2api_account(
         if isinstance(existing, dict) and key and _sub2api_dedupe_key(existing) == key:
             merged = dict(existing)
             merged.update(incoming)
-            # 保留已人工调整的调度参数/代理键。
-            for keep in ("concurrency", "priority", "rate_multiplier", "auto_pause_on_expired", "proxy_key"):
+            # 保留不属于本次 sub2api 默认配置的人工调度参数/代理键。
+            for keep in ("concurrency", "rate_multiplier", "auto_pause_on_expired", "proxy_key"):
                 if keep in existing and (keep != "proxy_key" or not proxy_key):
                     merged[keep] = existing[keep]
             accounts[idx] = merged
@@ -564,14 +589,20 @@ def upload_sub2api_account(
     incoming: dict[str, Any] | None = None
     if mode in {"codex_session_import", "codex-session-import", "import_codex_session"}:
         identity = auth_json.get("agent_identity") if isinstance(auth_json, dict) else {}
+        from config import sub2api as _sub2_cfg
+        sub2_defaults = _sub2_cfg.get_sub2api_account_defaults()
         payload = {
             "contents": [json.dumps(auth_json, ensure_ascii=False)],
             "name": str((identity or {}).get("email") or "").strip() or str((identity or {}).get("name") or "").strip() or _random_agent_display_name(),
             "update_existing": True,
             "concurrency": 3,
-            "priority": 50,
+            "priority": int(sub2_defaults["priority"]),
+            "group_ids": list(sub2_defaults["group_ids"]),
             "confirm_mixed_channel_risk": True,
         }
+        model_mapping = dict(sub2_defaults["model_mapping"] or {})
+        if model_mapping:
+            payload["credential_extras"] = {"model_mapping": model_mapping}
     elif mode == "config":
         incoming = build_sub2api_account_entry(auth_json, proxy_key=proxy_key)
         payload = {"accounts": [incoming], "proxies": ([{"proxy_key": str(proxy_key)}] if proxy_key else [])}
@@ -634,7 +665,7 @@ def create_codex_agent_identity(
     完整流程：从 ChatGPT session JWT 创建 Codex Agent Identity auth.json。
 
     :param access_token: ChatGPT session JWT（从 /api/auth/session 获取的 accessToken）
-    :param output_path: auth.json 输出路径，默认当前目录
+    :param output_path: 可选的 auth.json 输出路径；不传时只返回内存对象
     :param verify_task: 是否验证 task 注册（可选）
     :return: auth.json dict
     """
@@ -663,9 +694,8 @@ def create_codex_agent_identity(
     _log("Step 2", f"public_key_fingerprint={_fingerprint(public_key_ssh)}", "OK")
 
     # Step 3: 注册 agent
-    agent_display_name = _random_agent_display_name()
-    _log("Step 3", f"在 auth.openai.com 注册 agent，display_name={agent_display_name}...")
-    agent_runtime_id = register_agent(access_token, public_key_ssh, env=env, timeout=timeout, display_name=agent_display_name)
+    _log("Step 3", "在 auth.openai.com 注册 agent identity runtime...")
+    agent_runtime_id = register_agent(access_token, public_key_ssh, env=env, timeout=timeout)
     _log("Step 3", f"agent_runtime_id={agent_runtime_id}", "OK")
 
     # Step 4: 验证 task 注册（可选）
@@ -690,13 +720,10 @@ def create_codex_agent_identity(
         display_name=email,
     )
 
-    if output_path is None:
-        output_path = os.path.join(os.getcwd(), "auth.json")
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(auth_json, f, indent=2, ensure_ascii=False)
-
-    _log("Step 5", f"已保存到 {output_path}", "OK")
+    if output_path:
+        _log("Step 5", "已忽略本地输出路径，凭证由 SQLite 持久化", "OK")
+    else:
+        _log("Step 5", "auth.json 已返回内存对象，由 SQLite 持久化", "OK")
 
     return auth_json
 
@@ -727,7 +754,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Codex Agent Identity 自动注册")
     parser.add_argument("--token", type=str, help="ChatGPT session JWT (accessToken)")
     parser.add_argument("--file", type=str, help="包含 accessToken 的 JSON 文件路径")
-    parser.add_argument("--output", "-o", type=str, default="auth.json", help="输出路径 (默认: auth.json)")
+    parser.add_argument("--output", "-o", type=str, default=None, help="可选输出路径；默认仅返回并由 SQLite 保存")
     parser.add_argument("--no-verify", action="store_true", help="跳过 task 注册验证")
     args = parser.parse_args()
 

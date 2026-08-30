@@ -34,8 +34,12 @@ CLOAK_EXTRA_ARGS: list = []
 # 与原 Roxy Selenium 流程共用的超时时间。
 CLOAK_SELENIUM_TIMEOUT: int = 90
 
+# Cloak 页面导航遇到代理/上游短暂断开时的重试次数和退避间隔。
+CLOAK_NAVIGATION_RETRIES: int = 3
+CLOAK_NAVIGATION_RETRY_DELAY: float = 1.5
+
 # 调试时保留浏览器不自动关闭。
 CLOAK_KEEP_BROWSER_OPEN: bool = False
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'CLOAK_HEADLESS': 'bool', 'CLOAK_HUMANIZE': 'bool', 'CLOAK_GEOIP': 'bool', 'CLOAK_LOCALE': 'str', 'CLOAK_TIMEZONE': 'str', 'CLOAK_USE_PROXY': 'bool', 'CLOAK_LICENSE_KEY': 'str', 'CLOAK_FINGERPRINT_SEED': 'str', 'CLOAK_USER_DATA_DIR': 'str', 'CLOAK_SELENIUM_TIMEOUT': 'int', 'CLOAK_KEEP_BROWSER_OPEN': 'bool'})
+apply_env_overrides(globals(), {'CLOAK_HEADLESS': 'bool', 'CLOAK_HUMANIZE': 'bool', 'CLOAK_GEOIP': 'bool', 'CLOAK_LOCALE': 'str', 'CLOAK_TIMEZONE': 'str', 'CLOAK_USE_PROXY': 'bool', 'CLOAK_LICENSE_KEY': 'str', 'CLOAK_FINGERPRINT_SEED': 'str', 'CLOAK_USER_DATA_DIR': 'str', 'CLOAK_SELENIUM_TIMEOUT': 'int', 'CLOAK_NAVIGATION_RETRIES': 'int', 'CLOAK_NAVIGATION_RETRY_DELAY': 'float', 'CLOAK_KEEP_BROWSER_OPEN': 'bool'})

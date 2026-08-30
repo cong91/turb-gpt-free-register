@@ -4,6 +4,7 @@ curl_cffi Session 封装
 统一管理 Cookie、请求头和 TLS 指纹
 """
 import logging
+import hashlib
 import random
 import threading
 import time
@@ -17,6 +18,7 @@ from config import (
     SEC_CH_UA_BITNESS, SEC_CH_UA_MODEL, SEND_HIGH_ENTROPY_CLIENT_HINTS,
     ACCEPT_LANGUAGE, IMPERSONATE, OAI_CLIENT_BUILD_NUMBER, OAI_CLIENT_VERSION,
     REQUEST_TIMEOUT, pick_proxy, pick_browser_profile, validate_browser_profile,
+    BROWSER_PROFILE_POOL, build_browser_environment,
 )
 
 
@@ -26,13 +28,47 @@ _GEO_CACHE_LOCK = threading.Lock()
 _CF_COOKIE_NAMES = ("cf_clearance", "__cf_bm", "__cfseq", "cf_chl_rc_i", "cf_chl_rc_ni", "cf_chl_rc_m")
 
 
+def _seed_uuid(seed: str, salt: str) -> str:
+    text = f"{salt}:{seed}".strip()
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, text))
+
+
+def _seed_int(seed: str, salt: str, *, bits: int = 63) -> int:
+    digest = hashlib.sha256(f"{salt}:{seed}".encode("utf-8")).digest()
+    nbytes = max(1, (bits + 7) // 8)
+    value = int.from_bytes(digest[:nbytes], "big")
+    mask = (1 << bits) - 1
+    return value & mask
+
+
+def _seeded_browser_profile(seed: str, geo: dict | None = None) -> dict:
+    if not seed:
+        return pick_browser_profile(geo)
+    pool = list(BROWSER_PROFILE_POOL or [])
+    if not pool:
+        return pick_browser_profile(geo)
+    idx = _seed_int(seed, "browser_profile_index", bits=32) % len(pool)
+    return build_browser_environment(geo, base_profile=pool[idx])
+
+
 class BrowserSession:
     """
     模拟 Chrome 浏览器的 HTTP 会话管理器。
     使用 curl_cffi 的 impersonate 功能绕过 Cloudflare TLS 指纹检测。
     """
 
-    def __init__(self, proxy: str = None, *, detect_exit_geo: bool = True):
+    def __init__(
+        self,
+        proxy: str = None,
+        *,
+        detect_exit_geo: bool = True,
+        device_id: str | None = None,
+        auth_session_logging_id: str | None = None,
+        oai_session_id: str | None = None,
+        sentinel_sid: str | None = None,
+        browser_profile: dict | None = None,
+        fingerprint_seed: str | None = None,
+    ):
         """
         初始化会话。
 
@@ -51,26 +87,56 @@ class BrowserSession:
         else:
             self.proxy = proxy
 
-        # 生成设备ID（oai-did），整个注册流程复用
-        self.device_id = str(uuid.uuid4())
+        self.fingerprint_seed = str(fingerprint_seed or "").strip()
+
+        # 生成/复用设备ID（oai-did），整个任务周期复用。
+        if device_id:
+            self.device_id = str(device_id)
+        elif self.fingerprint_seed:
+            self.device_id = _seed_uuid(self.fingerprint_seed, "device_id")
+        else:
+            self.device_id = str(uuid.uuid4())
 
         # 生成 auth_session_logging_id
-        self.auth_session_logging_id = str(uuid.uuid4())
+        if auth_session_logging_id:
+            self.auth_session_logging_id = str(auth_session_logging_id)
+        elif self.fingerprint_seed:
+            self.auth_session_logging_id = _seed_uuid(self.fingerprint_seed, "auth_session_logging_id")
+        else:
+            self.auth_session_logging_id = str(uuid.uuid4())
 
         # ChatGPT 前端会话 ID：CES / Statsig / API 链路内保持稳定。
-        self.oai_session_id = str(uuid.uuid4())
+        if oai_session_id:
+            self.oai_session_id = str(oai_session_id)
+        elif self.fingerprint_seed:
+            self.oai_session_id = _seed_uuid(self.fingerprint_seed, "oai_session_id")
+        else:
+            self.oai_session_id = str(uuid.uuid4())
 
         # Datadog/RUM 关联 ID：每个 BrowserSession 独立生成，禁止跨账号复用。
-        # 只作为前端同形态诊断头，贯穿本会话内所有 auth/chatgpt/sentinel API 调用。
-        self.datadog_trace_id = str(random.getrandbits(63))
-        self.datadog_parent_id = str(random.getrandbits(63))
+        # 同一账号的运行时环境尽量保持固定，避免同账号多次操作指纹漂移。
+        if self.fingerprint_seed:
+            self.datadog_trace_id = str(_seed_int(self.fingerprint_seed, "datadog_trace_id"))
+            self.datadog_parent_id = str(_seed_int(self.fingerprint_seed, "datadog_parent_id"))
+        else:
+            self.datadog_trace_id = str(random.getrandbits(63))
+            self.datadog_parent_id = str(random.getrandbits(63))
         self.datadog_origin = "rum"
 
         # Sentinel SDK 内部 sid：真实 SDK 会单独生成一个 UUID，和 oai-did 不是同一个值。
         # Python 初始 p 与 Node Runner 最终 token 都复用这个 sid，保持同一 SDK 实例语义。
-        self.sentinel_sid = str(uuid.uuid4())
-        self.react_listening_key = "_reactListening" + uuid.uuid4().hex[:12]
-        self.react_container_key = "__reactContainer$" + uuid.uuid4().hex[:11]
+        if sentinel_sid:
+            self.sentinel_sid = str(sentinel_sid)
+        elif self.fingerprint_seed:
+            self.sentinel_sid = _seed_uuid(self.fingerprint_seed, "sentinel_sid")
+        else:
+            self.sentinel_sid = str(uuid.uuid4())
+        if self.fingerprint_seed:
+            self.react_listening_key = "_reactListening" + _seed_uuid(self.fingerprint_seed, "react_listening_key").replace("-", "")[:12]
+            self.react_container_key = "__reactContainer$" + _seed_uuid(self.fingerprint_seed, "react_container_key").replace("-", "")[:11]
+        else:
+            self.react_listening_key = "_reactListening" + uuid.uuid4().hex[:12]
+            self.react_container_key = "__reactContainer$" + uuid.uuid4().hex[:11]
         self.react_resources_key = "__reactResources$" + self.react_container_key.split("$", 1)[1]
 
         # 创建 curl_cffi 会话
@@ -94,7 +160,10 @@ class BrowserSession:
         # 这样 Accept-Language / navigator.language / timezone 可自动跟随出口地区。
         self.exit_geo = self._detect_exit_geo() if detect_exit_geo else {}
         self._enforce_proxy_quality()
-        self.browser_profile = pick_browser_profile(self.exit_geo)
+        if browser_profile:
+            self.browser_profile = dict(browser_profile)
+        else:
+            self.browser_profile = dict(_seeded_browser_profile(self.fingerprint_seed, self.exit_geo))
         self.browser_profile["react_listening_key"] = self.react_listening_key
         self.browser_profile["react_container_key"] = self.react_container_key
         self.browser_profile["react_resources_key"] = self.react_resources_key
@@ -122,6 +191,75 @@ class BrowserSession:
         except Exception:
             pass
         return out
+
+    @staticmethod
+    def _short_value(value: object, limit: int = 80) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        return text if len(text) <= limit else text[: max(0, limit - 3)] + "..."
+
+    def fingerprint_summary(self) -> dict:
+        """返回适合日志/落库的浏览器指纹摘要，不展开过长数组字段。"""
+        profile = getattr(self, "browser_profile", {}) or {}
+        geo = profile.get("geo") or self.exit_geo or {}
+        summary = {
+            "device_id": self.device_id,
+            "proxy": self.proxy or "",
+            "proxy_mode": "direct" if not self.proxy else "proxy",
+            "browser_family": profile.get("browser_family") or "chrome",
+            "browser_os": profile.get("browser_os") or "macOS",
+            "user_agent": profile.get("user_agent") or USER_AGENT,
+            "accept_language": profile.get("accept_language") or ACCEPT_LANGUAGE,
+            "navigator_language": profile.get("navigator_language") or "zh-CN",
+            "navigator_languages": list(profile.get("navigator_languages") or []),
+            "timezone_iana": profile.get("timezone_iana") or "",
+            "timezone_offset_minutes": int(profile.get("timezone_offset_minutes", 0) or 0),
+            "timezone_name": profile.get("timezone_name") or "",
+            "screen_width": int(profile.get("screen_width", 0) or 0),
+            "screen_height": int(profile.get("screen_height", 0) or 0),
+            "device_pixel_ratio": profile.get("device_pixel_ratio") or 0,
+            "hardware_concurrency": profile.get("hardware_concurrency") or 0,
+            "device_memory": profile.get("device_memory") or 0,
+            "js_heap_size_limit": profile.get("js_heap_size_limit") or 0,
+            "sec_ch_ua": profile.get("sec_ch_ua") or "",
+            "sec_ch_ua_platform": profile.get("sec_ch_ua_platform") or "",
+            "sec_ch_ua_platform_version": profile.get("sec_ch_ua_platform_version") or "",
+            "sec_ch_ua_mobile": profile.get("sec_ch_ua_mobile") or "",
+            "sec_ch_ua_arch": profile.get("sec_ch_ua_arch") or "",
+            "sec_ch_ua_bitness": profile.get("sec_ch_ua_bitness") or "",
+            "sec_ch_ua_model": profile.get("sec_ch_ua_model") or "",
+            "sec_ch_ua_full_version_list": profile.get("sec_ch_ua_full_version_list") or "",
+            "react_listening_key": profile.get("react_listening_key") or "",
+            "react_container_key": profile.get("react_container_key") or "",
+            "react_resources_key": profile.get("react_resources_key") or "",
+            "sentinel_sid": self.sentinel_sid,
+            "oai_session_id": self.oai_session_id,
+            "auth_session_logging_id": self.auth_session_logging_id,
+            "datadog_trace_id": self.datadog_trace_id,
+            "datadog_parent_id": self.datadog_parent_id,
+            "geo_country": geo.get("country") or "",
+            "geo_city": geo.get("city") or "",
+            "geo_timezone": geo.get("timezone") or "",
+            "geo_org": geo.get("org") or "",
+        }
+        return summary
+
+    def fingerprint_summary_text(self) -> str:
+        """把摘要压成单行，方便日志输出。"""
+        p = self.fingerprint_summary()
+        parts = [
+            f"device_id={self._short_value(p.get('device_id'), 12)}",
+            f"proxy={self._short_value(p.get('proxy') or 'direct', 36)}",
+            f"ua={self._short_value(p.get('user_agent'), 72)}",
+            f"lang={p.get('accept_language')}",
+            f"tz={p.get('timezone_iana')}({p.get('timezone_offset_minutes')})",
+            f"screen={p.get('screen_width')}x{p.get('screen_height')}@{p.get('device_pixel_ratio')}",
+            f"cpu={p.get('hardware_concurrency')}",
+            f"mem={p.get('device_memory')}",
+            f"geo={p.get('geo_country') or '?'}:{p.get('geo_city') or '?'}",
+        ]
+        return " ".join(parts)
 
     def _observe_cf_cookie_changes(self, url: str) -> None:
         current = self.cf_cookie_snapshot()
@@ -470,6 +608,15 @@ class BrowserSession:
         if self.blocked_until and time.time() < self.blocked_until:
             remain = max(0, int(self.blocked_until - time.time()))
             raise RuntimeError(f"当前 BrowserSession 已熔断冷却（剩余 {remain}s）：{self.blocked_reason}")
+
+    def reset_circuit_breaker(self) -> None:
+        """清理一次可选预热产生的本地熔断状态。
+
+        某些 best-effort bootstrap 接口返回 403 时，不代表后续正式认证接口
+        不可用；调用方完成错误隔离后可显式恢复本会话继续执行。
+        """
+        self.blocked_until = 0.0
+        self.blocked_reason = ""
 
     @staticmethod
     def _parse_retry_after(value: str | None) -> int:

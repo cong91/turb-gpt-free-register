@@ -13,11 +13,11 @@ from urllib.parse import urlparse
 
 from config import proxy as proxy_cfg
 from core import db
+from core.rotating_proxy_runtime import CODEX_AGENT_PROXY_SCOPE, resolve_rotating_proxy
 
 logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_OUTPUT_DIR = _PROJECT_ROOT / "codex_agent_accounts"
 
 
 def _join_sub2_url(base: str, path: str) -> str:
@@ -90,6 +90,17 @@ def _retryable_agent_error(exc: Exception) -> bool:
     )
 
 
+def _agent_failure_message(exc: Exception) -> str:
+    """将确定性 Agent Identity 权限错误转成可直接显示的提示。"""
+    try:
+        from core.codex_agent import AgentIdentityRegistrationError
+    except ImportError:
+        return ""
+    if isinstance(exc, AgentIdentityRegistrationError) and exc.error_code == "agent_registry_not_enabled":
+        return "Agent Registry chưa được bật cho account/workspace này; không thể tạo Agent Identity."
+    return ""
+
+
 def _wait_for_rate_slot() -> None:
     """参考套餐查询：错开 Agent 注册请求启动时间。"""
     global _NEXT_REQUEST_AT
@@ -117,15 +128,17 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
     try:
         if not db.mark_account_codex_agent_running(account_id):
             return {"ok": False, "error": "账号已删除或 Codex Agent 状态已被重置"}
-        _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        output_path = _OUTPUT_DIR / f"codex-agent-{_safe_email_filename(email)}.json"
         from core.codex_agent import create_codex_agent_identity
         from core.chatgpt_plan import resolve_plan_check_route
         from core.session import BrowserSession
 
         # 和查套餐一致解析网络路径；每个账号独立创建 BrowserSession，
         # 从而得到独立 oai-did / oai-session-id / Datadog trace / 浏览器画像 / 代理出口。
-        route = resolve_plan_check_route(None)
+        selected_proxy = resolve_rotating_proxy(
+            None,
+            scope=CODEX_AGENT_PROXY_SCOPE,
+        )
+        route = resolve_plan_check_route(selected_proxy)
         route_meta = {k: v for k, v in route.items() if k != "proxy"}
         timeout_seconds, attempts, retry_delay = _agent_request_settings()
         last_exc: Exception | None = None
@@ -134,7 +147,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
             attempt_count = attempt
             _wait_for_rate_slot()
             try:
-                env = BrowserSession(proxy=route["proxy"], detect_exit_geo=False)
+                env = BrowserSession(proxy=route["proxy"], detect_exit_geo=False, fingerprint_seed=f"account:{email.lower()}")
                 logger.info(
                     "[CodexAgent] 独立环境: %s attempt=%s/%s route=%s proxy=%s did=%s session=%s profile_ua=%s",
                     email,
@@ -148,7 +161,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
                 )
                 auth_json = create_codex_agent_identity(
                     access_token=access_token,
-                    output_path=str(output_path),
+                    output_path=None,
                     verify_task=verify_task,
                     env=env,
                     timeout=timeout_seconds,
@@ -246,7 +259,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
             "checked_at": datetime.now().isoformat(timespec="seconds"),
             "message": "Codex Agent Token 已生成" + ("，已同步 sub2api" if sub2api_result else ""),
             "agent_runtime_id": (identity or {}).get("agent_runtime_id"),
-            "auth_path": str(output_path),
+            "auth_path": None,
             "auth_json": auth_json,
             "sub2api_path": (sub2api_result or {}).get("path"),
             "sub2api_url": (sub2api_result or {}).get("url"),
@@ -256,8 +269,6 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
             "proxy_mode": route_meta.get("proxy_mode"),
             "proxy_used": route_meta.get("proxy_used"),
             "proxy_fallback_reason": route_meta.get("proxy_fallback_reason"),
-            "device_id": getattr(env, "device_id", ""),
-            "oai_session_id": getattr(env, "oai_session_id", ""),
             "attempt_count": attempt_count,
             "max_attempts": attempts,
             "request_timeout": timeout_seconds,
@@ -266,6 +277,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
         logger.info("[CodexAgent] 生成成功: %s runtime=%s", email, result.get("agent_runtime_id") or "-")
         return result
     except Exception as exc:
+        failure_message = _agent_failure_message(exc)
         result = {
             "ok": False,
             "status": "failed",
@@ -275,12 +287,12 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
             "proxy_mode": route_meta.get("proxy_mode"),
             "proxy_used": route_meta.get("proxy_used"),
             "proxy_fallback_reason": route_meta.get("proxy_fallback_reason"),
-            "device_id": getattr(env, "device_id", ""),
-            "oai_session_id": getattr(env, "oai_session_id", ""),
             "attempt_count": attempt_count,
             "max_attempts": attempts,
             "request_timeout": timeout_seconds,
         }
+        if failure_message:
+            result["message"] = failure_message
         try:
             db.update_account_codex_agent(account_id, result)
         except Exception:

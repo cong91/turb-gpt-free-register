@@ -27,14 +27,54 @@ accounts_viewer.html
 
 # Cloudflare 域名邮箱池（运行时数据）
 用于注册的域名邮箱.json
+gmail_cdk_ledger.json
+paymesh_card_ledger.json
 
 # 旧版数据/历史迁移残留
 data/
+
+# CDK inventory SQLite runtime data
+cdk_inventory.sqlite3
+cdk_inventory.sqlite3-journal
+cdk_inventory.sqlite3-wal
+cdk_inventory.sqlite3-shm
+cdk_inventory.sqlite3.backup
+cdk_inventory.sqlite3.staging
+cdk_inventory.sqlite3.backup.*
+cdk_inventory-*.sqlite3.backup
+otp_identity.sqlite3
+otp_identity.sqlite3-journal
+otp_identity.sqlite3-wal
+otp_identity.sqlite3-shm
+gmail_cdk_batches.sqlite3
+gmail_cdk_batches.sqlite3-journal
+gmail_cdk_batches.sqlite3-wal
+gmail_cdk_batches.sqlite3-shm
+
+# Roxy profile manager runtime catalog and encrypted archives
+roxy_profile_manager*.sqlite3
+roxy_profile_manager*.sqlite3-*
+roxy_profile_archives/
+roxy_profile_staging/
+
+# ============================================================
+# Central application state database (runtime source of truth)
+app_state.sqlite3
+app_state.sqlite3-journal
+app_state.sqlite3-wal
+app_state.sqlite3-shm
+
+# Legacy runtime databases retained only for migration/rollback
+用于注册的Gmail API邮箱_batches.db
+registration_jobs.db
 
 # ============================================================
 # 缓存 / 临时文件 / 诊断输出
 # ============================================================
 __pycache__/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 .venv/
 *.py[cod]
 *$py.class
@@ -85,3 +125,13 @@ webui.log
 webui.pid
 logs/
 run/
+
+# Local agent/workflow state
+.codex/
+.zcode/
+.beads/
+.planning/
+/nul
+
+# Registration task snapshots may contain real account identities
+注册任务.json.backup-*

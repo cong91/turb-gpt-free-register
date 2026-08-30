@@ -21,10 +21,19 @@ from typing import Any
 
 from config import browser_use as _cfg
 from config import twofa as _twofa_cfg
-from core.account_export import save_account_data
+from core.account_export import BrowserContextTransport, checkpoint_account_data, save_account_data, _post_register_dwell_seconds
+from core import db
 from core.browser_use_client import BrowserUseClient
+from core.browser_registration import _is_unsupported_email_error, _profile_submission_error
+from core.codex_login_credentials import CodexLoginCredentials
 from core.email_provider import resolve_email_source, wait_for_otp
 from core.humanize import delay as human_delay
+from core.openai_auth import (
+    AccountUnusableError,
+    account_unusable_error_message,
+    account_unusable_message,
+    detect_account_unusable_text,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +48,25 @@ def _set_log_provider_label(label: str) -> None:
     _LOG_CONTEXT.provider_label = label or "BrowserUse"
 
 
+def _set_cloud_provider(prefix: str) -> None:
+    _LOG_CONTEXT.provider_prefix = prefix or "browser_use"
+
+
+def _cloud_provider_prefix() -> str:
+    return str(getattr(_LOG_CONTEXT, "provider_prefix", "browser_use") or "browser_use")
+
+
+def _skyvern_human_mode() -> bool:
+    if _cloud_provider_prefix() != "skyvern":
+        return False
+    try:
+        from config import skyvern as _skyvern_cfg
+
+        return bool(getattr(_skyvern_cfg, "SKYVERN_HUMAN_MODE", True))
+    except Exception:
+        return True
+
+
 class _CloudProviderLogFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         label = _log_provider_label()
@@ -51,6 +79,8 @@ logger.addFilter(_CloudProviderLogFilter())
 
 
 def _fast_mode() -> bool:
+    if _skyvern_human_mode():
+        return False
     return bool(getattr(_cfg, "BROWSER_USE_FAST_MODE", True))
 
 
@@ -58,36 +88,146 @@ def _log_timing_enabled() -> bool:
     return bool(getattr(_cfg, "BROWSER_USE_LOG_TIMING", True))
 
 
-def _close_browser_use_session(browser, *, reason: str = "") -> None:
-    """关闭 Browser Use 注册阶段 CDP 会话。
-
-    Codex OAuth 会重新打开自己的干净 session；注册成功后若直接跑 Codex，
-    必须先断开注册阶段的 Browser Use 会话，避免两个远端浏览器 session 同时占用资源。
-    """
-    if browser is None:
-        return
-    label = f"：{reason}" if reason else ""
-    try:
-        logger.info("[BrowserUse] 关闭注册浏览器 session%s", label)
-        browser.close()
-    except Exception as exc:
-        logger.warning("[BrowserUse] 关闭注册浏览器 session 失败%s：%s: %s", label, type(exc).__name__, str(exc)[:180])
+def _cloud_typing_delay(kind: str = "normal") -> tuple[int, int]:
+    """统一控制人工输入速度：可见逐字，但不慢到一分钟一页。"""
+    if kind == "email":
+        return (30, 80) if _fast_mode() else (55, 125)
+    if kind == "otp":
+        return (25, 60) if _fast_mode() else (40, 90)
+    if kind == "name":
+        return (40, 90) if _fast_mode() else (60, 140)
+    return (40, 100) if _fast_mode() else (65, 150)
 
 
 def _bu_delay(kind: str, seconds: float | None = None) -> None:
     if _fast_mode():
         if seconds is None:
             seconds = {
-                "navigate": 0.2,
-                "form": 0.12,
-                "otp_input": 0.15,
-                "api": 0.15,
-                "post_auth": 0.2,
-            }.get(kind, 0.1)
+                "navigate": random.uniform(0.45, 0.95),
+                "form": random.uniform(0.35, 0.85),
+                "otp_input": random.uniform(0.25, 0.65),
+                "api": random.uniform(0.3, 0.8),
+                "post_auth": random.uniform(0.6, 1.2),
+            }.get(kind, random.uniform(0.15, 0.35))
         if seconds > 0:
             time.sleep(seconds)
         return
     human_delay(kind)
+
+
+def _human_pause(min_s: float = 0.08, max_s: float = 0.28) -> None:
+    """Browser Use / Skyvern 始终保留随机停顿，避免毫秒级连贯操作。"""
+    try:
+        time.sleep(random.uniform(float(min_s), float(max_s)))
+    except Exception:
+        time.sleep(0.12)
+
+
+def _safe_scroll_locator(loc, *, timeout: int = 1800) -> None:
+    """Skyvern/远端 CDP 上元素常有动画，scroll 等 stable 超时不能直接中断流程。"""
+    try:
+        loc.scroll_into_view_if_needed(timeout=timeout)
+        return
+    except Exception as exc:
+        logger.debug("[BrowserUse] scroll_into_view_if_needed 不稳定，使用轻量滚动兜底：%s", str(exc)[:160])
+    try:
+        loc.evaluate("el => { try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e) {} }")
+    except Exception:
+        pass
+
+
+def _human_click_locator(loc, *, timeout: int = 3000) -> None:
+    """Playwright locator 人工化点击：滚动到可见区域、hover、停顿后再点击。"""
+    _safe_scroll_locator(loc, timeout=min(1800, max(700, timeout)))
+    _human_pause(0.25, 0.75)
+    try:
+        loc.hover(timeout=min(1600, max(700, timeout)))
+        _human_pause(0.18, 0.55)
+    except Exception:
+        pass
+    try:
+        loc.click(timeout=timeout, delay=random.randint(80, 260))
+    except Exception as exc:
+        # Skyvern 远端页面偶发一直等待 stable；这里退一步用 force click，但仍保留前置滚动/hover/停顿。
+        logger.debug("[BrowserUse] 常规点击失败，使用 force click 兜底：%s", str(exc)[:160])
+        loc.click(timeout=timeout, delay=random.randint(80, 220), force=True)
+    _human_pause(0.18, 0.5)
+
+
+def _human_focus_for_typing(loc, *, timeout: int = 2500) -> None:
+    """输入框聚焦：优先像真人点击；Skyvern click 卡住时退回 focus，不做瞬时填值。"""
+    try:
+        _human_click_locator(loc, timeout=timeout)
+        return
+    except Exception as exc:
+        logger.debug("[BrowserUse] 输入框点击聚焦失败，改用 focus 聚焦继续键盘输入：%s", str(exc)[:180])
+    _safe_scroll_locator(loc, timeout=1200)
+    _human_pause(0.15, 0.45)
+    try:
+        loc.focus(timeout=1200)
+        _human_pause(0.12, 0.35)
+        return
+    except Exception as exc:
+        logger.debug("[BrowserUse] locator.focus 失败，改用 DOM focus：%s", str(exc)[:160])
+    try:
+        loc.evaluate("el => { try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e) {} try { el.focus({preventScroll:true}); } catch(e) { el.focus && el.focus(); } }")
+        _human_pause(0.12, 0.35)
+        return
+    except Exception as exc:
+        raise RuntimeError(f"输入框无法聚焦: {type(exc).__name__}: {exc}") from exc
+
+
+def _human_fill_locator(
+    page,
+    loc,
+    value: str,
+    *,
+    timeout: int = 5000,
+    typing_delay_range: tuple[int, int] | None = None,
+    per_char: bool = True,
+) -> None:
+    """模拟人工键盘输入；不使用瞬时 fill/evaluate 写入表单。"""
+    text = str(value)
+    delay_min, delay_max = typing_delay_range or _cloud_typing_delay("normal")
+
+    def _clear_current() -> None:
+        try:
+            page.keyboard.press("Meta+A")
+            _human_pause(0.04, 0.14)
+            page.keyboard.press("Backspace")
+            return
+        except Exception:
+            page.keyboard.press("Control+A")
+            _human_pause(0.04, 0.14)
+            page.keyboard.press("Backspace")
+
+    def _type_slowly() -> None:
+        # 始终逐字符发送，并在 Python 侧 sleep，避免云端 CDP 把整串 type 压缩成秒填。
+        for idx, ch in enumerate(text):
+            page.keyboard.type(ch, delay=random.randint(delay_min, delay_max))
+            if ch in "@._-+ /":
+                _human_pause(0.10, 0.28)
+            elif idx and idx % random.randint(6, 10) == 0:
+                _human_pause(0.08, 0.22)
+            else:
+                _human_pause(delay_min / 1000.0, delay_max / 1000.0)
+
+    try:
+        _human_focus_for_typing(loc, timeout=2500)
+        _clear_current()
+        _human_pause(0.08, 0.22)
+        _type_slowly()
+        return
+    except Exception:
+        try:
+            _safe_scroll_locator(loc, timeout=1200)
+            _human_focus_for_typing(loc, timeout=2500)
+            _clear_current()
+            _human_pause(0.08, 0.22)
+            _type_slowly()
+            return
+        except Exception as exc:
+            raise RuntimeError(f"人工输入失败，已禁止瞬时 fill 兜底: {type(exc).__name__}: {exc}") from exc
 
 
 class _StepTimer:
@@ -149,6 +289,96 @@ def _timeout_ms(seconds: int | None = None) -> int:
     return max(5, value) * 1000
 
 
+def _build_playwright_stealth(provider_prefix: str, *, label: str):
+    """构建默认增强版 playwright-stealth。
+
+    Browser Use / Skyvern 云端浏览器通常已有基础 stealth 指纹；这里默认叠加
+    playwright-stealth init scripts，并保持不覆盖 UA / Client Hints / WebGL，避免把
+    云端原生画像改乱。
+    """
+    try:
+        from playwright_stealth import Stealth
+    except ImportError:
+        logger.warning("[%s] 缺少 playwright-stealth；请执行: uv pip install playwright-stealth --python .venv/bin/python", label)
+        return None
+
+    return Stealth(
+        # 默认增强但不重写云端原生画像。
+        navigator_user_agent=False,
+        navigator_user_agent_data=False,
+        navigator_platform=False,
+        sec_ch_ua=False,
+        webgl_vendor=False,
+        # 增强自动化特征修正。
+        chrome_runtime=True,
+        chrome_app=True,
+        chrome_csi=True,
+        chrome_load_times=True,
+        hairline=True,
+        iframe_content_window=True,
+        media_codecs=True,
+        navigator_hardware_concurrency=True,
+        navigator_languages=True,
+        navigator_permissions=True,
+        navigator_plugins=True,
+        navigator_vendor=True,
+        navigator_webdriver=True,
+        error_prototype=True,
+        
+        init_scripts_only=True,
+    )
+
+
+def _apply_cloud_browser_automation_mask(context, page, *, label: str, provider_prefix: str = "browser_use", proxy_country_code: str | None = None) -> dict:
+    """给 Browser Use / Skyvern 应用 playwright-stealth。"""
+    result: dict[str, Any] = {"playwright_stealth": False}
+    stealth = _build_playwright_stealth(provider_prefix, label=label)
+    if stealth is None:
+        return result
+    try:
+        stealth.apply_stealth_sync(context)
+        result["playwright_stealth"] = True
+        logger.info("[%s] 已对 BrowserContext 应用 playwright-stealth", label)
+    except Exception as exc:
+        logger.debug("[%s] 对 BrowserContext 应用 playwright-stealth 失败：%s", label, str(exc)[:180])
+    try:
+        stealth.apply_stealth_sync(page)
+        result["playwright_stealth"] = True
+        logger.info("[%s] 已对当前 Page 应用 playwright-stealth", label)
+    except Exception as exc:
+        logger.debug("[%s] 对 Page 应用 playwright-stealth 失败：%s", label, str(exc)[:180])
+    return result
+
+
+def _should_apply_cloud_automation_mask(provider_prefix: str) -> bool:
+    # Browser Use / Skyvern 全部默认增强处理，不再暴露额外开关。
+    return True
+
+
+def _post_register_dwell(page, context, *, provider_prefix: str, email: str) -> None:
+    """注册成功后随机停留再断开，模拟手动注册后短暂观察。"""
+    seconds = _post_register_dwell_seconds()
+    if seconds <= 0:
+        return
+    logger.info("[%s] 注册成功后随机停留 %.1fs 再关闭连接：%s", _log_provider_label(), seconds, email)
+    end = time.time() + seconds
+    last_touch = 0.0
+    while time.time() < end:
+        try:
+            _check_manual_stop()
+        except Exception:
+            break
+        if time.time() - last_touch >= random.uniform(4.0, 8.0):
+            try:
+                page = _pick_live_page(context, page) or page
+                if page is not None:
+                    page.evaluate("() => { try { window.scrollBy(0, Math.floor(Math.random()*80)-40); } catch(e) {} return location.href; }")
+            except Exception:
+                pass
+            last_touch = time.time()
+        time.sleep(random.uniform(0.8, 1.8))
+
+
 def _page_url(page) -> str:
     try:
         return str(page.url or "")
@@ -167,36 +397,51 @@ def _visible_locator(page, selectors: list[str], timeout_ms: int = 1500):
     return None
 
 
-def _fill_first(page, selectors: list[str], value: str, timeout_ms: int | None = None) -> bool:
+def _visible_textbox_locator(page, timeout_ms: int = 1500):
+    """更宽松的可见输入框定位：兼容 textbox / contenteditable / 普通 input/textarea。"""
+    candidates = [
+        "input:not([type='hidden'])",
+        "textarea",
+        "[contenteditable='true']",
+        "[role='textbox']",
+        "[role='combobox'] input",
+        "[role='searchbox']",
+    ]
+    for selector in candidates:
+        loc = page.locator(selector).filter(has_not=page.locator("[type='password']")).first if selector.startswith("input") else page.locator(selector).first
+        try:
+            if loc.is_visible(timeout=timeout_ms):
+                return loc
+        except Exception:
+            continue
+    return None
+
+
+def _fill_first(
+    page,
+    selectors: list[str],
+    value: str,
+    timeout_ms: int | None = None,
+    typing_delay_range: tuple[int, int] | None = None,
+    per_char: bool = False,
+) -> bool:
     end = time.time() + ((timeout_ms or _timeout_ms()) / 1000)
     last_err = None
     while time.time() < end:
         loc = _visible_locator(page, selectors, timeout_ms=800)
         if loc is not None:
             try:
-                loc.scroll_into_view_if_needed(timeout=2000)
-                loc.click(timeout=2000)
-                loc.fill(value, timeout=5000)
+                _human_fill_locator(
+                    page,
+                    loc,
+                    value,
+                    timeout=5000,
+                    typing_delay_range=typing_delay_range,
+                    per_char=per_char,
+                )
                 return True
             except Exception as exc:
                 last_err = exc
-                # React 受控输入兜底
-                try:
-                    loc.evaluate(
-                        """(el, value) => {
-                          const proto = el.tagName === 'TEXTAREA'
-                            ? window.HTMLTextAreaElement.prototype
-                            : window.HTMLInputElement.prototype;
-                          const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-                          if (setter) setter.call(el, value); else el.value = value;
-                          el.dispatchEvent(new Event('input', {bubbles:true}));
-                          el.dispatchEvent(new Event('change', {bubbles:true}));
-                        }""",
-                        value,
-                    )
-                    return True
-                except Exception as exc2:
-                    last_err = exc2
         time.sleep(0.15 if _fast_mode() else 0.3)
     if last_err:
         logger.debug("[BrowserUse] fill failed: %s", last_err)
@@ -209,15 +454,10 @@ def _click_first(page, selectors: list[str], timeout_ms: int | None = None) -> b
         loc = _visible_locator(page, selectors, timeout_ms=800)
         if loc is not None:
             try:
-                loc.scroll_into_view_if_needed(timeout=2000)
-                loc.click(timeout=3000)
+                _human_click_locator(loc, timeout=3000)
                 return True
             except Exception:
-                try:
-                    loc.evaluate("el => el.click()")
-                    return True
-                except Exception:
-                    pass
+                pass
         time.sleep(0.15 if _fast_mode() else 0.3)
     return False
 
@@ -236,6 +476,36 @@ def _maybe_accept_cookies(page) -> None:
     )
 
 
+def _maybe_dismiss_chatgpt_onboarding(page) -> None:
+    """登录后 ChatGPT 欢迎/介绍弹窗兜底点击，避免 Skyvern 停在弹窗层。"""
+    selectors = [
+        "button:has-text('Get started')",
+        "button:has-text('Start using ChatGPT')",
+        "button:has-text('Continue')",
+        "button:has-text('Next')",
+        "button:has-text('Done')",
+        "button:has-text('Skip')",
+        "button:has-text('Maybe later')",
+        "button:has-text('开始使用')",
+        "button:has-text('继续')",
+        "button:has-text('下一步')",
+        "button:has-text('完成')",
+        "button:has-text('跳过')",
+        "[data-testid*='dismiss' i]",
+        "[aria-label*='close' i]",
+        "[aria-label*='关闭' i]",
+    ]
+    end = time.time() + (4 if _fast_mode() else 7)
+    clicks = 0
+    while time.time() < end and clicks < 4:
+        if "chatgpt.com" not in _page_url(page).lower():
+            return
+        if not _click_first(page, selectors, timeout_ms=900):
+            return
+        clicks += 1
+        _human_pause(0.25, 0.6)
+
+
 def _assert_not_external_idp(page, stage: str) -> None:
     url = _page_url(page).lower()
     bad_hosts = (
@@ -249,10 +519,36 @@ def _assert_not_external_idp(page, stage: str) -> None:
         raise RuntimeError(f"[BrowserUse] {stage} 误入第三方登录：{url}")
 
 
+def _account_unusable_page_code(page) -> str:
+    """读取 Playwright 页面正文并识别账号停用/删除状态。"""
+    try:
+        body = page.locator("body").inner_text(timeout=1000) or ""
+    except Exception:
+        return ""
+    return detect_account_unusable_text(str(body))
+
+
+def _raise_if_account_unusable(page) -> None:
+    code = _account_unusable_page_code(page)
+    if code:
+        raise AccountUnusableError(account_unusable_error_message(code), error_code=code)
+
+
+def _wait_after_password_submit(page, initial_url: str, timeout: float = 5.0) -> None:
+    """等待密码提交结果；账号停用页出现时立即停止后续 OTP。"""
+    end = time.time() + max(0.0, float(timeout))
+    while time.time() < end:
+        _raise_if_account_unusable(page)
+        current_url = _page_url(page)
+        if current_url and current_url != initial_url:
+            return
+        time.sleep(0.25)
+
+
 def _quick_auth_state(page) -> dict:
     """一次 JS 查询判断当前 auth 页面状态，避免多组 locator 逐个等待导致几十秒卡顿。"""
     try:
-        return page.evaluate(
+        result = page.evaluate(
             """() => {
               const url = String(location.href || '').toLowerCase();
               const visible = (el) => {
@@ -302,85 +598,300 @@ def _quick_auth_state(page) -> dict:
               return {state, url, hasOtp, hasPassword, textPreview: text.slice(0, 160)};
             }"""
         ) or {"state": "other", "url": _page_url(page)}
+        if isinstance(result, dict):
+            code = detect_account_unusable_text(str(result.get("textPreview") or ""))
+            if code:
+                result["state"] = f"deactivated:{code}"
+        return result
     except Exception as exc:
         if _is_target_closed_error(exc):
             raise
         return {"state": "other", "url": _page_url(page), "error": f"{type(exc).__name__}: {exc}"}
 
 
-def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
-    # 有的登录页要先点 “Continue with email”
-    _click_first(
-        page,
-        [
-            "button[data-testid*='email' i]",
-            "button[data-provider='email']",
-            "button:has-text('Continue with email')",
-            "button:has-text('Sign up with email')",
-            "button:has-text('Log in with email')",
-            "button:has-text('Email')",
-            "button:has-text('メールで続行')",
-            "button:has-text('メールアドレスで続行')",
-            "button:has-text('メール')",
-            "button:has-text('使用邮箱')",
-            "button:has-text('使用電子郵件')",
-            "button:has-text('邮箱')",
-            "button:has-text('電子郵件')",
-            "a:has-text('Continue with email')",
-            "a:has-text('メールで続行')",
-        ],
-        timeout_ms=4000,
-    )
-    _assert_not_external_idp(page, "邮箱入口")
+def _email_entry_state_pw(page) -> dict:
+    """Playwright 版 Roxy 邮箱入口诊断：只采集技术属性，不依赖页面文案。"""
+    try:
+        return page.evaluate(r"""
+        () => {
+          const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+            && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+            && !el.disabled;
+          const attrText = el => [
+            el.id, el.getAttribute('name'), el.getAttribute('type'), el.getAttribute('autocomplete'),
+            el.getAttribute('data-testid'), el.getAttribute('data-test-id'), el.getAttribute('data-provider'),
+            el.getAttribute('data-auth-provider'), el.getAttribute('href'), el.getAttribute('action'),
+            el.getAttribute('formaction'), el.getAttribute('value'), el.getAttribute('aria-label'), el.className
+          ].filter(Boolean).join(' ').toLowerCase();
+          const inputs = [...document.querySelectorAll('input')].filter(visible).map(el => ({
+            type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: el.id || '',
+            autocomplete: el.getAttribute('autocomplete') || '', value: el.value || '', placeholder: el.getAttribute('placeholder') || '', aria: el.getAttribute('aria-label') || ''
+          })).slice(0, 30);
+          const actions = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')]
+            .filter(visible).map(el => ({tag: el.tagName, type: el.getAttribute('type') || '', attrs: attrText(el).slice(0, 220)})).slice(0, 50);
+          return {url: location.href, title: document.title, inputs, actions};
+        }
+        """) or {}
+    except Exception as exc:
+        return {"url": _page_url(page), "error": f"{type(exc).__name__}: {exc}"}
 
-    fill_timeout_ms = timeout_ms if timeout_ms is not None else min(_timeout_ms(), 20000)
-    ok = _fill_first(
-        page,
-        [
-            "input[type='email']",
-            "input[name='email']",
-            "input[name='username']",
-            "input[name='loginfmt']",
-            "input[name='identifier']",
-            "input[autocomplete='email']",
-            "input[autocomplete='username']",
-            "input[inputmode='email']",
-            "input[id*='email' i]",
-            "input[id*='username' i]",
-            "input[aria-label*='email' i]",
-            "input[aria-label*='メール']",
-            "input[aria-label*='邮箱']",
-            "input[placeholder*='email' i]",
-            "input[placeholder*='メール']",
-            "input[placeholder*='邮箱']",
-            "input[placeholder*='電子郵件']",
-        ],
-        email,
-        timeout_ms=fill_timeout_ms,
-    )
-    if not ok:
-        raise RuntimeError("找不到邮箱输入框")
 
-    if not _click_first(
-        page,
-        [
-            "button[type='submit']",
-            "input[type='submit']",
-            "button:has-text('Continue')",
-            "button:has-text('Next')",
-            "button:has-text('Submit')",
-            "button:has-text('続行')",
-            "button:has-text('次へ')",
-            "button:has-text('送信')",
-            "button:has-text('继续')",
-            "button:has-text('下一步')",
-            "form button",
-        ],
-        timeout_ms=8000,
-    ):
-        # 回车提交
+def _is_oauth_consent_like_pw(page) -> bool:
+    try:
+        return bool(page.evaluate(r"""
+        () => {
+          const url = String(location.href || '').toLowerCase();
+          if (/oauth|authorize|consent/.test(url) && !/login|signup|identifier|email-verification/.test(url)) return true;
+          const formsWithEmail = [...document.querySelectorAll('form')]
+            .some(form => form.querySelector('input[type="email"],input[name="email"],input[name="username"],input[autocomplete="email"]'));
+          if (formsWithEmail) return false;
+          const actions = [...document.querySelectorAll('button,a,[role="button"],input[type="submit"],input[type="button"]')]
+            .map(el => [el.id, el.name, el.type, el.getAttribute('data-testid'), el.getAttribute('data-test-id'),
+              el.getAttribute('data-provider'), el.getAttribute('data-auth-provider'), el.getAttribute('href'),
+              el.getAttribute('formaction'), el.value, el.className].filter(Boolean).join(' ').toLowerCase())
+            .join(' ');
+          return /oauth|authorize|consent|grant|allow/.test(actions) && !/email|username/.test(actions);
+        }
+        """))
+    except Exception:
+        return False
+
+
+def _click_email_entry_option_pw(page) -> bool:
+    """Roxy 同款：按 DOM 技术属性点击邮箱入口，排除第三方登录，不依赖可见文字。"""
+    if _is_oauth_consent_like_pw(page):
+        logger.info("[BrowserUse] 当前疑似 OAuth 授权页，跳过邮箱入口兜底点击")
+        return False
+    try:
+        result = page.evaluate(r"""
+        () => {
+          const nodes = [...document.querySelectorAll('button,a,[role="button"],input[type="button"],input[type="submit"]')];
+          const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+            && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+            && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+          const attrText = el => {
+            const own = [
+              el.id, el.getAttribute('name'), el.getAttribute('type'), el.getAttribute('autocomplete'),
+              el.getAttribute('data-testid'), el.getAttribute('data-test-id'), el.getAttribute('data-provider'),
+              el.getAttribute('data-auth-provider'), el.getAttribute('data-idp'), el.getAttribute('href'), el.getAttribute('action'),
+              el.getAttribute('formaction'), el.getAttribute('value'), el.getAttribute('aria-label'), el.className
+            ].filter(Boolean).join(' ');
+            const desc = [...el.querySelectorAll('img,svg,use,[aria-label],[data-provider],[data-testid],[data-test-id]')]
+              .map(x => [x.getAttribute('alt'), x.getAttribute('src'), x.getAttribute('href'), x.getAttribute('xlink:href'),
+                x.getAttribute('aria-label'), x.getAttribute('data-provider'), x.getAttribute('data-testid'), x.getAttribute('data-test-id'), x.className]
+                .filter(Boolean).join(' ')).join(' ');
+            return `${own} ${desc}`.toLowerCase();
+          };
+          const bad = /google|apple|microsoft|github|facebook|saml|sso|oauth|social|oidc|idp|provider|authorize|consent|grant|allow/;
+          const good = /(^|[^a-z])(email|mail|username|passwordless|otp|magic)([^a-z]|$)/;
+          const candidates = nodes
+            .map((el, idx) => ({el, idx, attrs: attrText(el), hasLogo: !!el.querySelector('img,svg,use')}))
+            .filter(x => visible(x.el) && good.test(x.attrs) && !bad.test(x.attrs) && !x.hasLogo);
+          if (candidates.length !== 1) return {ok:false, reason:candidates.length ? 'ambiguous' : 'missing', count:candidates.length, candidates:candidates.slice(0,5).map(x => ({idx:x.idx, attrs:x.attrs.slice(0,180)}))};
+          candidates[0].el.scrollIntoView({block:'center', inline:'center'});
+          return {ok:true, idx:candidates[0].idx, attrs:candidates[0].attrs.slice(0,180)};
+        }
+        """) or {}
+        if not isinstance(result, dict) or not result.get("ok"):
+            logger.info("[BrowserUse] 邮箱入口 DOM 兜底未命中：%s", result)
+            return False
+        loc = page.locator('button,a,[role="button"],input[type="button"],input[type="submit"]').nth(int(result.get("idx") or 0))
+        _human_click_locator(loc, timeout=3000)
+        logger.info("[BrowserUse] 已按 DOM 属性点击邮箱入口：%s", result)
+        return True
+    except Exception as exc:
+        logger.info("[BrowserUse] 邮箱入口 DOM 兜底点击失败：%s: %s", type(exc).__name__, str(exc)[:180])
+        return False
+
+
+def _find_email_input_locator_pw(page, timeout_ms: int = 1000):
+    """Roxy 同款邮箱输入框选择器，先严格 email/username，再宽松 textbox。"""
+    strict = [
+        "input[type='email']",
+        "input[name='email']",
+        "input[name='username']",
+        "input#email-input",
+        "input[autocomplete='email']",
+        "input[autocomplete*='email' i]",
+        "input[autocomplete='username']",
+        "input[id*='email' i]",
+        "input[id*='username' i]",
+        "input[aria-label*='email' i]",
+        "input[placeholder*='email' i]",
+        "input[aria-label*='メール']",
+        "input[placeholder*='メール']",
+        "input[aria-label*='邮箱']",
+        "input[placeholder*='邮箱']",
+        "input[placeholder*='電子郵件']",
+    ]
+    loc = _visible_locator(page, strict, timeout_ms=timeout_ms)
+    if loc is not None:
+        return loc
+    return _visible_textbox_locator(page, timeout_ms=timeout_ms)
+
+
+def _submit_email_step_pw(page, email: str) -> bool:
+    """Playwright 版 Roxy 安全提交：只提交邮箱输入框所在 form 附近的非第三方按钮。"""
+    try:
+        result = page.evaluate(r"""
+        (email) => {
+          email = String(email || '').trim().toLowerCase();
+          const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+            && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+            && !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+          const editable = el => visible(el) && !el.readOnly;
+          const inputs = [...document.querySelectorAll('input[type="email"],input[name="email"],input[name="username"],input[autocomplete*="email"],input[autocomplete="username"],input#email-input')]
+            .filter(editable);
+          const input = inputs.find(el => String(el.value || '').trim().toLowerCase() === email) || inputs.find(el => String(el.value || '').includes('@')) || inputs[0];
+          if (!input) return {ok:false, reason:'missing_email_input'};
+          const value = String(input.value || '').trim();
+          if (!value || !value.includes('@')) return {ok:false, reason:'email_value_not_ready', value};
+          const form = input.closest('form');
+          if (!form) return {ok:false, reason:'missing_form', value};
+
+          const bad = /google|apple|microsoft|github|facebook|saml|sso|oauth|social|oidc|idp|provider|authorize|consent|grant|allow/;
+          const attrText = el => {
+            const own = [el.id, el.name, el.type, el.getAttribute('data-testid'), el.getAttribute('data-test-id'),
+              el.getAttribute('data-provider'), el.getAttribute('data-auth-provider'), el.getAttribute('data-idp'),
+              el.getAttribute('aria-label'), el.getAttribute('href'), el.getAttribute('formaction'), el.value, el.className]
+              .filter(Boolean).join(' ');
+            const desc = [...el.querySelectorAll('img,svg,use,[aria-label],[data-provider],[data-testid],[data-test-id]')]
+              .map(x => [x.getAttribute('alt'), x.getAttribute('src'), x.getAttribute('href'), x.getAttribute('xlink:href'),
+                x.getAttribute('aria-label'), x.getAttribute('data-provider'), x.getAttribute('data-testid'), x.getAttribute('data-test-id'), x.className]
+                .filter(Boolean).join(' ')).join(' ');
+            return `${own} ${desc}`.toLowerCase();
+          };
+          const formId = form.getAttribute('id') || '';
+          const scoped = [
+            ...form.querySelectorAll('button,input[type="submit"]'),
+            ...(formId ? [...document.querySelectorAll(`button[form="${CSS.escape(formId)}"],input[type="submit"][form="${CSS.escape(formId)}"]`)] : [])
+          ].filter((el, idx, arr) => arr.indexOf(el) === idx);
+          const inputRect = input.getBoundingClientRect();
+          const candidates = scoped
+            .map(el => {
+              const r = el.getBoundingClientRect();
+              const attrs = attrText(el);
+              const hasLogo = !!el.querySelector('img,svg,use');
+              const type = String(el.getAttribute('type') || '').toLowerCase();
+              const cls = String(el.className || '').toLowerCase();
+              const belowInput = r.top >= inputRect.bottom - 12;
+              const distance = Math.max(0, r.top - inputRect.bottom) + Math.abs((r.left + r.right) / 2 - (inputRect.left + inputRect.right) / 2) / 10;
+              const primary = (el.tagName === 'BUTTON' || el.tagName === 'INPUT') && type === 'submit'
+                && (/\bbtn-primary\b/.test(cls) || /\b_primary_/.test(cls) || /\bw-full\b/.test(cls));
+              const score = (primary ? 1000 : 0) + (type === 'submit' ? 120 : 0) - distance;
+              return {el, attrs, hasLogo, bad: bad.test(attrs), belowInput, distance, primary, score, type};
+            })
+            .filter(x => visible(x.el) && !x.bad && !x.hasLogo && x.belowInput)
+            .sort((a,b) => b.score - a.score || a.distance - b.distance);
+          input.scrollIntoView({block:'center', inline:'nearest'});
+          input.focus();
+          const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          if (setter) setter.call(input, value); else input.value = value;
+          try { input.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'insertText', data:value})); } catch (_) {}
+          try { input.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:value})); } catch (_) {
+            input.dispatchEvent(new Event('input', {bubbles:true}));
+          }
+          input.dispatchEvent(new Event('change', {bubbles:true}));
+          input.dispatchEvent(new FocusEvent('blur', {bubbles:true}));
+          input.blur();
+          const submit = candidates[0] ? candidates[0].el : null;
+          if (submit) {
+            submit.scrollIntoView({block:'center', inline:'center'});
+            try {
+              submit.dispatchEvent(new MouseEvent('pointerdown', {bubbles:true, cancelable:true, view:window}));
+              submit.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+              submit.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+              submit.click();
+            } catch (_) {
+              if (form && typeof form.requestSubmit === 'function') form.requestSubmit(submit);
+              else if (form && typeof form.requestSubmit === 'function') form.requestSubmit();
+              else form.submit();
+            }
+            return {ok:true, value, reason:submit.tagName === 'BUTTON' ? 'button_click' : 'submit_click', attrs:candidates[0].attrs.slice(0,180)};
+          }
+          if (form && typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+            return {ok:true, value, reason:'form_requestSubmit', attrs:''};
+          }
+          form.submit();
+          return {ok:true, value, reason:'form_submit', attrs:''};
+        }
+        """, email) or {}
+        if isinstance(result, dict) and result.get("ok"):
+            logger.info("[BrowserUse] 邮箱表单安全提交：%s", result)
+            _human_pause(0.8, 1.4)
+            _assert_not_external_idp(page, "提交邮箱后")
+            return True
+        logger.warning("[BrowserUse] 邮箱安全提交未命中，回退 Enter：%s", result)
+    except Exception as exc:
+        logger.warning("[BrowserUse] 邮箱安全提交异常，回退 Enter：%s: %s", type(exc).__name__, str(exc)[:180])
+    try:
+        _human_pause(0.25, 0.65)
         page.keyboard.press("Enter")
-    _bu_delay("form")
+        _human_pause(0.8, 1.4)
+        _assert_not_external_idp(page, "Enter 提交邮箱后")
+        return True
+    except Exception:
+        return False
+
+
+def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
+    """Roxy 同款邮箱入口流程：先找输入框，找不到再按 DOM 属性点邮箱入口，全程人工逐字输入。"""
+    fill_timeout_ms = timeout_ms if timeout_ms is not None else min(_timeout_ms(), 24000)
+    end = time.time() + (fill_timeout_ms / 1000.0)
+    clicked_email_option = False
+    last_state: dict[str, Any] | None = None
+
+    while time.time() < end:
+        loc = _find_email_input_locator_pw(page, timeout_ms=1000)
+        if loc is not None:
+            _human_fill_locator(
+                page,
+                loc,
+                email,
+                timeout=6000,
+                typing_delay_range=_cloud_typing_delay("email"),
+                per_char=True,
+            )
+            _human_pause(0.3, 0.8)
+            if not _submit_email_step_pw(page, email):
+                raise RuntimeError(f"邮箱已输入但提交失败，页面={_page_url(page) or '-'} state={_email_entry_state_pw(page)}")
+            return
+
+        last_state = _email_entry_state_pw(page)
+        if not clicked_email_option:
+            # 先尝试原来的多语言显式 selector，再用 Roxy DOM 属性兜底。
+            clicked_email_option = _click_first(
+                page,
+                [
+                    "button[data-testid*='email' i]",
+                    "button[data-provider='email']",
+                    "button[data-auth-provider='email']",
+                    "button[data-testid*='mail' i]",
+                    "button:has-text('Continue with email')",
+                    "button:has-text('Sign up with email')",
+                    "button:has-text('Log in with email')",
+                    "button:has-text('Email')",
+                    "button:has-text('メールで続行')",
+                    "button:has-text('メールアドレスで続行')",
+                    "button:has-text('メール')",
+                    "button:has-text('使用邮箱')",
+                    "button:has-text('使用電子郵件')",
+                    "button:has-text('邮箱')",
+                    "button:has-text('電子郵件')",
+                    "a:has-text('Continue with email')",
+                    "a:has-text('メールで続行')",
+                ],
+                timeout_ms=2500,
+            ) or _click_email_entry_option_pw(page)
+            if clicked_email_option:
+                _human_pause(0.8, 1.6)
+                _assert_not_external_idp(page, "点击邮箱入口后")
+                continue
+
+        time.sleep(0.35 if _fast_mode() else 0.55)
+
+    raise RuntimeError(f"找不到邮箱输入框/邮箱入口，页面={_page_url(page) or '-'} state={last_state}")
 
 
 def _wait_after_email_submit_transition(page, context=None, timeout: int = 14) -> str:
@@ -400,8 +911,12 @@ def _wait_after_email_submit_transition(page, context=None, timeout: int = 14) -
         url = str(info.get("url") or _page_url(page) or "")
         last_state, last_url = state, url
         lower = url.lower()
+        if state.startswith("deactivated:"):
+            return state
         if "/log-in/password" in lower:
             return "login_password"
+        if any(x in lower for x in ("/create-account/password", "/u/signup/password", "/signup/password")):
+            return "password"
         if state in ("email_verification", "password", "login_password", "profile", "chatgpt"):
             return state
         if any(x in lower for x in ("email-verification", "/password", "about-you", "profile")):
@@ -427,6 +942,9 @@ def _submit_email_until_transition(page, context, email: str, *, attempts: int =
         _check_manual_stop()
         last_state = _wait_after_email_submit_transition(page, context=context, timeout=10 if _fast_mode() else 16)
         logger.info("[BrowserUse] 邮箱提交后状态：%s url=%s", last_state, _page_url(page) or "-")
+        if last_state.startswith("deactivated:"):
+            code = last_state.split(":", 1)[1] or "account_deactivated"
+            raise AccountUnusableError(account_unusable_error_message(code), error_code=code)
         if last_state == "login_password":
             raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={_page_url(page) or 'https://auth.openai.com/log-in/password'}")
         if last_state != "email_page":
@@ -458,6 +976,37 @@ def _is_password_page(page) -> bool:
     return loc is not None and "email-verification" not in url
 
 
+def _is_signup_password_page(page) -> bool:
+    """更稳妥地识别注册密码页：优先看 URL，其次看密码输入框。"""
+    try:
+        url = str(_page_url(page) or "").lower()
+    except Exception:
+        url = ""
+    if any(x in url for x in ("/create-account/password", "/u/signup/password", "/signup/password")):
+        return True
+    if "/log-in/password" in url:
+        return False
+    try:
+        state = _quick_auth_state(page)
+        if str(state.get("state") or "") == "password":
+            return True
+    except Exception:
+        pass
+    try:
+        loc = _visible_locator(
+            page,
+            [
+                "input[type='password']",
+                "input[name='password']",
+                "input[autocomplete='new-password']",
+            ],
+            timeout_ms=500,
+        )
+        return loc is not None and "email-verification" not in url
+    except Exception:
+        return False
+
+
 def _is_email_verification_page(page) -> bool:
     try:
         if "/log-in/password" in (_page_url(page) or "").lower():
@@ -483,7 +1032,7 @@ def _is_email_verification_page(page) -> bool:
 
 
 def _click_passwordless_signup_if_present(page) -> bool:
-    """在注册/登录密码页优先点击“使用一次性验证码”，进入邮箱 OTP 流。"""
+    """Codex OAuth compatibility helper for one-time-code login."""
     selectors = [
         "button[name='intent'][value='passwordless_signup_send_otp']",
         "input[type='submit'][name='intent'][value='passwordless_signup_send_otp']",
@@ -578,12 +1127,105 @@ def _click_passwordless_signup_if_present(page) -> bool:
         return False
 
 
-def _fill_password_if_present(page, email: str, timeout: int = 25, context=None) -> str | None:
+def _click_continue_with_password_if_present(page) -> bool:
+    """在邮箱验证码页点击“使用密码继续”，切到 /create-account/password 创建密码账号。"""
+    selectors = [
+        "a[href*='/create-account/password']",
+        "a[href='/create-account/password']",
+        "[data-login-web-auth-control='true'][href*='/create-account/password']",
+        "[role='link'][href*='/create-account/password']",
+        "[role='button'][href*='/create-account/password']",
+    ]
+    if _click_first(page, selectors, timeout_ms=1800):
+        return True
+    try:
+        return bool(page.evaluate(
+            """() => {
+              const visible = el => {
+                if (!el) return false;
+                const st = getComputedStyle(el);
+                const r = el.getBoundingClientRect();
+                return st.visibility !== 'hidden' && st.display !== 'none' && r.width > 0 && r.height > 0;
+              };
+              const enabled = el => !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+              const btn = [...document.querySelectorAll('a,button,[role="link"],[role="button"]')]
+                .filter(el => visible(el) && enabled(el))
+                .find(el => {
+                  const href = String(el.getAttribute('href') || '').toLowerCase();
+                  const attrs = [
+                    href, el.id, el.getAttribute('aria-label'), el.getAttribute('title'),
+                    el.getAttribute('data-testid'), el.getAttribute('data-login-web-auth-control'),
+                    el.getAttribute('data-dd-action-name'), el.className
+                  ].join(' ').toLowerCase();
+                  return href.includes('/create-account/password')
+                    || attrs.includes('/create-account/password');
+                });
+              if (!btn) return false;
+              btn.scrollIntoView({block:'center'});
+              try {
+                btn.dispatchEvent(new MouseEvent('pointerdown', {bubbles:true, cancelable:true, view:window}));
+                btn.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+                btn.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+                btn.click();
+              } catch (e) {
+                const href = btn.getAttribute('href');
+                if (href) window.location.href = href;
+                else throw e;
+              }
+              return true;
+            }"""
+        ))
+    except Exception:
+        return False
+
+
+def _click_continue_with_password_link(page) -> bool:
+    """Force the signup flow from email OTP to the OpenAI password page."""
+    selectors = [
+        "button:has-text('Continue with password')",
+        "a:has-text('Continue with password')",
+        "[role='button']:has-text('Continue with password')",
+        "[role='link']:has-text('Continue with password')",
+        "button:has-text('使用密码继续')",
+        "a:has-text('使用密码继续')",
+        "button:has-text('使用密码')",
+        "a:has-text('使用密码')",
+        "button:has-text('Continuar com senha')",
+        "a:has-text('Continuar com senha')",
+    ]
+    if _click_first(page, selectors, timeout_ms=1800):
+        _bu_delay("navigate")
+        return True
+    try:
+        page.goto(
+            "https://auth.openai.com/create-account/password",
+            wait_until="domcontentloaded",
+            timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)),
+        )
+        _bu_delay("navigate")
+        return True
+    except Exception as exc:
+        logger.warning("[BrowserUse] 无法切换到注册密码页：%s: %s", type(exc).__name__, str(exc)[:180])
+        return False
+
+
+def _fill_password_if_present(page, email: str, timeout: int = 25, context=None) -> str:
+    """Wait for and fill the required OpenAI registration password page."""
     started = time.time()
     end = time.time() + timeout
     last_heartbeat = 0.0
     last_log = 0.0
     while time.time() < end:
+        _raise_if_account_unusable(page)
+        # OTP 页面不是注册完成条件；先切回 create-account/password。
+        try:
+            quick = _quick_auth_state(page)
+            if str(quick.get("state") or "") == "email_verification":
+                if not (_click_continue_with_password_if_present(page) or _click_continue_with_password_link(page)):
+                    raise RuntimeError("邮箱验证码页无法切换到注册密码页")
+                continue
+        except Exception:
+            pass
         if time.time() - last_heartbeat > 3:
             try:
                 page = _browser_use_heartbeat(page, context=context, label="password-detect")
@@ -597,73 +1239,147 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
                 raise
             last_heartbeat = time.time()
         state_info = _quick_auth_state(page)
-        state = str(state_info.get("state") or "other")
+        state = "password" if _is_signup_password_page(page) else str(state_info.get("state") or "other")
+        if state.startswith("deactivated:"):
+            code = state.split(":", 1)[1] or "account_deactivated"
+            raise AccountUnusableError(account_unusable_error_message(code), error_code=code)
         if time.time() - last_log > 3:
             logger.info("[BrowserUse] 检测密码/验证码页：state=%s url=%s", state, state_info.get("url") or "-")
             last_log = time.time()
-        if state == "email_verification":
-            return None
+        if state == "email_verification" and not _is_signup_password_page(page):
+            if _click_continue_with_password_if_present(page) or _click_continue_with_password_link(page):
+                logger.info("[BrowserUse] 邮箱验证码页已点击“使用密码继续”：email=%s", email)
+                time.sleep(0.4 if _fast_mode() else 1.0)
+                continue
+            try:
+                logger.info("[BrowserUse] 邮箱验证码页未命中按钮，直接跳转到密码页兜底：email=%s", email)
+                page.goto("https://auth.openai.com/create-account/password", wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
+                time.sleep(0.6 if _fast_mode() else 1.2)
+                continue
+            except Exception as exc:
+                logger.info("[BrowserUse] 邮箱验证码页兜底跳转密码页失败：%s", str(exc)[:180])
+                # 不要直接退出，继续等页面自己切到密码页
+                time.sleep(0.8 if _fast_mode() else 1.5)
+                continue
         if state not in ("password", "login_password"):
-            # 提交邮箱后如果仍显示 /auth/login 但页面其实已经渲染验证码输入框，
-            # 某些 Browser Use target 上 DOM 状态会短暂滞后。不要在“密码页检测”里长等，
-            # 直接交给后面的 OTP 阶段处理，避免云端会话被拖到关闭。
-            # fast 模式也不要 3 秒就放弃：提交邮箱后常仍停在 /auth/login，
-            # 需等跳到 auth.openai.com 或出现密码/OTP 控件。
+            # 提交邮箱后仍停在 /auth/login 可能只是 SPA 导航中间态；
+            # 继续等待 password 页面，不能把它降级成 OTP-only。
             if _fast_mode() and time.time() - started >= 8:
-                logger.info("[BrowserUse] 未检测到密码页，提前进入 OTP 阶段：state=%s url=%s", state, state_info.get("url") or "-")
-                return None
+                logger.info("[BrowserUse] 尚未检测到密码页，继续等待强制密码流程：state=%s url=%s", state, state_info.get("url") or "-")
             time.sleep(0.15 if _fast_mode() else 0.4)
             continue
-        if _click_passwordless_signup_if_present(page):
-            logger.info("[BrowserUse] 检测到密码页，已点击一次性验证码入口：state=%s email=%s", state, email)
-            wait_end = time.time() + 20
-            while time.time() < wait_end:
-                state_after = _quick_auth_state(page)
-                if state_after.get("state") == "email_verification":
-                    logger.info("[BrowserUse] 一次性验证码入口已进入邮箱验证码页")
-                    return None
-                if state_after.get("state") == "chatgpt":
-                    logger.info("[BrowserUse] 一次性验证码入口后已进入 ChatGPT")
-                    return None
-                if state_after.get("state") not in ("password", "login_password"):
-                    return None
-                time.sleep(0.2 if _fast_mode() else 0.5)
-            logger.info("[BrowserUse] 已点击一次性验证码入口，未立即检测到 OTP 页，交给后续 OTP 阶段继续处理")
-            return None
         if state == "login_password":
-            logger.info("[BrowserUse] 当前是登录密码页但未找到一次性验证码入口，跳过密码填写并交给 OTP 阶段：url=%s", state_info.get("url") or "-")
-            return None
+            raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={state_info.get('url') or _page_url(page) or '-'}")
         password = _registration_password()
         logger.info("[BrowserUse] 检测到密码页，设置密码（%s 位）：%s", len(password), email)
-        ok = _fill_first(
-            page,
-            [
-                "input[type='password']",
-                "input[name='password']",
-                "input[autocomplete='new-password']",
-                "input[autocomplete='current-password']",
-            ],
+        submit_result = page.evaluate(
+            r"""(password) => {
+              const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+                && getComputedStyle(el).visibility !== 'hidden'
+                && getComputedStyle(el).display !== 'none'
+                && !el.disabled && !el.readOnly;
+              const enabled = el => !!el && !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+              const norm = s => String(s || '').replace(/\s+/g, '').toLowerCase();
+              const inputs = [...document.querySelectorAll('input[type="password"],input[name*="password" i],input[autocomplete="new-password"]')]
+                .filter(visible);
+              const input = inputs[0];
+              if (!input) return {ok:false, reason:'missing_password_input', url: location.href};
+              const form = input.closest('form');
+              const scope = form || document;
+              const buttons = [...scope.querySelectorAll('button,input[type="submit"],[role="button"]')]
+                .filter(el => visible(el) && enabled(el))
+                .map((el, idx) => {
+                  const r = el.getBoundingClientRect();
+                  const ir = input.getBoundingClientRect();
+                  const attrs = [
+                    el.getAttribute('type'), el.getAttribute('data-dd-action-name'),
+                    el.getAttribute('data-login-web-auth-control'), el.getAttribute('aria-label'),
+                    el.getAttribute('name'), el.getAttribute('value'), el.textContent
+                  ].join(' ').toLowerCase();
+                  const text = norm(el.textContent || el.getAttribute('value') || '');
+                  let score = 0;
+                  if ((el.getAttribute('type') || '').toLowerCase() === 'submit') score += 80;
+                  if ((el.getAttribute('data-dd-action-name') || '').toLowerCase() === 'continue') score += 90;
+                  if (String(el.getAttribute('data-login-web-auth-control') || '').toLowerCase() === 'true') score += 70;
+                  if (/continue|next|submit|create|続行/.test(attrs) || /continue|next|submit|create|続行/.test(text)) score += 50;
+                  if (r.top >= ir.bottom - 10) score += 40;
+                  const dist = Math.max(0, r.top - ir.bottom) + Math.abs((r.left + r.right - ir.left - ir.right) / 2) / 10;
+                  return {el, idx, score, dist, attrs};
+                })
+                .sort((a,b) => b.score - a.score || a.dist - b.dist);
+              const target = buttons[0] ? buttons[0].el : null;
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+              input.scrollIntoView({block:'center', inline:'nearest'});
+              input.focus();
+              if (setter) setter.call(input, String(password || '')); else input.value = String(password || '');
+              try { input.dispatchEvent(new InputEvent('beforeinput', {bubbles:true, cancelable:true, inputType:'insertText', data:String(password || '')})); } catch (_) {}
+              try { input.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:String(password || '')})); } catch (_) {
+                input.dispatchEvent(new Event('input', {bubbles:true}));
+              }
+              input.dispatchEvent(new Event('change', {bubbles:true}));
+              input.dispatchEvent(new FocusEvent('blur', {bubbles:true}));
+              input.blur();
+              if (!target) {
+                if (form && typeof form.requestSubmit === 'function') {
+                  form.requestSubmit();
+                  return {ok:true, reason:'form_requestSubmit', url: location.href, hasForm: true, buttons: buttons.length};
+                }
+                if (form) {
+                  form.submit();
+                  return {ok:true, reason:'form_submit', url: location.href, hasForm: true, buttons: buttons.length};
+                }
+                return {ok:false, reason:'missing_enabled_submit', url: location.href, hasForm: !!form, buttons: buttons.length};
+              }
+              target.scrollIntoView({block:'center'});
+              try {
+                target.dispatchEvent(new MouseEvent('pointerdown', {bubbles:true, cancelable:true, view:window}));
+                target.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true, view:window}));
+                target.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
+                target.click();
+              } catch (e) {
+                if (form && typeof form.requestSubmit === 'function') form.requestSubmit(target);
+                else if (form) form.submit();
+                else throw e;
+              }
+              return {ok:true, reason:'button_click', url: location.href, hasForm: !!form, buttons: buttons.length, attrs: (buttons[0]?.attrs || '').slice(0, 180)};
+            }""",
             password,
-            timeout_ms=8000,
-        )
-        if not ok:
-            raise RuntimeError("密码页找到了，但无法填写密码")
-        if not _click_first(
-            page,
-            [
-                "button[type='submit']",
-                "button:has-text('Continue')",
-                "button:has-text('Next')",
-                "button:has-text('继续')",
-                "button:has-text('创建')",
-                "form button",
-            ],
-            timeout_ms=8000,
-        ):
-            page.keyboard.press("Enter")
+        ) or {}
+        if not submit_result.get("ok"):
+            raise RuntimeError(f"密码页找不到可点击的 Continue 按钮：{submit_result} state={state_info}")
+        logger.info("[BrowserUse] 已填写并点击密码页 Continue：detail=%s", {k: v for k, v in submit_result.items() if k != "button"})
         _bu_delay("form")
+        wait_end = time.time() + (8 if _fast_mode() else 14)
+        retried_submit = False
+        while time.time() < wait_end:
+            state_after = _quick_auth_state(page)
+            state_name = str(state_after.get("state") or "other")
+            if state_name in ("email_verification", "profile", "chatgpt"):
+                logger.info("[BrowserUse] 密码页提交后已进入后续状态：state=%s url=%s", state_name, state_after.get("url") or "-")
+                return password
+            if not retried_submit and state_name == "password" and time.time() > wait_end - (5 if _fast_mode() else 8):
+                retried_submit = True
+                logger.info("[BrowserUse] 密码页提交后仍未跳转，等待后重试一次 Continue/Enter：url=%s", state_after.get("url") or "-")
+                _human_pause(1.2, 2.2)
+                if not _click_first(
+                    page,
+                    [
+                        "button[data-dd-action-name='Continue']",
+                        "button[data-login-web-auth-control='true'][type='submit']",
+                        "button[type='submit']",
+                        "form button",
+                    ],
+                    timeout_ms=4000,
+                ):
+                    try:
+                        page.keyboard.press("Enter")
+                    except Exception:
+                        pass
+            if state_name not in ("password", "login_password"):
+                return password
+            time.sleep(0.25 if _fast_mode() else 0.5)
         return password
-    return None
+    raise RuntimeError(f"注册密码页检测超时，拒绝进入 OTP-only 流程：email={email} url={_page_url(page) or '-'}")
 
 
 def _type_otp(page, code: str) -> None:
@@ -684,6 +1400,8 @@ def _type_otp(page, code: str) -> None:
         ],
         code,
         timeout_ms=5000,
+        typing_delay_range=_cloud_typing_delay("otp"),
+        per_char=True,
     ):
         return
 
@@ -695,7 +1413,14 @@ def _type_otp(page, code: str) -> None:
         count = 0
     if count >= len(code):
         for i, ch in enumerate(code):
-            boxes.nth(i).fill(ch)
+            box = boxes.nth(i)
+            try:
+                _human_click_locator(box, timeout=1200)
+                _human_pause(0.05, 0.14)
+                page.keyboard.type(ch, delay=random.randint(25, 70))
+            except Exception:
+                raise
+            _human_pause(0.04, 0.16)
         return
     raise RuntimeError("找不到 OTP 输入框")
 
@@ -727,15 +1452,20 @@ def _click_continue(page) -> None:
         page,
         [
             "button[type='submit']",
+            "button[data-dd-action-name='Continue']",
+            "button[data-dd-action-name='continue']",
+            "button[data-login-web-auth-control='true'][type='submit']",
             "button:has-text('Continue')",
             "button:has-text('Verify')",
             "button:has-text('Submit')",
+            "button:has-text('続行')",
             "button:has-text('继续')",
             "button:has-text('验证')",
             "form button",
         ],
         timeout_ms=5000,
     ):
+        _human_pause(0.12, 0.35)
         page.keyboard.press("Enter")
 
 
@@ -858,6 +1588,7 @@ def _wait_after_otp(page, timeout: int = 12) -> str:
     """返回 accepted / invalid / unknown。"""
     end = time.time() + timeout
     while time.time() < end:
+        _raise_if_account_unusable(page)
         url = _page_url(page).lower()
         body = ""
         try:
@@ -882,7 +1613,8 @@ def _fill_birthday_fields(page, birthday: str) -> None:
         raise RuntimeError(f"生日格式应为 YYYY-MM-DD: {birthday}") from exc
 
     # 年龄数字页
-    age = max(18, min(60, 2026 - year))
+    today = date.today()
+    age = max(18, min(60, today.year - year - ((today.month, today.day) < (month, day))))
     if _fill_first(
         page,
         [
@@ -926,17 +1658,17 @@ def _fill_birthday_fields(page, birthday: str) -> None:
         try:
             tag = (loc.evaluate("el => el.tagName") or "").lower()
             if tag == "select":
+                _human_pause(0.12, 0.35)
                 try:
                     loc.select_option(value=value)
                 except Exception:
+                    _human_pause(0.08, 0.2)
                     loc.select_option(label=value)
             else:
-                loc.fill(value)
+                _human_pause(0.08, 0.22)
+                _human_fill_locator(page, loc, value, timeout=5000)
         except Exception:
-            try:
-                loc.fill(value)
-            except Exception:
-                pass
+            pass
 
 
 
@@ -969,10 +1701,22 @@ def _has_chatgpt_access_token(page) -> bool:
         if "chatgpt.com" not in _page_url(page).lower():
             return False
         data = page.evaluate(
-            """async () => {
-              const r = await fetch('/api/auth/session', {credentials:'include'});
-              return await r.json();
-            }"""
+            """async ({timeoutMs}) => {
+              const ctrl = new AbortController();
+              const timer = setTimeout(() => ctrl.abort('timeout'), timeoutMs);
+              try {
+                const r = await fetch('/api/auth/session', {
+                  credentials: 'include',
+                  cache: 'no-store',
+                  headers: {'accept': 'application/json'},
+                  signal: ctrl.signal,
+                });
+                return await r.json();
+              } finally {
+                clearTimeout(timer);
+              }
+            }""",
+            {"timeoutMs": 2500 if _fast_mode() else 4000},
         )
         return bool(isinstance(data, dict) and data.get("accessToken"))
     except Exception:
@@ -995,16 +1739,20 @@ def _fill_spinbutton_birthday(page, birthday: str) -> bool:
             loc = page.locator(selector).first
             if loc.count() <= 0:
                 continue
-            loc.scroll_into_view_if_needed(timeout=1500)
-            loc.click(timeout=1500)
+            _human_pause(0.08, 0.22)
+            _safe_scroll_locator(loc, timeout=1200)
+            _human_click_locator(loc, timeout=1800)
             page.keyboard.press("Meta+A")
-            page.keyboard.type(str(value), delay=10 if _fast_mode() else 40)
+            _human_pause(0.05, 0.15)
+            page.keyboard.type(str(value), delay=random.randint(60, 150) if _fast_mode() else random.randint(90, 220))
             loc.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); el.blur?.(); }")
             ok = True
         except Exception:
             try:
+                _human_pause(0.08, 0.22)
                 page.keyboard.press("Control+A")
-                page.keyboard.type(str(value), delay=10 if _fast_mode() else 40)
+                _human_pause(0.05, 0.15)
+                page.keyboard.type(str(value), delay=random.randint(60, 150) if _fast_mode() else random.randint(90, 220))
                 ok = True
             except Exception:
                 pass
@@ -1025,6 +1773,109 @@ def _fill_spinbutton_birthday(page, birthday: str) -> bool:
         except Exception:
             pass
     return ok
+
+
+def _human_complete_profile(page, name: str, birthday: str) -> dict:
+    """资料页人工化填写：滚动、点击、逐字输入、选择/输入生日、点击 checkbox 和提交。"""
+    info: dict[str, Any] = {"ok": False, "submitted": False, "method": "human_playwright", "filled": {}}
+
+    name_ok = _fill_first(
+        page,
+        [
+            "input[name*='name' i]",
+            "input[id*='name' i]",
+            "input[autocomplete='name']",
+            "input[aria-label*='name' i]",
+            "input[placeholder*='name' i]",
+            "input[aria-label*='名前']",
+            "input[placeholder*='名前']",
+            "input[aria-label*='姓名']",
+            "input[placeholder*='姓名']",
+            "input[type='text']",
+        ],
+        name,
+        timeout_ms=7000,
+        typing_delay_range=_cloud_typing_delay("name"),
+        per_char=True,
+    )
+    info["filled"]["name"] = bool(name_ok)
+    _human_pause(0.35, 0.9)
+
+    try:
+        _fill_birthday_fields(page, birthday)
+        info["filled"]["birthday"] = True
+    except Exception as exc:
+        info["birthday_error"] = f"{type(exc).__name__}: {exc}"
+        info["filled"]["birthday"] = False
+
+    spin_ok = False
+    try:
+        spin_ok = _fill_spinbutton_birthday(page, birthday)
+    except Exception:
+        spin_ok = False
+    if spin_ok:
+        info["filled"]["spinbutton"] = True
+
+    # 勾选可见 checkbox，使用真实 locator click，不用 JS 改 checked。
+    checkbox_count = 0
+    try:
+        boxes = page.locator("input[type='checkbox'], [role='checkbox']")
+        count = min(boxes.count(), 6)
+        for i in range(count):
+            box = boxes.nth(i)
+            try:
+                if not box.is_visible(timeout=500):
+                    continue
+                checked = False
+                try:
+                    checked = bool(box.is_checked(timeout=300))
+                except Exception:
+                    checked = str(box.get_attribute("aria-checked") or "").lower() == "true"
+                if not checked:
+                    _human_click_locator(box, timeout=1500)
+                    checkbox_count += 1
+                    _human_pause(0.25, 0.7)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    info["checkboxCount"] = checkbox_count
+
+    submitted = _click_first(
+        page,
+        [
+            "button[type='submit']",
+            "input[type='submit']",
+            "button:has-text('Continue')",
+            "button:has-text('Next')",
+            "button:has-text('Done')",
+            "button:has-text('Submit')",
+            "button:has-text('Create')",
+            "button:has-text('Start')",
+            "button:has-text('続行')",
+            "button:has-text('次へ')",
+            "button:has-text('完了')",
+            "button:has-text('送信')",
+            "button:has-text('继续')",
+            "button:has-text('下一步')",
+            "button:has-text('完成')",
+            "button:has-text('提交')",
+            "form button",
+        ],
+        timeout_ms=8000,
+    )
+    if not submitted:
+        _human_pause(0.2, 0.55)
+        try:
+            page.keyboard.press("Enter")
+            submitted = True
+            info["method"] = "human_enter"
+        except Exception:
+            submitted = False
+    info["submitted"] = bool(submitted)
+    info["ok"] = bool(name_ok and submitted)
+    info["url"] = _page_url(page)
+    return info
 
 
 def _js_complete_profile(page, name: str, birthday: str) -> dict:
@@ -1191,8 +2042,46 @@ def _js_complete_profile(page, name: str, birthday: str) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "url": _page_url(page)}
 
 
+def _force_exit_profile_page(page, deadline: float) -> bool:
+    """资料页提交后如果仍卡在 about-you/profile，强制跳出，避免 Skyvern 远端页面无限等待。"""
+    targets = [
+        "https://chatgpt.com/",
+        "https://chatgpt.com/auth/login",
+    ]
+    attempt = 0
+    while time.time() < deadline:
+        _check_manual_stop()
+        attempt += 1
+        try:
+            url = _page_url(page).lower()
+        except Exception:
+            url = ""
+        if "chatgpt.com" in url and "about-you" not in url and "signup/profile" not in url and "auth.openai.com" not in url:
+            return True
+        if _has_chatgpt_access_token(page):
+            return True
+        for target in targets:
+            if time.time() >= deadline:
+                break
+            try:
+                logger.info("[BrowserUse] 资料页提交后仍未离开，强制跳转兜底：attempt=%s target=%s current=%s", attempt, target, _page_url(page) or "-")
+                page.goto(target, wait_until="domcontentloaded", timeout=10000)
+                _bu_delay("navigate")
+                _maybe_dismiss_chatgpt_onboarding(page)
+                if _has_chatgpt_access_token(page):
+                    return True
+                url = _page_url(page).lower()
+                if "chatgpt.com" in url and "about-you" not in url and "signup/profile" not in url and "auth.openai.com" not in url:
+                    return True
+            except Exception as exc:
+                logger.warning("[BrowserUse] 强制跳出资料页失败：%s: %s", type(exc).__name__, str(exc)[:180])
+        time.sleep(0.8 if _fast_mode() else 1.2)
+    return False
+
+
 def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) -> bool:
-    # fast mode 也必须等资料页真正离开；不能未提交成功就主动打开 chatgpt.com。
+    """资料页填写/提交：提交后不无限等待；Skyvern 卡住时强制跳出 about-you。"""
+
     timeout = min(timeout, 45) if _fast_mode() else timeout
     end = time.time() + timeout
     submitted = False
@@ -1200,46 +2089,72 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
     last_log = 0.0
     last_info: dict[str, Any] = {}
     last_diag: dict[str, Any] = {}
+    post_submit_hard_exit_at: float | None = None
+
     while time.time() < end:
         _check_manual_stop()
         url = _page_url(page).lower()
-        if "chatgpt.com" in url and "auth.openai.com" not in url and "about-you" not in url:
+        if "chatgpt.com" in url and "auth.openai.com" not in url and "about-you" not in url and "signup/profile" not in url:
             logger.info("[BrowserUse] 已离开资料页并进入 ChatGPT：%s", _page_url(page))
             return True
         if _has_chatgpt_access_token(page):
-            logger.info("[BrowserUse] 资料页阶段已检测到 accessToken")
-            return False
+            logger.info("[BrowserUse] 资料页提交后已检测到 accessToken")
+            return True
 
         body = ""
         try:
             body = (page.locator("body").inner_text(timeout=800) or "").lower()
         except Exception:
             pass
+        profile_error = _profile_submission_error({"url": url, "text": body, "errors": []})
+        if profile_error:
+            raise RuntimeError(f"about-you 提交失败：{profile_error}")
         looks_profile = any(x in url for x in ("about-you", "profile", "create-account/about", "signup/profile")) or any(x in body for x in ("birthday", "birth", "age", "name", "誕生日", "年齢", "名前", "生日", "年龄", "姓名"))
 
         if looks_profile:
-            if not submitted or time.time() - last_submit > 3:
+            if not submitted:
                 logger.info("[BrowserUse] 资料页：填写/提交昵称生日 url=%s", _page_url(page) or "-")
-                info = _js_complete_profile(page, name, birthday)
-                if info.get("birthMode") == "spinbutton_needed":
-                    spin_ok = _fill_spinbutton_birthday(page, birthday)
-                    logger.info("[BrowserUse] 资料页 spinbutton 生日填写：%s", spin_ok)
-                    info = _js_complete_profile(page, name, birthday)
+                info = _human_complete_profile(page, name, birthday)
                 last_info = info
-                logger.info("[BrowserUse] 资料页 JS 提交结果：%s", str(info)[:900])
-                submitted = bool(info.get("submitted") or submitted)
+                logger.info("[BrowserUse] 资料页人工化提交结果：%s", str(info)[:900])
+                if not info.get("submitted"):
+                    js_info = _js_complete_profile(page, name, birthday)
+                    last_info = {"human": info, "js": js_info}
+                    logger.info("[BrowserUse] 资料页 JS 兜底提交结果：%s", str(js_info)[:900])
+                    submitted = bool(js_info.get("submitted") or submitted)
+                else:
+                    submitted = True
+                if submitted and post_submit_hard_exit_at is None:
+                    # 已提交后不再重复填写/点击；最多给它 10~16 秒同步登录态，然后强制跳出。
+                    post_submit_hard_exit_at = time.time() + (10 if _fast_mode() else 16)
                 last_submit = time.time()
                 _bu_delay("form")
             elif time.time() - last_log > 2:
-                logger.info("[BrowserUse] 资料页已提交，等待跳转：url=%s", _page_url(page) or "-")
+                logger.info("[BrowserUse] 资料页已提交，等待短暂跳转/准备取 AT：url=%s", _page_url(page) or "-")
                 last_log = time.time()
+
+            if submitted and post_submit_hard_exit_at and time.time() >= post_submit_hard_exit_at:
+                if _force_exit_profile_page(page, min(end, time.time() + (8 if _fast_mode() else 12))):
+                    logger.info("[BrowserUse] 资料页提交后已通过强制跳转退出：%s", _page_url(page) or "-")
+                    return True
+                break
             time.sleep(0.35 if _fast_mode() else 0.8)
             continue
 
         if submitted:
+            if _has_chatgpt_access_token(page):
+                logger.info("[BrowserUse] 资料页提交后已检测到 accessToken")
+                return True
+            if post_submit_hard_exit_at is None:
+                post_submit_hard_exit_at = time.time() + (10 if _fast_mode() else 16)
             if time.time() - last_log > 2:
-                logger.info("[BrowserUse] 资料页已提交，等待跳转/登录态同步：url=%s", _page_url(page) or "-")
+                logger.info("[BrowserUse] 资料页已提交，等待登录态同步：url=%s", _page_url(page) or "-")
                 last_log = time.time()
+            if time.time() >= post_submit_hard_exit_at:
+                if _force_exit_profile_page(page, min(end, time.time() + (8 if _fast_mode() else 12))):
+                    logger.info("[BrowserUse] 资料页提交后已通过强制跳转退出：%s", _page_url(page) or "-")
+                    return True
+                break
             time.sleep(0.35 if _fast_mode() else 0.8)
             continue
 
@@ -1251,9 +2166,10 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
     url = _page_url(page).lower()
     if any(x in url for x in ("about-you", "profile", "create-account/about", "signup/profile")):
         last_diag = _profile_diagnostics(page)
-        raise RuntimeError(f"资料页提交后仍未跳转，停止读取 session 以免误判；last_info={str(last_info)[:900]} diag={str(last_diag)[:1200]}")
+        if submitted:
+            raise RuntimeError(f"资料页提交后超时仍未跳转，转入取 AT；last_info={str(last_info)[:900]} diag={str(last_diag)[:1200]}")
+        raise RuntimeError(f"资料页处理超时且未确认提交，转入取 AT；last_info={str(last_info)[:900]} diag={str(last_diag)[:1200]}")
     return submitted
-
 
 
 def _is_target_closed_error(exc: Exception | str) -> bool:
@@ -1426,12 +2342,18 @@ def _browser_use_heartbeat(page, context=None, label: str = ""):
 
 
 
-def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: float) -> str:
+def _wait_for_otp_with_browser_heartbeat(
+    page,
+    context,
+    email: str,
+    after_ts: float,
+    before_code: str | None = None,
+) -> str:
     """短轮询邮箱 OTP；每轮之间触碰页面，避免 Browser Use Cloud 长时间无页面活动被回收。"""
     try:
         from config import email as _email_cfg
-        total_wait = int(getattr(_email_cfg, "OTP_MAX_WAIT", 90) or 90)
-        poll_interval = int(getattr(_email_cfg, "OTP_POLL_INTERVAL", 3) or 3)
+        total_wait = int(getattr(_email_cfg, "OTP_MAX_WAIT", 60) or 60)
+        poll_interval = int(getattr(_email_cfg, "OTP_POLL_INTERVAL", 2) or 2)
         settle = int(getattr(_email_cfg, "OTP_SETTLE_SECONDS", 5) or 0)
     except Exception:
         total_wait, poll_interval, settle = 90, 3, 5
@@ -1459,12 +2381,17 @@ def _wait_for_otp_with_browser_heartbeat(page, context, email: str, after_ts: fl
             remaining,
         )
         try:
+            wait_kwargs = {
+                "after_ts": after_ts,
+                "max_wait": wait_this_round,
+                "poll_interval": max(1, min(poll_interval, 3)),
+                "settle_seconds": slice_settle,
+            }
+            if before_code:
+                wait_kwargs["before_code"] = before_code
             return wait_for_otp(
                 email,
-                after_ts=after_ts,
-                max_wait=wait_this_round,
-                poll_interval=max(1, min(poll_interval, 3)),
-                settle_seconds=slice_settle,
+                **wait_kwargs,
             )
         except Exception as exc:
             last_exc = exc
@@ -1541,6 +2468,7 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
     last = None
     proactive_opened = False
     first_not_chatgpt_at: float | None = None
+    first_profile_still_at: float | None = None
     last_log = 0.0
     target_closed_count = 0
 
@@ -1563,7 +2491,7 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
 
         # 1) context.request 先读：快、不依赖页面 JS；即使页面 target 被关闭，只要 context 活着还能读。
         if context is not None:
-            data = _read_chatgpt_session_via_context(context, timeout_ms=4500 if _fast_mode() else 9000)
+            data = _read_chatgpt_session_via_context(context, timeout_ms=1800 if _fast_mode() else 5000)
             last = data
             if isinstance(data, dict) and data.get("accessToken"):
                 logger.info("[BrowserUse] /api/auth/session 已返回 accessToken via=context url=%s", _page_url(page) or "-")
@@ -1580,7 +2508,8 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
 
         # 2) 如果已经在 chatgpt.com，再用页面内 fetch 兜底；但设置短超时。
         if on_chatgpt and page is not None:
-            data = _read_chatgpt_session_via_page(page, timeout_ms=4500 if _fast_mode() else 9000)
+            _maybe_dismiss_chatgpt_onboarding(page)
+            data = _read_chatgpt_session_via_page(page, timeout_ms=2200 if _fast_mode() else 5000)
             last = data
             if isinstance(data, dict) and data.get("accessToken"):
                 logger.info("[BrowserUse] /api/auth/session 已返回 accessToken via=page url=%s", _page_url(page) or "-")
@@ -1597,10 +2526,17 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
                 logger.info("[BrowserUse] 等待 accessToken via=page，url=%s keys=%s", _page_url(page) or "-", keys)
                 last_log = time.time()
         else:
-            # 仍在 auth about-you/profile 时不能主动跳 chatgpt.com，否则资料未提交会拿不到 accessToken。
+            # 资料页提交后 Skyvern 偶发不会自动跳转；到 session 阶段说明 profile 处理已经结束，
+            # 继续停留在 about-you/profile 没有意义，短暂观察后强制跳到 ChatGPT 读取登录态。
             if any(x in url for x in ("about-you", "profile", "create-account/about", "signup/profile")):
+                if first_profile_still_at is None:
+                    first_profile_still_at = time.time()
+                if time.time() - first_profile_still_at >= (3.0 if _fast_mode() else 6.0):
+                    if _force_exit_profile_page(page, min(end, time.time() + (8 if _fast_mode() else 12))):
+                        proactive_opened = True
+                        continue
                 if time.time() - last_log > 2:
-                    logger.info("[BrowserUse] 仍在资料页，等待提交跳转，不主动打开 chatgpt.com：url=%s", _page_url(page) or "-")
+                    logger.info("[BrowserUse] session 阶段仍在资料页，短暂等待后将强制跳出：url=%s", _page_url(page) or "-")
                     last_log = time.time()
                 time.sleep(0.4 if _fast_mode() else 1.0)
                 continue
@@ -1613,6 +2549,7 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
                     page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
                     proactive_opened = True
                     _bu_delay("navigate")
+                    _maybe_dismiss_chatgpt_onboarding(page)
                     continue
                 except Exception as exc:
                     last = f"goto_chatgpt_failed {type(exc).__name__}: {exc}"
@@ -1658,8 +2595,13 @@ def run_browser_use_registration(
         client = BrowserUseClient()
 
     _set_log_provider_label(cloud_label)
+    _set_cloud_provider(provider_prefix)
     _t_all = _StepTimer(f"{cloud_label} 注册全流程")
-    session_info_open = client.open_session()
+    session_info_open = (
+        client.open_session(proxy=proxy)
+        if proxy is not None
+        else client.open_session()
+    )
     create_acknowledged = False
     openai_password: str | None = None
     browser = None
@@ -1690,8 +2632,21 @@ def run_browser_use_registration(
             else:
                 context = browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
+            from core.registration_network_identity import probe_playwright_geo
+
+            registration_geo = probe_playwright_geo(page)
             page.set_default_timeout(_timeout_ms())
             page.set_default_navigation_timeout(_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
+            if _should_apply_cloud_automation_mask(provider_prefix):
+                _apply_cloud_browser_automation_mask(
+                    context,
+                    page,
+                    label=cloud_label,
+                    provider_prefix=provider_prefix,
+                    proxy_country_code=session_info_open.proxy_country_code,
+                )
+            else:
+                logger.info("[%s] 已跳过额外 JS 指纹补丁，使用云浏览器原生 stealth 环境", cloud_label)
 
             if provider_prefix == "skyvern":
                 try:
@@ -1713,15 +2668,18 @@ def run_browser_use_registration(
             # OpenAI 可能在点击提交后立刻发 OTP，甚至邮件 ReceivedDateTime 早于 Playwright
             # 点击函数返回的本地时间；先记录时间戳，配合 _is_after 的时钟容忍，避免过滤掉首次验证码。
             otp_after_ts = time.time()
-            _submit_email_until_transition(page, context, email, attempts=2, timeout_ms=20000)
-            _t_email.done()
+            next_state = _submit_email_until_transition(page, context, email, attempts=2, timeout_ms=20000)
+            _t_email.done(f"state={next_state}")
             logger.info("[BrowserUse] 已提交邮箱：%s", email)
             _assert_not_external_idp(page, "提交邮箱后")
             _check_manual_stop()
 
             _t_pwd = _StepTimer("检测/处理密码页")
             try:
-                openai_password = _fill_password_if_present(page, email, timeout=8 if _fast_mode() else 15, context=context)
+                if next_state == "email_verification":
+                    logger.info("[BrowserUse] 邮箱提交已进入验证码页，尝试点击“使用密码继续”并设置密码")
+                openai_password = _fill_password_if_present(page, email, timeout=25, context=context)
+                create_acknowledged = True
                 _t_pwd.done("password_set=yes" if openai_password else "password_set=no")
             except Exception as exc:
                 _t_pwd.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
@@ -1733,7 +2691,7 @@ def run_browser_use_registration(
                 OpenAI 验证码页直接点 resend 偶发跳 chrome-error/500。
                 这里改为重新打开注册入口、重新提交同一个邮箱来触发新 OTP，保持页面回到可输入验证码的状态。
                 """
-                nonlocal page, otp_after_ts, openai_password
+                nonlocal page, otp_after_ts, openai_password, create_acknowledged
                 logger.info("[BrowserUse][OTP] 重新触发邮箱 OTP：%s", reason)
                 try:
                     _check_manual_stop()
@@ -1754,22 +2712,19 @@ def run_browser_use_registration(
                     _check_manual_stop()
                     logger.info("[BrowserUse][OTP] 已重新提交邮箱：%s", email)
                     _assert_not_external_idp(page, "重新提交邮箱后")
-                    try:
-                        pwd = _fill_password_if_present(page, email, timeout=6 if _fast_mode() else 10, context=context)
-                        _check_manual_stop()
-                        if pwd:
-                            openai_password = pwd
-                    except Exception as pwd_exc:
-                        if _is_manual_stop_exception(pwd_exc):
-                            raise
-                        logger.info("[BrowserUse][OTP] 重启 OTP 流后密码页处理跳过/失败，继续等待验证码页：%s", str(pwd_exc)[:140])
+                    pwd = _fill_password_if_present(page, email, timeout=25, context=context)
+                    _check_manual_stop()
+                    if pwd:
+                        openai_password = pwd
+                        create_acknowledged = True
                     _bu_delay("api")
                 except Exception as restart_exc:
-                    if _is_manual_stop_exception(restart_exc):
+                    if _is_manual_stop_exception(restart_exc) or "密码" in str(restart_exc) or "password" in str(restart_exc).lower():
                         raise
                     logger.warning("[BrowserUse][OTP] 重新触发邮箱 OTP 失败，继续按当前页面处理：%s: %s", type(restart_exc).__name__, str(restart_exc)[:180])
 
             current_otp = otp_code
+            previous_submitted_otp = None
             max_otp_attempts = 3
             for otp_attempt in range(1, max_otp_attempts + 1):
                 # 等验证码页出现
@@ -1795,7 +2750,13 @@ def run_browser_use_registration(
                     logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", email, otp_attempt, max_otp_attempts)
                     _t_otp_wait = _StepTimer("等待邮箱 OTP")
                     try:
-                        current_otp = _wait_for_otp_with_browser_heartbeat(page, context, email, after_ts=otp_after_ts)
+                        current_otp = _wait_for_otp_with_browser_heartbeat(
+                            page,
+                            context,
+                            email,
+                            after_ts=otp_after_ts,
+                            before_code=previous_submitted_otp,
+                        )
                         page = _pick_live_page(context, page) or page
                         _t_otp_wait.done()
                     except Exception as exc:
@@ -1833,56 +2794,147 @@ def run_browser_use_registration(
                 if otp_attempt >= max_otp_attempts:
                     raise RuntimeError("邮箱验证码连续错误/过期")
                 logger.warning("[BrowserUse][OTP] 验证码可能无效，重新触发 OTP（%s/%s）", otp_attempt + 1, max_otp_attempts)
+                previous_submitted_otp = current_otp
                 _restart_email_otp_flow("验证码错误/过期或页面未跳转，避免点击 resend 导致 500/chrome-error")
                 current_otp = None
 
             logger.info("[BrowserUse] 处理资料页/登录态")
             _t_profile = _StepTimer("资料页/登录态")
-            profile_submitted = _complete_profile_page(page, name, birthday, timeout=28 if _fast_mode() else 60)
-            if profile_submitted:
-                create_acknowledged = True
-                _bu_delay("post_auth")
+            if provider_prefix == "skyvern":
+                profile_timeout = int(getattr(_cfg, "SKYVERN_PROFILE_TIMEOUT", 45) or 45)
+                session_timeout = int(getattr(_cfg, "SKYVERN_SESSION_ACCESS_TOKEN_TIMEOUT", 35) or 35)
+            else:
+                profile_timeout = int(getattr(_cfg, "BROWSER_USE_PROFILE_TIMEOUT", 28 if _fast_mode() else 60) or (28 if _fast_mode() else 60))
+                session_timeout = int(getattr(_cfg, "BROWSER_USE_SESSION_ACCESS_TOKEN_TIMEOUT", 18 if _fast_mode() else 60) or (18 if _fast_mode() else 60))
 
-            session_info = _fetch_chatgpt_session(page, context=context, timeout=28 if _fast_mode() else 120)
-            _t_profile.done()
+            try:
+                profile_submitted = _complete_profile_page(page, name, birthday, timeout=profile_timeout)
+                if profile_submitted:
+                    create_acknowledged = True
+                    _bu_delay("post_auth")
+            except Exception as exc:
+                if _is_unsupported_email_error(exc):
+                    raise
+                # 资料页是高频卡点：超时/强制跳出失败后不继续卡，直接进入取 AT；取不到则由下一步抛错失败。
+                logger.warning("[BrowserUse] 资料页处理超时/失败，直接尝试取 AT：%s: %s", type(exc).__name__, str(exc)[:260])
+
+            try:
+                session_info = _fetch_chatgpt_session(page, context=context, timeout=session_timeout)
+                _t_profile.done()
+            except Exception as exc:
+                _t_profile.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
+                raise
             access_token = session_info.get("accessToken")
             if not access_token:
                 raise RuntimeError("注册流程结束但未拿到 accessToken")
             create_acknowledged = True
             logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
 
-            if _twofa_cfg.ENABLE_2FA:
-                logger.warning("[BrowserUse] 当前路径暂不自动设置 2FA，已跳过")
+            account_id = checkpoint_account_data(
+                email=email,
+                access_token=access_token,
+                email_source=resolve_email_source(email),
+                proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
+                registration_ip=registration_geo.get("ip") or None,
+                extra={
+                    "proxy_country_code": session_info_open.proxy_country_code,
+                    "registration_geo": registration_geo,
+                    "user": session_info.get("user"),
+                    "account": session_info.get("account"),
+                    "expires": session_info.get("expires"),
+                    "registration_password": openai_password,
+                    provider_prefix: {
+                        "proxy_country_code": session_info_open.proxy_country_code,
+                        "registration_geo": registration_geo,
+                        "profile_id": session_info_open.profile_id,
+                        "session_id": getattr(session_info_open, "session_id", ""),
+                        "connect": session_info_open.raw,
+                    },
+                },
+            )
+            logger.info("[%s] token 检查点已保存：account_id=%s twofa=pending", provider_prefix, account_id)
+
             totp_secret = None
+            twofa_status = "disabled"
+            twofa_error = None
+            if _twofa_cfg.ENABLE_2FA:
+                from core.account_export import setup_2fa_for_registration
+                try:
+                    totp_secret = setup_2fa_for_registration(BrowserContextTransport(context, page), email)
+                    twofa_status = "active"
+                    db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
+                except Exception as exc:
+                    twofa_status = "failed"
+                    twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                    db.update_account_2fa(account_id, status="failed", error=twofa_error)
+                    logger.error("[%s] 2FA 设置失败，账号已保留待重试：%s", provider_prefix, twofa_error)
+                    return {"success": False, "email": email, "account_id": account_id, "access_token": access_token, "twofa_status": twofa_status, "twofa_error": twofa_error, "error": f"2FA 设置失败，账号已保存：{twofa_error}"}
 
             codex_result = {
                 "status": "skipped",
                 "ok": True,
                 "message": "ENABLE_CODEX_AUTO=False，跳过 Codex",
             }
+            free_codex_auto_enabled = False
             try:
                 from config import codex as _codex_cfg
+                from config import register as _register_cfg
                 codex_auto_enabled = bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False))
-                oauth_driver = str(getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", "") or "").strip() or "same_as_registration"
-                if codex_auto_enabled:
-                    logger.info(
-                        "[BrowserUse][Codex] ENABLE_CODEX_AUTO=True，注册成功后自动执行 Codex OAuth：driver=%s",
-                        oauth_driver,
+                free_codex_auto_enabled = bool(
+                    getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+                )
+                codex_credentials = None
+                if openai_password and totp_secret:
+                    codex_credentials = CodexLoginCredentials(
+                        email=email,
+                        password=openai_password,
+                        totp_secret=totp_secret,
                     )
-                    # Codex OAuth 会创建自己的授权 session。先关闭注册阶段的 Browser Use
-                    # CDP 连接，避免注册浏览器继续占用远端会话/代理资源并干扰后续 OAuth。
-                    _close_browser_use_session(browser, reason="即将执行 Codex OAuth")
-                    if provider_prefix == "skyvern" and hasattr(client, "close_browser_session") and getattr(session_info_open, "session_id", ""):
-                        try:
-                            client.close_browser_session(session_info_open.session_id)
-                            logger.info("[Skyvern] 已关闭注册 browser session：%s", session_info_open.session_id)
-                        except Exception as exc:
-                            logger.warning("[Skyvern] 关闭注册 browser session 失败：%s: %s", type(exc).__name__, str(exc)[:180])
-                    browser = None
-                    context = None
-                    page = None
-                    from core.codex_oauth import run_codex_oauth
-                    codex_result = run_codex_oauth(email, otp_provider=wait_for_otp, proxy=proxy, force=True)
+
+                def _run_codex_in_current_browser() -> dict:
+                    from core.browser_use_codex_oauth import run_browser_use_codex_oauth
+
+                    logger.info(
+                        "[BrowserUse][Codex] 复用当前注册 browser session 执行 Codex OAuth：driver=%s，登录方式=%s",
+                        provider_prefix,
+                        (
+                            "密码 + authenticator TOTP"
+                            if codex_credentials
+                            else "邮箱 OTP fallback（注册密码或 TOTP 不完整）"
+                        ),
+                    )
+                    _check_manual_stop()
+                    return run_browser_use_codex_oauth(
+                        email,
+                        otp_provider=wait_for_otp,
+                        proxy=proxy,
+                        force=True,
+                        cloud_provider=provider_prefix,
+                        existing_browser=browser,
+                        existing_context=context,
+                        existing_page=page,
+                        existing_session_info=session_info_open,
+                        credentials=codex_credentials,
+                    )
+
+                post_auth_automation_enabled = bool(
+                    getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
+                    or free_codex_auto_enabled
+                    or codex_auto_enabled
+                )
+                if post_auth_automation_enabled:
+                    from core.registration_auto_codex import run_registration_auto_codex
+
+                    auto_codex = run_registration_auto_codex(
+                        account_id=account_id,
+                        email=email,
+                        access_token=access_token,
+                        proxy=proxy,
+                        browser_transport=BrowserContextTransport(context, page),
+                        run_codex=_run_codex_in_current_browser,
+                        twofa_status=twofa_status,
+                    )
+                    codex_result = auto_codex["codex"]
                 else:
                     logger.info("[BrowserUse][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
             except Exception as exc:
@@ -1899,21 +2951,30 @@ def run_browser_use_registration(
                 totp_secret=totp_secret,
                 email_source=resolve_email_source(email),
                 proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
+                registration_ip=registration_geo.get("ip") or None,
                 batch_dir=batch_dir,
+                auto_plan_check=False,
                 extra={
+                    "proxy_country_code": session_info_open.proxy_country_code,
+                    "registration_geo": registration_geo,
                     "user": session_info.get("user"),
                     "account": session_info.get("account"),
                     "expires": session_info.get("expires"),
                     provider_prefix: {
                         "proxy_country_code": session_info_open.proxy_country_code,
+                        "registration_geo": registration_geo,
                         "profile_id": session_info_open.profile_id,
                         "session_id": getattr(session_info_open, "session_id", ""),
                         "connect": session_info_open.raw,
                     },
                     "registration_password": openai_password,
+                    "registration_driver": provider_prefix,
+                    "twofa_status": twofa_status,
+                    "twofa_error": twofa_error,
                     "codex": codex_result,
                 },
             )
+            _post_register_dwell(page, context, provider_prefix=provider_prefix, email=email)
             _t_all.done("success")
             return {
                 "success": True,
@@ -1921,6 +2982,8 @@ def run_browser_use_registration(
                 "account_id": account_id,
                 "access_token": access_token,
                 "totp_secret": totp_secret,
+                "twofa_status": twofa_status,
+                "twofa_error": twofa_error,
                 "codex": codex_result,
                 "error": None,
             }
@@ -1929,10 +2992,19 @@ def run_browser_use_registration(
         logger.debug("[BrowserUse] 失败详情", exc_info=True)
         try:
             from core.email_provider import release_email
+            error_text = str(exc)
+            note_text = account_unusable_message(exc.error_code) if isinstance(exc, AccountUnusableError) else error_text
+            release_status = "disabled" if (
+                isinstance(exc, AccountUnusableError)
+                or "account_deactivated" in error_text
+                or "account_deleted" in error_text
+                or "account_banned" in error_text
+                or _is_unsupported_email_error(error_text)
+            ) else "failed" if create_acknowledged else "available"
             release_email(
                 email,
-                status="failed" if create_acknowledged else "available",
-                note=f"BrowserUse注册失败: {str(exc)[:180]}",
+                status=release_status,
+                note=note_text[:180],
             )
         except Exception:
             pass
@@ -1942,23 +3014,16 @@ def run_browser_use_registration(
             "error": f"{type(exc).__name__}: {str(exc)[:300]}",
         }
     finally:
-        # CDP 远端会话：关闭 browser 连接；Browser Use 侧通常会随断开回收。
-        keep_open = bool(getattr(_cfg, "BROWSER_USE_KEEP_BROWSER_OPEN", False))
-        if provider_prefix == "skyvern":
+        # 任务结束统一关闭连接，避免云浏览器/CDP 残留占用。
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
+        if provider_prefix == "skyvern" and 'client' in locals() and hasattr(client, "close_browser_session") and getattr(session_info_open, "session_id", ""):
             try:
-                from config import skyvern as _skyvern_cfg
-                keep_open = bool(getattr(_skyvern_cfg, "SKYVERN_KEEP_BROWSER_OPEN", False))
-            except Exception:
-                keep_open = False
-        if not keep_open:
-            try:
-                if browser is not None:
-                    browser.close()
+                client.close_browser_session(session_info_open.session_id)
             except Exception:
                 pass
-            if provider_prefix == "skyvern" and 'client' in locals() and hasattr(client, "close_browser_session") and getattr(session_info_open, "session_id", ""):
-                try:
-                    client.close_browser_session(session_info_open.session_id)
-                except Exception:
-                    pass
         _set_log_provider_label("BrowserUse")
+        _set_cloud_provider("browser_use")
