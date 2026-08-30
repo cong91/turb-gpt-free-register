@@ -19,7 +19,7 @@ class NordVPNAccountConfigTests(unittest.TestCase):
         self.assertIn("NORDVPN_WG_AUTO_DOWNLOAD", fields)
         self.assertIn("NORDVPN_API_BASE", fields)
         self.assertTrue(fields["NORDVPN_ACCESS_TOKEN"]["secret"])
-        self.assertEqual(fields["NORDVPN_ACCESS_TOKEN"]["storage"], "env")
+        self.assertEqual(fields["NORDVPN_ACCESS_TOKEN"]["storage"], "sqlite")
 
     def test_modules_are_hot_reloadable(self):
         self.assertIn("config.nordvpn_account", _RELOADABLE_SUBMODULES)

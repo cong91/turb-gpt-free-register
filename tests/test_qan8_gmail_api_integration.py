@@ -388,9 +388,9 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
 
     def test_qan8_configuration_and_registration_controls_are_exposed(self):
         fields = {item["key"]: item for item in config_editor.EDITABLE_FIELDS}
-        self.assertEqual(fields["QAN8_API_KEY"]["storage"], "env")
+        self.assertEqual(fields["QAN8_API_KEY"]["storage"], "sqlite")
         self.assertTrue(fields["QAN8_API_KEY"]["secret"])
-        self.assertEqual(fields["QAN8_GMAIL_SKU_ID"]["storage"], "env")
+        self.assertEqual(fields["QAN8_GMAIL_SKU_ID"]["storage"], "sqlite")
         self.assertEqual(fields["QAN8_ORDER_TIMEOUT"]["type"], "int")
 
         source = (
@@ -399,7 +399,7 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         self.assertIn('value="qan8_gmail_api"', source)
         self.assertIn('id="qan8AliasCountV2"', source)
         self.assertIn("qan8_alias_count", source)
-        self.assertIn("Mỗi worker = một lane", source)
+        self.assertIn("Mỗi luồng = một lane", source)
 
 
 if __name__ == "__main__":

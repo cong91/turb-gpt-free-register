@@ -564,6 +564,7 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
         from core import plan_check_service
 
         with (
+            patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=False),
             patch("core.account_network.resolve_rotating_proxy", return_value="http://203.0.113.40:8080") as resolve,
             patch.object(plan_check_service, "check_account_plan", return_value={"ok": True}) as check_plan,
             patch.object(plan_check_service.db, "mark_account_plan_check_running", return_value=True),

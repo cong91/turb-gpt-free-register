@@ -15,7 +15,7 @@ class SkyvernConfigTests(unittest.TestCase):
         fields = {f["key"]: f for f in config_editor.EDITABLE_FIELDS}
         self.assertIn("SKYVERN_API_KEY", fields)
         self.assertTrue(fields["SKYVERN_API_KEY"].get("secret"))
-        self.assertEqual(fields["SKYVERN_API_KEY"].get("storage"), "env")
+        self.assertEqual(fields["SKYVERN_API_KEY"].get("storage"), "sqlite")
         self.assertIn("SKYVERN_BROWSER_SESSION_TIMEOUT", fields)
 
     def test_cdp_headers_include_api_key(self):

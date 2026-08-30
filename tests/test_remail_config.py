@@ -28,7 +28,7 @@ class RemailConfigTests(unittest.TestCase):
             "https://remail.aishop6.com/register?aff=AFFLGYQMTYIXH",
         )
         self.assertTrue(fields["REMAIL_API_KEY"]["secret"])
-        self.assertEqual(fields["REMAIL_API_KEY"]["storage"], "env")
+        self.assertEqual(fields["REMAIL_API_KEY"]["storage"], "sqlite")
         self.assertEqual(fields["REMAIL_PROJECT_ID"]["type"], "int")
         self.assertEqual(fields["REMAIL_EMAIL_SUFFIX"]["type"], "str")
 
