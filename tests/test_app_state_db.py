@@ -26,57 +26,28 @@ class AppStateDbTests(unittest.TestCase):
             finally:
                 connection.close()
 
-    def test_core_database_path_tracks_central_app_state_path(self):
+    def test_core_database_path_tracks_canonical_turb_path(self):
         with tempfile.TemporaryDirectory() as tmp:
-            database = Path(tmp) / "app_state.sqlite3"
-            with patch.object(app_state_db, "APP_STATE_DB_PATH", database):
+            database = Path(tmp) / "turb.sqlite3"
+            with (
+                patch.object(app_state_db, "APP_STATE_DB_PATH", database),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", database),
+            ):
                 self.assertEqual(db._active_sqlite_path().resolve(), database.resolve())
                 self.assertEqual(Path(db.storage_paths()["sqlite"]).resolve(), database.resolve())
 
-    def test_default_core_path_waits_for_unified_migration_marker(self):
+    def test_default_core_path_does_not_wait_for_migration_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
-            central_database = Path(tmp) / "app_state.sqlite3"
-            legacy_database = Path(tmp) / "turb.sqlite3"
-            with (
-                patch.object(db, "_LEGACY_SQLITE_PATH", legacy_database),
-                patch.object(db, "_central_cutover_ready", return_value=False),
-            ):
-                self.assertEqual(db._active_sqlite_path().resolve(), legacy_database.resolve())
-
-            with (
-                patch.object(db, "_central_cutover_ready", return_value=True),
-                patch.object(app_state_db, "APP_STATE_DB_PATH", central_database),
-            ):
-                self.assertEqual(db._active_sqlite_path().resolve(), central_database.resolve())
-
-    def test_default_cutover_gate_reads_unified_marker(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            database = Path(tmp) / "app_state.sqlite3"
-            with (
-                patch.object(app_state_db, "APP_STATE_DB_PATH", database),
-                patch.object(db, "_DEFAULT_APP_STATE_DB_PATH", database),
-            ):
-                self.assertFalse(db._central_cutover_ready())
-                connection = sqlite3.connect(database)
-                try:
-                    connection.execute(
-                        "CREATE TABLE app_state_migrations (migration_key TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
-                    )
-                    connection.execute(
-                        "INSERT INTO app_state_migrations(migration_key, applied_at) VALUES (?, ?)",
-                        ("migration:application_state:1", "2026-08-30T00:00:00"),
-                    )
-                    connection.commit()
-                finally:
-                    connection.close()
-
-                self.assertTrue(db._central_cutover_ready())
+            database = Path(tmp) / "turb.sqlite3"
+            with patch.object(db, "_DEFAULT_SQLITE_PATH", database):
+                self.assertEqual(db._active_sqlite_path().resolve(), database.resolve())
 
     def test_central_initialization_does_not_read_stale_json_export(self):
         with tempfile.TemporaryDirectory() as tmp:
-            database = Path(tmp) / "app_state.sqlite3"
+            database = Path(tmp) / "turb.sqlite3"
             with (
                 patch.object(app_state_db, "APP_STATE_DB_PATH", database),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", database),
                 patch.object(db, "_SQLITE_READY", False),
                 patch.object(db, "_SQLITE_READY_PATH", None),
                 patch.object(db, "_read_json", side_effect=AssertionError("central init read an export")),
@@ -92,6 +63,26 @@ class AppStateDbTests(unittest.TestCase):
                 )
             finally:
                 connection.close()
+
+    def test_ready_flag_rechecks_missing_core_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "turb.sqlite3"
+            with (
+                patch.object(db, "_DEFAULT_SQLITE_PATH", database),
+                patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
+                patch.object(db, "_ACCOUNTS_JSON", database.with_name("accounts.json")),
+            ):
+                db._ensure_sqlite()
+                connection = sqlite3.connect(database)
+                try:
+                    connection.execute("DROP TABLE accounts")
+                    connection.commit()
+                finally:
+                    connection.close()
+                self.assertFalse(db._sqlite_schema_ready(database))
+                db._ensure_sqlite()
+                self.assertTrue(db._sqlite_schema_ready(database))
 
     def test_schema_and_named_documents_are_durable(self):
         with tempfile.TemporaryDirectory() as tmp:

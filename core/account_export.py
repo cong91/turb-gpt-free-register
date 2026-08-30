@@ -10,6 +10,7 @@
 import json
 import logging
 import random
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +26,9 @@ logger = logging.getLogger(__name__)
 
 _TWOFA_ACTION_URL = "https://chatgpt.com/?action=enable&factor=totp"
 _TWOFA_REAUTH_MAX_ATTEMPTS = 3
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_ACCOUNTS_DIR = _PROJECT_ROOT / "accounts"
+_BATCH_ARCHIVE_LOCK = threading.RLock()
 
 def _post_register_dwell_seconds() -> float:
     try:
@@ -342,9 +346,26 @@ def _account_copy_line(
     return "----".join(parts)
 
 
-def create_batch_archive_dir(count: int, workers: int = 1) -> None:
-    """兼容旧调用方；批次数据现在直接保存到 SQLite，不创建归档目录。"""
-    return None
+def create_batch_archive_dir(count: int, workers: int = 1) -> Path:
+    """为一次运行创建只读导出批次目录；SQLite 仍是唯一运行时 source of truth。"""
+    day = datetime.now().strftime("%Y%m%d")
+    base_name = f"{day}-{count}个" if workers <= 1 else f"{day}-{count}个-{workers}线程"
+    folder = _ACCOUNTS_DIR / base_name
+    suffix = 2
+    while folder.exists():
+        folder = _ACCOUNTS_DIR / f"{base_name}-{suffix}"
+        suffix += 1
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "注册成功的邮箱.txt").write_text("", encoding="utf-8")
+    (folder / "注册成功的token.txt").write_text("", encoding="utf-8")
+    (folder / "注册成功整行.txt").write_text("", encoding="utf-8")
+    (folder / "注册成功账号.json").write_text("[]\n", encoding="utf-8")
+    return folder
+
+
+def _append_line(path: Path, line: str) -> None:
+    with path.open("a", encoding="utf-8", newline="\n") as stream:
+        stream.write(line + "\n")
 
 
 def _append_batch_archive(
@@ -357,12 +378,50 @@ def _append_batch_archive(
     proxy_used: str | None,
     extra: dict,
     batch_dir: Path | None,
-) -> None:
-    """兼容旧调用方；注册账号已经由 db.insert_account 保存到 SQLite。"""
+) -> Path:
+    """将 SQLite 中已保存的账号同步到本次批次的兼容导出目录。"""
     from core import db
-    # 参数保留是为了兼容注册驱动；不再读取 batch_dir 或写入任何归档文件。
-    _ = (db, row_id, email, access_token, totp_secret, email_source, proxy_used, extra, batch_dir)
-    return None
+
+    folder = batch_dir or create_batch_archive_dir(count=1)
+    row = db.get_account(row_id) or {}
+    material_line = _account_material_line(email, row)
+    copy_line = db.account_line(row, "modern")
+    archive_extra = extra
+    if isinstance(row.get("extra_json"), str) and row.get("extra_json"):
+        try:
+            parsed_extra = json.loads(str(row["extra_json"]))
+            if isinstance(parsed_extra, dict):
+                archive_extra = parsed_extra
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    archive = {
+        "id": row_id,
+        "email": email,
+        "email_source": email_source,
+        "proxy_used": proxy_used,
+        "access_token": access_token,
+        "totp_secret": totp_secret,
+        "material_line": material_line,
+        "copy_line": copy_line,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "row": row,
+        "extra": archive_extra,
+    }
+    with _BATCH_ARCHIVE_LOCK:
+        folder.mkdir(parents=True, exist_ok=True)
+        _append_line(folder / "注册成功的邮箱.txt", material_line)
+        _append_line(folder / "注册成功的token.txt", access_token)
+        _append_line(folder / "注册成功整行.txt", copy_line)
+        json_path = folder / "注册成功账号.json"
+        try:
+            rows = json.loads(json_path.read_text(encoding="utf-8")) if json_path.exists() else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            rows = []
+        if not isinstance(rows, list):
+            rows = []
+        rows.append(archive)
+        json_path.write_text(json.dumps(rows, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return folder
 
 
 def follow_oauth_callback(session: BrowserSession, continue_url: str, referer: str = "https://auth.openai.com/about-you") -> str:
@@ -770,6 +829,10 @@ def setup_2fa(
 
 def setup_2fa_for_registration(session: BrowserSession, email: str) -> str:
     """Enable MFA after the fresh signup session completes an email re-auth."""
+    if not callable(getattr(session, "get_auth_headers", None)) and callable(
+        getattr(session, "execute_async_script", None)
+    ):
+        session = BrowserPageTransport(session)
     logger.info("[2FA] 注册完成，先完成邮箱 re-auth 再 enroll TOTP...")
     return setup_2fa(session, email, reauth=True)
 
@@ -899,7 +962,7 @@ def save_account_data(
     )
     from core.email_provider import mark_email_consumed
     mark_email_consumed(email)
-    batch_folder = _append_batch_archive(
+    _append_batch_archive(
         row_id=row_id,
         email=email,
         access_token=access_token,

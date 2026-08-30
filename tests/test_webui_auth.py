@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+from unittest.mock import patch
 
 from webui.app import create_app
 
@@ -38,6 +39,12 @@ class WebUiAuthTests(unittest.TestCase):
         self.assertEqual(r.status_code, 302)
         r = self.client.get("/api/summary")
         self.assertEqual(r.status_code, 200)
+
+    def test_secure_cookie_can_be_enabled_for_https_reverse_proxy(self):
+        with patch.dict("os.environ", {"WEBUI_SECURE_COOKIE": "True"}):
+            app = create_app(auth_code="test-auth")
+
+        self.assertTrue(app.config["SESSION_COOKIE_SECURE"])
 
 
 if __name__ == "__main__":

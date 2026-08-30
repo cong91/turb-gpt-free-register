@@ -12,9 +12,13 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 
 > 项目说明：本项目基于 [xiaoguzuiniu/gpt-free-register](https://github.com/xiaoguzuiniu/gpt-free-register) 进行改造与扩展。
 
-- TG 交流群：[https://t.me/+uC3Ix0l2E085Njhl](https://t.me/+uC3Ix0l2E085Njhl)
+- TG 交流群：[https://t.me/+gu_cvEKq_vcyZWRl](https://t.me/+gu_cvEKq_vcyZWRl)
 
 > 开源版说明：仓库只保留源码、配置模板和文档；运行时账号、Token、邮箱池、Codex 凭证、日志等真实数据均已通过 `.gitignore` 排除。
+
+### Runtime state database
+
+应用业务状态统一保存在根目录的 `turb.sqlite3`：origin 的账号、邮箱池、注册任务、Codex 凭证以及 fork 新增的 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 都以它为 source of truth。`app_state.sqlite3` 只作为 fork state 的离线 migration source，不是运行时数据库。JSON/TXT/HTML、Codex credential 文件以及 Roxy archive/log 仅作为导出或 artefact；运行时不会从旧版 SQLite、JSON、TXT 或 ledger 文件隐式导入状态。
 
 ---
 
@@ -32,9 +36,9 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 - 支持 RoxyBrowser 一号一环境：自动创建、打开、关闭、删除 Roxy Profile。
 - 支持 Roxy 无头启动：`ROXY_OPEN_HEADLESS=True`。
 - 支持 CloakBrowser：免费 binary、无头模式、humanize、固定 fingerprint seed、按出口 IP 自动匹配语言/时区/WebRTC。
-- Roxy / Cloak 浏览器注册已兼容：
-  - 填邮箱后直接进入邮箱验证码页；
-  - 填邮箱后先进入 `create-account/password`，自动设置密码再继续；
+- Roxy / Cloak / Browser Use / Skyvern 浏览器注册统一强制使用 OpenAI 注册密码：
+  - 即使填邮箱后直接进入邮箱验证码页，也会先切换到 `create-account/password` 设置密码；
+  - 无法进入或填写密码页时直接失败，不降级为 OTP-only；
   - `about-you/profile` 页面直接输入年龄数字；
   - `about-you/profile` 页面输入年月日生日；
   - React Aria birthday select / spinbutton 年月日控件；
@@ -48,13 +52,14 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 - Cloudflare 域名邮箱 + QQ 邮箱 IMAP 收信（`cloudflare_domain`）
 - Cloudflare Worker 临时邮箱：自动创建 + JWT 取码（`cloudflare`，兼容 cloudflare_temp_email）
 - 通用 API 邮箱：`email----取码地址`
-- 通用 IMAP 邮箱池：每行 `邮箱----IMAP密码` 或 `邮箱:IMAP密码`，服务器、端口和 SSL 在导入界面统一配置
+- Gmail API URL 邮箱：`email----取码URL`，轮询 API 响应 `code=601`（等待）、`code=602`（失败/退款）、`code=0`（成功）
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
-- Remail 开放 API：按项目下单短效邮箱并自动收取验证码（`remail`）
+- TinyHost 临时邮箱 API：从全量在线域名中选择域名，生成随机邮箱并自动收取验证码（`tinyhost`）
+- Paymesh MAIL card：`POST /api/v1/redeem` 领取邮箱，`GET /api/v1/order/lookup` 自动收取验证码（`paymesh`）
 - `EMAIL_SOURCE` 支持多个来源组合，例如：
 
 ```python
-EMAIL_SOURCE = "outlook,generic_api,imap"
+EMAIL_SOURCE = "outlook,generic_api,gmail_api_url"
 ```
 
 - MailNest-迈巢：Outlook 临时邮箱
@@ -62,6 +67,7 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 ### Codex OAuth
 
 - 注册成功后可自动跑 Codex OAuth。
+- 可在 WebUI 配置开启 `AUTO_CODEX_FOR_FREE_AFTER_REGISTER`：注册后先查套餐，只有确认是 Free 且 `plus_trial_eligible` 明确为 `False`（不是 Free Plus）才会自动创建 Codex 补跑任务；该选项会自动开启注册后套餐查询。
 - Codex 授权驱动可选：
   - `CODEX_OAUTH_DRIVER = "protocol"`
   - `CODEX_OAUTH_DRIVER = "roxy"`
@@ -71,7 +77,8 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 - 支持 CPA 管理接口生成授权 URL，并提交 OAuth callback。
 - 支持接码平台：
   - GrizzlySMS
-  - 本地 L 取号服务，见 `L_API.md`
+  - ViOTP
+  - 本地 L/H 取号服务，见 `L_API.md` / `H_API.md`
 - 手机验证支持自动取号、填号、收码、提交、失败换号重试。
 - Codex 凭证保存到 SQLite 的 `codex_accounts` 表。
 
@@ -82,17 +89,31 @@ EMAIL_SOURCE = "outlook,generic_api,imap"
 - 动态调整注册线程数，提交后新任务立即使用最新值。
 - 批量补跑 Codex，补跑线程数每次提交即时生效。
 - 管理账号、邮箱池、Codex 凭证；账号页支持复制全部/选中整行，邮箱池列表展示导入时间、已用时间和状态。
-- 邮箱池导入默认不创建账号；勾选“导入后默认视为注册成功账号”后，会将邮箱池标记为已用并同步显示在账号页，可直接批量补跑 Codex。
-- Roxy/Cloak 浏览器注册完成后统计整个浏览器会话的上传、下载和总流量，任务列表与账号扩展信息均会保存结果；Browser Use/Skyvern 云端浏览器不启用本地流量监听、资源拦截或 JS 覆盖率采集。
 - 配置页支持热加载，保存后无需重启。
 - Roxy 团队/项目可在配置页获取并保存。
+- 代理池配置支持 Proxy.vn 代理旋转：注册、Codex OAuth/补跑、查活、套餐、提链、2FA、改邮箱和 Codex Agent 等账号 workflow 都通过持久 lease 取 proxy；同一 `scope/lane` 复用 proxy TTL，`keyxoay` 在所有 scope 之间全局不重复。
+
+### Proxy.vn 代理旋转
+
+在 WebUI 的「代理池」中开启「Proxy.vn 代理旋转」，填写主 API Key，并选择 `http` 或 `socks5`。对应环境变量如下，API Key 只放在 `.env`：
+
+```dotenv
+ROTATING_PROXY_ENABLED=true
+ROTATING_PROXY_API_KEY=你的_proxy.vn_API_key
+ROTATING_PROXY_PROTOCOL=http
+ROTATING_PROXY_NHAMANG=random
+ROTATING_PROXY_TINHTHANH=0
+ROTATING_PROXY_WHITELIST=
+```
+
+批量注册的 `workers` 会映射为稳定的 lane（`index % workers`）。lane 有未过期 lease 时不会重复请求 API；proxy TTL 到期才调用 `proxyxoay.shop/api/get.php`。配置页状态区会分别显示 workflow scope（例如 `registration:0`、`codex_retry:0`），且只展示脱敏 key、assignment 和 proxy，不展示主 API Key。
 
 ### 数据存储
 
-- 迁移完成后，账号、邮箱库、任务、Codex 凭证以及 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 运行时统一存储在项目根目录 `app_state.sqlite3`。核心业务表包括 `accounts`、`email_pool`、`registration_jobs`、`codex_accounts` 和 `codex_agent_accounts`。
+- 迁移完成后，账号、邮箱库、任务、Codex 凭证以及 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 运行时统一存储在项目根目录 `turb.sqlite3`。它保留 origin 的全部表和数据，并补充 `app_state.sqlite3` 中 fork 独有的表。
 - 中央数据库使用 rollback journal（`journal_mode=DELETE`）、`synchronous=FULL`、超时等待和常用字段索引，以兼容 CDK/Gmail CDK 等 provider store。WebUI 的账号、套餐状态、邮箱池、Codex 和任务分页直接执行 SQLite `COUNT(*) + LIMIT/OFFSET`。
-- `turb.sqlite3` 是迁移前 origin 的离线输入，不是迁移后的运行时 source of truth。应用启动不会再从旧 SQLite、JSON、TXT 或 Codex credential 文件隐式导入状态。
-- `app_state.sqlite3*` 和 `turb.sqlite3*` 属于运行时/迁移数据，已加入 `.gitignore`，必须纳入备份策略；迁移完成后仍应保留原始 `turb.sqlite3` 和 SQLite snapshot，直到 smoke test 通过。
+- `app_state.sqlite3` 是 fork 的离线 migration input；如果某个表同时存在于两边，`turb.sqlite3` 的 schema 和 rows 优先，任何不一致都会中止 migration，绝不静默覆盖 origin。
+- `app_state.sqlite3*` 和 `turb.sqlite3*` 属于运行时/迁移数据，已加入 `.gitignore`，必须纳入备份策略；迁移完成后仍应保留 app-state source、原始 turb snapshot 和 rollback copy，直到 smoke test 通过。
 
 #### Split SQLite migration runbook
 
@@ -110,7 +131,7 @@ Sau đó chạy rehearsal không ghi file bằng `--dry-run`:
 python -m core.sqlite_state_migration migrate `
   --app-state .\app_state.sqlite3 `
   --turb .\turb.sqlite3 `
-  --target .\app_state.migrated.sqlite3 `
+  --target .\turb.migrated.sqlite3 `
   --backup-dir .\migration-backups `
   --dry-run
 ```
@@ -121,97 +142,28 @@ Khi audit đúng, tạo target mới và snapshot trong một thư mục backup 
 python -m core.sqlite_state_migration migrate `
   --app-state .\app_state.sqlite3 `
   --turb .\turb.sqlite3 `
-  --target .\app_state.migrated.sqlite3 `
+  --target .\turb.migrated.sqlite3 `
   --backup-dir .\migration-backups
 ```
 
-Service dùng SQLite backup API để snapshot, giữ nguyên toàn bộ bảng của `app_state.sqlite3`, rồi chỉ merge năm bảng authoritative từ `turb.sqlite3`. Duplicate cùng khóa và cùng nội dung được bỏ qua; schema hoặc row khác nội dung sẽ dừng và xóa target sinh ra. Kết quả có integrity check, foreign-key check, schema/count/digest verification và migration marker `migration:application_state:1`, không chứa payload row.
+Service dùng SQLite backup API để snapshot, khởi tạo target từ toàn bộ `turb.sqlite3`, rồi copy tất cả bảng chỉ có trong `app_state.sqlite3`. Bảng trùng tên phải có schema và row giống nhau; nếu khác, migration dừng và xóa target sinh ra để giữ nguyên origin. Kết quả có integrity check, foreign-key check, schema/count/digest verification và migration marker `migration:fork_state_into_turb:1`, không chứa payload row.
 
-Sau khi target validation thành công, giữ nguyên source và snapshot. Dừng application, giữ lại app-state cũ rồi promote target; các lệnh PowerShell sau cố ý không dùng `-Force`:
-
-```powershell
-if (Test-Path .\app_state.sqlite3.pre-unified) { throw "rollback copy already exists" }
-Move-Item -LiteralPath .\app_state.sqlite3 -Destination .\app_state.sqlite3.pre-unified
-Move-Item -LiteralPath .\app_state.migrated.sqlite3 -Destination .\app_state.sqlite3
-```
-
-Sau đó mới khởi động smoke test; marker trong target khiến core repository chuyển sang `app_state.sqlite3`. Nếu smoke test lỗi, dừng application và rollback bằng cách giữ target lỗi để điều tra rồi khôi phục bản cũ:
+Sau khi target validation thành công, giữ nguyên source và snapshot. Dừng application, giữ lại origin `turb.sqlite3` rồi promote target; các lệnh PowerShell sau cố ý không dùng `-Force`:
 
 ```powershell
-Move-Item -LiteralPath .\app_state.sqlite3 -Destination .\app_state.sqlite3.failed-unified
-Move-Item -LiteralPath .\app_state.sqlite3.pre-unified -Destination .\app_state.sqlite3
+if (Test-Path .\turb.sqlite3.pre-fork-merge) { throw "rollback copy already exists" }
+Move-Item -LiteralPath .\turb.sqlite3 -Destination .\turb.sqlite3.pre-fork-merge
+Move-Item -LiteralPath .\turb.migrated.sqlite3 -Destination .\turb.sqlite3
 ```
 
-Không xóa source hoặc snapshot. `turb.sqlite3` chỉ được archive sau khi đã xác nhận runtime đọc đúng `app_state.sqlite3`.
+Sau đó mới khởi động smoke test; core repository luôn đọc `turb.sqlite3`, không cần marker để đổi database. Nếu smoke test lỗi, dừng application và rollback bằng cách giữ target lỗi để điều tra rồi khôi phục bản cũ:
 
-### 浏览器网络流量统计
-
-浏览器驱动会从打开注册页开始统计，到注册后停留结束、浏览器关闭前完成汇总。结果包含：
-
-- 上传字节、下载字节、总字节数；
-- HTTP 请求数、失败/未完成请求数；
-- WebSocket 帧 payload 字节（如流程使用 WebSocket）。
-
-现代/Legacy WebUI 的注册任务列表会显示总流量，完整结构保存在任务记录的 `network_traffic` 和成功账号的 `extra_json` 中。统计为浏览器侧可观测的请求/响应流量，不包含 TLS/IP/代理隧道额外开销，也不包含邮箱 API、Roxy API 或 CDP 控制通道流量。
-
-#### 省流量模式
-
-在 WebUI「浏览器画像」中开启「本地浏览器省流量模式」，或在 `.env` 设置（仅 Roxy/Cloak 生效）：
-
-```dotenv
-BROWSER_DATA_SAVER_MODE=True
-BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES=["image", "media"]
-# URL glob 列表；WebUI 中则是一行一条
-BROWSER_DATA_SAVER_BLOCKED_URL_PATTERNS='["**://auth.openai.com/awe/api/v2/rum**", "**://chatgpt.com/ces/statsc/flush**", "**://connect.facebook.net/**", "**://analytics.tiktok.com/**", "**://snap.licdn.com/**", "**://bat.bing.com/**", "**://accounts.google.com/gsi/client**"]'
+```powershell
+Move-Item -LiteralPath .\turb.sqlite3 -Destination .\turb.sqlite3.failed-fork-merge
+Move-Item -LiteralPath .\turb.sqlite3.pre-fork-merge -Destination .\turb.sqlite3
 ```
 
-Roxy/Selenium 会在启动参数中关闭图片加载，并使用 Chrome CDP 拦截常见图片、媒体等 URL 后缀及配置的 URL glob（因此也能覆盖无扩展名资源）；Cloak 使用 Playwright 按资源类型和 URL glob 拦截。Browser Use/Skyvern 是云端浏览器，不安装本地省流量拦截器，始终保留完整页面资源。默认只拦截 `image`、`media`，以及配置中列出的 RUM/广告统计 URL，不会按类型拦截登录所需的核心脚本、接口和 WebSocket。Playwright 会放行带验证码/challenge 关键词的 URL；Roxy 的 Chromium 图片开关和 CDP URL 黑名单无法提供 URL 例外规则，若页面出现验证码或布局异常，关闭该模式后重试。
-
-Job 208 的明细显示，当前规则实际拦截了 5 个第三方脚本（Google GSI、Facebook、TikTok、LinkedIn、Bing）以及 380 次 RUM 请求；邮箱/密码注册成功。注册侧下载约 9.92 MiB，其中脚本约 8.90 MiB，主要来自 ChatGPT 核心 CDN chunk。
-
-当前默认规则只包含 RUM/广告统计和 Google GSI。邮箱/密码注册不使用 Google 登录，因此可以保留 GSI 规则；如果将来启用 Google 登录，需从「省流量 URL 屏蔽规则」中移除以下行：
-
-```text
-**://accounts.google.com/gsi/client**
-```
-
-疑似 CES 遥测的 `**://chatgpt.com/ces/v1/rgstr` 约 277 KiB/轮，也可在单独验证注册成功率后加入。
-
-不要屏蔽 `chatgpt.com/cdn/assets/*.js`、`auth-cdn.oaistatic.com/assets/*.js`、`sentinel.openai.com`、`chatgpt.com/backend-api/sentinel/*`、`ab.chatgpt.com/v1/initialize`、`chatgpt.com/realtime/wm` 和注册/OTP/session API。Job 207 屏蔽 `7aaae702-*.js` 后出现 OTP 输入框缺失；Job 208 放行该 chunk 后完整成功，因此不能仅凭低函数执行比例屏蔽 CDN chunk。URL 规则填写 `[]` 可恢复为仅按资源类型拦截，空白则使用内置默认规则。
-
-如需拦截 CSS，可加入 `stylesheet`：
-
-```dotenv
-BROWSER_DATA_SAVER_BLOCKED_RESOURCE_TYPES=["image", "media", "stylesheet"]
-```
-
-CSS 通常不是注册接口必需，但会影响隐藏元素、布局和可见性判断，建议先单独测试；出现元素找不到或点击异常时移除 `stylesheet`。
-
-#### 资源明细日志
-
-需要分析注册流程中哪些资源占流量时，开启：
-
-```dotenv
-BROWSER_TRAFFIC_DETAIL_LOG=True
-BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES=2000
-```
-
-启用统计的 Roxy/Cloak 注册任务结束后，日志会输出 `[资源明细]` 行，包含资源 URL、类型、HTTP 方法、状态码、上传大小、下载大小、响应 body/header 大小，以及 `failed`、`blocked`、`unfinished`、`cache` 状态；明细按单请求总字节从大到小排列。Browser Use/Skyvern 云端浏览器不启用该监听。`ws_upload/ws_download` 表示 WebSocket 帧 payload。Playwright 缓存状态在无法从 API 确认时显示 `unknown`，Selenium/CDP 能识别时显示 `hit` 或 `miss`。URL 查询参数值、data/blob URL 内容不会写入日志。
-
-把一轮注册的 `[资源明细]` 日志发回后，可以按域名、路径、资源类型和实际字节量判断下一步是否适合继续拦截；`stylesheet`、`font` 等类型需要结合注册是否受影响再启用。
-
-#### JS 执行函数覆盖率
-
-需要确认某个 CDN chunk 是否在 Roxy/Cloak 注册流程中真正执行时，开启：
-
-```dotenv
-BROWSER_JS_COVERAGE_LOG=True
-BROWSER_JS_COVERAGE_MAX_ENTRIES=1000
-```
-
-Roxy/Selenium 会在当前 Chrome target 上启用 CDP `Profiler.startPreciseCoverage`，Cloak 会为已发现的 Chromium Page 建立 CDP session；Browser Use/Skyvern 不启用 JS 覆盖率监听。任务结束时日志包含：`[JS执行汇总]`、每个脚本的 `[JS脚本]`、实际执行函数的 `[JS执行]`（函数名、调用次数、`startOffset-endOffset:count`）以及“本次未观察到执行范围”的 `[JS候选]`。`network_traffic.js_coverage` 会保存脚本级摘要和候选 URL，逐函数 offset 只写日志，不保存源码、参数或返回值。
-
-`[JS候选]` 仅表示该轮覆盖率没有观察到执行代码，不能单独证明可以屏蔽：先用一轮未屏蔽核心脚本的成功注册作为基线，再一次只屏蔽一个候选并对比 OTP、session、资料页和成功率。脚本若来自 `data:`/`blob:`/扩展页不会列为 URL 屏蔽候选；跨 popup/多 target 的 Selenium 页面只覆盖当前 CDP target。若 CDP Profiler 不受当前指纹浏览器支持，日志会标记 `supported=False`，不会影响注册流程。
+Không xóa `app_state.sqlite3` source hoặc snapshot. Chỉ archive rollback copy sau khi đã xác nhận runtime đọc đúng `turb.sqlite3`.
 
 ---
 
@@ -221,7 +173,7 @@ Roxy/Selenium 会在当前 Chrome target 上启用 CDP `Profiler.startPreciseCov
 - Node.js 18+
 - 可用代理、系统代理/VPN，或 RoxyBrowser 代理环境
 - 如使用 Roxy 注册：需要本机 RoxyBrowser API 可访问
-- 如使用 Cloak 注册：首次运行会自动下载 Cloak Chromium binary；`CLOAK_GEOIP=True` 需要 `cloakbrowser[geoip]` 依赖
+- 如使用 Cloak 注册：本地首次运行会自动下载 Cloak Chromium binary；Docker image 会在 build 阶段预装并在 `/opt/cloakbrowser` 持久化 cache；`CLOAK_GEOIP=True` 需要 `cloakbrowser[geoip]` 依赖
 - 如启用 Codex 自动授权：需要接码平台配置
 
 安装依赖：
@@ -230,6 +182,33 @@ Roxy/Selenium 会在当前 Chrome target 上启用 CDP `Profiler.startPreciseCov
 pip install -r requirements.txt
 node --version
 ```
+
+### Production Docker / CI-CD
+
+Production uses `compose.yaml`: the application image is immutable, while the
+single runtime database and all generated exports/logs live in the named volume
+`turb_gpt_runtime`. The CloakBrowser binary cache is kept separately in
+`turb_gpt_cloak_cache`. Deploys never copy either volume into GitHub or rebuild
+them from source.
+
+The production secret file must be created only on the server at
+`/srv/turb-gpt-free-register/secrets/.env`, with mode `600`. The container reads
+it through `TURB_ENV_FILE=/run/secrets/turb.env`; it is not passed as Docker
+build context or as a GitHub Actions log value. Set `WEBUI_SECURE_COOKIE=True`
+and keep `NORDVPN_WG_ENABLED=False` until a valid NordVPN access token is
+configured.
+
+The GitHub Actions workflow runs the deployment gate tests, builds and smoke
+tests the Docker image including CloakBrowser and Linux `wireproxy`, then SSHs
+to `ovh-sing` with a pinned `known_hosts` entry. The server-side deploy script
+creates a SQLite backup before replacing the container. Configure these
+repository secrets without placing their values in source: `OVH_HOST`,
+`OVH_USER`, `OVH_SSH_PRIVATE_KEY`, and `OVH_KNOWN_HOSTS`.
+
+The public endpoint is intentionally not published by Docker. Nginx must
+terminate HTTPS for `gpt-acc.v-claw.org` and proxy to `127.0.0.1:5057`; do not
+expose port `5057` directly. The DNS A/AAAA record and certificate issuance are
+environment setup steps and must succeed before entering the WebUI password.
 
 ### 密钥配置（.env）
 
@@ -251,7 +230,6 @@ cp .env.example .env
 - `ROXY_API_TOKEN`
 - `QQ_IMAP_PASSWORD`
 - `CLOUDFLARE_API_KEY` / `CLOUDFLARE_CUSTOM_AUTH`（`EMAIL_SOURCE=cloudflare` 时）
-- `REMAIL_API_KEY`（`EMAIL_SOURCE=remail` 时）
 - `CPA_MANAGEMENT_KEY`
 - `SMS_API_KEY`
 - `L_ADMIN_AUTH_CODE`
@@ -262,6 +240,29 @@ WebUI 配置页保存这些字段时会写入 `.env`（不是 config 源码）�
 ---
 
 ## 快速开始
+
+### Windows 一键启动
+
+双击项目根目录的 `start-local.bat` 即可启动。
+
+命令行方式：
+
+```bat
+start-local.bat
+```
+
+脚本会自动检查 Python 3.10+ / Node.js 18+、创建 `.venv`、按需安装 `requirements.txt`、在缺失时从 `.env.example` 创建 `.env`，然后启动 WebUI 并打开浏览器。
+
+常用参数：
+
+```bat
+start-local.bat -Port 5057
+start-local.bat -AuthCode "你的授权码"
+start-local.bat -NoBrowser
+start-local.bat -CheckOnly
+```
+
+启动前脚本会先 force-close `-Port` 指定端口上的监听进程（默认 `5057`），避免旧 WebUI 或残留进程造成端口冲突。`-CheckOnly` 只检查环境和依赖，不启动 WebUI，也不会关闭现有进程或提交注册任务。需要更多 PowerShell 参数时，`start-local.bat` 会原样转发给 `start-local.ps1`。
 
 ### WebUI 授权码
 
@@ -319,26 +320,42 @@ EMAIL_SOURCE = "generic_api"
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
 ```
 
-#### 通用 IMAP 邮箱
+#### Gmail API URL 邮箱
 
-在 WebUI「邮箱池 → 导入」选择“通用 IMAP 取码邮箱”，每行格式：
+专用于 MailsAPI 类接口。导入格式：
 
 ```text
-email----imap_password
-email:imap_password
+email----取码URL
 ```
 
-- 在导入类型选择“通用 IMAP 取码邮箱”后，填写统一的 IMAP 服务器、端口和 SSL 配置。
-- IMAP 登录用户名固定使用对应邮箱地址，无需额外配置。
-- 端口通常为 `993`，SSL 默认启用。
-- 示例：`user@example.com----app-password`
-- 默认读取 `INBOX`，可在「配置 → 邮箱 / OTP → 通用 IMAP」修改。
-
-将邮箱来源设置为：
+在 WebUI 邮箱池页面选择「Gmail API URL」导入，或在 `config/email.py` 设置：
 
 ```python
-EMAIL_SOURCE = "imap"
+EMAIL_SOURCE = "gmail_api_url"
 ```
+
+轮询响应码规则：
+- `{"code": 601}` — 等待中，继续轮询
+- `{"code": 602}` — 提供商错误，标记邮箱为失败并记录退款提示
+- `{"code": 0, "data": {"code": "123456"}}` — 成功，返回验证码
+
+邮箱池业务状态保存在 `turb.sqlite3`；`用于注册的Gmail API邮箱.json` 仅为同步导出。
+
+#### QAN8 Gmail API lazy provider
+
+QAN8 provider dùng tài liệu API chính thức tại [shop.qan8.com/api-docs](https://shop.qan8.com/api-docs). Cấu hình:
+
+```dotenv
+EMAIL_SOURCE=qan8_gmail_api
+QAN8_API_BASE=https://shop.qan8.com
+QAN8_API_KEY=your_qan8_api_key
+QAN8_GMAIL_SKU_ID=your_gmail_sku_id
+QAN8_ALIASES_PER_SOURCE=12
+```
+
+Số worker hiệu dụng cũng là số lane và số source đang hoạt động. Ví dụ `workers=5` tạo tối đa 5 source Gmail gốc khác nhau, mỗi lane giữ một source và xử lý alias của lane theo thứ tự. Client sinh alias từ mail gốc; mọi alias của source dùng chung `code_url` để nhận OTP. Khi một lane hết alias, lane đó mới mua thêm đúng một source; các lane khác không bị đổi source. QAN8 delivery phải trả về đúng một bản ghi `email----code_url`, vì quantity luôn là 1.
+
+Chi tiết lifecycle, recovery và contract delivery xem [docs/qan8_gmail_api_lazy.md](docs/qan8_gmail_api_lazy.md).
 
 #### GPTMail 临时邮箱
 
@@ -355,6 +372,33 @@ GPTMAIL_API_KEY=你的_GPTMail_API_Key
 ```
 
 服务地址固定为 `https://mail.chatgpt.org.uk`。未填写 Key 时，任务会提示填写 `GPTMail API Key`，不会使用公共测试 Key。
+
+#### TinyHost 临时邮箱（`tinyhost`）
+
+TinyHost 不需要 API Key。注册任务创建邮箱时，程序调用 `GET /api/all-domains/` 获取全部在线域名，再生成一个合法的 `user`（即邮箱地址的 local-part），形成 `user@domain`。TinyHost 文档没有单独的 create-user endpoint；收件箱通过 `GET /api/email/{domain}/{user}/` 由这两个路径参数定位。验证码轮询调用：
+
+```dotenv
+EMAIL_SOURCE=tinyhost
+TINYHOST_API_BASE=https://tinyhost.shop
+TINYHOST_REQUEST_TIMEOUT=20
+TINYHOST_RANDOM_LOCAL_LENGTH=12
+```
+
+收到邮件后按 TinyHost 的 `sender`、`subject`、`body`、`html_body` 字段提取 OpenAI 六位验证码，然后继续使用现有注册流程。若 ChatGPT 在 `about-you` 提交后明确返回“不支持此邮箱”，程序会把该邮箱所属 domain 记录为 `disabled`，后续从全量列表中跳过该 domain。TinyHost 文档说明邮件和不活跃用户会在 3 天后清理；API 也有按 IP/endpoint 的限流，请按实际额度设置并发。
+
+#### Paymesh MAIL card（`paymesh`）
+
+在 WebUI 注册页选择 `Paymesh MAIL card`，每行输入一个 card；API 地址默认是 `https://sms.paymesh.cn`。也可以通过配置指定：
+
+```dotenv
+EMAIL_SOURCE=paymesh
+PAYMESH_API_BASE=https://sms.paymesh.cn
+PAYMESH_REQUEST_TIMEOUT=30
+PAYMESH_OTP_MAX_WAIT=180
+PAYMESH_ACCOUNTS_PER_CDK=6
+```
+
+Provider 通过 `POST /api/v1/redeem`（body 为 `{"code":"..."}`）领取邮箱，再轮询 `GET /api/v1/order/lookup?code=...&poll=true` 获取 OTP。`PAYMESH_REQUEST_TIMEOUT` 只限制每次 HTTP 请求；`PAYMESH_OTP_MAX_WAIT` 限制每轮 OTP 轮询，默认 180 秒，Roxy 注册最多等待 3 轮并在前两轮超时后重发。每个 card 最多分配 6 个邮箱别名；运行时 ledger 仅保存 card 哈希，不写入原始 card。账号注册成功后会把原始 card 作为 `source_cdk` 写入受保护的账号数据，用于追溯来源。
 
 #### Cloudflare Worker 临时邮箱（`cloudflare`）
 
@@ -393,34 +437,6 @@ Cloudflare Email Routing 需要把域名邮件转发到 QQ 邮箱。此模式不
 - `api-key`获取页面：https://mailnest.top/account
 - 项目代码获取页面：https://mailnest.top/buy-email。默认为`chatgpt001`，可以直接使用
 
-#### Remail 开放 API
-
-Remail API 文档：[https://remail.aishop6.com/docs](https://remail.aishop6.com/docs)。该服务使用 API Key
-按项目创建短效接码订单，订单返回的邮箱和 service token 会自动用于后续取码。
-
-在 WebUI「配置 → 邮箱 / OTP」填写：
-
-- `REMAIL_API_KEY`：Remail 控制台生成的 `rk-` 开头 API Key；
-- `REMAIL_PROJECT_ID`：Remail「项目」列表中用于 ChatGPT/OpenAI 验证码的 `projectId`；
-- `REMAIL_EMAIL_SUFFIX`：下单后缀，微软邮箱通常填 `outlook.com`。
-
-然后设置：
-
-```dotenv
-USE_EMAIL_SERVICE=True
-EMAIL_SOURCE=remail
-REMAIL_API_BASE=https://remail.aishop6.com
-REMAIL_API_KEY=你的_Remail_API_Key
-REMAIL_PROJECT_ID=项目ID
-REMAIL_EMAIL_SUFFIX=outlook.com
-REMAIL_SERVICE_MODE=purchase
-REMAIL_SUPPLY_POLICY=public_only
-```
-
-`REMAIL_SERVICE_MODE` 默认为 `purchase`（长效购买，可重复收件），也可改为 `code`（短效接码）。
-`REMAIL_SUPPLY_POLICY` 默认为 `public_only`，也可改为 `private_first`。每个注册任务会创建一个
-对应模式的订单，验证码通过 `/v1/pickup` 获取；Remail 订单余额和对应项目库存需可用。
-
 ---
 
 ### 2. 配置注册驱动
@@ -439,6 +455,39 @@ ROXY_ONE_PROFILE_PER_ACCOUNT = True
 ROXY_DELETE_PROFILE_AFTER_RUN = True
 ROXY_CREATE_USE_PROXY_POOL = True
 ```
+
+##### NordVPN accessToken → 独立 Roxy 代理
+
+Nếu chỉ có NordVPN accessToken (giống cách JNMBrowser cấu hình), vào WebUI
+`配置 → NordVPN WireGuard`, bật `启用独立代理`, rồi điền:
+
+```env
+NORDVPN_ACCESS_TOKEN=your_nordvpn_access_token
+NORDVPN_WG_COUNTRY_FILTER=JP
+NORDVPN_WG_ENABLED=True
+```
+
+Khi công tắc này bật, chế độ không cần NordVPN desktop/CLI. Tắt
+`NORDVPN_WG_ENABLED` sẽ luôn ngừng dùng NordVPN, kể cả khi accessToken còn lưu.
+Mỗi task sẽ thực hiện theo thứ tự:
+
+1. Dùng Bearer token lấy `nordlynx_private_key` từ NordVPN Core API.
+2. Chọn một server NordLynx online khác với các server vừa dùng.
+3. Tạo một SOCKS5 cục bộ bằng `wireproxy`.
+4. Ghi SOCKS5 vào `proxyInfo` của `/browser/create`, sau đó mới `/browser/open`.
+5. Dừng `wireproxy` và xóa file config tạm khi task kết thúc.
+
+Nếu máy chưa có `wireproxy` (hoặc `wireproxy.exe` trên Windows), chương trình tự tải release đã pin và kiểm tra
+SHA-256 vào `data/tools/wireproxy/`. Có thể tắt bằng
+`NORDVPN_WG_AUTO_DOWNLOAD=False` hoặc điền đường dẫn riêng tại
+`NORDVPN_WG_WIREPROXY_EXE`.
+
+Lưu ý:
+
+- Để trống `ROXY_PROFILE_ID`; NordVPN proxy chỉ được attach chắc chắn khi tạo profile mới.
+- Access token và NordLynx private key không được gửi vào Roxy profile hoặc log.
+- Token mode tự vô hiệu hóa cơ chế NordVPN CLI auto-rotation và không ép workers về 1.
+- Proxy explicit truyền từ caller vẫn có độ ưu tiên cao hơn NordVPN token mode.
 
 如要无头：
 
@@ -537,8 +586,42 @@ pip install playwright
 - Outlook 取件日志会显示验证码来源：`source=graph`、`source=outlook_rest`、`source=imap_new`、`source=imap_entra_outlook`、`source=remote_graph` 或 `source=remote_imap`，便于判断是哪条链路成功取码。
 - `BROWSER_USE_FAST_MODE=True` 会跳过大部分人工节奏等待；`BROWSER_USE_LOG_TIMING=True` 会打印连接、打开页面、邮箱、OTP、手机、callback 等阶段耗时。
 - 支持作为 Codex OAuth 授权驱动：`CODEX_OAUTH_DRIVER="browser_use"`，可完成授权页面、邮箱 OTP、手机短信验证与 callback 捕获。
+- Proxy.vn rotating lease 会通过 Browser Use Cloud 的 custom proxy session 传入具体 IP/端口；若配置为 Skyvern，当前 Cloud API 不支持该类 custom proxy，程序会直接报错而不会偷偷改走其他出口。
 - 适合不想安装本机 Roxy、又想要 session 隔离 + 云端代理的场景。
 - 免费额度/并发以 Browser Use 官方定价页为准。
+
+---
+
+### Roxy Profile Manager độc lập
+
+WebUI có tab **Roxy Profiles** riêng, không dùng chung lifecycle với đăng ký hoặc Codex OAuth. Manager dùng một `ROXY_API_TOKEN` + `ROXY_WORKSPACE_ID` để tạo, sửa, liệt kê, mở/đóng và quản lý nhiều profile do chính manager sở hữu.
+
+Hai chế độ mở luôn tách biệt:
+
+- **Mở Roxy chuẩn** gọi `/browser/open` cho profile remote đang active; giữ control plane/fingerprint của Roxy.
+- **Mở local thử nghiệm** giải mã full-folder artifact v2 vào staging rồi chạy `RoxyChrome.exe --user-data-dir=<staging>` qua loopback CDP. Chế độ này chỉ cam kết `browser_state_only`, không cam kết fingerprint/proxy/sync tương đương Roxy.
+
+Artifact:
+
+- `.rpa` v1 chỉ chứa metadata đã mã hóa và không thể mở local.
+- `.rpa2` v2 chứa snapshot browser folder đã mã hóa AES-256-GCM, manifest SHA-256 theo file và source core version.
+- Archive remote luôn là soft-delete vào Roxy Trash (`isSoftDelete=true`), chỉ thực hiện sau khi `.rpa2` đã decrypt/verify thành công. Manager không tự động permanent-delete.
+- Khi đóng local, manager checkpoint staging thành `.rpa2` mới; nếu checkpoint lỗi, staging được giữ và state chuyển `OFFLINE_UNVERIFIED`.
+- Khi mở Roxy chuẩn, manager cố capture một browser-state signature đã băm (platform/language/timezone/screen/WebGL/GPU). `.rpa2` chỉ mang hash này nếu capture thành công; local open sau đó báo `matched`, `mismatched` hoặc `unknown`. Kết quả này không phải cam kết fingerprint-equivalent.
+- Catalog hiện dùng schema v3 và fail-closed với database schema cũ; không tự migrate hoặc xóa runtime catalog.
+
+Cấu hình trong `.env`:
+
+```env
+ROXY_PROFILE_ARCHIVE_KEY=
+ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED=true
+ROXY_PROFILE_ROXY_CHROME_PATH=
+ROXY_PROFILE_CACHE_ROOT=
+ROXY_PROFILE_OFFLINE_STAGING_DIR=
+ROXY_PROFILE_ALLOW_CORE_VERSION_MISMATCH=false
+```
+
+`ROXY_PROFILE_ARCHIVE_KEY` phải là URL-safe base64 giải mã đúng 32 byte và không được trả qua API/UI. Manual disposable-profile gate trên target RoxyChrome đã hoàn tất với parity `matched`; local open mặc định bật nhưng vẫn có thể tắt bằng biến môi trường và luôn được gắn nhãn `browser_state_only`.
 
 ---
 
@@ -575,13 +658,32 @@ CODEX_OAUTH_DRIVER = "browser_use"  # 可选 protocol / roxy / cloak / browser_u
 接码配置在 `config/codex.py`：
 
 ```python
-SMS_PROVIDER = "l"        # 可选 grizzly / l / h
-SMS_API_KEY = "你的 GrizzlySMS key"  # 仅 GrizzlySMS 需要
-SMS_SERVICE = "openai"
-SMS_COUNTRY = "国家代码"
+SMS_PROVIDER = "hero"     # 可选 grizzly / viotp / hero / l / h
 SMS_MAX_RETRIES = 10
 SMS_CODE_WAIT = 120
 SMS_POLL_INTERVAL = 5
+
+# ViOTP dùng cấu hình riêng; serviceId được JNMBrowser chọn từ /service/getv2.
+VIOTP_API_BASE = "https://api.viotp.com"
+VIOTP_API_TOKEN = "你的 ViOTP token"
+VIOTP_SERVICE_ID = "1234"   # OpenAI | ChatGPT tại thời điểm kiểm tra
+VIOTP_COUNTRY = "vn"
+VIOTP_NETWORK = "VINAPHONE"
+
+# GrizzlySMS 继续使用通用字段：
+SMS_API_KEY = "你的 GrizzlySMS key"
+SMS_SERVICE = "openai"
+SMS_COUNTRY = "国家代码"
+
+# HeroSMS 使用 SMS-Activate-compatible API；OpenAI / ChatGPT service code 为 dr。
+# HERO_SMS_COUNTRY=auto 时按实时 cost 从低到高扫描；sticky country 只在同价位优先，较贵 sticky 等低价候选失败后再试；max price 只是硬上限。
+HERO_SMS_API_BASE = "https://hero-sms.com/stubs/handler_api.php"
+HERO_SMS_API_KEY = "你的 HeroSMS API key"
+HERO_SMS_SERVICE = "dr"
+HERO_SMS_COUNTRY = "auto"
+HERO_SMS_MAX_PRICE = "0.1"
+HERO_SMS_COUNTRY_MIN_ATTEMPTS = 4
+HERO_SMS_COUNTRY_HIGH_FAILURE_RATE = 0.75
 
 # 若 SMS_PROVIDER="h"，H 固定复用：
 #   SMS_SERVICE -> H projectId
@@ -590,6 +692,11 @@ H_API_BASE = "http://localhost:8788"
 H_ADMIN_AUTH_CODE = "你的H后台授权码"
 ```
 
+ViOTP 在 `/session/getv2` 返回完成或过期状态；其公开 API 没有主动 `cancel` / `complete` 接口，因此程序失败换号时只清理本地会话记录并等待平台自动过期。
+
+HeroSMS 在 `HERO_SMS_COUNTRY=auto` 时先调用 `getPrices&service=dr`，过滤库存大于 0 且 `cost <= HERO_SMS_MAX_PRICE` 的全部国家；`HERO_SMS_MAX_PRICE` 是唯一的硬价格上限，当前示例为 `0.1`，不会自动超过该值，也不是一个起始价。候选直接按当前 offer 的实际 `cost` 从低到高排序，有多少个低于 `0.05` 就按实际价格逐个尝试，再继续到 `0.1`，不使用固定价格档位；多 worker 只在完全相同的 cost 中轮换，避免并发分配打乱低价优先顺序。每个 worker lane 都有独立的 country 记忆：本 lane 最近成功的 country 若仍有库存且与当前最低价相同，则优先复用；如果它更贵，则先让更低价候选尝试，低价候选失败后才回到 sticky country；任何 `NO_NUMBERS`/`WRONG_MAX_PRICE` 都会继续扫描当前候选池，直到取号成功或候选耗尽。每个 country 的 Codex 手机验证成功/失败，以及取号时的即时无库存结果都会写入 `turb.sqlite3`，health 会跨不同价格 profile 汇总。单次收不到 OTP 或 verify 错误不会立即高风险封禁，默认累计至少 4 次且失败率达到 75% 才降为低优先级兜底 country；后续成功会清除该 country 的最近失败标记并恢复本 lane 复用。拿到验证码后使用 `setStatus=6` 完成，失败时使用 `setStatus=8` 取消。价格和库存是动态数据，已成功 country 仍会重新经过当前价格/库存筛选，不能把某个 country ID 视为永久最低价。
+在 Cloak/Roxy 浏览器流程中，Hero 返回的 E.164 号码还用于自动选择 OpenAI 表单的对应国家/区号，避免号码前缀和 country selector 不一致导致 `whatsapp_channel` 或号码发送失败。
+
 CPA 授权地址来源：
 
 ```python
@@ -597,6 +704,16 @@ CODEX_AUTH_URL_SOURCE = "cpa"
 CPA_MANAGEMENT_URL = "你的CPA管理地址"
 CPA_MANAGEMENT_KEY = "你的CPA管理密钥"
 ```
+
+sub2api 导出默认值在 WebUI「配置」的 Codex 分组设置，也可写入 `.env`：
+
+```dotenv
+SUB2API_GROUP_IDS=14
+SUB2API_PRIORITY=1
+SUB2API_MODEL=gpt-5.4-mini,gpt-5.5,gpt-5.6-luna,gpt-5.6-terra
+```
+
+`SUB2API_GROUP_IDS` 每行填写一个分组 ID。`SUB2API_MODEL` 支持逗号或换行分隔多个 model；每个 model 会生成一个 `model -> model` 映射。分组和优先级会随 OAuth callback、Agent Token 导入及 Codex 补跑一起发送，无需再逐个账号手动配置。
 
 ---
 
@@ -726,7 +843,7 @@ python tools/test_codex_oauth.py --email <已注册邮箱> --verbose
 
 ## 注册密码说明
 
-Roxy 注册如果遇到新版流程：
+所有 browser 注册驱动（Roxy、Cloak、Browser Use、Skyvern）如果遇到新版流程：
 
 ```text
 /create-account/password
@@ -777,8 +894,8 @@ WebUI 配置页保存后会调用热加载；Roxy、Codex、邮箱、代理、�
 
 | 路径 | 内容 |
 |---|---|
-| `app_state.sqlite3` | 迁移后的唯一运行时数据库，包含核心业务表和 provider state |
-| `turb.sqlite3` | 迁移前 origin；仅作为受控离线 migration input，保留作 rollback 证据 |
+| `turb.sqlite3` | origin 与 fork state 合并后的唯一运行时数据库 |
+| `app_state.sqlite3` | fork state 的离线 migration input；迁移后不再由 runtime 读取 |
 | 旧 JSON/TXT/Codex 文件 | 导出或 legacy 输入；central runtime 不会隐式导入 |
 | `注册日志/` | 注册任务日志、Codex 补跑日志 |
 
@@ -907,8 +1024,6 @@ ENABLE_CODEX_AUTO = False
 │   ├── register.py                 # 默认注册信息
 │   └── ...
 ├── core/
-│   ├── browser_data_saver.py       # Roxy/Cloak 本地浏览器省流量资源拦截
-│   ├── browser_traffic.py          # 浏览器注册 HTTP/WebSocket 流量统计
 │   ├── roxy_registration.py        # Roxy / 浏览器注册页面流程
 │   ├── cloakbrowser_registration.py # Cloak 注册入口
 │   ├── cloakbrowser_driver.py      # Cloak Playwright→Selenium 风格适配层
