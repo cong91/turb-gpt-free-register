@@ -1,7 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from core import db, registration_service
 from core.qan8_gmail_api_store import Qan8GmailApiStore
@@ -136,12 +136,15 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             def submit(self, fn, *args):
                 submitted.append((fn, args))
 
-        with patch.object(registration_service, "get_executor", return_value=ImmediateExecutor()), patch.object(
-            registration_service, "get_executor_workers", return_value=1
-        ):
+        with patch(
+            "core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"
+        ) as prepare, patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(registration_service, "get_executor_workers", return_value=1):
             result = registration_service.retry_job(source["id"], workers=1)
 
         self.assertTrue(result["ok"])
+        prepare.assert_called_once_with(1, scope="twofa_retry")
         self.assertEqual(result["retry_action"], "2fa")
         retry_job = db.get_job(result["job"]["id"])
         self.assertEqual(retry_job["job_type"], "twofa_retry")
@@ -168,7 +171,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
 
         with patch.object(registration_service, "get_executor", return_value=ImmediateExecutor()), patch.object(
             registration_service, "get_executor_workers", return_value=1
-        ):
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
             result = registration_service.retry_account_twofa(account_id, workers=1)
 
         self.assertTrue(result["ok"])
@@ -177,6 +180,24 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertEqual(retry_job["job_type"], "twofa_retry")
         self.assertEqual(retry_job["parent_job_id"], source["id"])
         self.assertIs(submitted[0][0], registration_service._run_twofa_retry_job)
+
+    def test_bulk_account_reactivate_deduplicates_and_classifies_results(self):
+        with patch.object(
+            registration_service,
+            "retry_account_twofa",
+            side_effect=[
+                {"ok": True, "reused": False, "job": {"id": 101}, "message": "started"},
+                {"ok": False, "error": "该账号的 2FA 已启用"},
+                {"ok": True, "reused": True, "job": {"id": 102}, "message": "reused"},
+            ],
+        ) as retry_one:
+            result = registration_service.retry_accounts_twofa([7, 7, 8, 9], workers=3)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["started"], [{"account_id": 7, "job_id": 101, "message": "started"}])
+        self.assertEqual(result["reused"], [{"account_id": 9, "job_id": 102, "message": "reused"}])
+        self.assertEqual(result["skipped"], [{"account_id": 8, "reason": "该账号的 2FA 已启用"}])
+        retry_one.assert_has_calls([call(7, workers=3), call(8, workers=3), call(9, workers=3)])
     def test_registration_exception_after_checkpoint_keeps_account_link(self):
         account_id = db.insert_account(
             email="user@example.com",

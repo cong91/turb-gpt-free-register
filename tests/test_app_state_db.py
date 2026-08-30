@@ -36,6 +36,9 @@ class AppStateDbTests(unittest.TestCase):
                 self.assertEqual(db._active_sqlite_path().resolve(), database.resolve())
                 self.assertEqual(Path(db.storage_paths()["sqlite"]).resolve(), database.resolve())
 
+    def test_default_runtime_database_name_is_not_legacy_app_state_file(self):
+        self.assertEqual(app_state_db.APP_STATE_DB_PATH.name, "turb.sqlite3")
+
     def test_default_core_path_does_not_wait_for_migration_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "turb.sqlite3"

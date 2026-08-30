@@ -381,7 +381,7 @@ class Sub2APIAutomationContractTests(unittest.TestCase):
         self.assertNotIn("refresh_token", body)
 
     @patch("core.codex_retry_service.db.update_account_codex_status")
-    @patch("core.codex_retry_service.resolve_rotating_proxy", return_value=None)
+    @patch("core.account_network.resolve_rotating_proxy", return_value=None)
     @patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=False)
     @patch("core.codex_retry_service.check_stop_requested")
     @patch("core.codex_retry_service.db.get_account_by_email", return_value={"email": "person@example.com"})

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-注册成功后的 Codex OAuth 授权模块（2026-06-15 改造：全新 session + 接码）。
+注册成功后的 Codex OAuth 授权模块（2026-06-15 改造：协议模式全新 session + 接码）。
 
-旧方案"复用注册的已登录 session"会撞 /choose-an-account 卡死（React SPA 解析不出
-可提交字段）。新方案改为用**全新干净 session**从头登录，走 OpenAI 标准风控路径，
+协议模式使用**全新干净 session**从头登录，走 OpenAI 标准风控路径；浏览器驱动只有在
+caller 明确传入现有 driver/session 时才复用，并会先清理授权状态，避免误用注册态。
 手机号验证靠接码平台自动收码，当前通过 core.sms_provider 支持 GrizzlySMS、ViOTP 和本地 L/H 服务。
 
 完整接口链（2026-06-15 浏览器抓包确认，均 POST auth.openai.com，json）：
@@ -1440,6 +1440,116 @@ def run_codex_oauth(
     credentials=None,
     oauth_driver: str | None = None,
     proxy_lane_id: int | None = None,
+    existing_driver=None,
+    existing_opened=None,
+    existing_browser=None,
+    existing_context=None,
+    existing_page=None,
+    existing_session_info=None,
+    fresh_browser_profile: bool = False,
+    _cpa_reauth_round: int = 1,
+) -> dict:
+    """Run Codex OAuth, optionally reusing a caller-owned browser session."""
+    if not force and not _cfg.ENABLE_CODEX_AUTO:
+        return _codex_result(status="skipped", message="ENABLE_CODEX_AUTO=False")
+    if not email:
+        return _codex_result(status="skipped", message="email 为空")
+    has_reusable_browser_context = any(
+        value is not None
+        for value in (
+            existing_driver,
+            existing_opened,
+            existing_browser,
+            existing_context,
+            existing_page,
+            existing_session_info,
+        )
+    )
+    if fresh_browser_profile and has_reusable_browser_context:
+        return _codex_result(
+            status="failed",
+            email=email,
+            message="Codex OAuth fresh browser profile 不能复用现有 browser context",
+        )
+    if proxy is not None or has_reusable_browser_context:
+        return _run_codex_oauth_impl(
+            email,
+            otp_provider=otp_provider,
+            proxy=proxy,
+            force=force,
+            credentials=credentials,
+            oauth_driver=oauth_driver,
+            proxy_lane_id=proxy_lane_id,
+            existing_driver=existing_driver,
+            existing_opened=existing_opened,
+            existing_browser=existing_browser,
+            existing_context=existing_context,
+            existing_page=existing_page,
+            existing_session_info=existing_session_info,
+            fresh_browser_profile=fresh_browser_profile,
+            _cpa_reauth_round=_cpa_reauth_round,
+        )
+
+    from core.rotating_proxy_runtime import (
+        CODEX_OAUTH_PROXY_SCOPE,
+        release_rotating_proxy,
+        resolve_rotating_proxy,
+    )
+
+    try:
+        active_proxy = resolve_rotating_proxy(
+            None,
+            scope=CODEX_OAUTH_PROXY_SCOPE,
+            lane_id=proxy_lane_id,
+        )
+    except Exception as exc:
+        return _codex_result(
+            status="failed",
+            email=email,
+            message=f"rotating proxy lease failed: {type(exc).__name__}: {str(exc)[:180]}",
+        )
+    try:
+        return _run_codex_oauth_impl(
+            email,
+            otp_provider=otp_provider,
+            proxy=active_proxy,
+            force=force,
+            credentials=credentials,
+            oauth_driver=oauth_driver,
+            proxy_lane_id=proxy_lane_id,
+            existing_driver=existing_driver,
+            existing_opened=existing_opened,
+            existing_browser=existing_browser,
+            existing_context=existing_context,
+            existing_page=existing_page,
+            existing_session_info=existing_session_info,
+            fresh_browser_profile=fresh_browser_profile,
+            _cpa_reauth_round=_cpa_reauth_round,
+        )
+    finally:
+        if active_proxy is not None:
+            release_rotating_proxy(
+                scope=CODEX_OAUTH_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=active_proxy,
+            )
+
+
+def _run_codex_oauth_impl(
+    email: str,
+    otp_provider=None,
+    proxy: str | None = None,
+    force: bool = False,
+    credentials=None,
+    oauth_driver: str | None = None,
+    proxy_lane_id: int | None = None,
+    existing_driver=None,
+    existing_opened=None,
+    existing_browser=None,
+    existing_context=None,
+    existing_page=None,
+    existing_session_info=None,
+    fresh_browser_profile: bool = False,
     _cpa_reauth_round: int = 1,
 ) -> dict:
     """
@@ -1452,10 +1562,19 @@ def run_codex_oauth(
         email: 已注册成功的账号邮箱
         otp_provider: 邮箱 OTP 获取回调 fn(email, after_ts)->code，默认用 wait_for_otp
         proxy: 代理（不传按 rotating lease 或现有配置选择）
-        force: True 时跳过 ENABLE_CODEX_AUTO 开关限制，供手动补跑使用
+        force: True 只跳过 ENABLE_CODEX_AUTO 开关限制；是否复用浏览器由
+            existing_* context 参数决定，不会仅凭 force 自动发现账号 profile
         credentials: 可选 CodexLoginCredentials；仅限浏览器驱动
         oauth_driver: 可选显式驱动；未传时使用 CODEX_OAUTH_DRIVER
         proxy_lane_id: rotating proxy lane；未传时使用当前 worker thread
+        existing_driver/existing_opened: Roxy/Cloak 当前已打开的 driver/profile。
+        existing_browser/existing_context/existing_page/existing_session_info:
+            BrowserUse/Skyvern 当前已打开的 Playwright session。
+        fresh_browser_profile: 为独立 Codex retry 创建新环境，忽略驱动配置中的固定 profile；
+            与 existing_* 互斥。
+
+    A reusable browser context is never inferred from email. When one is
+    supplied, the selected browser driver must consume it or the call fails.
 
     Returns:
         结构化结果 dict。任何异常都被吞掉转 status=failed，不向上抛，不影响注册主流程。
@@ -1465,27 +1584,43 @@ def run_codex_oauth(
     if not email:
         return _codex_result(status="skipped", message="email 为空")
 
+    has_roxy_context = existing_driver is not None or existing_opened is not None
+    has_cloud_context = any(
+        value is not None
+        for value in (
+            existing_browser,
+            existing_context,
+            existing_page,
+            existing_session_info,
+        )
+    )
+    if fresh_browser_profile and (has_roxy_context or has_cloud_context):
+        return _codex_result(
+            status="failed",
+            email=email,
+            message="Codex OAuth fresh browser profile 不能复用现有 browser context",
+        )
+    if has_roxy_context and has_cloud_context:
+        return _codex_result(
+            status="failed",
+            email=email,
+            message="Codex OAuth 不能同时接收 Roxy/Cloak 和 BrowserUse/Skyvern browser context",
+        )
+    if has_roxy_context and (existing_driver is None or existing_opened is None):
+        return _codex_result(
+            status="failed",
+            email=email,
+            message="复用 Roxy/Cloak profile 必须同时提供 existing_driver 和 existing_opened",
+        )
+    if has_cloud_context and (existing_browser is None or existing_session_info is None):
+        return _codex_result(
+            status="failed",
+            email=email,
+            message="复用 BrowserUse/Skyvern session 必须同时提供 existing_browser 和 existing_session_info",
+        )
+
     # Codex OAuth 支持多种驱动：
     # protocol：原纯协议；roxy/cloak/browser_use：用真实浏览器跑页面并捕获 localhost callback。
-    if proxy is None:
-        try:
-            from core.rotating_proxy_runtime import (
-                CODEX_OAUTH_PROXY_SCOPE,
-                resolve_rotating_proxy,
-            )
-
-            proxy = resolve_rotating_proxy(
-                None,
-                scope=CODEX_OAUTH_PROXY_SCOPE,
-                lane_id=proxy_lane_id,
-            )
-        except Exception as exc:
-            return _codex_result(
-                status="failed",
-                email=email,
-                message=f"rotating proxy lease failed: {type(exc).__name__}: {str(exc)[:180]}",
-            )
-
     try:
         from config import codex as _codex_cfg
         from config import roxybrowser as _roxy_cfg
@@ -1496,6 +1631,33 @@ def run_codex_oauth(
             selected_oauth_driver = str(
                 getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol"
             ).strip().lower()
+        reusing_roxy_context = has_roxy_context
+        reusing_cloud_context = has_cloud_context
+        if (reusing_roxy_context or reusing_cloud_context) and selected_oauth_driver in (
+            "protocol", "api", "http",
+        ):
+            return _codex_result(
+                status="failed",
+                email=email,
+                message="protocol Codex OAuth 没有可复用的 browser profile；请在拥有当前 browser 的 worker 内执行",
+            )
+        if reusing_roxy_context and selected_oauth_driver not in (
+            "roxy", "roxybrowser", "fingerprint", "browser",
+            "cloak", "cloakbrowser",
+        ):
+            return _codex_result(
+                status="failed",
+                email=email,
+                message="当前 Roxy/Cloak browser context 与 CODEX_OAUTH_DRIVER 不匹配",
+            )
+        if reusing_cloud_context and selected_oauth_driver not in (
+            "browser_use", "browseruse", "browser-use", "bu", "skyvern", "sv",
+        ):
+            return _codex_result(
+                status="failed",
+                email=email,
+                message="当前 BrowserUse/Skyvern session 与 CODEX_OAUTH_DRIVER 不匹配",
+            )
         if credentials:
             credential_email = str(getattr(credentials, "email", "") or "").strip().lower()
             if credential_email != str(email or "").strip().lower():
@@ -1513,35 +1675,73 @@ def run_codex_oauth(
                 )
         if selected_oauth_driver in ("roxy", "roxybrowser", "fingerprint", "browser"):
             from core.roxy_codex_oauth import run_roxy_codex_oauth
+            roxy_kwargs = {
+                "otp_provider": otp_provider,
+                "proxy": proxy,
+                "force": True,
+                "credentials": credentials,
+                "existing_driver": existing_driver,
+                "existing_opened": existing_opened,
+                "reuse_existing_profile": reusing_roxy_context,
+            }
+            if fresh_browser_profile:
+                roxy_kwargs["fresh_profile"] = True
             return run_roxy_codex_oauth(
                 email,
-                otp_provider=otp_provider,
-                proxy=proxy,
-                force=True,
-                credentials=credentials,
+                **roxy_kwargs,
             )
         if selected_oauth_driver in ("browser_use", "browseruse", "browser-use", "bu"):
             from core.browser_use_codex_oauth import run_browser_use_codex_oauth
+            browser_kwargs = {
+                "otp_provider": otp_provider,
+                "proxy": proxy,
+                "force": True,
+                "credentials": credentials,
+                "existing_browser": existing_browser,
+                "existing_context": existing_context,
+                "existing_page": existing_page,
+                "existing_session_info": existing_session_info,
+            }
+            if fresh_browser_profile:
+                browser_kwargs["fresh_browser_profile"] = True
             return run_browser_use_codex_oauth(
                 email,
-                otp_provider=otp_provider,
-                proxy=proxy,
-                force=True,
-                credentials=credentials,
+                **browser_kwargs,
             )
         if selected_oauth_driver in ("skyvern", "sv"):
             from core.skyvern_codex_oauth import run_skyvern_codex_oauth
+            skyvern_kwargs = {
+                "otp_provider": otp_provider,
+                "proxy": proxy,
+                "force": True,
+                "credentials": credentials,
+                "existing_browser": existing_browser,
+                "existing_context": existing_context,
+                "existing_page": existing_page,
+                "existing_session_info": existing_session_info,
+            }
+            if fresh_browser_profile:
+                skyvern_kwargs["fresh_browser_profile"] = True
             return run_skyvern_codex_oauth(
                 email,
-                otp_provider=otp_provider,
-                proxy=proxy,
-                force=True,
-                credentials=credentials,
+                **skyvern_kwargs,
             )
         if selected_oauth_driver in ("cloak", "cloakbrowser"):
             from config import cloakbrowser as _cloak_cfg
             from core.cloakbrowser_driver import build_cloak_driver
             from core.roxy_codex_oauth import run_roxy_codex_oauth
+            if reusing_roxy_context:
+                return run_roxy_codex_oauth(
+                    email,
+                    otp_provider=otp_provider,
+                    proxy=proxy,
+                    force=True,
+                    existing_driver=existing_driver,
+                    existing_opened=existing_opened,
+                    reuse_existing_profile=True,
+                    clear_existing_state=True,
+                    credentials=credentials,
+                )
             driver, opened = build_cloak_driver(proxy=proxy)
             try:
                 return run_roxy_codex_oauth(
@@ -1564,6 +1764,24 @@ def run_codex_oauth(
         if selected_oauth_driver not in ("protocol", "api", "http"):
             raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={selected_oauth_driver!r}，可选 protocol / roxy / cloak / browser_use / skyvern")
     except ImportError as exc:
+        if has_reusable_browser_context:
+            return _codex_result(
+                status="failed",
+                email=email,
+                message=(
+                    "复用 browser context 所需的 Codex OAuth driver 不可用："
+                    f"{type(exc).__name__}"
+                ),
+            )
+        if fresh_browser_profile:
+            return _codex_result(
+                status="failed",
+                email=email,
+                message=(
+                    "Codex retry 的 fresh browser profile driver 不可用："
+                    f"{type(exc).__name__}"
+                ),
+            )
         if credentials:
             return _codex_result(
                 status="failed",
@@ -1743,6 +1961,7 @@ def run_codex_oauth(
                 force=force,
                 credentials=credentials,
                 proxy_lane_id=proxy_lane_id,
+                fresh_browser_profile=fresh_browser_profile,
                 _cpa_reauth_round=_cpa_reauth_round + 1,
             )
         logger.warning(f"[Codex] 失败：{email}，{type(exc).__name__}: {str(exc)[:200]}")

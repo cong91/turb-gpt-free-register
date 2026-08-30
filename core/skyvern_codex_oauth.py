@@ -12,6 +12,11 @@ def run_skyvern_codex_oauth(
     proxy: str | None = None,
     force: bool = False,
     credentials: CodexLoginCredentials | None = None,
+    existing_browser=None,
+    existing_context=None,
+    existing_page=None,
+    existing_session_info=None,
+    fresh_browser_profile: bool = False,
 ) -> dict:
     return run_browser_use_codex_oauth(
         email=email,
@@ -20,4 +25,9 @@ def run_skyvern_codex_oauth(
         force=force,
         cloud_provider="skyvern",
         credentials=credentials,
+        existing_browser=existing_browser,
+        existing_context=existing_context,
+        existing_page=existing_page,
+        existing_session_info=existing_session_info,
+        fresh_browser_profile=fresh_browser_profile,
     )

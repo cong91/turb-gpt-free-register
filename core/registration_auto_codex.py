@@ -211,15 +211,15 @@ def run_registration_auto_codex(
     plan = str(plan_result.get("current_plan_type") or "").strip().lower()
     if auto_free_codex_enabled:
         if plan != "free":
-            message = f"当前套餐为 {plan or 'unknown'}，跳过 Free Codex 补跑"
+            message = f"当前套餐为 {plan or 'unknown'}，跳过 Free 自动 Codex OAuth"
             logger.info("[Plan][Codex] %s: %s", email, message)
             return {"plan": plan_result, "codex": _skipped_codex(message)}
         if plan_result.get("plus_trial_eligible") is not False:
-            message = "Free 账号存在 Plus 试用资格或资格未知，跳过 Codex 补跑"
+            message = "Free 账号存在 Plus 试用资格或资格未知，跳过自动 Codex OAuth"
             logger.info("[Plan][Codex] %s: %s", email, message)
             return {"plan": plan_result, "codex": _skipped_codex(message)}
 
-        logger.info("[Plan][Codex] 已确认 Free 且无 Plus 试用，复用当前注册浏览器: %s", email)
+        logger.info("[Plan][Codex] 已确认 Free 且无 Plus 试用，复用当前注册浏览器执行 OAuth: %s", email)
         codex_result = run_codex()
         return {"plan": plan_result, "codex": codex_result}
 

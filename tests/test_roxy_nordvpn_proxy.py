@@ -115,6 +115,18 @@ class RoxyProxyAttachmentTests(unittest.TestCase):
                 proxy="socks5://127.0.0.1:25000",
             )
 
+    def test_fresh_profile_ignores_configured_and_explicit_profile_ids(self):
+        client = RoxyBrowserClient()
+        with (
+            mock.patch("config.roxybrowser.ROXY_PROFILE_ID", "saved-profile"),
+            mock.patch.object(client, "create_profile", return_value="fresh-profile") as create,
+            mock.patch.object(client, "request", return_value={"debuggerAddress": "127.0.0.1:9222"}),
+        ):
+            opened = client.open_profile(profile_id="another-saved-profile", fresh_profile=True)
+
+        self.assertEqual(opened.profile_id, "fresh-profile")
+        create.assert_called_once()
+
     def test_roxy_registration_verifies_tunnel_before_navigation(self):
         client = mock.MagicMock()
         client.open_profile.return_value = mock.Mock(

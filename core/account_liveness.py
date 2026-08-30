@@ -534,9 +534,15 @@ def check_account_liveness(
     if not email:
         raise ValueError("email 不能为空")
 
-    from core.rotating_proxy_runtime import LIVE_CHECK_PROXY_SCOPE, resolve_rotating_proxy
+    from core.rotating_proxy_runtime import (
+        LIVE_CHECK_PROXY_SCOPE,
+        release_rotating_proxy,
+        resolve_rotating_proxy,
+    )
 
+    requested_proxy = proxy
     proxy = resolve_rotating_proxy(proxy, scope=LIVE_CHECK_PROXY_SCOPE)
+    rotating_proxy = proxy if requested_proxy is None else None
 
     checked_at = _now()
     key = email.lower()
@@ -649,3 +655,8 @@ def check_account_liveness(
         finally:
             with _RUNNING_LOCK:
                 _RUNNING.discard(key)
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=LIVE_CHECK_PROXY_SCOPE,
+                proxy_url=rotating_proxy,
+            )

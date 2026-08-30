@@ -1,9 +1,9 @@
 # Migration: Gmail API URL Multi-Alias Batch Schema
 
 > Runtime note: the batch tables now live in the canonical root
-> `app_state.sqlite3`. The historical `data/gmail_api_url_batches.db` path
-> below is retained only as legacy reference material; do not create a second
-> runtime database from this document.
+> `turb.sqlite3`. The historical `data/gmail_api_url_batches.db` path below is
+> retained only as legacy reference material; do not create a second runtime
+> database from this document.
 
 ## Database Changes
 

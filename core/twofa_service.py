@@ -4,22 +4,43 @@ from __future__ import annotations
 
 import logging
 import threading
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 from config import email as _email_cfg
 from core import db
 from core.account_export import setup_2fa
+from core.rotating_proxy_runtime import (
+    TWOFA_SETUP_PROXY_SCOPE,
+    prepare_rotating_proxy_lanes,
+    release_rotating_proxy,
+    resolve_rotating_proxy,
+)
 from core.session import BrowserSession
 
 logger = logging.getLogger(__name__)
 
-_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="twofa")
+_WORKERS = 2
+_EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="twofa")
 _QUEUE_SLOTS = threading.BoundedSemaphore(50)
 _RUNNING: set[int] = set()
 _LOCK = threading.Lock()
+_PROXY_INVENTORY_LOCK = threading.Lock()
+_PROXY_INVENTORY_READY = False
 _LOG_DIR = Path(__file__).resolve().parent.parent / "注册日志"
+
+
+def _prepare_proxy_inventory() -> None:
+    global _PROXY_INVENTORY_READY
+    from config import proxy as proxy_config
+
+    if not bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False)):
+        return
+    with _PROXY_INVENTORY_LOCK:
+        if not _PROXY_INVENTORY_READY:
+            prepare_rotating_proxy_lanes(_WORKERS, scope=TWOFA_SETUP_PROXY_SCOPE)
+            _PROXY_INVENTORY_READY = True
 
 
 def log_path(email: str) -> Path:
@@ -57,10 +78,19 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
         f.write(f"{stamp} [INFO] {line}\n")
 
 
-def _run_twofa(*, account_id: int, email: str, access_token: str, proxy: str | None, trigger: str) -> dict:
+def _run_twofa(
+    *,
+    account_id: int,
+    email: str,
+    access_token: str,
+    proxy: str | None,
+    trigger: str,
+    proxy_lane_id: int | None = None,
+) -> dict:
     fh: logging.FileHandler | None = None
     root_logger = logging.getLogger()
     thread_name = threading.current_thread().name
+    rotating_proxy: str | None = None
     try:
         with _LOCK:
             _RUNNING.add(int(account_id))
@@ -75,7 +105,15 @@ def _run_twofa(*, account_id: int, email: str, access_token: str, proxy: str | N
         fh.addFilter(lambda record: record.threadName == thread_name)
         root_logger.addHandler(fh)
         logger.info("[2FA] 开始后台设置：email=%s trigger=%s", email, trigger)
-        real_proxy = _normalize_proxy(proxy)
+        explicit_proxy = _normalize_proxy(proxy)
+        selected_proxy = resolve_rotating_proxy(
+            explicit_proxy,
+            scope=TWOFA_SETUP_PROXY_SCOPE,
+            lane_id=proxy_lane_id,
+        )
+        if explicit_proxy is None:
+            rotating_proxy = _normalize_proxy(selected_proxy)
+        real_proxy = _normalize_proxy(selected_proxy)
         session = BrowserSession(proxy=real_proxy, fingerprint_seed=f"account:{email.lower()}")
         _append_log(email, f"[2FA] 会话创建完成：proxy={session.proxy or 'direct'} device_id={session.device_id}")
         _append_log(email, f"[2FA] 指纹摘要：{session.fingerprint_summary_text()}")
@@ -100,6 +138,12 @@ def _run_twofa(*, account_id: int, email: str, access_token: str, proxy: str | N
         logger.exception("[2FA] 后台异常: %s", email)
         return result
     finally:
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=TWOFA_SETUP_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=rotating_proxy,
+            )
         if fh is not None:
             try:
                 root_logger.removeHandler(fh)
@@ -118,6 +162,7 @@ def enqueue_account_totp_setup(
     access_token: str,
     trigger: str = "manual",
     proxy: str | None = None,
+    proxy_lane_id: int | None = None,
 ) -> dict:
     account_id = int(account_id)
     email = str(email or "").strip()
@@ -136,6 +181,7 @@ def enqueue_account_totp_setup(
 
     _append_log(email, f"[2FA] 已入队 account_id={account_id} trigger={trigger}", clear=True)
     try:
+        _prepare_proxy_inventory()
         future = _EXECUTOR.submit(
             _run_twofa,
             account_id=account_id,
@@ -143,6 +189,7 @@ def enqueue_account_totp_setup(
             access_token=access_token,
             proxy=proxy,
             trigger=str(trigger or "manual"),
+            proxy_lane_id=proxy_lane_id,
         )
         return {"accepted": True, "busy": False, "future": future, "log_path": str(log_path(email))}
     except Exception as exc:

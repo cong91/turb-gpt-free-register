@@ -1496,6 +1496,7 @@ def _run_roxy_codex_oauth_once(
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
     credentials=None,
+    fresh_profile: bool = False,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口。
 
@@ -1511,8 +1512,19 @@ def _run_roxy_codex_oauth_once(
     if otp_provider is None and credentials is None:
         otp_provider = wait_for_otp
 
+    if fresh_profile and reuse_existing_profile:
+        return proto._codex_result(
+            status="failed",
+            email=email,
+            message="Roxy Codex OAuth fresh profile 不能复用现有 browser profile",
+        )
     client = None if reuse_existing_profile else RoxyBrowserClient()
-    opened = existing_opened if reuse_existing_profile else client.open_profile()
+    if reuse_existing_profile:
+        opened = existing_opened
+    elif fresh_profile:
+        opened = client.open_profile(fresh_profile=True)
+    else:
+        opened = client.open_profile()
     browser_kind_token = _CODEX_BROWSER_KIND.set(_detect_browser_kind(opened))
     driver = existing_driver if reuse_existing_profile else None
     owns_driver = not reuse_existing_profile
@@ -1700,6 +1712,7 @@ def run_roxy_codex_oauth(
     reuse_existing_profile: bool = False,
     clear_existing_state: bool = True,
     credentials=None,
+    fresh_profile: bool = False,
 ) -> dict:
     """指纹浏览器 Codex OAuth 入口，失败时在当前浏览器内进行有限重试。"""
     from config import codex as _codex_cfg
@@ -1721,6 +1734,11 @@ def run_roxy_codex_oauth(
                     "[Codex][Browser] CPA callback 返回 Timeout waiting for OAuth callback，重新开启第 %s/%s 轮 Codex 授权：%s",
                     round_no, max_rounds, email,
                 )
+            elif fresh_profile:
+                logger.warning(
+                    "[Codex][Browser] retry 使用新建 profile 开启第 %s/%s 轮 Codex 授权：%s",
+                    round_no, max_rounds, email,
+                )
             else:
                 logger.warning(
                     "[Codex][Browser] 当前 browser 仍在运行，上一轮授权失败，重新开启第 %s/%s 轮 Codex 授权：%s",
@@ -1736,6 +1754,7 @@ def run_roxy_codex_oauth(
             reuse_existing_profile=reuse_existing_profile,
             clear_existing_state=clear_existing_state,
             credentials=credentials,
+            fresh_profile=fresh_profile,
         )
         last_result = result
         if result.get("ok"):
@@ -1752,11 +1771,18 @@ def run_roxy_codex_oauth(
         reauth_reason = "browser_failure"
         if round_no >= max_rounds:
             break
-        logger.warning(
-            "[Codex][Browser] 当前 browser 仍在运行，授权失败后 %.1f 秒清理 OAuth 状态并重试：%s",
-            retry_delay,
-            email,
-        )
+        if fresh_profile:
+            logger.warning(
+                "[Codex][Browser] retry 将清理本轮新 profile，%.1f 秒后创建全新 profile：%s",
+                retry_delay,
+                email,
+            )
+        else:
+            logger.warning(
+                "[Codex][Browser] 当前 browser 仍在运行，授权失败后 %.1f 秒清理 OAuth 状态并重试：%s",
+                retry_delay,
+                email,
+            )
         if retry_delay:
             time.sleep(retry_delay)
     if last_result:

@@ -39,7 +39,7 @@ class ReservedTestAliasUiTests(unittest.TestCase):
         self.assertEqual(html.count('<input data-local-test-domain'), 2)
         self.assertIn("local_test_base", html)
         self.assertIn("local_test_domains", html)
-        self.assertIn("Local test", html)
+        self.assertIn("Kiểm thử cục bộ", html)
 
     def test_runtime_script_calls_only_preview_endpoint(self):
         script = (ROOT / "webui" / "static" / "reserved_test_aliases.js").read_text(

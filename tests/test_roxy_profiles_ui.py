@@ -14,18 +14,18 @@ class RoxyProfilesUiContractTests(unittest.TestCase):
             self.assertIn(marker, self.template)
 
     def test_script_keeps_remote_and_local_actions_separate(self):
-        for marker in ("remote-open", "remote-close", "local-open", "local-close", "export-full", "browser_state_only", "runBulk", "editProfile", "metadata_export", "remote_open"):
+        for marker in ("remote-open", "remote-close", "local-open", "local-close", "export-full", "Chỉ trạng thái trình duyệt", "runBulk", "editProfile", "metadata_export", "remote_open"):
             self.assertIn(marker, self.script)
 
     def test_script_renders_pagination_and_state_filter(self):
         for marker in (
             "page_size", "state.profileState", "btnRoxyProfilesPrev",
             "btnRoxyProfilesNext", "has_next", "source_core_version",
-            "fingerprint_status", "CDP active", "eligibility",
+            "fingerprint_status", "CDP đang hoạt động", "eligibility",
             "offline_recovery_staging",
         ):
             self.assertIn(marker, self.script)
-        self.assertIn("Runtime", self.template)
+        self.assertIn("Thời gian chạy", self.template)
 
 
 if __name__ == "__main__":

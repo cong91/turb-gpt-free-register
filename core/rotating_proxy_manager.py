@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from core.rotating_proxy_client import RotatingProxyApiError, RotatingProxyClient
+from core.rotating_proxy_client import RotatingProxyClient
 from core.rotating_proxy_store import RotatingProxyStore
 
 logger = logging.getLogger(__name__)
@@ -83,26 +83,32 @@ class RotatingProxyManager:
         expires_at = key_info.get("key_expires_at") if key_info else None
         return expires_at is not None and float(expires_at) <= self.clock()
 
+    def _lease_active(self, lease: dict[str, Any]) -> bool:
+        try:
+            if float(lease.get("proxy_expires_at") or 0) <= self.clock():
+                return False
+        except (TypeError, ValueError):
+            return False
+        key = str(lease.get("rotating_key") or "").strip()
+        return bool(key) and not self._key_expired(self.store.get_key(key))
+
     def _refresh_keys(self) -> list[dict[str, Any]]:
         try:
             keys = list(self.client.list_keys())
         except Exception as exc:
             raise RotatingProxyError(f"无法获取 proxy.vn keyxoay 列表: {exc}") from exc
         self.store.sync_keys(keys)
+        refreshed_key_set = {
+            str(item.get("key") or "").strip()
+            for item in keys
+            if str(item.get("key") or "").strip()
+        }
+        expired_at = self.clock()
+        for item in self.store.list_keys():
+            key = str(item.get("rotating_key") or "").strip()
+            if key and key not in refreshed_key_set:
+                self.store.set_key_expiration(key, expired_at)
         return keys
-
-    def _renew_key(self, key: str) -> dict[str, Any] | None:
-        try:
-            renewed = self.client.renew_key(key)
-        except RotatingProxyApiError as exc:
-            logger.warning("[RotatingProxy] keyxoay gia hạn thất bại: %s", type(exc).__name__)
-            return None
-        expires_at = renewed.get("expires_at")
-        if expires_at is None:
-            expires_at = self.clock() + _PURCHASED_KEY_TTL_SECONDS
-            renewed = {**renewed, "expires_at": expires_at}
-        self.store.set_key_expiration(str(key), expires_at)
-        return renewed
 
     def _choose_available_key(self, excluded: set[str]) -> dict[str, Any] | None:
         for item in self.store.list_keys():
@@ -123,14 +129,12 @@ class RotatingProxyManager:
                 info = self.store.get_key(key)
                 if not self._key_expired(info):
                     return info or {"rotating_key": key, "key_expires_at": None}
-                renewed = self._renew_key(key)
-                if renewed is not None:
-                    return self.store.get_key(key) or {
-                        "rotating_key": key,
-                        "key_expires_at": renewed.get("expires_at"),
-                    }
 
-        used_keys = {str(item.get("rotating_key") or "") for item in self.store.list_leases()}
+        used_keys = {
+            str(item.get("rotating_key") or "")
+            for item in self.store.list_leases()
+            if self._lease_active(item)
+        }
         used_keys.update(excluded or set())
         candidate = self._choose_available_key(used_keys)
         if candidate is None:
@@ -139,25 +143,105 @@ class RotatingProxyManager:
         if candidate is not None:
             return candidate
         try:
-            purchased = self.client.purchase_key()
+            return self._purchase_and_store(1)[0]
         except Exception as exc:
             raise RotatingProxyError(f"没有可用 keyxoay，购买新 key thất bại: {exc}") from exc
-        key = str(purchased.get("key") or "").strip()
-        if not key:
+
+    def _purchase_and_store(self, quantity: int) -> list[dict[str, Any]]:
+        if quantity < 1:
+            return []
+        raw_items = (
+            [self.client.purchase_key()]
+            if quantity == 1
+            else list(self.client.purchase_keys(quantity))
+        )
+        purchased: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            expires_at = item.get("expires_at")
+            if expires_at is None:
+                expires_at = self.clock() + _PURCHASED_KEY_TTL_SECONDS
+            self.store.upsert_key(key, expires_at)
+            purchased.append(self.store.get_key(key) or {
+                "rotating_key": key,
+                "key_expires_at": expires_at,
+            })
+        if not purchased:
             raise RotatingProxyError("proxy.vn mua key thành công nhưng không có keyxoay")
-        expires_at = purchased.get("expires_at")
-        if expires_at is None:
-            expires_at = self.clock() + _PURCHASED_KEY_TTL_SECONDS
-        self.store.upsert_key(key, expires_at)
-        return self.store.get_key(key) or {
-            "rotating_key": key,
-            "key_expires_at": expires_at,
-        }
+        return purchased
+
+    def ensure_key_inventory(self, lane_count: int, *, scope: str = "registration") -> list[dict[str, Any]]:
+        """Ensure enough active, unclaimed keyxoay values exist for the requested lanes."""
+        try:
+            target = int(lane_count)
+        except (TypeError, ValueError) as exc:
+            raise RotatingProxyError("proxy lane_count phải là số nguyên dương") from exc
+        if target < 1:
+            raise RotatingProxyError("proxy lane_count phải là số nguyên dương")
+        lane_scope = self._scope(scope)
+        with self._lock:
+            self.store.delete_expired_leases(self.clock())
+            refreshed = self._refresh_keys()
+            ordered_keys = [
+                str(item.get("key") or "").strip()
+                for item in refreshed
+                if str(item.get("key") or "").strip()
+            ]
+            active_keys = {
+                key
+                for key in ordered_keys
+                if not self._key_expired(self.store.get_key(key))
+            }
+            occupied_keys = set()
+            for lease in self.store.list_leases():
+                key = str(lease.get("rotating_key") or "").strip()
+                if key not in active_keys or not self._lease_active(lease):
+                    continue
+                same_target_lane = (
+                    str(lease.get("lane_scope") or "registration") == lane_scope
+                    and 0 <= int(lease.get("lane_id") or 0) < target
+                )
+                if not same_target_lane:
+                    occupied_keys.add(key)
+
+            missing = max(0, target - len(active_keys - occupied_keys))
+            known_keys = {str(item.get("rotating_key") or "").strip() for item in self.store.list_keys()}
+            while missing:
+                purchased = self._purchase_and_store(missing)
+                new_keys = []
+                for item in purchased:
+                    key = str(item.get("rotating_key") or "").strip()
+                    if key and key not in known_keys:
+                        known_keys.add(key)
+                        active_keys.add(key)
+                        ordered_keys.append(key)
+                        new_keys.append(key)
+                if not new_keys:
+                    raise RotatingProxyError("proxy.vn mua key thành công nhưng không bổ sung keyxoay mới")
+                missing -= len(new_keys)
+
+            available = active_keys - occupied_keys
+            if len(available) < target:
+                raise RotatingProxyError(
+                    f"keyxoay khả dụng không đủ cho {target} lane, hiện chỉ có {len(available)} key"
+                )
+            return [
+                self.store.get_key(key) or {"rotating_key": key, "key_expires_at": None}
+                for key in ordered_keys
+                if key in available
+            ]
 
     def acquire(self, lane_id: int, *, scope: str = "registration") -> RotatingProxyLease:
         lane = self._lane_id(lane_id)
         lane_scope = self._scope(scope)
         with self._lock:
+            self.store.delete_expired_leases(self.clock())
             now = self.clock()
             existing = self.store.get_lease(lane, scope=lane_scope)
             key_info = self.store.get_key(existing.get("rotating_key")) if existing else None
@@ -223,6 +307,32 @@ class RotatingProxyManager:
             raise RotatingProxyError(
                 "rotating proxy key vừa được lane khác claim, không tìm được key thay thế"
             )
+
+    def release(
+        self,
+        lane_id: int,
+        *,
+        scope: str = "registration",
+        rotating_key: str | None = None,
+        proxy_url: str | None = None,
+    ) -> bool:
+        """Release a scoped worker-lane lease so another workflow can claim the key."""
+        lane = self._lane_id(lane_id)
+        lane_scope = self._scope(scope)
+        with self._lock:
+            released = self.store.delete_lease(
+                lane,
+                scope=lane_scope,
+                rotating_key=rotating_key,
+                proxy_url=proxy_url,
+            )
+        if released:
+            logger.info(
+                "[RotatingProxy] released lease: scope=%s lane=%s",
+                lane_scope,
+                lane,
+            )
+        return released
 
     def refresh_keys(self) -> dict[str, Any]:
         with self._lock:
