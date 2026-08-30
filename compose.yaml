@@ -1,9 +1,6 @@
 services:
   web:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: turb-gpt-free-register:local
+    image: ${TURB_IMAGE:-ghcr.io/cong91/turb-gpt-free-register:main}
     container_name: turb-gpt-free-register
     restart: unless-stopped
     init: true
