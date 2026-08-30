@@ -24,6 +24,7 @@ USE_EMAIL_SERVICE = False
 #   "cloudmail"         — CloudMail/Cloud Mail API（自动从平台获取域名并随机生成邮箱）
 #   "tinyhost"          — TinyHost 临时邮箱 API（全量 domain + user 并自动收码）
 #   "qan8_gmail_api"    — QAN8 Gmail API URL，按 worker lane 懒购买 source 并生成 client alias
+#   "remail"            — Remail 开放 API，按项目下单并自动收取验证码
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
 
 
@@ -198,5 +199,19 @@ TINYHOST_API_BASE = "https://tinyhost.shop"
 TINYHOST_REQUEST_TIMEOUT = 20
 TINYHOST_RANDOM_LOCAL_LENGTH = 12
 
+
+# ============================================================
+# Remail 开放 API：https://remail.aishop6.com/docs
+# ============================================================
+
+REMAIL_API_BASE = "https://remail.aishop6.com"
+REMAIL_API_KEY = env_str("REMAIL_API_KEY", "")
+REMAIL_PROJECT_ID = 2
+REMAIL_EMAIL_SUFFIX = "outlook.com"
+REMAIL_SERVICE_MODE = "purchase"
+REMAIL_SUPPLY_POLICY = "public_only"
+REMAIL_ORDER_WAIT_SECONDS = 30
+REMAIL_REQUEST_TIMEOUT = 20
+
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'QAN8_API_BASE': 'str', 'QAN8_API_KEY': 'str', 'QAN8_GMAIL_SKU_ID': 'str', 'QAN8_REQUEST_TIMEOUT': 'int', 'QAN8_ORDER_TIMEOUT': 'int', 'QAN8_ALIASES_PER_SOURCE': 'int', 'GMAIL_123452026_API_BASE': 'str', 'GMAIL_123452026_REQUEST_TIMEOUT': 'int', 'GMAIL_123452026_ACCOUNTS_PER_CDK': 'int', 'GMAIL_123452026_ALLOW_INSECURE_HTTP': 'bool', 'PAYMESH_API_BASE': 'str', 'PAYMESH_REQUEST_TIMEOUT': 'int', 'PAYMESH_OTP_MAX_WAIT': 'int', 'PAYMESH_ACCOUNTS_PER_CDK': 'int', 'PAYMESH_ROUTED_DOMAINS': 'list_str_multiline', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'TINYHOST_API_BASE': 'str', 'TINYHOST_REQUEST_TIMEOUT': 'int', 'TINYHOST_RANDOM_LOCAL_LENGTH': 'int'})
+apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'QAN8_API_BASE': 'str', 'QAN8_API_KEY': 'str', 'QAN8_GMAIL_SKU_ID': 'str', 'QAN8_REQUEST_TIMEOUT': 'int', 'QAN8_ORDER_TIMEOUT': 'int', 'QAN8_ALIASES_PER_SOURCE': 'int', 'GMAIL_123452026_API_BASE': 'str', 'GMAIL_123452026_REQUEST_TIMEOUT': 'int', 'GMAIL_123452026_ACCOUNTS_PER_CDK': 'int', 'GMAIL_123452026_ALLOW_INSECURE_HTTP': 'bool', 'PAYMESH_API_BASE': 'str', 'PAYMESH_REQUEST_TIMEOUT': 'int', 'PAYMESH_OTP_MAX_WAIT': 'int', 'PAYMESH_ACCOUNTS_PER_CDK': 'int', 'PAYMESH_ROUTED_DOMAINS': 'list_str_multiline', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'TINYHOST_API_BASE': 'str', 'TINYHOST_REQUEST_TIMEOUT': 'int', 'TINYHOST_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})

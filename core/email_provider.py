@@ -11,6 +11,7 @@ EMAIL_SOURCE 支持单个或多个来源：
     "mailnest"
     "cloudmail"
     "tinyhost"
+    "remail"
     "outlook,generic_api,mailnest,cloudmail"          # 按顺序兜底
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
@@ -93,7 +94,7 @@ def acknowledge_verification_code(
 
 _VALID_SOURCES = (
     "outlook", "generic_api", "gmail_api_url", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "tinyhost",
-    "gmail_123452026", "paymesh", "qan8_gmail_api",
+    "gmail_123452026", "paymesh", "qan8_gmail_api", "remail",
 )
 
 _SOURCE_ALIASES = {
@@ -234,6 +235,9 @@ def _pick_from_source(
     if source == "cloudmail":
         from core.cloudmail_client import pick_account
         return pick_account().email
+    if source == "remail":
+        from core.remail_client import pick_account
+        return pick_account().email
     from core.outlook_client import pick_account
     return pick_account().email
 
@@ -295,6 +299,22 @@ def acquire_email(
     raise RuntimeError(f"所有邮箱来源均领取失败: {sources}; last={last_exc}")
 
 
+def acquire_email_after_input(email: str | None = None) -> str:
+    """在浏览器已找到邮箱输入框后才领取邮箱，避免页面失败时提前消耗库存。"""
+    current = str(email or "").strip()
+    if current:
+        return current
+    from config import email as _email_cfg
+
+    if not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", False)):
+        raise RuntimeError("页面已找到邮箱输入框，但自动取邮箱未启用且未配置 REGISTER_EMAIL")
+    allocated = str(acquire_email() or "").strip()
+    if not allocated:
+        raise RuntimeError("邮箱服务返回了空邮箱地址")
+    logger.info("[EmailProvider] 已找到邮箱输入框，开始分配邮箱: %s", allocated)
+    return allocated
+
+
 def resolve_email_source(email: str) -> str:
     """根据邮箱在各池中的归属判断实际来源。"""
     if Qan8GmailApiAllocator().get_account_context(email):
@@ -321,6 +341,9 @@ def resolve_email_source(email: str) -> str:
     from core.cloudmail_client import get_account_context as get_cloudmail_context
     if get_cloudmail_context(email):
         return "cloudmail"
+    from core.remail_client import get_account_context as get_remail_context
+    if get_remail_context(email):
+        return "remail"
 
     from core import db
     if db.get_generic_api_email_by_email(email):
@@ -492,6 +515,9 @@ def wait_for_otp(
     if source == "cloudmail":
         from core.cloudmail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "remail":
+        from core.remail_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     from core.outlook_client import fetch_latest_otp
     return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
 
@@ -532,6 +558,9 @@ def release_email(email: str, status: str = "available", note: str | None = None
         release_account(email, status=status, note=note)
     elif source == "cloudmail":
         from core.cloudmail_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "remail":
+        from core.remail_client import release_account
         release_account(email, status=status, note=note)
     else:
         from core.outlook_client import release_account

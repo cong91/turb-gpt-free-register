@@ -462,6 +462,40 @@ EDITABLE_FIELDS = [
         "label": "TinyHost 邮箱名前缀长度", "help": "随机 local-part 长度，范围 6-32",
     },
     {
+        "key": "REMAIL_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail API 地址", "help": "默认 https://remail.aishop6.com；也可填写文档地址 https://remail.aishop6.com/docs",
+        "external_url": "https://remail.aishop6.com/register?aff=AFFLGYQMTYIXH",
+    },
+    {
+        "key": "REMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail API Key", "help": "Remail 控制台生成的 rk- 开头 API Key；选择 remail 来源时必填，保存在 .env",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "REMAIL_PROJECT_ID", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Remail 项目 ID", "help": "Remail API 项目列表中的 projectId",
+    },
+    {
+        "key": "REMAIL_EMAIL_SUFFIX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail 邮箱后缀", "help": "下单时使用的邮箱后缀，默认 outlook.com；不要填写完整邮箱",
+    },
+    {
+        "key": "REMAIL_SERVICE_MODE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail 服务模式", "help": "code=短效接码；purchase=长效购买",
+    },
+    {
+        "key": "REMAIL_SUPPLY_POLICY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Remail 库存策略", "help": "private_first 优先自有库存；public_only 只使用公开库存",
+    },
+    {
+        "key": "REMAIL_ORDER_WAIT_SECONDS", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Remail 订单等待(秒)", "help": "下单后等待 service token 补齐的最长时间",
+    },
+    {
+        "key": "REMAIL_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Remail 请求超时(秒)", "help": "Remail API 单次 HTTP 请求超时",
+    },
+    {
         "key": "CLOUDFLARE_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "Cloudflare API 地址", "help": "Worker 临时邮箱 API 根地址，如 https://mail.example.com；选择 cloudflare 时必填",
         "storage": "env",

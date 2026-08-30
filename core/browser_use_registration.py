@@ -17,7 +17,7 @@ import string
 import time
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from config import browser_use as _cfg
 from config import twofa as _twofa_cfg
@@ -26,7 +26,7 @@ from core import db
 from core.browser_use_client import BrowserUseClient
 from core.browser_registration import _is_unsupported_email_error, _profile_submission_error
 from core.codex_login_credentials import CodexLoginCredentials
-from core.email_provider import resolve_email_source, wait_for_otp
+from core.email_provider import acquire_email_after_input, resolve_email_source, wait_for_otp
 from core.humanize import delay as human_delay
 from core.openai_auth import (
     AccountUnusableError,
@@ -835,8 +835,8 @@ def _submit_email_step_pw(page, email: str) -> bool:
         return False
 
 
-def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
-    """Roxy 同款邮箱入口流程：先找输入框，找不到再按 DOM 属性点邮箱入口，全程人工逐字输入。"""
+def _wait_for_email_input_pw(page, timeout_ms: int | None = None):
+    """进入邮箱登录/注册方式并返回可见邮箱输入框。"""
     fill_timeout_ms = timeout_ms if timeout_ms is not None else min(_timeout_ms(), 24000)
     end = time.time() + (fill_timeout_ms / 1000.0)
     clicked_email_option = False
@@ -845,18 +845,7 @@ def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
     while time.time() < end:
         loc = _find_email_input_locator_pw(page, timeout_ms=1000)
         if loc is not None:
-            _human_fill_locator(
-                page,
-                loc,
-                email,
-                timeout=6000,
-                typing_delay_range=_cloud_typing_delay("email"),
-                per_char=True,
-            )
-            _human_pause(0.3, 0.8)
-            if not _submit_email_step_pw(page, email):
-                raise RuntimeError(f"邮箱已输入但提交失败，页面={_page_url(page) or '-'} state={_email_entry_state_pw(page)}")
-            return
+            return loc
 
         last_state = _email_entry_state_pw(page)
         if not clicked_email_option:
@@ -894,6 +883,22 @@ def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
     raise RuntimeError(f"找不到邮箱输入框/邮箱入口，页面={_page_url(page) or '-'} state={last_state}")
 
 
+def _type_email(page, email: str, timeout_ms: int | None = None) -> None:
+    """找到邮箱输入框后填写并提交邮箱。"""
+    loc = _wait_for_email_input_pw(page, timeout_ms=timeout_ms)
+    _human_fill_locator(
+        page,
+        loc,
+        email,
+        timeout=6000,
+        typing_delay_range=_cloud_typing_delay("email"),
+        per_char=True,
+    )
+    _human_pause(0.3, 0.8)
+    if not _submit_email_step_pw(page, email):
+        raise RuntimeError(f"邮箱已输入但提交失败，页面={_page_url(page) or '-'} state={_email_entry_state_pw(page)}")
+
+
 def _wait_after_email_submit_transition(page, context=None, timeout: int = 14) -> str:
     """提交邮箱后确认页面真的离开邮箱输入页，避免直接空等 OTP。"""
     end = time.time() + timeout
@@ -929,16 +934,46 @@ def _wait_after_email_submit_transition(page, context=None, timeout: int = 14) -
     return last_state
 
 
-def _submit_email_until_transition(page, context, email: str, *, attempts: int = 2, timeout_ms: int | None = None) -> str:
+def _submit_email_until_transition(
+    page,
+    context,
+    email: str | None,
+    *,
+    attempts: int = 2,
+    timeout_ms: int | None = None,
+    email_supplier: Callable[[], str] | None = None,
+) -> str:
     """
     填写并提交邮箱，并确认进入 password/OTP/后续页面。
     若仍停留 chatgpt.com/auth/login?email=...，重试一次，避免无效等待邮箱验证码。
     """
     last_state = "other"
+    current_email = str(email or "").strip()
     for attempt in range(1, max(1, attempts) + 1):
         _check_manual_stop()
-        logger.info("[BrowserUse] 提交邮箱尝试 %s/%s：%s", attempt, attempts, email)
-        _type_email(page, email, timeout_ms=timeout_ms)
+        email_input = None
+        if not current_email:
+            email_input = _wait_for_email_input_pw(page, timeout_ms=timeout_ms)
+            if email_supplier is None:
+                raise RuntimeError("已找到邮箱输入框，但未提供邮箱分配器")
+            current_email = str(email_supplier() or "").strip()
+            if not current_email:
+                raise RuntimeError("邮箱分配器返回了空邮箱地址")
+            _human_fill_locator(
+                page,
+                email_input,
+                current_email,
+                timeout=6000,
+                typing_delay_range=_cloud_typing_delay("email"),
+                per_char=True,
+            )
+            _human_pause(0.3, 0.8)
+            if not _submit_email_step_pw(page, current_email):
+                raise RuntimeError(f"邮箱已输入但提交失败，页面={_page_url(page) or '-'} state={_email_entry_state_pw(page)}")
+        else:
+            logger.info("[BrowserUse] 提交邮箱尝试 %s/%s：%s", attempt, attempts, current_email)
+            _type_email(page, current_email, timeout_ms=timeout_ms)
+        logger.info("[BrowserUse] 提交邮箱尝试 %s/%s：%s", attempt, attempts, current_email)
         _check_manual_stop()
         last_state = _wait_after_email_submit_transition(page, context=context, timeout=10 if _fast_mode() else 16)
         logger.info("[BrowserUse] 邮箱提交后状态：%s url=%s", last_state, _page_url(page) or "-")

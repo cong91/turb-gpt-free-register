@@ -2303,6 +2303,7 @@
             <option value="qan8_gmail_api">QAN8 Gmail API (lazy)</option>
             <option value="paymesh">Paymesh (MAIL card)</option>
             <option value="tinyhost">TinyHost email tạm</option>
+            <option value="remail">Remail email tạm</option>
             <option value="local_test">Kiểm thử cục bộ (dry-run)</option>
           </select>
         </label>
@@ -6626,6 +6627,7 @@ function emailConfigSectionForKey(key) {
   if (key.startsWith('MAIL_NEST_')) return ['MailNest', 'MailNest / 迈巢临时邮箱 API 配置'];
   if (key.startsWith('CLOUDMAIL_')) return ['CloudMail', 'CloudMail 域名随机邮箱、Token 和收信 API 配置'];
   if (key.startsWith('TINYHOST_')) return ['TinyHost', 'TinyHost 随机域名临时邮箱 API 配置'];
+  if (key.startsWith('REMAIL_')) return ['Remail', 'Remail 项目下单、service token 和验证码收取配置'];
   if (key.startsWith('OUTLOOK_')) return ['Outlook 邮箱池', 'Outlook 邮箱池和取件模式配置'];
   if (key.startsWith('CLOUDFLARE_')) return ['Cloudflare 临时邮箱', 'Cloudflare Worker 临时邮箱 API、鉴权与路径配置'];
   if (['EMAIL_DOMAIN','QQ_EMAIL','QQ_IMAP_PASSWORD'].includes(key)) return ['Cloudflare 域名邮箱', 'Cloudflare 转发到 QQ 邮箱后的 IMAP 收信配置'];
@@ -7281,7 +7283,7 @@ function renderConfigSectionV2(name, fields) {
       name,
       fields,
       emailConfigSectionForKey,
-      ['通用邮箱 / OTP', 'Gmail CDK', 'GPTMail', 'MailNest', 'CloudMail', 'TinyHost', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
+      ['通用邮箱 / OTP', 'Gmail CDK', 'GPTMail', 'MailNest', 'CloudMail', 'TinyHost', 'Remail', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
       { get: () => CONFIG_EMAIL_ACTIVE_SECTION_V2, set: v => { CONFIG_EMAIL_ACTIVE_SECTION_V2 = v; } },
       'email-section-v2'
     );

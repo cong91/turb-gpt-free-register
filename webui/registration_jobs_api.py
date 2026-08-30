@@ -73,6 +73,25 @@ def _provider_error(
             return "已选择 cloudmail 邮箱来源，请填写 CloudMail API 地址（配置 → 邮箱 / OTP）。"
         if not str(getattr(email_config, "CLOUDMAIL_AUTH_TOKEN", "") or "").strip():
             return "已选择 cloudmail 邮箱来源，请填写 CloudMail Token（配置 → 邮箱 / OTP）。"
+    if "remail" in sources:
+        api_base = str(getattr(email_config, "REMAIL_API_BASE", "") or "").strip()
+        api_key = str(getattr(email_config, "REMAIL_API_KEY", "") or "").strip()
+        try:
+            project_id = int(getattr(email_config, "REMAIL_PROJECT_ID", 2) or 0)
+        except (TypeError, ValueError):
+            project_id = 0
+        suffix = str(getattr(email_config, "REMAIL_EMAIL_SUFFIX", "") or "").strip()
+        service_mode = str(getattr(email_config, "REMAIL_SERVICE_MODE", "purchase") or "purchase").strip().lower()
+        if not api_base:
+            return "已选择 remail 邮箱来源，请填写 Remail API 地址（配置 → 邮箱 / OTP）。"
+        if not api_key:
+            return "已选择 remail 邮箱来源，请填写 Remail API Key（配置 → 邮箱 / OTP）。"
+        if project_id <= 0:
+            return "已选择 remail 邮箱来源，请填写 Remail 项目 ID（配置 → 邮箱 / OTP）。"
+        if not suffix:
+            return "已选择 remail 邮箱来源，请填写 Remail 邮箱后缀（例如 outlook.com）。"
+        if service_mode not in ("code", "purchase"):
+            return "Remail 服务模式只能填写 code 或 purchase（配置 → 邮箱 / OTP）。"
     if "tinyhost" in sources and not str(getattr(email_config, "TINYHOST_API_BASE", "") or "").strip():
         return "已选择 tinyhost 邮箱来源，请填写 TinyHost API 地址（配置 → 邮箱 / OTP）。"
     return None
@@ -81,7 +100,7 @@ def _provider_error(
 def _pool_warning(database, sources: list[str], count: int) -> str:
     if any(source in sources for source in (
         "gptmail", "mailnest", "cloudmail", "tinyhost", "cloudflare", "gmail_123452026", "paymesh",
-        "qan8_gmail_api",
+        "qan8_gmail_api", "remail",
     )):
         return ""
     if sources == ["gmail_api_url"]:
