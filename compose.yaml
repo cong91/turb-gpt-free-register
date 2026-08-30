@@ -21,7 +21,7 @@ services:
     volumes:
       - turb_runtime:/var/lib/turb
       - turb_cloak_cache:/opt/cloakbrowser
-      - ./secrets:/run/secrets:rw
+      - ./secrets/.env:/run/secrets/turb.env:ro
     ports:
       - "127.0.0.1:5057:5057"
     tmpfs:
