@@ -44,6 +44,8 @@ USER app
 RUN python -m cloakbrowser install
 
 USER root
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 COPY . .
 RUN set -eux; \
     for path in \
@@ -80,4 +82,5 @@ USER app
 
 EXPOSE 5057
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["gunicorn", "--bind", "0.0.0.0:5057", "--workers", "1", "--threads", "8", "--timeout", "0", "--access-logfile", "-", "--error-logfile", "-", "wsgi:app"]

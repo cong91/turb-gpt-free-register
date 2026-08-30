@@ -18,6 +18,9 @@ git pull --ff-only origin main
 
 docker compose config --quiet
 
+docker volume create turb_gpt_runtime >/dev/null
+docker volume create turb_gpt_cloak_cache >/dev/null
+
 if [[ -n "$(docker compose ps --status running -q web)" ]]; then
   docker compose exec -T web python -c '
 import sqlite3
@@ -36,6 +39,14 @@ print("SQLite backup created")
 fi
 
 docker compose build --pull
+docker run --rm --user 0:0 --entrypoint /bin/chown \
+  -v turb_gpt_runtime:/var/lib/turb \
+  turb-gpt-free-register:local \
+  -R 1000:1000 /var/lib/turb
+docker run --rm --user 0:0 --entrypoint /bin/chown \
+  -v turb_gpt_cloak_cache:/opt/cloakbrowser \
+  turb-gpt-free-register:local \
+  -R 1000:1000 /opt/cloakbrowser
 docker compose up -d --remove-orphans
 
 for attempt in {1..30}; do
