@@ -1,0 +1,48 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: turb-gpt-free-register:local
+    container_name: turb-gpt-free-register
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"
+    read_only: true
+    shm_size: "1gb"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      TURB_ENV_FILE: /run/secrets/turb.env
+      WEBUI_SECURE_COOKIE: "True"
+      CLOAKBROWSER_CACHE_DIR: /opt/cloakbrowser
+      NORDVPN_WG_WIREPROXY_EXE: wireproxy
+      NORDVPN_WG_CONFIGS_DIR: /var/lib/turb/nordvpn-wireguard
+    volumes:
+      - turb_runtime:/var/lib/turb
+      - turb_cloak_cache:/opt/cloakbrowser
+      - ./secrets:/run/secrets:rw
+    ports:
+      - "127.0.0.1:5057:5057"
+    tmpfs:
+      - /tmp:rw,nosuid,size=512m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          response=urllib.request.urlopen('http://127.0.0.1:5057/login', timeout=5);
+          raise SystemExit(0 if response.status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    stop_grace_period: 30s
+
+volumes:
+  turb_runtime:
+    name: turb_gpt_runtime
+  turb_cloak_cache:
+    name: turb_gpt_cloak_cache

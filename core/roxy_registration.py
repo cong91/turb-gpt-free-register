@@ -8,27 +8,16 @@ import string
 import time
 import uuid
 from pathlib import Path
-from typing import Callable
 
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
-from core.account_export import save_account_data, post_register_dwell
-from core.browser_data_saver import BrowserDataSaver
-from core.browser_traffic import SeleniumTrafficTracker
-from core.roxy_asset_cache import RoxyLocalAssetCache
-from core.email_provider import acquire_email_after_input, wait_for_otp, resolve_email_source
+from core import db
+from core.account_export import checkpoint_account_data, save_account_data, post_register_dwell
+from core.email_provider import wait_for_otp, resolve_email_source
 from core.humanize import delay as human_delay
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
 
 logger = logging.getLogger(__name__)
-
-
-def _enable_performance_logging(options) -> None:
-    """尽量开启 Chrome performance log；不支持时不阻断注册。"""
-    try:
-        options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    except Exception as exc:
-        logger.debug("[Roxy] 当前 Selenium 选项不支持 performance log：%s", exc)
 
 
 def _log_prefix(driver=None) -> str:
@@ -59,7 +48,6 @@ def _build_driver(opened: RoxyOpenResult):
         options = Options()
         # 页面里长轮询/风控脚本偶尔会让 driver.get 等到超时；eager 只等 DOMContentLoaded。
         options.page_load_strategy = "eager"
-        _enable_performance_logging(options)
         options.add_experimental_option("debuggerAddress", opened.debugger_address)
         driver_path = ""
         try:
@@ -80,7 +68,6 @@ def _build_driver(opened: RoxyOpenResult):
         logger.info("[Roxy] Selenium 连接 webdriver_url=%s", opened.webdriver_url)
         options = Options()
         options.page_load_strategy = "eager"
-        _enable_performance_logging(options)
         driver = RemoteWebDriver(command_executor=opened.webdriver_url, options=options)
         _apply_browser_automation_mask(driver)
         return driver
@@ -370,33 +357,6 @@ def _page_warmup(driver, *, reason: str = "") -> None:
         pass
 
 
-_MISSING_PAGE_ELEMENT_REFRESH_RETRIES = 3
-
-
-def _refresh_after_missing_page_element(driver, step: str, retry_index: int) -> bool:
-    """元素缺失时刷新当前页面，避免把页面迟渲染误判成流程失败。"""
-    max_retries = _MISSING_PAGE_ELEMENT_REFRESH_RETRIES
-    if retry_index >= max_retries:
-        return False
-    try:
-        current_url = str(getattr(driver, "current_url", "") or "")
-        logger.warning(
-            "%s %s未找到，刷新页面重试（第 %s/%s 次）：url=%s",
-            _log_prefix(driver), step, retry_index + 1, max_retries, current_url[:180],
-        )
-        driver.refresh()
-        time.sleep(1.5)
-        _page_warmup(driver, reason=f"missing_{step}")
-        return True
-    except Exception as exc:
-        logger.warning(
-            "%s %s缺失后的页面刷新失败（第 %s/%s 次）：%s: %s",
-            _log_prefix(driver), step, retry_index + 1, max_retries,
-            type(exc).__name__, str(exc)[:180],
-        )
-        return False
-
-
 def _find_any(driver, selectors: list[str], timeout: int | None = None):
     from selenium.webdriver.common.by import By
 
@@ -433,27 +393,6 @@ _EMAIL_INPUT_SELECTORS = [
     "input#email-input",
     "input[autocomplete='email']",
 ]
-
-
-class _EmailFlowAdvanced(RuntimeError):
-    """等待邮箱输入框期间，页面实际上已经进入了后续认证步骤。"""
-
-    def __init__(self, state: str):
-        super().__init__(state)
-        self.state = state
-
-
-def _current_email_submit_next_state(driver) -> str | None:
-    """无等待地识别邮箱提交后的有效状态，避免把慢跳转误判成邮箱页丢失。"""
-    if _has_access_token(driver):
-        return "logged_in"
-    if _is_login_password_page(driver):
-        return "login_password"
-    if _is_email_verification_page(driver):
-        return "otp"
-    if _is_signup_password_page(driver):
-        return "password"
-    return None
 
 
 def _email_entry_state(driver) -> dict:
@@ -503,7 +442,7 @@ def _find_visible_email_input_js(driver):
 def _is_oauth_consent_like(driver) -> bool:
     """检测是否已到 OAuth 授权/consent 页。这里不能再点任何邮箱分支或全局提交按钮。"""
     try:
-        return bool(driver.execute_script(r"""
+        result = driver.execute_script(r"""
         const url = String(location.href || '').toLowerCase();
         if (/oauth|authorize|consent/.test(url) && !/login|signup|identifier|email-verification/.test(url)) return true;
         const formsWithEmail = [...document.querySelectorAll('form')]
@@ -515,7 +454,10 @@ def _is_oauth_consent_like(driver) -> bool:
             el.getAttribute('formaction'), el.value, el.className].filter(Boolean).join(' ').toLowerCase())
           .join(' ');
         return /oauth|authorize|consent|grant|allow/.test(actions) && !/email|username/.test(actions);
-        """))
+        """)
+        if isinstance(result, dict):
+            return bool(result.get("has_consent_action") and not result.get("has_email_entry"))
+        return bool(result)
     except Exception:
         return False
 
@@ -575,39 +517,24 @@ def _click_email_entry_option(driver) -> bool:
     return False
 
 
-def _wait_for_email_input(driver, timeout: int | None = None):
-    """进入邮箱登录/注册方式并返回已找到的可见邮箱输入框。"""
-    wait_timeout = timeout or int(_cfg.ROXY_SELENIUM_TIMEOUT)
-    last_state = None
-    for refresh_retry in range(_MISSING_PAGE_ELEMENT_REFRESH_RETRIES + 1):
-        end = time.time() + wait_timeout
-        clicked_email_option = False
-        while time.time() < end:
-            advanced = _current_email_submit_next_state(driver)
-            if advanced:
-                raise _EmailFlowAdvanced(advanced)
-            el = _find_visible_email_input_js(driver)
-            if el:
-                return el
-            last_state = _email_entry_state(driver)
-            if not clicked_email_option and _click_email_entry_option(driver):
-                clicked_email_option = True
-                time.sleep(1.0)
-                _assert_not_external_idp(driver, "点击邮箱入口后")
-                continue
-            time.sleep(0.4)
-        if not _refresh_after_missing_page_element(driver, "邮箱输入框/邮箱入口", refresh_retry):
-            break
-    raise RuntimeError(
-        f"找不到邮箱输入框/邮箱入口，已刷新重试{_MISSING_PAGE_ELEMENT_REFRESH_RETRIES}次"
-        f"（未使用文字识别），state={last_state}"
-    )
-
-
 def _type_email_address(driver, email: str, timeout: int | None = None) -> None:
-    """进入邮箱登录/注册方式并填写邮箱。全程不依赖页面可见文字。"""
-    el = _wait_for_email_input(driver, timeout=timeout)
-    _human_type_text(driver, el, email, clear=True)
+    """进入邮箱登录/注册方式并填写邮箱。全程不依赖页面可见文字，避免非日本出口本地化后误点 Google。"""
+    end = time.time() + (timeout or int(_cfg.ROXY_SELENIUM_TIMEOUT))
+    last_state = None
+    clicked_email_option = False
+    while time.time() < end:
+        el = _find_visible_email_input_js(driver)
+        if el:
+            _human_type_text(driver, el, email, clear=True)
+            return
+        last_state = _email_entry_state(driver)
+        if not clicked_email_option and _click_email_entry_option(driver):
+            clicked_email_option = True
+            time.sleep(1.0)
+            _assert_not_external_idp(driver, "点击邮箱入口后")
+            continue
+        time.sleep(0.4)
+    raise RuntimeError(f"找不到邮箱输入框/邮箱入口（未使用文字识别），state={last_state}")
 
 
 def _submit_nearest_form_for_active_input(driver) -> bool:
@@ -1032,9 +959,14 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     cleared_recover_done = False
     expected_email = str(email or "").strip().lower()
     while time.time() < end:
-        advanced = _current_email_submit_next_state(driver)
-        if advanced:
-            return advanced
+        if _has_access_token(driver):
+            return "logged_in"
+        if _is_login_password_page(driver):
+            return "login_password"
+        if _is_email_verification_page(driver):
+            return "otp"
+        if _is_signup_password_page(driver):
+            return "password"
         state = _email_input_value_state(driver)
         last = state
         inputs = state.get("inputs") or []
@@ -1085,43 +1017,20 @@ def _reset_login_page_for_retry(driver) -> None:
 def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
     """填写并提交邮箱，必须确认进入 password/otp/logged_in 才返回。"""
     last_state = None
-    current_email = str(email or "").strip()
     for attempt in range(1, attempts + 1):
-        advanced = _current_email_submit_next_state(driver)
-        if advanced:
-            if advanced == "login_password":
-                raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
-            logger.info("%s 重试填写邮箱前发现页面已进入下一步：%s", _log_prefix(driver), advanced)
-            return advanced
-        try:
-            if current_email:
-                _type_email_address(driver, current_email, timeout=20)
-            else:
-                # 先确认页面已有可用输入框，再领取邮箱；不能把领取动作放在页面导航之前。
-                email_input = _wait_for_email_input(driver, timeout=20)
-                if email_supplier is None:
-                    raise RuntimeError("已找到邮箱输入框，但未提供邮箱分配器")
-                current_email = str(email_supplier() or "").strip()
-                if not current_email:
-                    raise RuntimeError("邮箱分配器返回了空邮箱地址")
-                _human_type_text(driver, email_input, current_email, clear=True)
-        except _EmailFlowAdvanced as exc:
-            if exc.state == "login_password":
-                raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}") from exc
-            logger.info("%s 等待邮箱输入框期间页面已进入下一步：%s", _log_prefix(driver), exc.state)
-            return exc.state
+        _type_email_address(driver, email, timeout=20)
         state = _email_input_value_state(driver)
         last_state = state
         values = [str(i.get("value") or "") for i in (state.get("inputs") or [])]
-        if not any(v.strip().lower() == current_email.lower() for v in values):
+        if not any(v.strip().lower() == email.strip().lower() for v in values):
             logger.warning("%s 邮箱写入校验失败，准备重试：attempt=%s/%s state=%s", _log_prefix(driver), attempt, attempts, state)
             time.sleep(0.8)
             continue
-        logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), current_email)
+        logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), email)
         human_delay("form")
-        _submit_email_step(driver, current_email)
+        _submit_email_step(driver, email)
         logger.info("%s 已提交邮箱，等待进入密码页或验证码页（%s/%s）", _log_prefix(driver), attempt, attempts)
-        state_name = _wait_email_submit_next_state(driver, current_email, timeout=20)
+        state_name = _wait_email_submit_next_state(driver, email, timeout=20)
         if state_name == "login_password":
             raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
         if state_name in ("password", "otp", "logged_in"):
@@ -1138,42 +1047,36 @@ def _submit_email_and_wait_next(driver, email: str, attempts: int = 3) -> str:
 def _type_otp(driver, code: str) -> None:
     from selenium.webdriver.common.by import By
 
-    for refresh_retry in range(_MISSING_PAGE_ELEMENT_REFRESH_RETRIES + 1):
-        # 单输入框
-        for selector in [
-            "input[autocomplete='one-time-code']",
-            "input[name='code']",
-            "input[inputmode='numeric']",
-            "input[type='tel']",
-        ]:
-            els = [e for e in driver.find_elements(By.CSS_SELECTOR, selector) if _visible(e)]
-            if len(els) == 1:
-                _human_type_text(driver, els[0], code, clear=True)
-                return
-
-        # 6 个分格输入框
-        boxes = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if _visible(e)]
-        numeric_boxes = []
-        for e in boxes:
-            attrs = " ".join(str(e.get_attribute(k) or "") for k in ("inputmode", "autocomplete", "aria-label", "name", "id", "type"))
-            if any(x in attrs.lower() for x in ("numeric", "one-time", "code", "otp", "tel")):
-                numeric_boxes.append(e)
-        if len(numeric_boxes) >= len(code):
-            for e, ch in zip(numeric_boxes, code):
-                if _browser_actions_enabled():
-                    _human_scroll_to(driver, e)
-                    time.sleep(random.uniform(0.04, 0.18))
-                e.send_keys(ch)
-                if _browser_actions_enabled():
-                    human_delay("keystroke")
+    # 单输入框
+    for selector in [
+        "input[autocomplete='one-time-code']",
+        "input[name='code']",
+        "input[inputmode='numeric']",
+        "input[type='tel']",
+    ]:
+        els = [e for e in driver.find_elements(By.CSS_SELECTOR, selector) if _visible(e)]
+        if len(els) == 1:
+            _human_type_text(driver, els[0], code, clear=True)
             return
 
-        if not _refresh_after_missing_page_element(driver, "OTP输入框", refresh_retry):
-            break
+    # 6 个分格输入框
+    boxes = [e for e in driver.find_elements(By.CSS_SELECTOR, "input") if _visible(e)]
+    numeric_boxes = []
+    for e in boxes:
+        attrs = " ".join(str(e.get_attribute(k) or "") for k in ("inputmode", "autocomplete", "aria-label", "name", "id", "type"))
+        if any(x in attrs.lower() for x in ("numeric", "one-time", "code", "otp", "tel")):
+            numeric_boxes.append(e)
+    if len(numeric_boxes) >= len(code):
+        for e, ch in zip(numeric_boxes, code):
+            if _browser_actions_enabled():
+                _human_scroll_to(driver, e)
+                time.sleep(random.uniform(0.04, 0.18))
+            e.send_keys(ch)
+            if _browser_actions_enabled():
+                human_delay("keystroke")
+        return
 
-    raise RuntimeError(
-        f"找不到 OTP 输入框，已刷新重试{_MISSING_PAGE_ELEMENT_REFRESH_RETRIES}次"
-    )
+    raise RuntimeError("找不到 OTP 输入框")
 
 
 def _email_otp_page_state(driver) -> dict:
@@ -1298,6 +1201,99 @@ def _wait_after_email_otp_submit(driver, timeout: int = 30) -> str:
         )
         return 'accepted'
     return 'accepted'
+
+
+def _complete_email_otp(
+    driver,
+    email: str,
+    *,
+    otp_after_ts: float,
+    otp_code: str | None = None,
+    otp_before_code: str | None = None,
+    max_attempts: int = 3,
+) -> None:
+    """获取、提交并在失败后重发邮箱 OTP；重试只接受新取到的码。"""
+    current_otp = otp_code
+    previous_submitted_otp = None
+    last_error: Exception | None = None
+    attempts = max(1, int(max_attempts))
+
+    for otp_attempt in range(1, attempts + 1):
+        if current_otp is None:
+            logger.info(
+                "%s[OTP] 等待验证码：%s（第 %s/%s 次）",
+                _log_prefix(driver),
+                email,
+                otp_attempt,
+                attempts,
+            )
+            try:
+                wait_kwargs = {
+                    "after_ts": otp_after_ts,
+                    "stage": "registration_email_otp",
+                }
+                before_code = otp_before_code or previous_submitted_otp
+                if before_code:
+                    wait_kwargs["before_code"] = before_code
+                current_otp = wait_for_otp(email, **wait_kwargs)
+            except Exception as exc:
+                last_error = exc
+                if otp_attempt >= attempts:
+                    raise
+                logger.warning(
+                    "%s[OTP] 取码失败，先重新发送验证码再请求新码（%s/%s）：%s: %s",
+                    _log_prefix(driver),
+                    otp_attempt + 1,
+                    attempts,
+                    type(exc).__name__,
+                    str(exc)[:180],
+                )
+                otp_after_ts = time.time()
+                _click_resend_email_otp(driver, timeout=25)
+                human_delay("api")
+                continue
+
+        previous_submitted_otp = current_otp
+        try:
+            logger.info("%s[OTP] 收到验证码：%s", _log_prefix(driver), current_otp)
+            _clear_otp_inputs(driver)
+            _type_otp(driver, current_otp)
+            logger.info("%s[OTP] 已填写邮箱验证码", _log_prefix(driver))
+            _check_manual_stop()
+            human_delay("otp_input")
+            try:
+                _click_continue(driver)
+                logger.info("%s[OTP] 已提交邮箱验证码，等待资料页或登录态", _log_prefix(driver))
+            except Exception as exc:
+                logger.info(
+                    "%s[OTP] 未找到显式提交按钮，继续等待页面状态：%s",
+                    _log_prefix(driver),
+                    str(exc)[:120],
+                )
+            outcome = _wait_after_email_otp_submit(driver, timeout=30)
+        except Exception as exc:
+            last_error = exc
+            outcome = "error"
+
+        if outcome == "accepted":
+            return
+        if otp_attempt >= attempts:
+            if outcome == "invalid":
+                raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("邮箱验证码提交失败，已达到最大重试次数")
+
+        logger.warning(
+            "%s[OTP] 验证码提交失败，准备重新发送并重新获取验证码（%s/%s）",
+            _log_prefix(driver),
+            otp_attempt + 1,
+            attempts,
+        )
+        otp_after_ts = time.time()
+        _click_resend_email_otp(driver, timeout=25)
+        human_delay("api")
+        current_otp = None
 
 
 def _click_continue(driver) -> None:
@@ -1653,9 +1649,7 @@ def _password_page_state(driver) -> dict:
           type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: el.id || '',
           disabled: !!el.disabled, visible: !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
         })).slice(0, 30);
-        const errors = [...document.querySelectorAll('[role="alert"],[aria-live="assertive"],[aria-live="polite"],.react-aria-FieldError,[slot="errorMessage"],[class*="error"]')]
-          .filter(el => visible(el)).map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 10);
-        return {url: location.href, inputs, forms, buttons, errors};
+        return {url: location.href, inputs, forms, buttons};
         """) or {}
     except Exception as exc:
         return {"url": getattr(driver, "current_url", ""), "error": f"{type(exc).__name__}: {exc}"}
@@ -1663,9 +1657,7 @@ def _password_page_state(driver) -> dict:
 
 def _is_signup_password_page(driver) -> bool:
     state = _password_page_state(driver)
-    # 页面刚完成导航时 execute_script 可能短暂失败；URL 仍足以确认这是注册密码页，
-    # 不能因此提前返回 None，导致后续错误地进入 OTP 输入阶段。
-    url = str(state.get('url') or getattr(driver, 'current_url', '') or '').lower()
+    url = str(state.get('url') or '').lower()
     if any(x in url for x in ('/create-account/password', '/u/signup/password', '/signup/password')):
         return True
     if '/log-in/password' in url:
@@ -1691,31 +1683,6 @@ def _is_login_password_page(driver) -> bool:
     state = _password_page_state(driver)
     url = str(state.get('url') or '').lower()
     return '/log-in/password' in url
-
-
-def _resubmit_signup_password_form(driver) -> dict:
-    """密码页点击无跳转时，针对当前密码表单执行一次原生 requestSubmit。"""
-    try:
-        return driver.execute_script(r"""
-        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
-        const input = [...document.querySelectorAll('input[type="password"],input[name*="password" i],input[autocomplete="new-password"]')]
-          .find(visible);
-        const form = input?.closest('form');
-        const button = form ? [...form.querySelectorAll('button[type="submit"],input[type="submit"],button')]
-          .find(el => visible(el) && !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true') : null;
-        const errors = [...document.querySelectorAll('[role="alert"],[aria-live="assertive"],[aria-live="polite"],.react-aria-FieldError,[slot="errorMessage"],[class*="error"]')]
-          .filter(visible).map(el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean).slice(0, 10);
-        if (!input || !form) return {ok:false, reason:'missing_password_form', url:location.href, errors};
-        if (!String(input.value || '')) return {ok:false, reason:'empty_password', url:location.href, errors};
-        if (errors.length) return {ok:false, reason:'page_errors', url:location.href, errors};
-        if (typeof form.requestSubmit === 'function') form.requestSubmit(button || undefined);
-        else if (button) button.click();
-        else form.submit();
-        return {ok:true, reason:'form_requestSubmit', url:location.href, valueLength:String(input.value || '').length};
-        """) or {"ok": False, "reason": "empty_result"}
-    except Exception as exc:
-        return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
 def _click_passwordless_signup_if_present(driver) -> dict:
@@ -1795,8 +1762,7 @@ def _click_continue_with_password_if_present(driver) -> dict:
           && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
         const enabled = el => !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
         const norm = s => String(s || '').replace(/\s+/g, '').toLowerCase();
-        const candidates = [...document.querySelectorAll('a,button,input[type="button"],input[type="submit"],[role="link"],[role="button"],[data-login-web-auth-control],[data-dd-action-name]')]
-          .filter(el => visible(el) && enabled(el));
+        const candidates = [...document.querySelectorAll('a,button,[role="link"],[role="button"]')].filter(el => visible(el) && enabled(el));
         const isPasswordCreate = el => {
           const href = String(el.getAttribute('href') || '').toLowerCase();
           const attrs = [
@@ -1804,13 +1770,13 @@ def _click_continue_with_password_if_present(driver) -> dict:
             el.getAttribute('data-testid'), el.getAttribute('data-login-web-auth-control'),
             el.getAttribute('data-dd-action-name'), el.className, el.textContent
           ].join(' ').toLowerCase();
-          const text = norm(el.innerText || el.textContent || '');
-          const passwordContinue = /continuewithpassword|continuewithapassword|usepasswordtocontinue|continueusingpassword/.test(text)
-            || /密码.*继续|密碼.*繼續|비밀번호.*계속|パスワード.*続行|パスワード.*つづける/.test(text);
+          const text = norm(el.textContent || '');
           return (
             href.includes('/create-account/password') ||
             attrs.includes('/create-account/password') ||
-            passwordContinue
+            attrs.includes("data-dd-action-name") ||
+            text.includes('continuewithpassword') ||
+            text.includes('continuewithapassword')
           );
         };
         const btn = candidates.find(isPasswordCreate);
@@ -1878,45 +1844,16 @@ def _click_continue_with_password_link(driver) -> bool:
 def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str | None:
     """邮箱提交后兼容 create-account/password。返回本次设置的 OpenAI 账号密码；未遇到密码页返回 None。"""
     end = time.time() + timeout
-    verification_wait_end = min(end, time.time() + 10)
     last = {}
-    missing_element_refreshes = 0
-    password_route_requested = False
     while time.time() < end:
         if _is_email_verification_page(driver):
-            result = {}
-            for _ in range(8):
-                result = _click_continue_with_password_if_present(driver)
-                if result.get("ok"):
-                    logger.info("%s 邮箱验证码页已点击“使用密码继续”：email=%s detail=%s", _log_prefix(driver), email, result)
-                    # 点击后导航在高延迟代理下可能要十几秒。旧逻辑只等 0.8 秒便再次
-                    # 点击，并沿用原来的 25 秒总期限，最后可能恰好在密码页刚出现时
-                    # 返回 None。首次点击后单独预留导航/渲染时间，并等待状态真正改变。
-                    if not password_route_requested:
-                        password_route_requested = True
-                        end = max(end, time.time() + 40)
-                    navigation_end = min(end, time.time() + 12)
-                    while time.time() < navigation_end:
-                        if _is_signup_password_page(driver) or _has_access_token(driver):
-                            break
-                        if not _is_email_verification_page(driver):
-                            break
-                        time.sleep(0.5)
-                    break
-                time.sleep(0.5)
-            else:
-                if time.time() < verification_wait_end:
-                    logger.info("%s 邮箱验证码页暂未找到“使用密码继续”，继续等待页面渲染：detail=%s", _log_prefix(driver), result)
-                    time.sleep(0.5)
-                    continue
-                if _refresh_after_missing_page_element(driver, "使用密码继续按钮", missing_element_refreshes):
-                    missing_element_refreshes += 1
-                    end = time.time() + timeout
-                    verification_wait_end = min(end, time.time() + 10)
-                    continue
-                logger.info("%s 已在邮箱验证码页，但未找到“使用密码继续”按钮：detail=%s", _log_prefix(driver), result)
-                return None
-            continue
+            result = _click_continue_with_password_if_present(driver)
+            if result.get("ok"):
+                logger.info("%s 邮箱验证码页已点击“使用密码继续”：email=%s detail=%s", _log_prefix(driver), email, result)
+                time.sleep(0.8)
+                continue
+            logger.info("%s 已在邮箱验证码页，但未找到“使用密码继续”按钮：detail=%s", _log_prefix(driver), result)
+            return None
         if _has_access_token(driver):
             return None
         last = _password_page_state(driver)
@@ -1955,13 +1892,6 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
         return {ok:true, reason:'password_targets', input, button: buttons[0].el};
         """) or {}
         if not result.get('ok'):
-            reason = str(result.get('reason') or '')
-            if reason in {'missing_password_input', 'missing_submit'} and _refresh_after_missing_page_element(
-                driver, "密码输入框/提交按钮", missing_element_refreshes
-            ):
-                missing_element_refreshes += 1
-                end = time.time() + timeout
-                continue
             raise RuntimeError(f"密码页处理失败：{result} state={last}")
         _human_type_text(driver, result.get("input"), password, clear=True)
         # React/Auth0 会在 input/change 后异步校验密码强度并启用 Continue。
@@ -2006,19 +1936,11 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
         };
         """) or {}
         if not submit_result.get("ok") or not submit_result.get("button"):
-            reason = str(submit_result.get('reason') or '')
-            if reason == 'missing_enabled_submit' and _refresh_after_missing_page_element(
-                driver, "密码页 Continue 按钮", missing_element_refreshes
-            ):
-                missing_element_refreshes += 1
-                end = time.time() + timeout
-                continue
             raise RuntimeError(f"密码页找不到可点击的 Continue 按钮：{submit_result} state={_password_page_state(driver)}")
         _human_click(driver, submit_result.get("button"), label="password_submit")
         logger.info("%s 已填写并点击密码页 Continue：detail=%s", _log_prefix(driver), {k: v for k, v in submit_result.items() if k != "button"})
-        # 高延迟代理下 Auth0 提交和导航可能明显超过 20 秒；过早进入 OTP 阶段
-        # 会在 /create-account/password 上查找验证码框。这里给足提交/导航时间。
-        wait_end = time.time() + 60
+        # 提交密码后通常进入邮箱验证码页，最多等一段时间。
+        wait_end = time.time() + 20
         retried_submit = False
         while time.time() < wait_end:
             if _is_email_verification_page(driver):
@@ -2027,39 +1949,22 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             if _has_access_token(driver):
                 logger.info("%s 密码提交后已检测到登录态", _log_prefix(driver))
                 return password
-            if _is_signup_password_page(driver):
-                error_state = _password_page_state(driver)
-                errors = error_state.get("errors") or []
-                if errors:
-                    error_text = "；".join(str(item) for item in errors[:3])
-                    raise RuntimeError(
-                        f"密码页提交被拒绝: {error_text} "
-                        f"url={error_state.get('url') or getattr(driver, 'current_url', '')}"
-                    )
-            if not retried_submit and time.time() > wait_end - 42 and _is_signup_password_page(driver):
+            if not retried_submit and time.time() > wait_end - 15 and _is_signup_password_page(driver):
                 retried_submit = True
-                retry_result = _resubmit_signup_password_form(driver)
-                logger.info("%s 密码页点击后仍未跳转，原生表单补交一次：%s", _log_prefix(driver), retry_result)
-                if retry_result.get("reason") == "page_errors":
-                    raise RuntimeError(f"密码页提交被页面拒绝: {retry_result}")
+                logger.info("%s 密码页点击后仍未跳转，等待后重试一次 Continue/Enter", _log_prefix(driver))
+                human_delay("form", minimum=1.2, maximum=2.2)
+                try:
+                    _click_continue(driver)
+                except Exception:
+                    try:
+                        from selenium.webdriver.common.keys import Keys
+                        driver.switch_to.active_element.send_keys(Keys.ENTER)
+                    except Exception:
+                        pass
             if not _is_signup_password_page(driver):
                 return password
             time.sleep(0.5)
-        # 密码提交超时仍停留在注册密码页时，不能把“已设置密码”当成成功并
-        # 直接交给后续 OTP 阶段；此时 OTP 输入框必然不存在。明确失败并保留
-        # 当前 URL/DOM 诊断，避免无意义地刷新密码页三次。
-        if _is_signup_password_page(driver):
-            current_url = str(getattr(driver, "current_url", "") or "")
-            raise RuntimeError(f"密码提交后仍停留在注册密码页: url={current_url} state={_password_page_state(driver)}")
         return password
-    # 如果已经请求切换到密码方式，不允许在导航竞态中静默进入 OTP 阶段。
-    # 最后再读取一次浏览器 URL；已抵达密码路由但 DOM 尚未就绪时明确报错，
-    # 避免后续在密码页连续刷新并查找 OTP 输入框。
-    current_url = str(getattr(driver, "current_url", "") or "")
-    if password_route_requested and any(x in current_url.lower() for x in (
-        "/create-account/password", "/u/signup/password", "/signup/password",
-    )):
-        raise RuntimeError(f"已进入注册密码页但密码表单在等待期限内未就绪: url={current_url} state={last}")
     logger.info("%s 未检测到密码页，继续后续流程 last=%s", _log_prefix(driver), last)
     return None
 
@@ -2136,6 +2041,18 @@ def _profile_submission_error(snapshot: dict) -> str | None:
         "cannot create your account due to the terms",
         "cannot create your account because of the terms of use.",
         "cannot create your account because of the terms",
+        "this email is not supported.",
+        "this email is not supported",
+        "email address is not supported.",
+        "email address is not supported",
+        "email is not supported",
+        "email domain is not supported.",
+        "email domain is not supported",
+        "unsupported email.",
+        "unsupported email",
+        "email not supported",
+        "email is unsupported",
+        "email isn't supported",
     )
     lowered = text.lower()
     for marker in markers:
@@ -2361,77 +2278,35 @@ def _check_manual_stop() -> None:
         return
 
 
-def run_roxy_registration(
-    email: str | None,
-    name: str,
-    birthday: str,
-    proxy: str = None,
-    otp_code: str = None,
-    batch_dir: Path | None = None,
-    on_email_acquired: Callable[[str], None] | None = None,
-) -> dict:
+def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = None, otp_code: str = None, batch_dir: Path | None = None) -> dict:
     """Roxy 指纹浏览器自动化注册入口。"""
     client = RoxyBrowserClient()
-    opened = client.open_profile(proxy=proxy)
+    opened = None
     driver = None
     create_acknowledged = False
     openai_password: str | None = None
-    traffic_tracker: SeleniumTrafficTracker | None = None
-    data_saver: BrowserDataSaver | None = None
-    asset_cache: RoxyLocalAssetCache | None = None
-    asset_cache_snapshot: dict | None = None
-    network_traffic: dict | None = None
-
-    def _merge_proxy_transport_traffic() -> None:
-        """用代理链全量计数补正仅覆盖当前页面 target 的 CDP 统计。"""
-        nonlocal network_traffic
-        transport = client.proxy_transport_snapshot()
-        if not transport or not transport.get("available"):
-            return
-        if not isinstance(network_traffic, dict):
-            network_traffic = {}
-        browser_total = int(network_traffic.get("total_bytes") or 0)
-        transport_total = int(transport.get("total_bytes") or 0)
-        network_traffic["browser_observed_upload_bytes"] = int(network_traffic.get("upload_bytes") or 0)
-        network_traffic["browser_observed_download_bytes"] = int(network_traffic.get("download_bytes") or 0)
-        network_traffic["browser_observed_total_bytes"] = browser_total
-        network_traffic["proxy_transport"] = dict(transport)
-        network_traffic["upload_bytes"] = int(transport.get("upload_bytes") or 0)
-        network_traffic["download_bytes"] = int(transport.get("download_bytes") or 0)
-        network_traffic["total_bytes"] = transport_total
-        network_traffic["measurement_scope"] = "proxy_chain_all_roxy_targets"
-        if browser_total > 0 and transport_total > browser_total * 1.2:
-            logger.warning(
-                "[Roxy] CDP 当前页面统计 %.2f MiB，代理链全浏览器实际 %.2f MiB（%.2fx）；"
-                "差额来自启动阶段、扩展/Service Worker 或其他 target",
-                browser_total / 1024 / 1024,
-                transport_total / 1024 / 1024,
-                transport_total / browser_total,
-            )
-
-    def _traffic_checkpoint() -> None:
-        if traffic_tracker is not None:
-            try:
-                traffic_tracker.checkpoint()
-            except Exception as exc:
-                logger.debug("[Roxy注册] 刷新浏览器流量统计失败：%s", exc)
-
+    network_identity: dict | None = None
+    tunnel = getattr(proxy, "tunnel", None)
+    if tunnel is not None:
+        network_identity = {
+            **tunnel.network_identity(),
+            "profile_id": None,
+            "verified": False,
+        }
     try:
+        opened = client.open_profile(proxy=proxy, stop_check=_check_manual_stop)
+        if tunnel is not None:
+            pool = getattr(tunnel, "pool", None)
+            if pool is not None:
+                pool.bind_profile(tunnel, opened.profile_id)
+            from core.registration_network_identity import network_identity_for_tunnel
+
+            network_identity = network_identity_for_tunnel(tunnel, opened.profile_id)
         driver = _build_driver(opened)
-        try:
-            asset_cache = RoxyLocalAssetCache(opened.debugger_address, label="Roxy").start()
-        except Exception as exc:
-            logger.warning("[Roxy注册] 初始化本地静态资源缓存失败，继续联网加载：%s: %s", type(exc).__name__, str(exc)[:180])
-        try:
-            traffic_tracker = SeleniumTrafficTracker(driver, label="Roxy")
-        except Exception as exc:
-            # 统计失败不应影响注册主流程。
-            logger.warning("[Roxy注册] 初始化浏览器流量统计失败，继续注册：%s: %s", type(exc).__name__, str(exc)[:180])
-        data_saver = BrowserDataSaver(label="Roxy")
-        if traffic_tracker is not None:
-            traffic_tracker.attach_data_saver(data_saver)
-            traffic_tracker.attach_local_asset_cache(asset_cache)
-        data_saver.install_selenium(driver)
+        if network_identity is not None:
+            from core.registration_network_identity import verify_profile_network_identity
+
+            network_identity = verify_profile_network_identity(driver, network_identity)
         _center_browser_window(driver)
         driver.set_page_load_timeout(int(_cfg.ROXY_SELENIUM_TIMEOUT))
         try:
@@ -2449,7 +2324,6 @@ def run_roxy_registration(
             attempts=2,
             accept_hosts=("chatgpt.com", "auth.openai.com"),
         )
-        _traffic_checkpoint()
         human_delay("navigate")
         _page_warmup(driver, reason="login_page")
         logger.info("[Roxy注册] 登录页加载完成，准备填写邮箱")
@@ -2458,21 +2332,7 @@ def run_roxy_registration(
 
         # 填邮箱。OpenAI UI 会随出口 IP/语言变化；这里只按 DOM 技术属性找邮箱入口，
         # 并排除 Google/Apple/Microsoft 等第三方入口，不依赖按钮可见文字。
-        def _email_supplier_after_input() -> str:
-            nonlocal email
-            _check_manual_stop()
-            email = acquire_email_after_input(email)
-            if on_email_acquired:
-                on_email_acquired(email)
-            return email
-
-        next_state = _submit_email_and_wait_next(
-            driver,
-            email,
-            attempts=3,
-            email_supplier=_email_supplier_after_input,
-        )
-        _traffic_checkpoint()
+        next_state = _submit_email_and_wait_next(driver, email, attempts=3)
         _check_manual_stop()
 
         # Luôn luôn force password: dù next_state là "otp" hay password, đều phải tạo password.
@@ -2486,81 +2346,18 @@ def run_roxy_registration(
             create_acknowledged = True
         _check_manual_stop()
 
-        # 防御性校验：任何密码页处理分支都不得把仍停留在密码路由的页面交给
-        # OTP 输入逻辑，否则只会刷新密码页并报告“找不到 OTP 输入框”。
-        if _is_signup_password_page(driver):
-            raise RuntimeError(
-                f"密码页处理结束后仍停留在注册密码页: "
-                f"url={getattr(driver, 'current_url', '')} state={_password_page_state(driver)}"
-            )
-
-        current_otp = otp_code
-        max_otp_attempts = 3
-        for otp_attempt in range(1, max_otp_attempts + 1):
-            if current_otp is None:
-                logger.info("[Roxy注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
-                try:
-                    current_otp = wait_for_otp(email, after_ts=otp_after_ts)
-                except Exception as exc:
-                    if otp_attempt >= max_otp_attempts:
-                        raise
-                    # 兜底：OpenAI 重发验证码时常常是同一封邮件（时间戳不变），
-                    # after_ts 过滤会把它当成旧邮件忽略。先宽松取最新一条验证码，
-                    # 取到就直接用它重试提交，避免误点“重新发送”后死等。
-                    fallback_otp = None
-                    try:
-                        fallback_otp = wait_for_otp(email, after_ts=0.0, max_wait=15, poll_interval=3)
-                    except Exception:
-                        fallback_otp = None
-                    if fallback_otp:
-                        logger.info(
-                            "[Roxy注册][OTP] 取码接口超时但宽松取到最新验证码，直接重试提交：%s (fallback)",
-                            fallback_otp,
-                        )
-                        current_otp = fallback_otp
-                        continue
-                    logger.warning(
-                        "[Roxy注册][OTP] 一直未收到验证码，点击“重新发送电子邮件”后继续等待（下一轮 %s/%s）：%s: %s",
-                        otp_attempt + 1,
-                        max_otp_attempts,
-                        type(exc).__name__,
-                        str(exc)[:180],
-                    )
-                    otp_after_ts = time.time()
-                    _click_resend_email_otp(driver, timeout=25)
-                    human_delay("api")
-                    current_otp = None
-                    continue
-            logger.info("[Roxy注册][OTP] 收到验证码：%s", current_otp)
-            _clear_otp_inputs(driver)
-            _type_otp(driver, current_otp)
-            logger.info("[Roxy注册][OTP] 已填写邮箱验证码")
-            _check_manual_stop()
-            human_delay("otp_input")
-            try:
-                _click_continue(driver)
-                logger.info("[Roxy注册][OTP] 已提交邮箱验证码，等待资料页或登录态")
-            except Exception as exc:
-                logger.info("[Roxy注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
-
-            outcome = _wait_after_email_otp_submit(driver, timeout=30)
-            _traffic_checkpoint()
-            if outcome == 'accepted':
-                break
-            if otp_attempt >= max_otp_attempts:
-                raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
-            logger.warning("[Roxy注册][OTP] 验证码错误/过期，准备重新发送并重新获取验证码（%s/%s）", otp_attempt + 1, max_otp_attempts)
-            otp_after_ts = time.time()
-            _click_resend_email_otp(driver, timeout=25)
-            _traffic_checkpoint()
-            human_delay("api")
-            current_otp = None
+        _complete_email_otp(
+            driver,
+            email,
+            otp_after_ts=otp_after_ts,
+            otp_code=otp_code,
+            max_attempts=3,
+        )
 
         # about-you / profile 信息页：必须完成或确认已有登录态，不能静默跳过。
         logger.info("[Roxy注册] 开始等待资料页/登录态")
         _check_manual_stop()
         profile_submitted = _complete_profile_page(driver, name, birthday, timeout=60)
-        _traffic_checkpoint()
         if profile_submitted:
             create_acknowledged = True
             # 给 OAuth 回调 / session cookie 写入一点时间。
@@ -2569,38 +2366,55 @@ def run_roxy_registration(
         logger.info("[Roxy注册] 等待 ChatGPT 跳转并写入 session/accessToken")
         _check_manual_stop()
         session_info = _fetch_chatgpt_session(driver, timeout=120)
-        _traffic_checkpoint()
         access_token = session_info["accessToken"]
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
         _check_manual_stop()
-        # 已拿到 accessToken 后不再需要 ChatGPT 应用壳；Codex 复用当前窗口时保留完整页面。
-        try:
-            from config import codex as _codex_deep_cfg
-            if not bool(getattr(_codex_deep_cfg, "ENABLE_CODEX_AUTO", False)) and data_saver is not None:
-                data_saver.enable_post_auth_deep_mode(driver)
-                # 不需要 Codex 时切到本地空白页，停止 ChatGPT SPA 的轮询、遥测
-                # 和懒加载资源；accessToken 已经在上一步落盘所需数据中取得。
-                try:
-                    driver.get("about:blank")
-                    logger.info("[Roxy注册] 已切换 about:blank，停止注册后的页面后台流量")
-                except Exception as blank_exc:
-                    logger.debug("[Roxy注册] 切换空白页失败，保留深度拦截：%s", blank_exc)
-        except Exception as exc:
-            logger.debug("[Roxy注册] 深度省流量阶段跳过：%s", exc)
+
+        email_source = resolve_email_source(email)
+        checkpoint_extra = {
+            "user": session_info.get("user"),
+            "account": session_info.get("account"),
+            "expires": session_info.get("expires"),
+            "device_id": getattr(driver, "device_id", None),
+            "roxybrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
+            "registration_password": openai_password,
+            "registration_driver": "roxy",
+        }
+        account_id = checkpoint_account_data(
+            email=email,
+            access_token=access_token,
+            email_source=email_source,
+            proxy_used=str(proxy) if proxy else None,
+            extra=checkpoint_extra,
+        )
+        logger.info("[Roxy注册] token 检查点已保存：account_id=%s twofa=pending", account_id)
+        _check_manual_stop()
 
         totp_secret = None
         twofa_status = "disabled"
         twofa_error = None
         if _twofa_cfg.ENABLE_2FA:
-            from core.account_export import setup_2fa_in_page
+            from core.account_export import setup_2fa_for_registration
             try:
-                totp_secret = setup_2fa_in_page(driver, email)
+                human_delay("post_auth", minimum=2.0, maximum=4.0)
+                totp_secret = setup_2fa_for_registration(driver, email)
                 twofa_status = "active"
+                db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
             except Exception as exc:
                 twofa_status = "failed"
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
-                logger.error("[Roxy注册] 2FA 设置失败: %s", twofa_error)
-                raise RuntimeError(f"2FA 设置失败，未保存为成功账号: {twofa_error}") from exc
+                db.update_account_2fa(account_id, status="failed", error=twofa_error)
+                logger.error("[Roxy注册] 2FA 设置失败，账号已保留待重试：%s", twofa_error)
+                return {
+                    "success": False,
+                    "email": email,
+                    "account_id": account_id,
+                    "access_token": access_token,
+                    "totp_secret": None,
+                    "twofa_status": twofa_status,
+                    "twofa_error": twofa_error,
+                    "error": f"2FA 设置失败，账号已保存：{twofa_error}",
+                }
 
         codex_result = {
             "status": "skipped",
@@ -2623,32 +2437,17 @@ def run_roxy_registration(
                     force=True,
                     clear_existing_state=True,
                 )
-                _traffic_checkpoint()
             else:
                 logger.info("[Roxy注册][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
         except Exception as exc:
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
-        # 统计注册浏览器关闭前的完整会话；注册后停留期间的网络请求也计入。
-        post_register_dwell(email, label="Roxy注册")
-        _traffic_checkpoint()
-        if asset_cache is not None:
-            asset_cache_snapshot = asset_cache.stop()
-        if traffic_tracker is not None:
-            network_traffic = traffic_tracker.stop()
-        if asset_cache_snapshot is not None:
-            if not isinstance(network_traffic, dict):
-                network_traffic = {}
-            network_traffic["local_asset_cache"] = asset_cache_snapshot
-        _merge_proxy_transport_traffic()
-        if data_saver is not None:
-            data_saver.stop()
         account_id = save_account_data(
             email=email,
             access_token=access_token,
             totp_secret=totp_secret,
-            email_source=resolve_email_source(email),
-            proxy_used=((opened.raw or {}).get("proxy_pool_target") if opened else None) or proxy or None,
+            email_source=email_source,
+            proxy_used=proxy or None,
             batch_dir=batch_dir,
             extra={
                 "user": session_info.get("user"),
@@ -2659,9 +2458,9 @@ def run_roxy_registration(
                 "twofa_status": twofa_status,
                 "twofa_error": twofa_error,
                 "codex": codex_result,
-                "network_traffic": network_traffic,
             },
         )
+        post_register_dwell(email, label="Roxy注册")
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
         return {
             "success": bool(codex_ok),
@@ -2672,23 +2471,10 @@ def run_roxy_registration(
             "twofa_status": twofa_status,
             "twofa_error": twofa_error,
             "codex": codex_result,
-            "network_traffic": network_traffic,
+            "network_identity": network_identity,
             "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
         }
     except Exception as exc:
-        if asset_cache is not None and asset_cache_snapshot is None:
-            try:
-                asset_cache_snapshot = asset_cache.stop()
-            except Exception:
-                pass
-        if traffic_tracker is not None:
-            try:
-                network_traffic = traffic_tracker.stop()
-            except Exception:
-                pass
-        _merge_proxy_transport_traffic()
-        if data_saver is not None:
-            data_saver.stop()
         logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, exc)
         logger.debug("[Roxy注册] 失败详情", exc_info=True)
         # 未确认创建前回收邮箱；已提交密码或已撞到登录密码页时避免重复使用。
@@ -2717,26 +2503,14 @@ def run_roxy_registration(
         return {
             "success": False,
             "email": email,
-            "network_traffic": network_traffic,
+            "network_identity": network_identity,
             "error": f"{type(exc).__name__}: {str(exc)[:300]}",
         }
     finally:
-        if asset_cache is not None:
-            try:
-                asset_cache.stop()
-            except Exception:
-                pass
-        if traffic_tracker is not None:
-            try:
-                traffic_tracker.stop()
-            except Exception:
-                pass
-        if data_saver is not None:
-            data_saver.stop()
         if driver and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN):
             try:
                 driver.quit()
             except Exception:
                 pass
-        if not bool(_cfg.ROXY_KEEP_BROWSER_OPEN):
+        if opened is not None and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN):
             client.cleanup_profile(opened)

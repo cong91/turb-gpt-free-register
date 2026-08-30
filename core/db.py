@@ -2,8 +2,8 @@
 """
 SQLite 持久化层。
 
-迁移完成后，运行时数据全部存储在根目录 `app_state.sqlite3`；旧 JSON/TXT/Codex
-文件不再作为运行时输入。临时测试路径仍保留旧文件布局以隔离 fixture。
+运行时数据全部存储在根目录 `turb.sqlite3`；旧 JSON/TXT/Codex 文件不再作为
+运行时输入。临时测试路径仍保留旧文件布局以隔离 fixture。
 """
 import hashlib
 import json
@@ -42,12 +42,22 @@ _CODEX_DIR = _PROJECT_ROOT / "codex_accounts"
 _CODEX_AGENT_DIR = _PROJECT_ROOT / "codex_agent_accounts"
 # 仅供一次性迁移旧导出状态，运行期间不再读取该文件。
 _LEGACY_CODEX_EXPORT_STATE = _PROJECT_ROOT / "codex_导出状态.json"
-# SQLite 是运行时唯一业务数据主存储；中央路径由 app_state_db 动态提供。
-_SQLITE_PATH = app_state_db.APP_STATE_DB_PATH
-_LEGACY_SQLITE_PATH = _PROJECT_ROOT / "turb.sqlite3"
-_DEFAULT_APP_STATE_DB_PATH = app_state_db.APP_STATE_DB_PATH
+# SQLite 是运行时唯一业务数据主存储；fork-added provider state 也写入这里。
+_SQLITE_PATH = _PROJECT_ROOT / "turb.sqlite3"
 _SQLITE_LOCK = threading.RLock()
 _SQLITE_READY = False
+_VIEWER_DEBOUNCE_SECONDS = 3.0
+_VIEWER_REFRESH_LOCK = threading.Lock()
+_VIEWER_REFRESH_TIMER: threading.Timer | None = None
+_VIEWER_REFRESH_REASON = ""
+_REQUIRED_SQLITE_TABLES = frozenset({
+    "accounts",
+    "email_pool",
+    "registration_jobs",
+    "codex_accounts",
+    "codex_agent_accounts",
+    "storage_meta",
+})
 _TABLES = {
     "accounts": "accounts",
     "outlook": "email_pool",
@@ -67,10 +77,11 @@ _LEGACY_OUTLOOK_JSON = _LEGACY_DATA_DIR / "outlook_accounts.json"
 _LEGACY_ACCOUNTS_JSON = _LEGACY_DATA_DIR / "registered_accounts.json"
 _LEGACY_JOBS_JSON = _LEGACY_DATA_DIR / "registration_jobs.json"
 _LOCK = threading.RLock()
-_DEFAULT_SQLITE_PATH = _LEGACY_SQLITE_PATH
+_DEFAULT_SQLITE_PATH = _SQLITE_PATH
 _DEFAULT_ACCOUNTS_JSON = _ACCOUNTS_JSON
 _DEFAULT_OUTLOOK_JSON = _OUTLOOK_JSON
 _DEFAULT_JOBS_JSON = _JOBS_JSON
+_DEFAULT_VIEWER_HTML = _VIEWER_HTML
 _SQLITE_READY_PATH: Path | None = None
 
 
@@ -89,26 +100,6 @@ def _sqlite_conn() -> sqlite3.Connection:
     return app_state_db.connect(_active_sqlite_path(), busy_timeout_ms=30000)
 
 
-def _central_cutover_ready() -> bool:
-    """Return whether the validated unified target has been promoted."""
-    central_path = Path(app_state_db.APP_STATE_DB_PATH)
-    if central_path.resolve() != _DEFAULT_APP_STATE_DB_PATH.resolve():
-        return True
-    if not central_path.is_file():
-        return False
-    try:
-        with closing(sqlite3.connect(f"file:{central_path.resolve().as_posix()}?mode=ro", uri=True)) as connection:
-            return (
-                connection.execute(
-                    "SELECT 1 FROM app_state_migrations WHERE migration_key=? LIMIT 1",
-                    ("migration:application_state:1",),
-                ).fetchone()
-                is not None
-            )
-    except sqlite3.Error:
-        return False
-
-
 def _active_sqlite_path() -> Path:
     """测试替换旧 JSON 路径时使用同目录数据库，避免污染正式库。"""
     for configured_path, default_path in (
@@ -118,9 +109,24 @@ def _active_sqlite_path() -> Path:
     ):
         if configured_path != default_path:
             return configured_path.parent / "turb.sqlite3"
-    if _central_cutover_ready():
-        return Path(app_state_db.APP_STATE_DB_PATH)
-    return _LEGACY_SQLITE_PATH
+    return _DEFAULT_SQLITE_PATH
+
+
+def _sqlite_schema_ready(path: Path) -> bool:
+    """Validate the core tables before trusting the process-local ready flag."""
+    if not path.is_file():
+        return False
+    try:
+        with closing(sqlite3.connect(str(path), timeout=30)) as conn:
+            tables = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        return _REQUIRED_SQLITE_TABLES.issubset(tables)
+    except sqlite3.Error:
+        return False
 
 
 def _read_legacy_sqlite_collection(collection: str) -> list[dict] | None:
@@ -142,16 +148,15 @@ def _ensure_sqlite() -> None:
     """Ensure core tables exist without importing central exports after cutover."""
     global _SQLITE_READY, _SQLITE_READY_PATH
     active_path = _active_sqlite_path()
-    if _SQLITE_READY and _SQLITE_READY_PATH == active_path:
+    if _SQLITE_READY and _SQLITE_READY_PATH == active_path and _sqlite_schema_ready(active_path):
         return
     with _SQLITE_LOCK:
         active_path = _active_sqlite_path()
-        if _SQLITE_READY and _SQLITE_READY_PATH == active_path:
+        if _SQLITE_READY and _SQLITE_READY_PATH == active_path and _sqlite_schema_ready(active_path):
             return
         conn = _sqlite_conn()
-        central_path = app_state_db.is_app_state_path(active_path)
-        if central_path:
-            app_state_db.ensure_schema(conn)
+        canonical_path = app_state_db.is_app_state_path(active_path)
+        app_state_db.ensure_schema(conn)
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER NOT NULL,
@@ -199,7 +204,7 @@ def _ensure_sqlite() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_created ON codex_accounts(created_at DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_email ON codex_agent_accounts(email COLLATE NOCASE)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_agent_accounts_updated ON codex_agent_accounts(updated_at DESC)")
-        migration_done = central_path or conn.execute(
+        migration_done = canonical_path or conn.execute(
             "SELECT 1 FROM storage_meta WHERE key='legacy_import_completed' LIMIT 1"
         ).fetchone()
         # 迁移标记写入 SQLite，而不是依赖“表是否为空”。这样用户删除全部数据后，
@@ -588,16 +593,7 @@ def _ensure_password_in_material_line(base: str, password: str) -> str:
 
 
 def _account_line(row: dict) -> str:
-    base = row.get("original_email_line") or row.get("email") or ""
-    email_password = str(row.get("password") or "").strip()
-    base = _ensure_password_in_material_line(base, email_password)
-    token = row.get("access_token") or ""
-    gpt_password = _extract_registration_password(row) or "未设置"
-    totp = row.get("totp_secret") or ""
-    parts = [base, token, gpt_password]
-    if totp:
-        parts.append(totp)
-    return "----".join(parts)
+    return account_line(row, "modern")
 
 
 def _gmail_api_url_email_line(row: dict) -> str:
@@ -1037,6 +1033,8 @@ def _run_debounced_static_viewer_refresh() -> None:
 def _schedule_static_viewer_refresh(reason: str = "") -> None:
     """防抖刷新静态查看页：短时间内多次保存只生成一次 HTML。"""
     global _VIEWER_REFRESH_TIMER, _VIEWER_REFRESH_REASON
+    if _ACCOUNTS_JSON != _DEFAULT_ACCOUNTS_JSON or _VIEWER_HTML != _DEFAULT_VIEWER_HTML:
+        return
     with _VIEWER_REFRESH_LOCK:
         _VIEWER_REFRESH_REASON = reason or _VIEWER_REFRESH_REASON
         if _VIEWER_REFRESH_TIMER is not None:
@@ -1086,6 +1084,10 @@ def _save_accounts(rows: list[dict]) -> None:
     for row in rows:
         row["copy_line"] = _account_line(row)
     _save_collection("accounts", rows)
+    _write_json(_ACCOUNTS_JSON, rows)
+    _sync_accounts_txt(rows)
+    _sync_tokens_txt(rows)
+    _schedule_static_viewer_refresh("save_accounts")
 
 
 def _load_jobs() -> list[dict]:

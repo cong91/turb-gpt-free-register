@@ -154,7 +154,7 @@ class AuditTests(unittest.TestCase):
             report = audit_databases(app_state, turb)
             rendered = json.dumps(report, ensure_ascii=False, sort_keys=True)
 
-            self.assertEqual(report["format_version"], 1)
+            self.assertEqual(report["format_version"], 2)
             self.assertEqual(report["sources"]["app_state"]["tables"]["provider_state"]["row_count"], 1)
             self.assertEqual(report["sources"]["turb"]["tables"]["provider_state"]["row_count"], 1)
             self.assertRegex(
@@ -171,7 +171,7 @@ class MigrationTests(unittest.TestCase):
             root = Path(tmp)
             app_state = root / "app_state.sqlite3"
             turb = root / "turb.sqlite3"
-            target = root / "app_state.migrated.sqlite3"
+            target = root / "turb.migrated.sqlite3"
             backup_dir = root / "backups"
             _create_migration_sources(app_state, turb)
             app_hash = _file_sha256(app_state)
@@ -181,6 +181,8 @@ class MigrationTests(unittest.TestCase):
 
             self.assertEqual(report["action"], "migrate")
             self.assertEqual(report["validation"]["integrity_check"], "ok")
+            self.assertEqual(report["metadata_verification"]["origin_authority"], "turb")
+            self.assertGreater(report["table_merge"]["provider_state"]["inserted"], 0)
             self.assertEqual(_file_sha256(app_state), app_hash)
             self.assertEqual(_file_sha256(turb), turb_hash)
             self.assertTrue((backup_dir / "app_state.snapshot.sqlite3").is_file())
@@ -201,15 +203,21 @@ class MigrationTests(unittest.TestCase):
                             (table,),
                         ).fetchone()
                     )
-                self.assertIsNone(
+                self.assertIsNotNone(
                     connection.execute(
                         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ignored_runtime_table'"
                     ).fetchone()
                 )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT payload FROM ignored_runtime_table WHERE id=6"
+                    ).fetchone()[0],
+                    "must-not-copy",
+                )
                 self.assertRegex(
                     connection.execute(
                         "SELECT applied_at FROM app_state_migrations WHERE migration_key=?",
-                        ("migration:application_state:1",),
+                        ("migration:fork_state_into_turb:1",),
                     ).fetchone()[0],
                     r"^20\d\d-",
                 )
@@ -230,6 +238,57 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(report["action"], "dry-run")
             self.assertFalse(target.exists())
             self.assertFalse(backup_dir.exists())
+
+    def test_fork_foreign_key_tables_merge_parent_before_child(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app_state = root / "app_state.sqlite3"
+            turb = root / "turb.sqlite3"
+            target = root / "target.sqlite3"
+            backup_dir = root / "backups"
+
+            app_connection = sqlite3.connect(app_state)
+            try:
+                app_connection.executescript(
+                    """
+                    CREATE TABLE child_state (
+                        child_id INTEGER PRIMARY KEY,
+                        parent_id INTEGER NOT NULL,
+                        FOREIGN KEY(parent_id) REFERENCES parent_state(parent_id)
+                    );
+                    CREATE TABLE parent_state (
+                        parent_id INTEGER PRIMARY KEY,
+                        payload TEXT NOT NULL
+                    );
+                    INSERT INTO parent_state(parent_id, payload) VALUES (7, 'parent');
+                    INSERT INTO child_state(child_id, parent_id) VALUES (8, 7);
+                    """
+                )
+                app_connection.commit()
+            finally:
+                app_connection.close()
+
+            turb_connection = sqlite3.connect(turb)
+            try:
+                turb_connection.execute(
+                    "CREATE TABLE origin_state (state_id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+                )
+                turb_connection.execute(
+                    "INSERT INTO origin_state(state_id, payload) VALUES (1, 'origin')"
+                )
+                turb_connection.commit()
+            finally:
+                turb_connection.close()
+
+            report = migrate_databases(app_state, turb, target, backup_dir)
+
+            self.assertEqual(report["validation"]["foreign_key_errors"], [])
+            connection = sqlite3.connect(target)
+            try:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM parent_state").fetchone()[0], 1)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM child_state").fetchone()[0], 1)
+            finally:
+                connection.close()
 
     def test_identical_duplicate_row_is_skipped(self):
         with tempfile.TemporaryDirectory() as tmp:

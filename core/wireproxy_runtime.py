@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Resolve or install the pinned wireproxy runtime on Windows.
+"""Resolve or install the pinned wireproxy runtime on Windows/Linux.
 
 The downloaded archive is pinned to a release and SHA-256 checksum. Runtime
 artifacts live under ``data/tools`` (already gitignored) and are never committed.
@@ -22,14 +22,22 @@ _RELEASE_BASE = f"https://github.com/windtf/wireproxy/releases/download/{_VERSIO
 _MAX_DOWNLOAD_BYTES = 32 * 1024 * 1024
 _INSTALL_ROOT = Path(__file__).resolve().parent.parent / "data" / "tools" / "wireproxy"
 _ASSETS = {
-    "amd64": (
-        "wireproxy_windows_amd64.tar.gz",
-        "bce041ea9fe0f8a3351301dcbe29cdf6a523bb25cf9c62f17ebb5699a8051d0f",
-    ),
-    "386": (
-        "wireproxy_windows_386.tar.gz",
-        "512bd0b724ef50125f00b6d7e978009caa359066ab7f777ae473f734278f326e",
-    ),
+    "Windows": {
+        "amd64": (
+            "wireproxy_windows_amd64.tar.gz",
+            "bce041ea9fe0f8a3351301dcbe29cdf6a523bb25cf9c62f17ebb5699a8051d0f",
+        ),
+        "386": (
+            "wireproxy_windows_386.tar.gz",
+            "512bd0b724ef50125f00b6d7e978009caa359066ab7f777ae473f734278f326e",
+        ),
+    },
+    "Linux": {
+        "amd64": (
+            "wireproxy_linux_amd64.tar.gz",
+            "e88c1d090740373fc606c1bafd81d9a5eadc642cce5667616e20e9d7a444f51c",
+        ),
+    },
 }
 _INSTALL_LOCK = threading.Lock()
 
@@ -51,8 +59,21 @@ def _architecture() -> str:
     if machine in ("x86", "i386", "i686"):
         return "386"
     raise WireproxyRuntimeError(
-        f"wireproxy tự động cài đặt chưa hỗ trợ kiến trúc Windows {machine!r}"
+        f"wireproxy tự động cài đặt chưa hỗ trợ kiến trúc {machine!r}"
     )
+
+
+def _platform_name() -> str:
+    system = platform.system()
+    if system not in _ASSETS:
+        raise WireproxyRuntimeError(
+            f"wireproxy tự động cài đặt chưa hỗ trợ hệ điều hành {system!r}"
+        )
+    return system
+
+
+def _executable_name(system: str | None = None) -> str:
+    return "wireproxy.exe" if (system or platform.system()) == "Windows" else "wireproxy"
 
 
 def _sha256_bytes(value: bytes) -> str:
@@ -95,36 +116,46 @@ def _download_archive(url: str, expected_sha256: str) -> bytes:
     return archive
 
 
-def _extract_executable(archive: bytes) -> bytes:
+def _extract_executable(archive: bytes, executable_name: str | None = None) -> bytes:
+    executable_name = executable_name or _executable_name()
     try:
         with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
             member = next(
                 (
                     item
                     for item in bundle.getmembers()
-                    if item.isfile() and Path(item.name).name.lower() == "wireproxy.exe"
+                    if item.isfile() and Path(item.name).name.lower() == executable_name.lower()
                 ),
                 None,
             )
             if member is None:
-                raise WireproxyRuntimeError("wireproxy archive không chứa wireproxy.exe")
+                raise WireproxyRuntimeError(
+                    f"wireproxy archive không chứa {executable_name}"
+                )
             if member.size <= 0 or member.size > _MAX_DOWNLOAD_BYTES:
                 raise WireproxyRuntimeError(
-                    f"wireproxy.exe có kích thước không hợp lệ: {member.size}"
+                    f"{executable_name} có kích thước không hợp lệ: {member.size}"
                 )
             source = bundle.extractfile(member)
             if source is None:
-                raise WireproxyRuntimeError("không thể đọc wireproxy.exe từ archive")
+                raise WireproxyRuntimeError(
+                    f"không thể đọc {executable_name} từ archive"
+                )
             executable = source.read(_MAX_DOWNLOAD_BYTES + 1)
     except (tarfile.TarError, OSError) as exc:
         raise WireproxyRuntimeError(f"wireproxy archive không hợp lệ: {exc}") from exc
     if len(executable) > _MAX_DOWNLOAD_BYTES:
-        raise WireproxyRuntimeError("wireproxy.exe vượt giới hạn kích thước")
+        raise WireproxyRuntimeError(f"{executable_name} vượt giới hạn kích thước")
     return executable
 
 
-def _owned_install(install_dir: Path, asset_name: str, archive_sha256: str) -> Path | None:
-    executable = install_dir / "wireproxy.exe"
+def _owned_install(
+    install_dir: Path,
+    asset_name: str,
+    archive_sha256: str,
+    executable_name: str | None = None,
+) -> Path | None:
+    executable = install_dir / (executable_name or _executable_name())
     manifest_path = install_dir / "manifest.json"
     if not executable.exists() and not manifest_path.exists():
         return None
@@ -151,7 +182,7 @@ def _owned_install(install_dir: Path, asset_name: str, archive_sha256: str) -> P
     executable_sha256 = str(manifest.get("executable_sha256") or "")
     if not executable_sha256 or _sha256_file(executable) != executable_sha256:
         raise WireproxyRuntimeError(
-            f"wireproxy.exe hiện có không khớp manifest, từ chối ghi đè: {executable}"
+            f"wireproxy executable hiện có không khớp manifest, từ chối ghi đè: {executable}"
         )
     return executable
 
@@ -174,16 +205,21 @@ def _atomic_write(path: Path, content: bytes) -> None:
 
 
 def _install_pinned_release() -> Path:
-    if platform.system() != "Windows":
-        raise WireproxyRuntimeError(
-            "wireproxy tự động cài đặt hiện chỉ hỗ trợ Windows; hãy cấu hình đường dẫn binary thủ công"
-        )
+    system = _platform_name()
     architecture = _architecture()
-    asset_name, archive_sha256 = _ASSETS[architecture]
-    install_dir = _INSTALL_ROOT / _VERSION / architecture
+    asset_name, archive_sha256 = _ASSETS[system][architecture]
+    executable_name = _executable_name(system)
+    install_dir = _INSTALL_ROOT / _VERSION / (
+        architecture if system == "Windows" else f"linux-{architecture}"
+    )
 
     with _INSTALL_LOCK:
-        existing = _owned_install(install_dir, asset_name, archive_sha256)
+        existing = _owned_install(
+            install_dir,
+            asset_name,
+            archive_sha256,
+            executable_name,
+        )
         if existing is not None:
             return existing
 
@@ -191,8 +227,8 @@ def _install_pinned_release() -> Path:
             f"{_RELEASE_BASE}/{asset_name}",
             archive_sha256,
         )
-        executable = _extract_executable(archive)
-        executable_path = install_dir / "wireproxy.exe"
+        executable = _extract_executable(archive, executable_name)
+        executable_path = install_dir / executable_name
         manifest_path = install_dir / "manifest.json"
         if executable_path.exists() or manifest_path.exists():
             raise WireproxyRuntimeError(
@@ -221,12 +257,12 @@ def _install_pinned_release() -> Path:
 
 
 def resolve_wireproxy_executable(configured: str | None = None) -> str:
-    """Resolve a configured executable or install the pinned Windows release."""
+    """Resolve a configured executable or install the pinned native release."""
     value = str(
         configured
         if configured is not None
-        else _cfg_attr("NORDVPN_WG_WIREPROXY_EXE", "wireproxy.exe")
-    ).strip() or "wireproxy.exe"
+        else _cfg_attr("NORDVPN_WG_WIREPROXY_EXE", "wireproxy")
+    ).strip() or "wireproxy"
     expanded = Path(os.path.expandvars(value)).expanduser()
     explicit_path = expanded.is_absolute() or expanded.parent != Path(".")
     if explicit_path:
