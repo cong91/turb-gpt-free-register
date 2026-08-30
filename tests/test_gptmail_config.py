@@ -19,4 +19,4 @@ class GPTMailConfigTests(unittest.TestCase):
         field = next(item for item in EDITABLE_FIELDS if item["key"] == "GPTMAIL_API_KEY")
         self.assertEqual(field["group"], "邮箱 / OTP")
         self.assertTrue(field["secret"])
-        self.assertEqual(field["storage"], "env")
+        self.assertEqual(field["storage"], "sqlite")

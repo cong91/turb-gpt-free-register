@@ -78,7 +78,7 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
 
     def test_tinyhost_config_fields_are_exposed(self):
         fields = {item["key"]: item for item in config_editor.EDITABLE_FIELDS}
-        self.assertEqual(fields["TINYHOST_API_BASE"]["storage"], "env")
+        self.assertEqual(fields["TINYHOST_API_BASE"]["storage"], "sqlite")
         self.assertEqual(fields["TINYHOST_REQUEST_TIMEOUT"]["type"], "int")
         self.assertEqual(fields["TINYHOST_RANDOM_LOCAL_LENGTH"]["type"], "int")
 

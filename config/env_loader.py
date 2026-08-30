@@ -4,12 +4,11 @@
 设计目标：
   - 重要 API Key 不进 git 跟踪的 config/*.py 默认值
   - config 模块启动 / reload 时读取环境变量
-  - WebUI 可读写 .env 中的密钥字段
+  - WebUI 可读写 canonical SQLite 中的 runtime settings
 """
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -17,6 +16,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # The default remains the repository-root .env for local development.
 _ENV_PATH = Path(os.getenv("TURB_ENV_FILE", str(_PROJECT_ROOT / ".env"))).expanduser()
 _LOADED = False
+_PROCESS_ENV_KEYS = frozenset(os.environ)
+RUNTIME_SETTINGS_DOCUMENT_KEY = "runtime_config"
 
 # 这些多行列表字段允许用空值显式覆盖为 []。
 # 例如 WebUI 清空代理池后会写入 PROXY_POOL="" / PROXY_POOL="[]"，不能再回退到源码默认本地代理。
@@ -56,6 +57,30 @@ def env_path() -> Path:
     return _ENV_PATH
 
 
+def read_runtime_settings() -> dict[str, str]:
+    """Read WebUI-managed settings from the canonical ``turb.sqlite3`` file."""
+    from core import app_state_db
+
+    stored = app_state_db.get_named_document(RUNTIME_SETTINGS_DOCUMENT_KEY, {})
+    if not isinstance(stored, dict):
+        return {}
+    return {
+        str(key): "" if value is None else str(value)
+        for key, value in stored.items()
+        if str(key).strip()
+    }
+
+
+def _write_runtime_settings(updates: dict[str, str]) -> list[str]:
+    """Merge WebUI settings into the canonical SQLite document."""
+    from core import app_state_db
+
+    current = read_runtime_settings()
+    current.update(updates)
+    app_state_db.set_named_document(RUNTIME_SETTINGS_DOCUMENT_KEY, current)
+    return list(updates)
+
+
 def load_env(*, override: bool = False) -> Path:
     """加载项目根 .env 到进程环境。可重复调用（reload 时用 override=True）。
 
@@ -69,14 +94,18 @@ def load_env(*, override: bool = False) -> Path:
             for key, value in read_env_file().items():
                 if override or key not in os.environ:
                     os.environ[key] = value
-        _LOADED = True
-        return _ENV_PATH
-
-    if _ENV_PATH.exists():
-        load_dotenv(dotenv_path=_ENV_PATH, override=override)
     else:
-        # 仍然允许系统环境变量生效
-        load_dotenv(override=override)
+        if _ENV_PATH.exists():
+            load_dotenv(dotenv_path=_ENV_PATH, override=override)
+        else:
+            # 仍然允许系统环境变量生效
+            load_dotenv(override=override)
+
+    # The immutable env file is only bootstrap/fallback input. Settings saved
+    # by WebUI are authoritative and live in the persistent runtime database.
+    for key, value in read_runtime_settings().items():
+        if key not in _PROCESS_ENV_KEYS:
+            os.environ[key] = value
     _LOADED = True
     return _ENV_PATH
 
@@ -92,18 +121,6 @@ def env_str(key: str, default: str = "") -> str:
     if value is None or str(value).strip() == "":
         return default
     return str(value).strip()
-
-
-def _escape_env_value(value: str) -> str:
-    # 统一双引号，避免空格/特殊字符问题
-    escaped = (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "")
-    )
-    return f'"{escaped}"'
 
 
 def read_env_file() -> dict[str, str]:
@@ -132,46 +149,21 @@ def read_env_file() -> dict[str, str]:
 
 
 def write_env_values(updates: dict[str, str]) -> list[str]:
-    """更新 .env 中的若干 key；不存在则追加。返回实际写入的 key 列表。"""
+    """Persist WebUI settings in ``turb.sqlite3`` instead of rewriting ``.env``.
+
+    The historical function name is retained for callers that generate provider
+    credentials. In production ``.env`` is mounted read-only as a bootstrap
+    secret, while the named SQLite document remains writable on the runtime
+    volume.
+    """
     if not updates:
         return []
 
-    existing_lines: list[str] = []
-    if _ENV_PATH.exists():
-        existing_lines = _ENV_PATH.read_text(encoding="utf-8").splitlines()
-
-    remaining = {str(k): ("" if v is None else str(v)) for k, v in updates.items()}
-    written: list[str] = []
-    out_lines: list[str] = []
-    key_re = re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=")
-
-    for line in existing_lines:
-        m = key_re.match(line)
-        if not m:
-            out_lines.append(line)
-            continue
-        key = m.group(1)
-        if key in remaining:
-            out_lines.append(f"{key}={_escape_env_value(remaining.pop(key))}")
-            written.append(key)
-        else:
-            out_lines.append(line)
-
-    if remaining:
-        if out_lines and out_lines[-1].strip():
-            out_lines.append("")
-        out_lines.append("# ---- updated by WebUI / config.env_loader ----")
-        for key, value in remaining.items():
-            out_lines.append(f"{key}={_escape_env_value(value)}")
-            written.append(key)
-
-    text = "\n".join(out_lines).rstrip() + "\n"
-    tmp = _ENV_PATH.with_suffix(".env.tmp")
-    tmp.write_text(text, encoding="utf-8")
-    if _ENV_PATH.exists():
-        # Preserve the operator's restrictive secret-file mode across atomic replacement.
-        tmp.chmod(_ENV_PATH.stat().st_mode & 0o777)
-    tmp.replace(_ENV_PATH)
+    normalized = {
+        str(key): "" if value is None else str(value)
+        for key, value in updates.items()
+    }
+    written = _write_runtime_settings(normalized)
 
     # 让当前进程立刻看到新值
     load_env(override=True)

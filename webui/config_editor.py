@@ -5,9 +5,10 @@
 设计原则：
     1. 白名单：只暴露"运行时安全"的开关/数值/默认值，协议级常量
        （client_id / scope / sentinel 版本等）一律不开放，避免一改就废号。
-    2. 所有 WebUI 可编辑项统一写入项目根 `.env`，不再修改 `config/*.py`。
-    3. `config/*.py` 只保留默认值；运行时通过 config.env_loader 用 `.env` 覆盖。
-    4. 读取时优先 `.env`，缺失时回退解析 `config/*.py` 默认值。
+    2. 所有 WebUI 可编辑项统一写入 `turb.sqlite3`，不再修改 `config/*.py`。
+    3. `.env` / Docker secret 只作为只读 bootstrap；运行时通过
+       config.env_loader 叠加 SQLite 中保存的 settings。
+    4. 读取时优先 SQLite settings，再读 `.env`，最后回退到源码默认值。
 """
 import ast
 import os
@@ -955,6 +956,11 @@ EDITABLE_FIELDS = [
     },
 ]
 
+RUNTIME_SETTINGS_STORAGE = "sqlite"
+for _field in EDITABLE_FIELDS:
+    _field["storage"] = RUNTIME_SETTINGS_STORAGE
+    _field["help"] = str(_field.get("help") or "").replace(".env", "SQLite")
+
 _FIELD_BY_KEY = {f["key"]: f for f in EDITABLE_FIELDS}
 
 
@@ -1097,11 +1103,13 @@ def _coerce_raw_value(raw: str, fallback, vtype: str):
 def get_config() -> list[dict]:
     """返回所有可编辑项的当前值 + 元信息，供前端渲染表单。
 
-    优先读取 `.env` / 环境变量；没有配置时回退到 `config/*.py` 默认值。
+    优先读取 SQLite settings，再读取 `.env` / 环境变量；没有配置时回退到
+    `config/*.py` 默认值。
     """
-    from config.env_loader import load_env, read_env_file
+    from config.env_loader import load_env, read_env_file, read_runtime_settings
     load_env(override=True)
     env_file_values = read_env_file()
+    runtime_values = read_runtime_settings()
 
     out = []
     for field in EDITABLE_FIELDS:
@@ -1110,7 +1118,13 @@ def get_config() -> list[dict]:
         source = path.read_text(encoding="utf-8") if path.exists() else ""
         fallback = _parse_value_from_source(source, key, field["type"])
 
-        if key in env_file_values:
+        if key in runtime_values:
+            raw_env_value = runtime_values[key]
+            if field["type"] == "list_str_multiline" and key in EXPLICIT_EMPTY_LIST_KEYS and str(raw_env_value).strip() == "":
+                value = []
+            else:
+                value = _coerce_raw_value(raw_env_value, fallback, field["type"])
+        elif key in env_file_values:
             raw_env_value = env_file_values[key]
             if field["type"] == "list_str_multiline" and key in EXPLICIT_EMPTY_LIST_KEYS and str(raw_env_value).strip() == "":
                 value = []
@@ -1124,14 +1138,15 @@ def get_config() -> list[dict]:
         if field["type"] in ("str", "list_str_multiline"):
             value = _normalize_config_value(value, field["type"])
         item = dict(field)
-        item["storage"] = "env"
+        item["storage"] = RUNTIME_SETTINGS_STORAGE
+        item["help"] = str(item.get("help") or "").replace(".env", "SQLite")
         item["value"] = value
         out.append(item)
     return out
 
 
 # ============================================================
-# 写：统一写 .env，不修改 config/*.py
+# 写：统一写 canonical SQLite，不修改 config/*.py 或只读 .env
 # ============================================================
 
 
@@ -1166,82 +1181,8 @@ def _normalize_config_value(value, vtype: str):
     return value
 
 
-def _format_literal(value, vtype: str) -> str:
-    """把前端传来的值格式化成 Python 字面量字符串。"""
-    if vtype == "bool":
-        if isinstance(value, str):
-            value = value.strip().lower() in ("true", "1", "yes", "on")
-        return "True" if value else "False"
-    if vtype == "int":
-        return str(int(value))
-    if vtype == "float":
-        return repr(float(value))
-    if vtype == "str":
-        s = str(value)
-        # 用 repr 保证转义安全，但统一成双引号风格
-        return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
-    raise ValueError(f"_format_literal 不支持的类型: {vtype}")
-
-
-def _replace_scalar(source: str, key: str, literal: str) -> str:
-    """替换 `KEY[: 类型] = 旧值` 行的右值，保留行内注释和类型标注。"""
-    pattern = re.compile(
-        rf"^(?P<head>{re.escape(key)}\s*(?::[^=\n]+)?=\s*)"
-        rf"(?P<val>.+?)"
-        rf"(?P<tail>\s*(?:#.*)?)$",
-        re.MULTILINE,
-    )
-    if not pattern.search(source):
-        raise ValueError(f"未在源码中找到可替换的赋值: {key}")
-    return pattern.sub(lambda m: f"{m.group('head')}{literal}{m.group('tail')}", source, count=1)
-
-
-def _replace_proxy_pool(source: str, lines: list[str]) -> str:
-    """整块替换 PROXY_POOL = [ ... ] 列表字面量（保留前面的赋值头）。"""
-    items = [ln.strip() for ln in lines if ln.strip()]
-    if items:
-        body = "\n".join(
-            '    "' + it.replace("\\", "\\\\").replace('"', '\\"') + '",'
-            for it in items
-        )
-        literal = "[\n" + body + "\n]"
-    else:
-        literal = "[]"
-
-    # 匹配 PROXY_POOL = [ ... ]（含跨行），用 AST 定位起止偏移最稳
-    tree = ast.parse(source)
-    for node in tree.body:
-        targets = node.targets if isinstance(node, ast.Assign) else (
-            [node.target] if isinstance(node, ast.AnnAssign) else []
-        )
-        for t in targets:
-            if isinstance(t, ast.Name) and t.id == "PROXY_POOL":
-                src_lines = source.splitlines(keepends=True)
-                start = node.value.lineno          # 值（[）所在行，1-based
-                end = node.value.end_lineno        # 值（]）所在行，1-based
-                col = node.value.col_offset         # [ 在起始行的列偏移
-                # 保留起始行 [ 之前的内容（即 "PROXY_POOL = " 或 "PROXY_POOL: list = "）
-                prefix = src_lines[start - 1][:col]
-                # 保留结束行 ] 之后的内容（行内注释 / 换行）
-                end_line = src_lines[end - 1]
-                suffix = end_line[node.value.end_col_offset:]
-                new_lines = (
-                    src_lines[: start - 1]
-                    + [prefix + literal + suffix]
-                    + src_lines[end:]
-                )
-                return "".join(new_lines)
-    raise ValueError("未找到 PROXY_POOL 赋值")
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
-
-
 def _format_env_value(value, vtype: str) -> str:
-    """把前端值格式化成适合写入 .env 的字符串。"""
+    """把前端值格式化成适合写入 runtime_config 的字符串。"""
     if vtype == "bool":
         if isinstance(value, str):
             value = value.strip().lower() in ("true", "1", "yes", "on", "y")
@@ -1259,7 +1200,7 @@ def _format_env_value(value, vtype: str) -> str:
 
 
 def update_config(updates: dict) -> dict:
-    """批量更新配置。所有 WebUI 可编辑项只写项目根 `.env`。"""
+    """批量更新配置。所有 WebUI 可编辑项只写 canonical SQLite settings。"""
     from config.env_loader import write_env_values, load_env
 
     updated, ignored = [], []
