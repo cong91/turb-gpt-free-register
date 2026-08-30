@@ -1683,6 +1683,7 @@ def _run_browser_use_codex_oauth_once(
     existing_context=None,
     existing_page=None,
     existing_session_info=None,
+    fresh_browser_profile: bool = False,
 ) -> dict:
     from core import codex_oauth as proto
     if not force and not proto._cfg.ENABLE_CODEX_AUTO:
@@ -1712,11 +1713,18 @@ def _run_browser_use_codex_oauth_once(
             from playwright.sync_api import sync_playwright
         except ImportError:
             return proto._codex_result(status="failed", email=email, message="缺少 playwright，请执行 pip install playwright")
-        session_info = (
-            client.open_session(proxy=proxy)
-            if proxy is not None
-            else client.open_session()
-        )
+        if proxy is not None:
+            session_info = (
+                client.open_session(proxy=proxy, fresh_profile=True)
+                if fresh_browser_profile
+                else client.open_session(proxy=proxy)
+            )
+        else:
+            session_info = (
+                client.open_session(fresh_profile=True)
+                if fresh_browser_profile
+                else client.open_session()
+            )
 
     _set_log_provider_label(provider_label)
     _t_all = _StepTimer(f"Codex {provider_label} 全流程")
@@ -1914,6 +1922,7 @@ def _run_browser_use_codex_oauth_impl(
     existing_context=None,
     existing_page=None,
     existing_session_info=None,
+    fresh_browser_profile: bool = False,
 ) -> dict:
     """Browser Use Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
@@ -1939,6 +1948,7 @@ def _run_browser_use_codex_oauth_impl(
             existing_context=existing_context,
             existing_page=existing_page,
             existing_session_info=existing_session_info,
+            fresh_browser_profile=fresh_browser_profile,
         )
         last_result = result
         if result.get("ok"):
@@ -1964,6 +1974,7 @@ def run_browser_use_codex_oauth(
     existing_context=None,
     existing_page=None,
     existing_session_info=None,
+    fresh_browser_profile: bool = False,
 ) -> dict:
     """Browser Use Codex OAuth 入口。
 
@@ -1984,6 +1995,7 @@ def run_browser_use_codex_oauth(
             existing_context=existing_context,
             existing_page=existing_page,
             existing_session_info=existing_session_info,
+            fresh_browser_profile=fresh_browser_profile,
         )
     return _run_browser_use_codex_oauth_impl(
         email=email,
@@ -1996,4 +2008,5 @@ def run_browser_use_codex_oauth(
         existing_context=existing_context,
         existing_page=existing_page,
         existing_session_info=existing_session_info,
+        fresh_browser_profile=fresh_browser_profile,
     )

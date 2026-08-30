@@ -149,7 +149,7 @@ def create_registration_jobs(
     if requested_source == "local_test":
         domains = data.get("local_test_domains")
         if not isinstance(domains, list):
-            return {"ok": False, "error": "Domain test phải được gửi dưới dạng danh sách"}, 400
+            return {"ok": False, "error": "Tên miền kiểm thử phải được gửi dưới dạng danh sách"}, 400
         try:
             aliases = generate_reserved_test_aliases(
                 data.get("local_test_base"),
@@ -163,7 +163,7 @@ def create_registration_jobs(
             "ok": True,
             "submitted": len(jobs),
             "jobs": jobs,
-            "warning": "Local test dry-run: không gọi OpenAI, browser, OTP hoặc email provider.",
+            "warning": "Kiểm thử cục bộ dry-run: không gọi OpenAI, trình duyệt, OTP hoặc nhà cung cấp email.",
             "workers": workers,
         }, 200
 

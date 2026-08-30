@@ -9,6 +9,11 @@ from core import plan_check_service
 
 
 class PlanCheckWorkerLifecycleTests(unittest.TestCase):
+    def setUp(self):
+        self._prepare_proxy = patch.object(plan_check_service, "prepare_rotating_proxy_lanes")
+        self._prepare_proxy.start()
+        self.addCleanup(self._prepare_proxy.stop)
+
     def test_plan_worker_uses_wireguard_when_no_proxy_is_supplied(self):
         payload = {
             "ok": True,
@@ -29,7 +34,7 @@ class PlanCheckWorkerLifecycleTests(unittest.TestCase):
             patch.object(plan_check_service._QUEUE_SLOTS, "release"),
             patch.object(
                 plan_check_service,
-                "_enqueue_auto_codex_for_free_account",
+                "_run_auto_codex_oauth_for_free_account",
                 return_value={"accepted": False, "reason": "disabled"},
             ),
             patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=True),
@@ -88,7 +93,7 @@ class PlanCheckWorkerLifecycleTests(unittest.TestCase):
                 patch.object(plan_check_service.db, "update_account_plan_check"),
                 patch.object(
                     plan_check_service,
-                    "_enqueue_auto_codex_for_free_account",
+                    "_run_auto_codex_oauth_for_free_account",
                     return_value={"accepted": False, "reason": "disabled"},
                 ),
             ):

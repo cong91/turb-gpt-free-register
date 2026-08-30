@@ -5,6 +5,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INDEX_TEMPLATE = PROJECT_ROOT / "webui" / "templates" / "index.html"
 VI_TRANSLATION = PROJECT_ROOT / "webui" / "static" / "vi.js"
+CONFIG_EDITOR = PROJECT_ROOT / "webui" / "config_editor.py"
 
 
 class RegistrationSettingsUiTests(unittest.TestCase):
@@ -38,6 +39,12 @@ class RegistrationSettingsUiTests(unittest.TestCase):
         source = VI_TRANSLATION.read_text(encoding="utf-8")
 
         self.assertIn("'Proxy.vn 代理旋转': 'Proxy xoay Proxy.vn'", source)
+
+    def test_roxy_profile_manager_owner_prefix_has_vietnamese_label(self):
+        source = CONFIG_EDITOR.read_text(encoding="utf-8")
+
+        self.assertIn('"label": "Tiền tố nhận diện"', source)
+        self.assertIn('"help": "Ghi dấu nhận diện của trình quản lý vào remark của Roxy"', source)
 
 
 if __name__ == "__main__":

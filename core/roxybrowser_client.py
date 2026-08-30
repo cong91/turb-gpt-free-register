@@ -541,9 +541,14 @@ class RoxyBrowserClient:
         proxy: str | None = None,
         *,
         stop_check: Callable[[], None] | None = None,
+        fresh_profile: bool = False,
     ) -> RoxyOpenResult:
         one_profile = bool(getattr(_cfg, "ROXY_ONE_PROFILE_PER_ACCOUNT", True))
-        configured_pid = self._normalize_profile_id(profile_id if profile_id is not None else getattr(_cfg, "ROXY_PROFILE_ID", ""))
+        configured_pid = self._normalize_profile_id(
+            ""
+            if fresh_profile
+            else (profile_id if profile_id is not None else getattr(_cfg, "ROXY_PROFILE_ID", ""))
+        )
         if proxy and configured_pid:
             raise RuntimeError(
                 "无法把本轮 NordVPN 代理安全附加到已存在的 Roxy 环境；"

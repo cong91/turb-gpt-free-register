@@ -2918,7 +2918,7 @@ def run_browser_use_registration(
                     )
 
                 def _run_codex_in_current_browser() -> dict:
-                    from core.browser_use_codex_oauth import run_browser_use_codex_oauth
+                    from core.codex_oauth import run_codex_oauth
 
                     logger.info(
                         "[BrowserUse][Codex] 复用当前注册 browser session 执行 Codex OAuth：driver=%s，登录方式=%s",
@@ -2930,12 +2930,12 @@ def run_browser_use_registration(
                         ),
                     )
                     _check_manual_stop()
-                    return run_browser_use_codex_oauth(
+                    return run_codex_oauth(
                         email,
                         otp_provider=wait_for_otp,
                         proxy=proxy,
                         force=True,
-                        cloud_provider=provider_prefix,
+                        oauth_driver=provider_prefix,
                         existing_browser=browser,
                         existing_context=context,
                         existing_page=page,

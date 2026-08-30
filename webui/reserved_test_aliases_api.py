@@ -15,7 +15,7 @@ def reserved_test_alias_preview_payload(data: dict) -> tuple[dict, int]:
 
     domains = data.get("domains")
     if not isinstance(domains, list):
-        return {"ok": False, "error": "Domain test phải được gửi dưới dạng danh sách"}, 400
+        return {"ok": False, "error": "Tên miền kiểm thử phải được gửi dưới dạng danh sách"}, 400
 
     try:
         aliases = generate_reserved_test_aliases(

@@ -6,6 +6,11 @@ from core import account_export, plan_check_service, registration_service
 
 
 class AutoFreeCodexTests(unittest.TestCase):
+    def setUp(self):
+        self._rotating_proxy = patch("core.account_network.resolve_rotating_proxy", return_value=None)
+        self._rotating_proxy.start()
+        self.addCleanup(self._rotating_proxy.stop)
+
     @patch("core.plan_check_service.enqueue_account_plan_check", return_value={"accepted": True})
     @patch("core.email_provider.mark_email_consumed", return_value=True)
     @patch("core.account_export._append_batch_archive", return_value="batch")
@@ -27,7 +32,7 @@ class AutoFreeCodexTests(unittest.TestCase):
         insert_account.assert_called_once()
         enqueue_plan.assert_called_once()
 
-    def test_free_without_plus_trial_enqueues_codex_after_registration_plan_check(self):
+    def test_free_without_plus_trial_runs_codex_oauth_after_registration_plan_check(self):
         result = {
             "ok": True,
             "current_plan_type": "free",
@@ -37,33 +42,38 @@ class AutoFreeCodexTests(unittest.TestCase):
         with (
             patch.object(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True, create=True),
             patch("config.roxybrowser.REGISTRATION_DRIVER", "protocol"),
-            patch("core.registration_service.submit_codex_retry_for_account",
-                create=True,
-                return_value={"accepted": True, "job_id": 12},
-            ) as submit,
+            patch.object(plan_check_service.db, "get_account", return_value={"id": 7}),
+            patch.object(plan_check_service.db, "update_account_codex_status") as update_status,
+            patch(
+                "core.codex_oauth.run_codex_oauth",
+                return_value={"ok": True, "status": "success"},
+            ) as run_oauth,
+            patch("core.registration_service.submit_codex_retry_for_account", create=True) as submit,
         ):
-            outcome = plan_check_service._enqueue_auto_codex_for_free_account(
+            outcome = plan_check_service._run_auto_codex_oauth_for_free_account(
                 account_id=7,
                 email="free@example.com",
                 access_token="token",
                 trigger="registration_auto",
                 result=result,
+                proxy="socks5://127.0.0.1:25000",
             )
 
-        self.assertEqual(outcome, {"accepted": True, "job_id": 12})
-        submit.assert_called_once_with(
-            account_id=7,
-            email="free@example.com",
-            access_token="token",
-            trigger="registration_auto_free",
-            registration_driver="protocol",
+        self.assertTrue(outcome["accepted"])
+        self.assertEqual(outcome["status"], "success")
+        run_oauth.assert_called_once_with(
+            "free@example.com",
+            proxy="socks5://127.0.0.1:25000",
+            force=True,
         )
+        update_status.assert_called_once_with("free@example.com", "success", None)
+        submit.assert_not_called()
 
     def test_free_plus_trial_does_not_enqueue_codex(self):
         with patch.object(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True, create=True), patch(
-            "core.registration_service.submit_codex_retry_for_account", create=True
+            "core.codex_oauth.run_codex_oauth", create=True
         ) as submit:
-            outcome = plan_check_service._enqueue_auto_codex_for_free_account(
+            outcome = plan_check_service._run_auto_codex_oauth_for_free_account(
                 account_id=7,
                 email="free-plus@example.com",
                 access_token="token",
@@ -83,9 +93,9 @@ class AutoFreeCodexTests(unittest.TestCase):
         with (
             patch.object(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True, create=True),
             patch("config.roxybrowser.REGISTRATION_DRIVER", "cloak"),
-            patch("core.registration_service.submit_codex_retry_for_account", create=True) as submit,
+            patch("core.codex_oauth.run_codex_oauth", create=True) as submit,
         ):
-            outcome = plan_check_service._enqueue_auto_codex_for_free_account(
+            outcome = plan_check_service._run_auto_codex_oauth_for_free_account(
                 account_id=7,
                 email="free-browser@example.com",
                 access_token="token",
@@ -182,9 +192,9 @@ class AutoFreeCodexTests(unittest.TestCase):
 
     def test_unknown_plus_trial_status_does_not_enqueue_codex(self):
         with patch.object(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True, create=True), patch(
-            "core.registration_service.submit_codex_retry_for_account", create=True
+            "core.codex_oauth.run_codex_oauth", create=True
         ) as submit:
-            outcome = plan_check_service._enqueue_auto_codex_for_free_account(
+            outcome = plan_check_service._run_auto_codex_oauth_for_free_account(
                 account_id=7,
                 email="free-unknown@example.com",
                 access_token="token",
@@ -212,7 +222,7 @@ class AutoFreeCodexTests(unittest.TestCase):
         self.assertEqual(outcome["reason"], "already_success")
         reserve.assert_not_called()
 
-    @patch.object(plan_check_service, "_enqueue_auto_codex_for_free_account")
+    @patch.object(plan_check_service, "_run_auto_codex_oauth_for_free_account")
     @patch.object(plan_check_service.db, "update_account_plan_check")
     @patch.object(plan_check_service, "check_account_plan")
     @patch.object(plan_check_service.db, "mark_account_plan_check_running", return_value=True)
@@ -241,9 +251,10 @@ class AutoFreeCodexTests(unittest.TestCase):
             access_token="token",
             trigger="registration_auto",
             result=result,
+            proxy=None,
         )
 
-    @patch.object(plan_check_service, "_enqueue_auto_codex_for_free_account", return_value={"accepted": False, "reason": "disabled"})
+    @patch.object(plan_check_service, "_run_auto_codex_oauth_for_free_account", return_value={"accepted": False, "reason": "disabled"})
     @patch.object(plan_check_service.db, "update_account_plan_check")
     @patch.object(plan_check_service, "check_account_plan")
     @patch.object(plan_check_service.db, "mark_account_plan_check_running", return_value=True)

@@ -77,7 +77,7 @@ def _error_response(exc: Exception):
         return jsonify({"ok": False, "error": "RoxyBrowser 操作失败，请刷新状态后重试"}), 502
     if isinstance(exc, (RoxyProfileManagerError, RoxyProfileStoreError)):
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": False, "error": "Roxy profile manager unavailable"}), 503
+    return jsonify({"ok": False, "error": "Trình quản lý profile Roxy hiện không khả dụng"}), 503
 
 
 def register_roxy_profile_routes(app) -> None:

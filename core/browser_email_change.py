@@ -8,7 +8,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from core import db
 from core.browser_profile import open_browser_profile
 from core.email_change import EmailChangeInput, change_email_in_browser
-from core.rotating_proxy_runtime import EMAIL_CHANGE_PROXY_SCOPE, resolve_rotating_proxy
+from core.rotating_proxy_runtime import (
+    EMAIL_CHANGE_PROXY_SCOPE,
+    prepare_rotating_proxy_lanes,
+    release_rotating_proxy,
+    resolve_rotating_proxy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,12 +33,14 @@ def run_email_change(
 ) -> dict[str, object]:
     """Run one email change in an isolated configured browser session."""
     profile = None
+    rotating_proxy: str | None = None
     try:
         active_proxy = resolve_rotating_proxy(
             None,
             scope=EMAIL_CHANGE_PROXY_SCOPE,
             lane_id=proxy_lane_id,
         )
+        rotating_proxy = active_proxy
         profile = (
             open_browser_profile(proxy=active_proxy)
             if active_proxy is not None
@@ -76,6 +83,12 @@ def run_email_change(
             "error": _redacted_error(exc, item),
         }
     finally:
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=EMAIL_CHANGE_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=rotating_proxy,
+            )
         if profile is not None:
             try:
                 profile.close()
@@ -115,6 +128,8 @@ def run_email_change_batch(
         ]
 
     max_workers = max(1, min(4, int(workers or 1), len(grouped) or 1))
+    if grouped:
+        prepare_rotating_proxy_lanes(max_workers, scope=EMAIL_CHANGE_PROXY_SCOPE)
     results: list[dict[str, object] | None] = [None] * len(items)
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="email-change") as executor:
         futures = [

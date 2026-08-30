@@ -18,6 +18,8 @@ class BrowserProfileSession:
     timeout: int
     keep_open: bool
     _cleanup: Callable[[], None]
+    # Cloud providers need the original session descriptor to reuse the same CDP session.
+    session_info: Any | None = None
 
     def close(self) -> None:
         if not self.keep_open:
@@ -167,6 +169,7 @@ def _open_cloud(provider: str, proxy: str | None = None) -> BrowserProfileSessio
         timeout=timeout,
         keep_open=False,
         _cleanup=cleanup,
+        session_info=session,
     )
 
 

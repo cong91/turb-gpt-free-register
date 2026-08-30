@@ -38,7 +38,7 @@ class BrowserUseClient:
             )
         return self.api_key
 
-    def build_connect_url(self) -> BrowserUseSession:
+    def build_connect_url(self, *, fresh_profile: bool = False) -> BrowserUseSession:
         api_key = self.require_api_key()
         base = str(getattr(_cfg, "BROWSER_USE_CDP_BASE", "wss://connect.browser-use.com") or "wss://connect.browser-use.com").rstrip("?&")
         query: dict[str, str] = {"apiKey": api_key}
@@ -48,7 +48,7 @@ class BrowserUseClient:
         if use_proxy and proxy_country:
             query["proxyCountryCode"] = proxy_country
 
-        profile_id = str(getattr(_cfg, "BROWSER_USE_PROFILE_ID", "") or "").strip()
+        profile_id = "" if fresh_profile else str(getattr(_cfg, "BROWSER_USE_PROFILE_ID", "") or "").strip()
         if profile_id:
             query["profileId"] = profile_id
 
@@ -60,6 +60,8 @@ class BrowserUseClient:
 
         extra = dict(getattr(_cfg, "BROWSER_USE_EXTRA_QUERY", {}) or {})
         for key, value in extra.items():
+            if fresh_profile and str(key).strip().lower() in ("profileid", "profile_id"):
+                continue
             if value is None:
                 continue
             text = str(value).strip()
@@ -99,7 +101,7 @@ class BrowserUseClient:
             base = f"{base}/api/v3"
         return f"{base}/browsers"
 
-    def _open_custom_proxy_session(self, proxy: str) -> BrowserUseSession:
+    def _open_custom_proxy_session(self, proxy: str, *, fresh_profile: bool = False) -> BrowserUseSession:
         from core.rotating_proxy_runtime import custom_proxy_details
 
         session_timeout = int(getattr(_cfg, "BROWSER_USE_SESSION_TIMEOUT", 240) or 240)
@@ -107,7 +109,7 @@ class BrowserUseClient:
             "timeout": max(1, min(240, session_timeout)),
             "customProxy": custom_proxy_details(proxy),
         }
-        profile_id = str(getattr(_cfg, "BROWSER_USE_PROFILE_ID", "") or "").strip()
+        profile_id = "" if fresh_profile else str(getattr(_cfg, "BROWSER_USE_PROFILE_ID", "") or "").strip()
         if profile_id:
             payload["profileId"] = profile_id
         start_url = str(getattr(_cfg, "BROWSER_USE_START_URL", "") or "").strip()
@@ -154,12 +156,12 @@ class BrowserUseClient:
             raw={"custom_proxy": safe_custom_proxy},
         )
 
-    def open_session(self, proxy: str | None = None) -> BrowserUseSession:
+    def open_session(self, proxy: str | None = None, *, fresh_profile: bool = False) -> BrowserUseSession:
         mode = str(getattr(_cfg, "BROWSER_USE_CONNECT_MODE", "cdp_url") or "cdp_url").strip().lower()
         if mode not in ("cdp_url", "cdp", "websocket", "ws", "sdk"):
             raise RuntimeError(f"不支持的 BROWSER_USE_CONNECT_MODE={mode!r}，当前支持 cdp_url")
         if proxy is not None:
-            return self._open_custom_proxy_session(proxy)
+            return self._open_custom_proxy_session(proxy, fresh_profile=fresh_profile)
         # 目前 Browser Use 官方最稳的公开接入就是 CDP websocket。
         # sdk/rest create-session 接口若以后稳定，可在此扩展。
-        return self.build_connect_url()
+        return self.build_connect_url(fresh_profile=fresh_profile)

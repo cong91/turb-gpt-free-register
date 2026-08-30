@@ -568,6 +568,24 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify(result), int(result.get("status") or 400)
         return jsonify(result)
 
+    @app.post("/api/accounts/twofa/reactivate-bulk")
+    def api_accounts_twofa_reactivate_bulk():
+        """批量重新登录账号并补做 2FA。"""
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 500:
+            return jsonify({"ok": False, "error": "Khôi phục 2FA chỉ xử lý tối đa 500 tài khoản mỗi lần"}), 400
+        try:
+            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "Số luồng không hợp lệ"}), 400
+        result = svc.retry_accounts_twofa(ids, workers=workers)
+        if not result.get("ok"):
+            return jsonify(result), int(result.get("status") or 400)
+        return jsonify(result), 202
+
 
     @app.get("/api/accounts/<int:acc_id>/secret")
     def api_account_secret(acc_id: int):
@@ -591,7 +609,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         field = str(data.get("field") or "").strip()
         format_name = str(data.get("format") or "modern").strip()
         if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+            return jsonify({"ok": False, "error": "account_ids phải là một danh sách không rỗng"}), 400
         if len(ids) > 5000:
             return jsonify({"ok": False, "error": "单次最多读取 5000 个账号"}), 400
         values = []
@@ -2492,6 +2510,21 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not selected:
             return jsonify({"ok": False, "error": "没有可补跑的账号", "skipped": skipped}), 409
 
+        try:
+            from core.rotating_proxy_runtime import (
+                CODEX_RETRY_PROXY_SCOPE,
+                prepare_rotating_proxy_lanes,
+            )
+
+            prepare_rotating_proxy_lanes(
+                min(workers, len(selected)),
+                scope=CODEX_RETRY_PROXY_SCOPE,
+            )
+        except Exception as exc:  # noqa: BLE001 - convert provider failures to an HTTP response.
+            for item in selected:
+                _release_codex_retry(item["email"])
+            return jsonify({"ok": False, "error": f"Proxy.vn keyxoay 准备失败: {exc}", "skipped": skipped}), 503
+
         batch_id = _dt.now().strftime("%Y%m%d-%H%M%S")
         for item in selected:
             email = item["email"]
@@ -2692,7 +2725,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         try:
             workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
         except (TypeError, ValueError):
-            return jsonify({"ok": False, "error": "workers 非法"}), 400
+            return jsonify({"ok": False, "error": "Số luồng không hợp lệ"}), 400
         result = svc.retry_job(job_id, workers=workers)
         if not result.get("ok"):
             return jsonify(result), int(result.get("status") or 400)

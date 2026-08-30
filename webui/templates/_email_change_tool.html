@@ -3,7 +3,7 @@
   <div class="personal-info-shell">
     <header class="personal-info-head">
       <div>
-        <p class="personal-info-eyebrow">ACCOUNT OPERATIONS</p>
+        <p class="personal-info-eyebrow">THAO TÁC TÀI KHOẢN</p>
         <h1 class="personal-info-title">Thông tin cá nhân</h1>
         <p class="personal-info-subtitle">Cập nhật email đăng nhập hoặc thay khóa xác thực cho các tài khoản đã lưu.</p>
       </div>
@@ -30,7 +30,7 @@
       <section class="personal-info-workspace" data-personal-panel="email" role="tabpanel">
         <div class="personal-info-form-head">
           <div>
-            <p class="personal-info-kicker">EMAIL LOGIN</p>
+            <p class="personal-info-kicker">ĐĂNG NHẬP EMAIL</p>
             <h2>Thay địa chỉ đăng nhập</h2>
           </div>
           <span class="personal-info-form-state">OTP qua Gmail API</span>
@@ -41,13 +41,13 @@
             <textarea id="credentials" name="credentials" required spellcheck="false" autocomplete="off" placeholder="user@example.com|password|TOTP_SECRET"></textarea>
           </label>
           <label class="personal-info-field">
-            <span>Email mới <b>EMAIL----URL GET OTP</b></span>
+            <span>Email mới <b>EMAIL----URL LẤY OTP</b></span>
             <textarea id="gmailApi" name="gmail_api" required spellcheck="false" autocomplete="off" placeholder="new@example.com----https://provider.example/otp"></textarea>
           </label>
         </div>
         <div class="personal-info-actionbar">
-          <label class="personal-info-number">Quota / Gmail API <input id="quota" type="number" min="1" max="6" value="1"></label>
-          <label class="personal-info-number">Worker <input id="workers" type="number" min="1" max="4" value="1"></label>
+          <label class="personal-info-number">Hạn mức / Gmail API <input id="quota" type="number" min="1" max="6" value="1"></label>
+          <label class="personal-info-number">Luồng xử lý <input id="workers" type="number" min="1" max="4" value="1"></label>
           <button class="personal-info-primary" id="submit" type="submit">Chạy đổi email</button>
         </div>
       </section>
@@ -55,10 +55,10 @@
       <section class="personal-info-workspace is-hidden" data-personal-panel="twofa" role="tabpanel" aria-hidden="true">
         <div class="personal-info-form-head">
           <div>
-            <p class="personal-info-kicker">AUTHENTICATOR KEY</p>
+            <p class="personal-info-kicker">KHÓA XÁC THỰC</p>
             <h2>Tạo khóa 2FA mới</h2>
           </div>
-          <span class="personal-info-form-state">Deactivate → Enroll → Activate</span>
+          <span class="personal-info-form-state">Tắt → Đăng ký → Bật</span>
         </div>
         <div class="personal-info-twofa-layout">
           <label class="personal-info-field personal-info-field-wide">
@@ -68,11 +68,11 @@
           <div class="personal-info-sequence" aria-label="Trạng thái quy trình 2FA">
             <div><span>01</span><p>Đăng nhập bằng khóa cũ</p></div>
             <div><span>02</span><p>Tắt MFA hiện tại</p></div>
-            <div><span>03</span><p>Enroll và lưu khóa mới</p></div>
+            <div><span>03</span><p>Đăng ký và lưu khóa mới</p></div>
           </div>
         </div>
         <div class="personal-info-actionbar">
-          <label class="personal-info-number">Worker <input id="twofaWorkers" type="number" min="1" max="4" value="1"></label>
+          <label class="personal-info-number">Luồng xử lý <input id="twofaWorkers" type="number" min="1" max="4" value="1"></label>
           <button class="personal-info-primary" id="twofaSubmit" type="button">Chạy đổi 2FA</button>
         </div>
       </section>
@@ -80,7 +80,7 @@
       <section id="personalInfoResults" class="personal-info-results" hidden>
         <div class="personal-info-results-head">
           <div>
-            <p class="personal-info-kicker">RUN RESULTS</p>
+            <p class="personal-info-kicker">KẾT QUẢ XỬ LÝ</p>
             <h2>Kết quả xử lý</h2>
           </div>
           <button id="exportChangedAccounts" class="personal-info-export" type="button" disabled>Xuất tài khoản đã đổi</button>

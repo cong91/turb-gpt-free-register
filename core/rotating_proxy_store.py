@@ -189,6 +189,63 @@ class RotatingProxyStore:
             ).fetchone()
         return dict(row) if row is not None else None
 
+    def delete_lease(
+        self,
+        lane_id: int,
+        *,
+        scope: str = "registration",
+        rotating_key: str | None = None,
+        proxy_url: str | None = None,
+    ) -> bool:
+        """Release one scoped worker-lane lease after its workflow completes."""
+        lane_scope = self._scope(scope)
+        conditions = ["lane_scope = ?", "lane_id = ?"]
+        params: list[object] = [lane_scope, int(lane_id)]
+        if rotating_key is not None:
+            conditions.append("rotating_key = ?")
+            params.append(str(rotating_key))
+        if proxy_url is not None:
+            conditions.append("proxy_url = ?")
+            params.append(str(proxy_url))
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "DELETE FROM rotating_proxy_scoped_leases WHERE " + " AND ".join(conditions),
+                params,
+            )
+            legacy_cursor = None
+            if lane_scope == "registration":
+                legacy_conditions = ["lane_id = ?"]
+                legacy_params: list[object] = [int(lane_id)]
+                if rotating_key is not None:
+                    legacy_conditions.append("rotating_key = ?")
+                    legacy_params.append(str(rotating_key))
+                if proxy_url is not None:
+                    legacy_conditions.append("proxy_url = ?")
+                    legacy_params.append(str(proxy_url))
+                legacy_cursor = connection.execute(
+                    "DELETE FROM rotating_proxy_leases WHERE " + " AND ".join(legacy_conditions),
+                    legacy_params,
+                )
+        return bool(cursor.rowcount or (legacy_cursor and legacy_cursor.rowcount))
+
+    def delete_expired_leases(self, now: float | None = None) -> int:
+        """Remove proxy/key leases that can no longer be used."""
+        current = time.time() if now is None else float(now)
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "DELETE FROM rotating_proxy_scoped_leases "
+                "WHERE proxy_expires_at <= ? "
+                "OR (key_expires_at IS NOT NULL AND key_expires_at <= ?)",
+                (current, current),
+            )
+            connection.execute(
+                "DELETE FROM rotating_proxy_leases "
+                "WHERE proxy_expires_at <= ? "
+                "OR (key_expires_at IS NOT NULL AND key_expires_at <= ?)",
+                (current, current),
+            )
+        return cursor.rowcount
+
     def list_leases(self) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:
             rows = connection.execute(

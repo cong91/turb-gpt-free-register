@@ -354,7 +354,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         try:
             from config import codex as _codex_cfg
             from config import register as _register_cfg
-            from core.roxy_codex_oauth import run_roxy_codex_oauth
+            from core.codex_oauth import run_codex_oauth
             codex_auto_enabled = bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False))
             free_codex_auto_enabled = bool(
                 getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
@@ -378,14 +378,13 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                     login_mode,
                 )
                 _check_manual_stop()
-                return run_roxy_codex_oauth(
+                return run_codex_oauth(
                     email,
-                    reuse_existing_profile=True,
+                    oauth_driver="cloak",
+                    force=True,
+                    credentials=codex_credentials,
                     existing_driver=driver,
                     existing_opened=opened,
-                    force=True,
-                    clear_existing_state=True,
-                    credentials=codex_credentials,
                 )
 
             post_auth_automation_enabled = bool(

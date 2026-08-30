@@ -139,7 +139,7 @@
       });
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
-        throw new Error(payload.error || 'Không thể export tài khoản');
+        throw new Error(payload.error || 'Không thể xuất tài khoản');
       }
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
@@ -152,9 +152,9 @@
         link.remove();
         URL.revokeObjectURL(url);
       }, 800);
-      setStatus(`Đã export ${exportableCount} tài khoản.`);
+      setStatus(`Đã xuất ${exportableCount} tài khoản.`);
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Không thể export tài khoản', true);
+      setStatus(error instanceof Error ? error.message : 'Không thể xuất tài khoản', true);
     } finally {
       exportButton.disabled = !exportBatchId || exportableCount === 0;
     }

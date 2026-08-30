@@ -55,9 +55,17 @@ def _status(document: dict[str, Any]) -> int:
         return 0
 
 
+def _provider_message(document: dict[str, Any]) -> str:
+    return str(document.get("comen") or document.get("message") or "").strip()
+
+
+def _is_empty_inventory_response(document: dict[str, Any]) -> bool:
+    return _status(document) == 101
+
+
 def _error_from(document: dict[str, Any]) -> RotatingProxyApiError:
     status = _status(document)
-    message = str(document.get("comen") or document.get("message") or "未知错误")
+    message = _provider_message(document) or "未知错误"
     return RotatingProxyApiError(f"proxy.vn API status={status}: {message[:240]}")
 
 
@@ -123,13 +131,25 @@ class RotatingProxyClient:
         try:
             response = self._http.get(url, params=params, timeout=self._timeout())
             response.raise_for_status()
+        except requests.HTTPError as exc:
+            response = getattr(exc, "response", None)
+            status_code = getattr(response, "status_code", None)
+            status = f"HTTP {status_code}" if status_code is not None else "HTTP error"
+            raise RotatingProxyApiError(
+                f"proxy.vn 请求失败: {status}, endpoint={url}"
+            ) from exc
         except requests.RequestException as exc:
             raise RotatingProxyApiError(f"proxy.vn 请求失败: {type(exc).__name__}") from exc
         return _response_documents(response)
 
     @staticmethod
     def _api_key() -> str:
-        return str(getattr(proxy_config, "ROTATING_PROXY_API_KEY", "") or "").strip()
+        value = str(getattr(proxy_config, "ROTATING_PROXY_API_KEY", "") or "").strip()
+        if not value:
+            raise RotatingProxyApiError(
+                "ROTATING_PROXY_API_KEY chưa được cấu hình trong Settings"
+            )
+        return value
 
     def list_keys(self) -> list[dict[str, Any]]:
         documents = self._get(
@@ -139,24 +159,41 @@ class RotatingProxyClient:
         result = []
         for document in documents:
             if _status(document) != 100:
+                # The provider uses status 101 when no purchased key remains active.
+                if _is_empty_inventory_response(document):
+                    continue
                 raise _error_from(document)
             key = str(document.get("keyxoay") or "").strip()
             if key:
                 result.append({"key": key, "expires_at": _parse_expiration(document.get("expired"))})
         return result
 
-    def purchase_key(self) -> dict[str, Any]:
+    def purchase_keys(self, quantity: int) -> list[dict[str, Any]]:
+        try:
+            amount = int(quantity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("quantity must be a positive integer") from exc
+        if amount < 1:
+            raise ValueError("quantity must be a positive integer")
         documents = self._get(
             self._provider_url("apimuangngay.php"),
-            {"key": self._api_key(), "thoigian": 1, "soluong": 1},
+            {"key": self._api_key(), "thoigian": 1, "soluong": amount},
         )
+        result = []
+        seen: set[str] = set()
         for document in documents:
             if _status(document) != 100:
                 raise _error_from(document)
             key = str(document.get("keyxoay") or "").strip()
-            if key:
-                return {"key": key, "expires_at": _parse_expiration(document.get("expired"))}
-        raise RotatingProxyApiError("proxy.vn mua key thành công nhưng không trả keyxoay")
+            if key and key not in seen:
+                seen.add(key)
+                result.append({"key": key, "expires_at": _parse_expiration(document.get("expired"))})
+        if not result:
+            raise RotatingProxyApiError("proxy.vn mua key thành công nhưng không trả keyxoay")
+        return result
+
+    def purchase_key(self) -> dict[str, Any]:
+        return self.purchase_keys(1)[0]
 
     def renew_key(self, key: str) -> dict[str, Any]:
         documents = self._get(

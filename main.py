@@ -166,6 +166,48 @@ def run_registration(
     proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
 ):
+    """Run registration and release its rotating-proxy lane when it completes."""
+    from core.rotating_proxy_runtime import (
+        REGISTRATION_PROXY_SCOPE,
+        release_rotating_proxy,
+        resolve_rotating_proxy,
+    )
+
+    active_proxy = resolve_rotating_proxy(
+        proxy,
+        scope=REGISTRATION_PROXY_SCOPE,
+        lane_id=proxy_lane_id,
+    )
+    try:
+        return _run_registration_impl(
+            email,
+            name,
+            birthday=birthday,
+            proxy=active_proxy,
+            otp_code=otp_code,
+            batch_dir=batch_dir,
+            proxy_lane_id=proxy_lane_id,
+            lease_owner_id=lease_owner_id,
+        )
+    finally:
+        if proxy is None and active_proxy is not None:
+            release_rotating_proxy(
+                scope=REGISTRATION_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=active_proxy,
+            )
+
+
+def _run_registration_impl(
+    email: str,
+    name: str,
+    birthday: str | None = None,
+    proxy: str = None,
+    otp_code: str = None,
+    batch_dir=None,
+    proxy_lane_id: int | None = None,
+    lease_owner_id: str | None = None,
+):
     """
     执行完整的 ChatGPT 注册流程。
 
@@ -191,16 +233,6 @@ def run_registration(
     #   browser_use  = Browser Use Cloud stealth Chromium + Playwright
     #   skyvern      = Skyvern Browser Sessions + Playwright
     driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
-    from core.rotating_proxy_runtime import (
-        REGISTRATION_PROXY_SCOPE,
-        resolve_rotating_proxy,
-    )
-
-    proxy = resolve_rotating_proxy(
-        proxy,
-        scope=REGISTRATION_PROXY_SCOPE,
-        lane_id=proxy_lane_id,
-    )
     if proxy and proxy_lane_id is not None:
         logger.info("[RotatingProxy] registration lane=%s 已分配 proxy lease", proxy_lane_id)
     if driver_mode in ("roxy", "roxybrowser", "fingerprint", "browser"):
@@ -810,6 +842,10 @@ def run_one_batch_item(index: int, total: int, batch_dir=None, proxy_lane_id: in
 
 def run_serial_batch(count: int, delay: float, continue_on_fail: bool, batch_dir=None) -> list[dict]:
     """按原有串行方式执行批量注册。"""
+    from core.rotating_proxy_runtime import REGISTRATION_PROXY_SCOPE, prepare_rotating_proxy_lanes
+
+    if count > 0:
+        prepare_rotating_proxy_lanes(1, scope=REGISTRATION_PROXY_SCOPE)
     results = []
     for index in range(count):
         result = run_one_batch_item(index, count, batch_dir)
@@ -833,6 +869,10 @@ def run_parallel_batch(
 ) -> list[dict]:
     """使用线程池并发执行批量注册。"""
     logger.info(f"[批量] 启用多线程注册：目标 {count}，并发 {workers}")
+    from core.rotating_proxy_runtime import REGISTRATION_PROXY_SCOPE, prepare_rotating_proxy_lanes
+
+    if count > 0:
+        prepare_rotating_proxy_lanes(min(max(1, workers), count), scope=REGISTRATION_PROXY_SCOPE)
     if delay > 0:
         logger.info(f"[批量] 并发模式下 --delay={delay} 表示提交任务之间的错峰间隔")
 

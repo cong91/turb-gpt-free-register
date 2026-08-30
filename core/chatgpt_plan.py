@@ -342,6 +342,59 @@ def check_account_plan(
     retry_delay: float | None = None,
     proxy_lane_id: int | None = None,
 ) -> dict:
+    """Check an account plan and release a directly acquired rotating lease."""
+    normalized_token = normalize_token(token)
+    token_is_expired = bool(normalized_token) and token_claims(normalized_token).get("token_expired") is True
+    if proxy is not None or browser_transport is not None or not normalized_token or token_is_expired:
+        return _check_account_plan_impl(
+            token,
+            proxy=proxy,
+            browser_transport=browser_transport,
+            timezone_offset_min=timezone_offset_min,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            proxy_lane_id=proxy_lane_id,
+        )
+
+    from core.rotating_proxy_runtime import (
+        PLAN_CHECK_PROXY_SCOPE,
+        release_rotating_proxy,
+        resolve_rotating_proxy,
+    )
+
+    active_proxy = resolve_rotating_proxy(None, scope=PLAN_CHECK_PROXY_SCOPE, lane_id=proxy_lane_id)
+    try:
+        return _check_account_plan_impl(
+            token,
+            proxy=active_proxy,
+            browser_transport=browser_transport,
+            timezone_offset_min=timezone_offset_min,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            retry_delay=retry_delay,
+            proxy_lane_id=proxy_lane_id,
+        )
+    finally:
+        if active_proxy is not None:
+            release_rotating_proxy(
+                scope=PLAN_CHECK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=active_proxy,
+            )
+
+
+def _check_account_plan_impl(
+    token: str,
+    *,
+    proxy: Optional[str] = None,
+    browser_transport: PlanCheckBrowserTransport | None = None,
+    timezone_offset_min: str = "-",
+    timeout: float | None = None,
+    max_attempts: int | None = None,
+    retry_delay: float | None = None,
+    proxy_lane_id: int | None = None,
+) -> dict:
     token = normalize_token(token)
     if not token:
         return {"ok": False, "checked_at": now_iso(), "error": "token 为空"}
@@ -355,15 +408,6 @@ def check_account_plan(
             "needs_live_check": True,
             **{k: v for k, v in claims.items() if k != "payload"},
         }
-
-    if browser_transport is None:
-        from core.rotating_proxy_runtime import PLAN_CHECK_PROXY_SCOPE, resolve_rotating_proxy
-
-        proxy = resolve_rotating_proxy(
-            proxy,
-            scope=PLAN_CHECK_PROXY_SCOPE,
-            lane_id=proxy_lane_id,
-        )
 
     if browser_transport is not None:
         route = {

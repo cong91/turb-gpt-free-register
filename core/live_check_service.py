@@ -11,7 +11,12 @@ from pathlib import Path
 from core import db
 from core.account_liveness import check_account_liveness, log_path
 from core.chatgpt_plan import resolve_plan_check_route
-from core.rotating_proxy_runtime import LIVE_CHECK_PROXY_SCOPE, resolve_rotating_proxy
+from core.rotating_proxy_runtime import (
+    LIVE_CHECK_PROXY_SCOPE,
+    prepare_rotating_proxy_lanes,
+    release_rotating_proxy,
+    resolve_rotating_proxy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +26,19 @@ _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="live-ch
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
 _RUNNING: set[int] = set()
 _LOCK = threading.Lock()
+_PROXY_INVENTORY_READY = False
+
+
+def _prepare_proxy_inventory() -> None:
+    global _PROXY_INVENTORY_READY
+    from config import proxy as proxy_config
+
+    if not bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False)):
+        return
+    with _LOCK:
+        if not _PROXY_INVENTORY_READY:
+            prepare_rotating_proxy_lanes(_WORKERS, scope=LIVE_CHECK_PROXY_SCOPE)
+            _PROXY_INVENTORY_READY = True
 
 
 def is_checking(email: str) -> bool:
@@ -47,6 +65,7 @@ def _run_live_check(
     trigger: str,
     proxy_lane_id: int | None = None,
 ) -> dict:
+    rotating_proxy: str | None = None
     try:
         with _LOCK:
             _RUNNING.add(int(account_id))
@@ -58,6 +77,8 @@ def _run_live_check(
             scope=LIVE_CHECK_PROXY_SCOPE,
             lane_id=proxy_lane_id,
         )
+        if proxy is None:
+            rotating_proxy = selected_proxy
         route = resolve_plan_check_route(explicit_proxy=selected_proxy)
         selected_proxy = route.get("proxy")
         _append_log(
@@ -112,6 +133,12 @@ def _run_live_check(
             pass
         return result
     finally:
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=LIVE_CHECK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=rotating_proxy,
+            )
         with _LOCK:
             _RUNNING.discard(int(account_id))
         _QUEUE_SLOTS.release()
@@ -137,6 +164,7 @@ def enqueue_account_live_check(
 
     _append_log(email, f"[查活] 已入队 account_id={account_id} trigger={trigger}", clear=True)
     try:
+        _prepare_proxy_inventory()
         _EXECUTOR.submit(
             _run_live_check,
             account_id=account_id,

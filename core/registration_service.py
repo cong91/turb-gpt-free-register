@@ -968,7 +968,7 @@ def _run_codex_retry_job(
         ).strip().lower()
         if registration_driver_uses_live_browser(registration_driver):
             reason = (
-                f"旧的 registration_auto_free Codex 任务来自 {registration_driver} 注册，"
+                f"旧的 registration_auto_free 自动 Codex OAuth 任务来自 {registration_driver} 注册，"
                 "没有注册 browser 可复用，已跳过，禁止另起浏览器；"
                 "新注册必须由 registration worker 同步执行"
             )
@@ -1102,6 +1102,12 @@ def submit_codex_retry_for_account(
         db.update_account_codex_status(email, "retrying", None)
         effective_workers = workers if workers is not None else get_executor_workers()
         proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers))
+        from core.rotating_proxy_runtime import (
+            CODEX_RETRY_PROXY_SCOPE,
+            prepare_rotating_proxy_lanes,
+        )
+
+        prepare_rotating_proxy_lanes(1, scope=CODEX_RETRY_PROXY_SCOPE)
         with _executor_lock:
             executor = get_executor(max_workers=effective_workers)
             executor.submit(
@@ -1225,6 +1231,16 @@ def submit_registration(
     )
 
     effective_workers = effective_registration_workers(workers)
+    if rotating_proxy_enabled:
+        from core.rotating_proxy_runtime import (
+            REGISTRATION_PROXY_SCOPE,
+            prepare_rotating_proxy_lanes,
+        )
+
+        prepare_rotating_proxy_lanes(
+            min(effective_workers, count),
+            scope=REGISTRATION_PROXY_SCOPE,
+        )
     # 创建/切换线程池和提交本批任务必须整体串行化：否则另一请求在本批提交中途
     # 切换 workers 并 shutdown 旧池，会导致后续 submit 报 cannot schedule new futures after shutdown。
     with _executor_lock:
@@ -1546,6 +1562,18 @@ def retry_job(
             workers if action in {"codex", "2fa"} else effective_registration_workers(workers)
         )
         proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers))
+        from core.rotating_proxy_runtime import (
+            CODEX_RETRY_PROXY_SCOPE,
+            REGISTRATION_PROXY_SCOPE,
+            TWOFA_RETRY_PROXY_SCOPE,
+            prepare_rotating_proxy_lanes,
+        )
+
+        retry_scope = {
+            "codex": CODEX_RETRY_PROXY_SCOPE,
+            "2fa": TWOFA_RETRY_PROXY_SCOPE,
+        }.get(action, REGISTRATION_PROXY_SCOPE)
+        prepare_rotating_proxy_lanes(1, scope=retry_scope)
         with _executor_lock:
             executor = get_executor(max_workers=effective_workers)
             if action == "codex":
@@ -1616,6 +1644,49 @@ def retry_account_twofa(account_id: int, workers: int | None = None) -> dict:
     if source is None:
         return {"ok": False, "error": "找不到该账号对应的注册任务，无法执行 2FA 重试", "status": 409}
     return retry_job(int(source["id"]), workers=workers, allow_success_twofa=True)
+
+
+def retry_accounts_twofa(account_ids: list[object], workers: int | None = None) -> dict:
+    """从账号列表批量触发 2FA 补做，并逐项返回跳过原因。"""
+    started = []
+    reused = []
+    skipped = []
+    seen: set[int] = set()
+    for raw_account_id in account_ids:
+        try:
+            account_id = int(raw_account_id)
+        except (TypeError, ValueError):
+            skipped.append({"account_id": raw_account_id, "reason": "账号 ID 非法"})
+            continue
+        if account_id in seen:
+            continue
+        seen.add(account_id)
+        result = retry_account_twofa(account_id, workers=workers)
+        if not result.get("ok"):
+            skipped.append({"account_id": account_id, "reason": result.get("error") or "无法补做 2FA"})
+            continue
+        item = {
+            "account_id": account_id,
+            "job_id": (result.get("job") or {}).get("id"),
+            "message": result.get("message"),
+        }
+        (reused if result.get("reused") else started).append(item)
+
+    response = {
+        "ok": bool(started or reused),
+        "started": started,
+        "started_count": len(started),
+        "reused": reused,
+        "reused_count": len(reused),
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+        "workers": workers,
+    }
+    if not response["ok"]:
+        response.update({"error": "没有可补做 2FA 的账号", "status": 409})
+    else:
+        response["message"] = f"已启动 {len(started)} 个 Reactive 2FA，复用 {len(reused)} 个排队任务"
+    return response
 
 
 def cancel_pending_jobs() -> int:

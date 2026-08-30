@@ -1,6 +1,7 @@
 """Resolve the configured rotating proxy for every network workflow."""
 from __future__ import annotations
 
+import logging
 import threading
 from urllib.parse import unquote, urlparse
 
@@ -11,9 +12,12 @@ PLAN_CHECK_PROXY_SCOPE = "plan_check"
 LIVE_CHECK_PROXY_SCOPE = "live_check"
 CODEX_AGENT_PROXY_SCOPE = "codex_agent"
 TWOFA_RETRY_PROXY_SCOPE = "twofa_retry"
+TWOFA_SETUP_PROXY_SCOPE = "twofa_setup"
 TWOFA_CHANGE_PROXY_SCOPE = "twofa_change"
 EMAIL_CHANGE_PROXY_SCOPE = "email_change"
 EXTRACT_LINK_PROXY_SCOPE = "extract_link"
+
+logger = logging.getLogger(__name__)
 
 
 def default_proxy_lane_id() -> int:
@@ -67,3 +71,47 @@ def resolve_rotating_proxy(
     else:
         lease = manager.acquire(effective_lane, scope=scope)
     return lease.proxy_url
+
+
+def release_rotating_proxy(
+    *,
+    scope: str,
+    lane_id: int | None = None,
+    proxy_url: str | None = None,
+) -> bool:
+    """Release a completed rotating-proxy lane while retaining the purchased key."""
+    from core.rotating_proxy_manager import get_rotating_proxy_manager
+
+    try:
+        effective_lane = default_proxy_lane_id() if lane_id is None else lane_id
+        return get_rotating_proxy_manager().release(
+            effective_lane,
+            scope=scope,
+            proxy_url=proxy_url,
+        )
+    except Exception as exc:  # cleanup must not hide the workflow result
+        logger.warning(
+            "[RotatingProxy] release lease failed: scope=%s lane=%s error=%s: %s",
+            scope,
+            lane_id if lane_id is not None else "thread",
+            type(exc).__name__,
+            str(exc)[:180],
+        )
+        return False
+
+
+def prepare_rotating_proxy_lanes(lane_count: int, *, scope: str) -> None:
+    """Pre-purchase enough unique rotating keys for a batch's worker lanes."""
+    from config import proxy as proxy_config
+
+    if not bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False)):
+        return
+    if scope in {CODEX_RETRY_PROXY_SCOPE, PLAN_CHECK_PROXY_SCOPE, TWOFA_RETRY_PROXY_SCOPE}:
+        from core.nordvpn_wireguard import is_per_profile_proxy_enabled
+
+        if is_per_profile_proxy_enabled():
+            return
+
+    from core.rotating_proxy_manager import get_rotating_proxy_manager
+
+    get_rotating_proxy_manager().ensure_key_inventory(lane_count, scope=scope)

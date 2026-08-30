@@ -18,7 +18,12 @@ except Exception:  # WebUI 环境未装 curl_cffi 时使用标准库兜底
 
 from config import extract_link as cfg
 from core import db
-from core.rotating_proxy_runtime import EXTRACT_LINK_PROXY_SCOPE, resolve_rotating_proxy
+from core.rotating_proxy_runtime import (
+    EXTRACT_LINK_PROXY_SCOPE,
+    prepare_rotating_proxy_lanes,
+    release_rotating_proxy,
+    resolve_rotating_proxy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +80,20 @@ _WORKERS = _int_setting("EXTRACT_LINK_WORKERS", 3, 1, 16)
 _QUEUE_LIMIT = _int_setting("EXTRACT_LINK_QUEUE_LIMIT", 500, _WORKERS, 5000)
 _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="extract-link")
 _QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
+_PROXY_INVENTORY_LOCK = threading.Lock()
+_PROXY_INVENTORY_READY = False
+
+
+def _prepare_proxy_inventory() -> None:
+    global _PROXY_INVENTORY_READY
+    from config import proxy as proxy_config
+
+    if not bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False)):
+        return
+    with _PROXY_INVENTORY_LOCK:
+        if not _PROXY_INVENTORY_READY:
+            prepare_rotating_proxy_lanes(_WORKERS, scope=EXTRACT_LINK_PROXY_SCOPE)
+            _PROXY_INVENTORY_READY = True
 
 
 def queue_settings() -> dict:
@@ -110,6 +129,7 @@ def query_cdk(*, cdk: str | None = None, proxy: str | None = None, proxy_lane_id
         scope=EXTRACT_LINK_PROXY_SCOPE,
         lane_id=proxy_lane_id,
     )
+    rotating_proxy = active_proxy if proxy is None else None
     timeout = _int_setting("EXTRACT_LINK_REQUEST_TIMEOUT", 30, 5, 300)
     s = _session(active_proxy)
     try:
@@ -135,6 +155,12 @@ def query_cdk(*, cdk: str | None = None, proxy: str | None = None, proxy_lane_id
             s.close()
         except Exception:
             pass
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=EXTRACT_LINK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=rotating_proxy,
+            )
 
 
 def _create_extract_job(
@@ -153,6 +179,7 @@ def _create_extract_job(
         scope=EXTRACT_LINK_PROXY_SCOPE,
         lane_id=proxy_lane_id,
     )
+    rotating_proxy = active_proxy if proxy is None else None
     s = _session(active_proxy)
     try:
         if s is None:
@@ -188,6 +215,12 @@ def _create_extract_job(
             s.close()
         except Exception:
             pass
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=EXTRACT_LINK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=rotating_proxy,
+            )
 
 
 def _iter_sse_events(
@@ -205,6 +238,7 @@ def _iter_sse_events(
         scope=EXTRACT_LINK_PROXY_SCOPE,
         lane_id=proxy_lane_id,
     )
+    rotating_proxy = active_proxy if proxy is None else None
     s = _session(active_proxy)
     try:
         if s is None:
@@ -286,6 +320,12 @@ def _iter_sse_events(
             s.close()
         except Exception:
             pass
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=EXTRACT_LINK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=rotating_proxy,
+            )
 
 
 def _extract_error_message(data) -> str:
@@ -336,6 +376,7 @@ def _run_extract(
 ) -> dict:
     logs: list[str] = []
     last_event = None
+    rotating_proxy: str | None = None
     try:
         if not db.mark_account_extract_running(account_id):
             return {"ok": False, "error": "账号已删除或提链状态已被重置"}
@@ -344,6 +385,8 @@ def _run_extract(
             scope=EXTRACT_LINK_PROXY_SCOPE,
             lane_id=proxy_lane_id,
         )
+        if proxy is None:
+            rotating_proxy = active_proxy
         job = _create_extract_job(
             token=access_token,
             link_type=link_type,
@@ -402,6 +445,12 @@ def _run_extract(
         logger.exception("[提链] 失败: %s", email)
         return result
     finally:
+        if rotating_proxy is not None:
+            release_rotating_proxy(
+                scope=EXTRACT_LINK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=rotating_proxy,
+            )
         _QUEUE_SLOTS.release()
 
 
@@ -424,6 +473,7 @@ def enqueue_account_extract(
         if not db.claim_account_extract(account_id, trigger=trigger, link_type=lt):
             _QUEUE_SLOTS.release()
             return {"accepted": False, "busy": True, "error": "该账号正在提链中"}
+        _prepare_proxy_inventory()
         fut = _EXECUTOR.submit(
             _run_extract,
             account_id=account_id,

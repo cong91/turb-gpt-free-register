@@ -2180,7 +2180,7 @@
       <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 8h10M7 12h6M7 16h4"/>
       </svg>
-      <span class="sidebar-item-label">Roxy Profiles</span>
+      <span class="sidebar-item-label">Profile Roxy</span>
     </button>
     <button type="button" data-tab="config" class="sidebar-item">
       <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2300,10 +2300,10 @@
             <option value="">Theo cấu hình hiện tại</option>
             <option value="gmail_123452026">Gmail CDK</option>
             <option value="gmail_api_url">Gmail API URL</option>
-            <option value="qan8_gmail_api">QAN8 Gmail API lazy</option>
-            <option value="paymesh">Paymesh MAIL card</option>
-            <option value="tinyhost">TinyHost temp mail</option>
-            <option value="local_test">Local test (dry-run)</option>
+            <option value="qan8_gmail_api">QAN8 Gmail API (lazy)</option>
+            <option value="paymesh">Paymesh (MAIL card)</option>
+            <option value="tinyhost">TinyHost email tạm</option>
+            <option value="local_test">Kiểm thử cục bộ (dry-run)</option>
           </select>
         </label>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnStartV2">开始注册</button>
@@ -2312,31 +2312,31 @@
         <label for="gmailCdkBatchV2">Gmail CDK batch</label>
         <textarea id="gmailCdkBatchV2" data-cdk-batch-input placeholder="Mỗi dòng một CDK" autocomplete="off" spellcheck="false"></textarea>
         <div class="provider-inline-config">
-          <label class="fld-inline">Gmail routed domain 1
+          <label class="fld-inline">Tên miền chuyển tiếp Gmail 1
             <input data-gmail-routed-domain type="text" placeholder="relay-one.net" autocomplete="off" spellcheck="false">
           </label>
-          <label class="fld-inline">Gmail routed domain 2 (optional)
+          <label class="fld-inline">Tên miền chuyển tiếp Gmail 2 (tùy chọn)
             <input data-gmail-routed-domain type="text" placeholder="relay-two.org" autocomplete="off" spellcheck="false">
           </label>
-          <span class="hint">Domain routing/catch-all thật phải chuyển thư về mailbox của CDK. Quota routed là N tổng.</span>
+          <span class="hint">Định tuyến tên miền/catch-all thực tế phải chuyển thư về hộp thư CDK. Hạn mức routed là tổng N.</span>
         </div>
         <span data-cdk-count>0 CDK</span>
       </div>
       <div class="gmail-cdk-batch-v2 hidden" data-provider-input="paymesh">
-        <label for="paymeshCdkBatchV2">Paymesh MAIL card batch</label>
+        <label for="paymeshCdkBatchV2">Danh sách MAIL card Paymesh</label>
         <textarea id="paymeshCdkBatchV2" data-cdk-batch-input placeholder="Mỗi dòng một MAIL card" autocomplete="off" spellcheck="false"></textarea>
         <span data-cdk-count>0 CDK</span>
         <div class="provider-inline-config">
-          <label class="fld-inline">Paymesh routed domain 1
+          <label class="fld-inline">Tên miền chuyển tiếp Paymesh 1
             <input data-paymesh-routed-domain type="text" placeholder="test.com" autocomplete="off" spellcheck="false">
           </label>
-          <label class="fld-inline">Paymesh routed domain 2 (optional)
+          <label class="fld-inline">Tên miền chuyển tiếp Paymesh 2 (tùy chọn)
             <input data-paymesh-routed-domain type="text" placeholder="mail.test" autocomplete="off" spellcheck="false">
           </label>
-          <span class="hint">Alias local sẽ tạo thêm xxx+hash@&lt;domain&gt; để test local chống giả mạo email.</span>
+          <span class="hint">Bí danh cục bộ sẽ tạo thêm xxx+hash@&lt;tên miền&gt; để kiểm thử chống giả mạo email cục bộ.</span>
         </div>
         <div class="provider-inline-config" data-provider-config="paymesh">
-          <label class="fld-inline">Paymesh API
+          <label class="fld-inline">API Paymesh
             <input id="paymeshApiBaseInline" data-config-key="PAYMESH_API_BASE" type="text" placeholder="https://sms.paymesh.cn" autocomplete="off">
           </label>
           <label class="fld-inline">每 card 账号数
@@ -2348,44 +2348,44 @@
       </div>
       <div class="gmail-cdk-batch-v2 hidden" data-provider-input="gmail_api_url">
         <div class="provider-inline-config">
-          <label class="fld-inline">Số alias mỗi email (tối đa 12)
+          <label class="fld-inline">Số bí danh mỗi email (tối đa 12)
             <input id="gmailApiUrlAliasCountV2" type="number" min="1" max="12" value="12"
               inputmode="numeric" autocomplete="off"
-              title="1 email gốc → sinh tối đa 12 alias: tối đa 1 alias có dấu chấm, các alias còn lại dùng +; tổng 6 gmail.com + 6 googlemail.com. Tất cả share cùng URL lấy OTP.">
+              title="1 email gốc → sinh tối đa 12 bí danh: tối đa 1 bí danh có dấu chấm, các bí danh còn lại dùng +; tổng 6 gmail.com + 6 googlemail.com. Tất cả dùng chung URL lấy OTP.">
           </label>
           <button type="button" class="jobs-tb-btn" id="btnUseAllGmailApiUrlV2" title="Đặt số bản ghi bằng toàn bộ bản ghi chưa dùng trong kho">Dùng hết bản ghi chưa dùng</button>
           <span class="hint">
             Ô <b>Số bản ghi</b> chọn bao nhiêu email chưa dùng trong kho sẽ đăng ký.
             Tối đa bằng số còn sẵn sàng: <b id="gmailApiUrlPoolAvailableV2">?</b>.
             Bấm <b>Dùng hết</b> để lấy toàn bộ.<br>
-            Hệ thống nhân với số alias mỗi bản ghi (tối đa 12). Ví dụ: 3 × 12 = 36 tài khoản.
+            Hệ thống nhân với số bí danh mỗi bản ghi (tối đa 12). Ví dụ: 3 × 12 = 36 tài khoản.
           </span>
         </div>
       </div>
       <div class="gmail-cdk-batch-v2 hidden" data-provider-input="qan8_gmail_api">
         <div class="provider-inline-config">
-          <label class="fld-inline">Số alias mỗi source
+          <label class="fld-inline">Số bí danh mỗi nguồn
             <input id="qan8AliasCountV2" type="number" min="1" max="12" value="12"
               inputmode="numeric" autocomplete="off"
-              title="Mỗi worker sở hữu một source Gmail riêng; source chỉ được thay khi hết alias.">
+              title="Mỗi luồng sở hữu một nguồn Gmail riêng; nguồn chỉ được thay khi hết bí danh.">
           </label>
           <span class="hint">
-            Mỗi worker = một lane = một mail gốc QAN8 khác nhau. Alias do client sinh ra và cùng nhận OTP qua code URL của mail gốc.
+            Mỗi luồng = một lane = một email gốc QAN8 khác nhau. Bí danh do client sinh ra và cùng nhận OTP qua URL lấy mã của email gốc.
           </span>
         </div>
       </div>
       <div class="gmail-cdk-batch-v2 hidden" data-provider-input="local_test">
         <div class="provider-inline-config">
-          <label class="fld-inline">Local test base
+          <label class="fld-inline">Tiền tố kiểm thử cục bộ
             <input data-local-test-base type="text" maxlength="32" placeholder="sampleuser" autocomplete="off" spellcheck="false">
           </label>
-          <label class="fld-inline">Test domain 1
+          <label class="fld-inline">Tên miền kiểm thử 1
             <input data-local-test-domain type="text" placeholder="mail.test" autocomplete="off" spellcheck="false">
           </label>
-          <label class="fld-inline">Test domain 2 (optional)
+          <label class="fld-inline">Tên miền kiểm thử 2 (tùy chọn)
             <input data-local-test-domain type="text" placeholder="inbox.invalid" autocomplete="off" spellcheck="false">
           </label>
-          <span class="hint">Local test dry-run không gọi OpenAI, browser, OTP hoặc email provider.</span>
+          <span class="hint">Kiểm thử cục bộ dry-run không gọi OpenAI, trình duyệt, OTP hoặc nhà cung cấp email.</span>
         </div>
       </div>
       <div id="regWarnV2"></div>
@@ -2437,13 +2437,13 @@
             <select id="accountSourceFilterV2">
               <option value="">Tất cả nguồn</option>
               <option value="gmail_api_url">Gmail API URL</option>
-              <option value="qan8_gmail_api">QAN8 Gmail API lazy</option>
+              <option value="qan8_gmail_api">QAN8 Gmail API (lazy)</option>
               <option value="paymesh">Paymesh</option>
               <option value="gmail_123452026">Gmail CDK</option>
               <option value="outlook">Outlook</option>
               <option value="generic_api">Generic API</option>
               <option value="cloudflare">Cloudflare tạm</option>
-              <option value="cloudflare_domain">Domain mailbox</option>
+              <option value="cloudflare_domain">Hộp thư theo tên miền</option>
               <option value="gptmail">GPTMail</option>
               <option value="mailnest">MailNest</option>
               <option value="cloudmail">CloudMail</option>
@@ -2505,7 +2505,7 @@
             </select>
           </label>
           <label class="acc-v2-field acc-v2-field-locale">
-            <span>Locale / country</span>
+            <span>Khu vực / quốc gia</span>
             <input id="accountLocaleFilterV2" type="search" placeholder="Ví dụ: jp hoặc JP" autocomplete="off">
           </label>
           <div class="acc-v2-field acc-v2-date-field">
@@ -2529,7 +2529,7 @@
       <div class="jobs-toolbar-v2" id="accountsToolbarV2">
         <div class="accounts-commandbar-head">
           <div>
-            <span class="accounts-eyebrow">BULK COMMANDS</span>
+            <span class="accounts-eyebrow">LỆNH HÀNG LOẠT</span>
             <strong id="accountsBulkSelectionLabelV2">0 tài khoản</strong>
           </div>
           <label class="accounts-scope-field">Phạm vi
@@ -2552,6 +2552,7 @@
           <span class="accounts-command-label">Xử lý chính</span>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" disabled title="Kiểm tra trạng thái đăng nhập và làm mới accessToken theo phạm vi">Kiểm tra tài khoản</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="Kiểm tra gói hiện tại theo phạm vi">Kiểm tra gói</button>
+          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnReactivateSelectedTwofaV2" disabled title="Đăng nhập lại và hoàn thành 2FA theo phạm vi">Khôi phục 2FA</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="Tạo link cho tài khoản Free có trial theo phạm vi">Tạo link</button>
         </div>
         <details class="accounts-command-section" open>
@@ -2570,9 +2571,9 @@
           <summary><span>Xuất & sao chép</span><small>file, token, email, Free Plus</small></summary>
           <div class="accounts-command-items">
             <label class="accounts-format-field">Định dạng
-              <select id="accountExportFormatV2"><option value="modern">email | pass | 2fa</option><option value="legacy">Legacy</option></select>
+              <select id="accountExportFormatV2"><option value="modern">email | pass | 2fa</option><option value="legacy">Cũ</option></select>
             </label>
-            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusAllV2" title="Xuất các Free Plus chưa xuất trong kết quả lọc và tự lưu trữ">Xuất Free Plus theo filter</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusAllV2" title="Xuất các Free Plus chưa xuất trong kết quả lọc và tự lưu trữ">Xuất Free Plus theo bộ lọc</button>
             <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusSelectedV2" disabled title="Xuất Free Plus theo phạm vi đang chọn">Xuất Free Plus</button>
             <button type="button" class="jobs-tb-btn" id="btnRecoverLatestFreePlusV2" title="Tạo lại bản xuất Free Plus gần nhất">Lấy bản xuất gần nhất</button>
             <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusExportedV2" disabled title="Đánh dấu đã xuất theo phạm vi">Đánh dấu đã xuất</button>
@@ -3102,7 +3103,7 @@ function jobsV2OpIcons() {
     del: `<svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`,
   };
 }
-function showToast(t) { const el=$('#toast'); el.textContent=t; el.classList.add('show'); clearTimeout(showToast.t); showToast.t=setTimeout(()=>el.classList.remove('show'),1400); }
+function showToast(t) { const el=$('#toast'); const text = typeof window.__translateVi === 'function' ? window.__translateVi(String(t)) : t; el.textContent=text; el.classList.add('show'); clearTimeout(showToast.t); showToast.t=setTimeout(()=>el.classList.remove('show'),1400); }
 async function copyText(text) {
   if (!text) return;
   try {
@@ -3361,7 +3362,7 @@ function renderJobs() {
         <td class="col-check"><input type="checkbox" class="job-row-check" data-job-id="${esc(j.id)}" ${JOB_SELECTED.has(Number(j.id)) ? 'checked' : ''} ${running ? 'disabled title="运行中的任务不能选择"' : ''}></td>
         <td class="col-id">#${esc(j.id)}${j.parent_job_id ? `<div class="sub-cell" title="重试自任务 #${esc(j.parent_job_id)}">↳ #${esc(j.parent_job_id)} · ${esc(j.retry_attempt || 1)}</div>` : ''}</td>
         <td class="col-status">${pillV2(j.display_status || j.status)}</td>
-        <td class="col-email" title="${esc(j.email || '-')}">${esc(j.email || '-')}${j.job_type === 'local_test' ? '<div class="sub-cell">Local test</div>' : ''}</td>
+        <td class="col-email" title="${esc(j.email || '-')}">${esc(j.email || '-')}${j.job_type === 'local_test' ? '<div class="sub-cell">Kiểm thử cục bộ</div>' : ''}</td>
         <td class="col-time" title="${esc(started)}">${esc(started)}</td>
         <td class="col-time" title="${esc(completed)}">${esc(completed)}</td>
         <td class="col-error" title="${esc(err)}">${esc(err ? short(err, 60) : '-')}</td>
@@ -4007,7 +4008,7 @@ function _codexAction(r) {
 }
 function _twofaReactivateAction(r) {
   if (!r.twofa_reactivate_available) return '';
-  return `<button type="button" class="good" data-account-twofa-reactivate="${esc(r.id)}" data-email="${esc(r.email || '')}" title="重新登录该账号并补做 2FA">Reactive 2FA</button>`;
+  return `<button type="button" class="good" data-account-twofa-reactivate="${esc(r.id)}" data-email="${esc(r.email || '')}" title="重新登录该账号并补做 2FA">Khôi phục 2FA</button>`;
 }
 function _tokenCellV2(r) {
   const live = r.live_check_status || '';
@@ -4121,7 +4122,7 @@ function updateAccountSelectionUi(pageRows = null) {
   const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
   const v2Ids = [
-    'btnCheckSelectedLiveV2', 'btnCheckSelectedPlansV2', 'btnExtractSelectedLinksV2',
+    'btnCheckSelectedLiveV2', 'btnCheckSelectedPlansV2', 'btnReactivateSelectedTwofaV2', 'btnExtractSelectedLinksV2',
     'btnGenerateSelectedAgentV2', 'btnDownloadSelectedAgentV2', 'btnUploadSelectedAgentSub2V2',
     'btnLoginFreeNoTrialSub2V2', 'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
@@ -4543,10 +4544,10 @@ async function onAccountsBodyClick(e) {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({}),
       });
-      showToast(result.message || '已开始 Reactive 2FA');
+      showToast(result.message || 'Đã bắt đầu khôi phục 2FA');
       await loadAccounts();
     } catch (err) {
-      showToast('Reactive 2FA 失败: ' + err.message);
+      showToast('Khôi phục 2FA thất bại: ' + err.message);
       twofaBtn.disabled = false;
     }
     return;
@@ -4844,7 +4845,7 @@ async function exportFreePlus(scope) {
   const ids = scope === 'selected' ? await getAccountBulkIds() : [];
   if (scope === 'selected' && !ids.length) { showToast('当前批量范围没有账号'); return; }
   const formatName = getAccountExportFormat();
-  if (formatName === 'legacy' && !confirm('Legacy 会包含原始邮箱素材和 Access Token，确定继续吗？')) return;
+  if (formatName === 'legacy' && !confirm('Định dạng Cũ sẽ bao gồm dữ liệu email gốc và Access Token. Bạn có chắc muốn tiếp tục không?')) return;
   try {
     const body = {scope, account_ids: scope === 'selected' ? ids : undefined, format: formatName};
     if (scope === 'all_filtered') {
@@ -5657,9 +5658,42 @@ async function retrySelectedCodex() {
   }
 }
 
+async function reactivateSelectedTwofa() {
+  const ids = await getAccountBulkIds();
+  if (ids.length === 0) { showToast('请先选择账号'); return; }
+  if (ids.length > 500) { showToast('Khôi phục 2FA chỉ xử lý tối đa 500 tài khoản mỗi lần'); return; }
+  const workers = getCodexBulkWorkers();
+  const workersElV2 = $('#codexBulkWorkersV2');
+  if (workersElV2) workersElV2.value = workers;
+  if (!confirm(`批量重新登录并补做当前范围内 ${ids.length} 个账号的 2FA？\n\n并发线程数：${workers}\n\n已启用 2FA 的账号、缺少登录密码或正在运行的账号会自动跳过。`)) return;
+  const btn = $('#btnReactivateSelectedTwofaV2');
+  if (!btn) return;
+  btn.disabled = true;
+  try {
+    const result = await api('/api/accounts/twofa/reactivate-bulk', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({account_ids: ids, workers}),
+    });
+    const skippedCount = (result.skipped || []).length;
+    const reusedCount = result.reused_count || 0;
+    showToast(skippedCount
+      ? `已启动 ${result.started_count || 0} 个，复用 ${reusedCount} 个，跳过 ${skippedCount} 个`
+      : `Đã bắt đầu khôi phục 2FA cho ${result.started_count || 0} tài khoản${reusedCount ? `, dùng lại ${reusedCount} tài khoản` : ''}`);
+    loadAccounts();
+    const poll = setInterval(loadAccounts, 10000);
+    setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
+  } catch (err) {
+    showToast('Khôi phục 2FA hàng loạt thất bại: ' + err.message);
+    updateAccountSelectionUi();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function recoverLatestFreePlusExport() {
   const formatName = getAccountExportFormat();
-  if (formatName === 'legacy' && !confirm('Legacy 会包含原始邮箱素材和 Access Token，确定继续吗？')) return;
+  if (formatName === 'legacy' && !confirm('Định dạng Cũ sẽ bao gồm dữ liệu email gốc và Access Token. Bạn có chắc muốn tiếp tục không?')) return;
   try {
     const r = await api('/api/accounts/free-plus/recover-latest', {
       method: 'POST',
@@ -5734,6 +5768,7 @@ async function loginAllFreeNoTrialToSub2() {
     if (el) el.addEventListener('click', fn);
   };
   bind('btnCheckSelectedPlansV2', checkSelectedPlans);
+  bind('btnReactivateSelectedTwofaV2', reactivateSelectedTwofa);
   bind('btnImportPlanEmailsV2', openImportPlanPanel);
   bind('btnExtractSelectedLinksV2', extractSelectedLinks);
   bind('btnGenerateSelectedAgentV2', generateSelectedCodexAgents);

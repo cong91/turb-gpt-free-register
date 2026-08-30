@@ -55,7 +55,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", "file": "register.py", "type": "bool", "group": "注册方式",
-        "label": "Free无Plus试用自动补跑 Codex", "help": "注册后先查套餐；仅明确为 Free 且没有 Free Plus 试用资格时，在当前注册浏览器内运行 Codex。",
+        "label": "Free无Plus试用自动 Codex OAuth", "help": "注册后先查套餐；仅明确为 Free 且没有 Free Plus 试用资格时，直接执行 Codex OAuth。浏览器驱动复用当前注册浏览器。",
     },
 
     # ---- CloakBrowser ----
@@ -85,7 +85,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "CLOAK_LICENSE_KEY", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
-        "label": "Cloak License", "help": "Pro license；留空使用免费 binary",
+        "label": "Khóa bản quyền Cloak", "help": "Bản quyền Pro; để trống để dùng binary miễn phí",
     },
     {
         "key": "CLOAK_FINGERPRINT_SEED", "file": "cloakbrowser.py", "type": "str", "group": "CloakBrowser",
@@ -115,7 +115,7 @@ EDITABLE_FIELDS = [
     # ---- Browser Use Cloud ----
     {
         "key": "BROWSER_USE_API_KEY", "file": "browser_use.py", "type": "str", "group": "Browser Use",
-        "label": "Browser Use API Key", "help": "保存在 .env（BROWSER_USE_API_KEY），不写回 config/*.py",
+        "label": "Khóa API Browser Use", "help": "Lưu trong .env (BROWSER_USE_API_KEY), không ghi lại vào config/*.py",
         "storage": "env", "secret": True,
     },
     {
@@ -128,7 +128,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "BROWSER_USE_PROFILE_ID", "file": "browser_use.py", "type": "str", "group": "Browser Use",
-        "label": "Profile ID", "help": "可选。填写则复用 Browser Use profile 的 cookies/localStorage；批量建议留空",
+        "label": "ID profile", "help": "Tùy chọn. Nếu nhập sẽ dùng lại cookies/localStorage của profile Browser Use; nên để trống khi chạy hàng loạt",
     },
     {
         "key": "BROWSER_USE_CDP_BASE", "file": "browser_use.py", "type": "str", "group": "Browser Use",
@@ -175,7 +175,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "SKYVERN_BROWSER_PROFILE_ID", "file": "skyvern.py", "type": "str", "group": "Skyvern",
-        "label": "Browser Profile ID", "help": "可选，复用 Skyvern browser profile",
+        "label": "ID profile trình duyệt", "help": "Tùy chọn, dùng lại profile trình duyệt của Skyvern",
     },
     {
         "key": "SKYVERN_PROXY_LOCATION", "file": "skyvern.py", "type": "str", "group": "Skyvern",
@@ -207,7 +207,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "ROXY_API_TOKEN", "file": "roxybrowser.py", "type": "str", "group": "RoxyBrowser",
-        "label": "Roxy API Key", "help": "保存在 .env（ROXY_API_TOKEN），不写回 config/*.py",
+        "label": "Khóa API Roxy", "help": "Lưu trong .env (ROXY_API_TOKEN), không ghi lại vào config/*.py",
         "storage": "env", "secret": True,
     },
     {
@@ -283,48 +283,48 @@ EDITABLE_FIELDS = [
         "label": "删除接口路径", "help": "默认 /browser/delete；如 Roxy 版本不同可调整",
     },
     {
-        "key": "ROXY_PROFILE_MANAGER_ENABLED", "file": "roxy_profile_manager.py", "type": "bool", "group": "Roxy Profile Manager",
-        "label": "启用 Profile Manager", "help": "独立管理 Roxy profile，不影响注册流程",
+        "key": "ROXY_PROFILE_MANAGER_ENABLED", "file": "roxy_profile_manager.py", "type": "bool", "group": "Quản lý profile Roxy",
+        "label": "Bật quản lý profile", "help": "Quản lý profile Roxy độc lập, không ảnh hưởng luồng đăng ký",
     },
     {
-        "key": "ROXY_PROFILE_MANAGER_OWNER_PREFIX", "file": "roxy_profile_manager.py", "type": "str", "group": "Roxy Profile Manager",
-        "label": "归属标记前缀", "help": "写入 Roxy remark 的管理器归属标记",
+        "key": "ROXY_PROFILE_MANAGER_OWNER_PREFIX", "file": "roxy_profile_manager.py", "type": "str", "group": "Quản lý profile Roxy",
+                    "label": "Tiền tố nhận diện", "help": "Ghi dấu nhận diện của trình quản lý vào remark của Roxy",
     },
     {
-        "key": "ROXY_PROFILE_ARCHIVE_DIR", "file": "roxy_profile_manager.py", "type": "str", "group": "Roxy Profile Manager",
-        "label": "Archive 目录", "help": "加密 metadata/folder artifact 的本地目录",
+        "key": "ROXY_PROFILE_ARCHIVE_DIR", "file": "roxy_profile_manager.py", "type": "str", "group": "Quản lý profile Roxy",
+        "label": "Thư mục lưu trữ", "help": "Thư mục cục bộ chứa artifact thư mục/siêu dữ liệu đã mã hóa",
     },
     {
-        "key": "ROXY_PROFILE_ARCHIVE_MAX_BYTES", "file": "roxy_profile_manager.py", "type": "int", "group": "Roxy Profile Manager",
-        "label": "Metadata archive 上限", "help": "metadata v1 artifact 最大字节数",
+        "key": "ROXY_PROFILE_ARCHIVE_MAX_BYTES", "file": "roxy_profile_manager.py", "type": "int", "group": "Quản lý profile Roxy",
+        "label": "Giới hạn lưu trữ siêu dữ liệu", "help": "Số byte tối đa của artifact siêu dữ liệu v1",
     },
     {
-        "key": "ROXY_PROFILE_FULL_ARCHIVE_MAX_BYTES", "file": "roxy_profile_manager.py", "type": "int", "group": "Roxy Profile Manager",
-        "label": "Full archive 上限", "help": "folder artifact 最大字节数",
+        "key": "ROXY_PROFILE_FULL_ARCHIVE_MAX_BYTES", "file": "roxy_profile_manager.py", "type": "int", "group": "Quản lý profile Roxy",
+        "label": "Giới hạn lưu trữ đầy đủ", "help": "Số byte tối đa của artifact thư mục",
     },
     {
-        "key": "ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED", "file": "roxy_profile_manager.py", "type": "bool", "group": "Roxy Profile Manager",
-        "label": "启用实验性 local open", "help": "仅在目标 Roxy 版本通过手动验证后启用",
+        "key": "ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED", "file": "roxy_profile_manager.py", "type": "bool", "group": "Quản lý profile Roxy",
+        "label": "Bật mở cục bộ thử nghiệm", "help": "Chỉ bật sau khi đã kiểm tra thủ công trên phiên bản Roxy mục tiêu",
     },
     {
-        "key": "ROXY_PROFILE_ROXY_CHROME_PATH", "file": "roxy_profile_manager.py", "type": "str", "group": "Roxy Profile Manager",
-        "label": "RoxyChrome 路径", "help": "本地实验性启动使用的 RoxyChrome.exe",
+        "key": "ROXY_PROFILE_ROXY_CHROME_PATH", "file": "roxy_profile_manager.py", "type": "str", "group": "Quản lý profile Roxy",
+        "label": "Đường dẫn RoxyChrome", "help": "RoxyChrome.exe dùng để khởi động thử nghiệm cục bộ",
     },
     {
-        "key": "ROXY_PROFILE_CACHE_ROOT", "file": "roxy_profile_manager.py", "type": "str", "group": "Roxy Profile Manager",
-        "label": "Roxy cache 目录", "help": "只读获取已关闭远程 profile 的浏览器目录",
+        "key": "ROXY_PROFILE_CACHE_ROOT", "file": "roxy_profile_manager.py", "type": "str", "group": "Quản lý profile Roxy",
+        "label": "Thư mục bộ nhớ đệm Roxy", "help": "Chỉ đọc để lấy thư mục trình duyệt của profile từ xa đã đóng",
     },
     {
-        "key": "ROXY_PROFILE_OFFLINE_STAGING_DIR", "file": "roxy_profile_manager.py", "type": "str", "group": "Roxy Profile Manager",
-        "label": "Offline staging 目录", "help": "解密 artifact 到本地实验浏览器的隔离目录",
+        "key": "ROXY_PROFILE_OFFLINE_STAGING_DIR", "file": "roxy_profile_manager.py", "type": "str", "group": "Quản lý profile Roxy",
+        "label": "Thư mục chuẩn bị cục bộ", "help": "Thư mục cô lập để giải mã artifact cho trình duyệt thử nghiệm cục bộ",
     },
     {
-        "key": "ROXY_PROFILE_OFFLINE_TIMEOUT", "file": "roxy_profile_manager.py", "type": "int", "group": "Roxy Profile Manager",
-        "label": "Offline CDP 超时", "help": "等待本地 RoxyChrome CDP 就绪的秒数",
+        "key": "ROXY_PROFILE_OFFLINE_TIMEOUT", "file": "roxy_profile_manager.py", "type": "int", "group": "Quản lý profile Roxy",
+        "label": "Thời gian chờ CDP cục bộ", "help": "Số giây chờ CDP của RoxyChrome cục bộ sẵn sàng",
     },
     {
-        "key": "ROXY_PROFILE_ALLOW_CORE_VERSION_MISMATCH", "file": "roxy_profile_manager.py", "type": "bool", "group": "Roxy Profile Manager",
-        "label": "允许 core 版本不匹配", "help": "实验选项；默认关闭，snapshot core 与本地 RoxyChrome 版本必须一致",
+        "key": "ROXY_PROFILE_ALLOW_CORE_VERSION_MISMATCH", "file": "roxy_profile_manager.py", "type": "bool", "group": "Quản lý profile Roxy",
+        "label": "Cho phép lệch phiên bản Core", "help": "Tùy chọn thử nghiệm; mặc định tắt, phiên bản Core của bản chụp và RoxyChrome cục bộ phải giống nhau",
     },
     {
         "key": "CODEX_OAUTH_DRIVER", "file": "codex.py", "type": "str", "group": "Codex",
