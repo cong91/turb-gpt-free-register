@@ -53,21 +53,21 @@ RUN set -eux; \
       data \
       roxy_profile_archives \
       roxy_profile_staging \
-      注册日志 \
+      '注册日志' \
       turb.sqlite3 \
-      用于注册的邮箱.json \
-      用于注册的邮箱.txt \
-      用于注册的API邮箱.json \
-      用于注册的API邮箱.txt \
-      用于注册的Gmail API邮箱.json \
-      用于注册的Gmail API邮箱.txt \
-      用于注册的域名邮箱.json \
-      注册成功的邮箱.json \
-      注册成功的邮箱.txt \
-      注册成功的token.txt \
-      注册任务.json \
+      '用于注册的邮箱.json' \
+      '用于注册的邮箱.txt' \
+      '用于注册的API邮箱.json' \
+      '用于注册的API邮箱.txt' \
+      '用于注册的Gmail API邮箱.json' \
+      '用于注册的Gmail API邮箱.txt' \
+      '用于注册的域名邮箱.json' \
+      '注册成功的邮箱.json' \
+      '注册成功的邮箱.txt' \
+      '注册成功的token.txt' \
+      '注册任务.json' \
       accounts_viewer.html \
-      codex_导出状态.json \
+      'codex_导出状态.json' \
       gmail_cdk_ledger.json \
       paymesh_card_ledger.json \
       outlook_accounts.txt \
