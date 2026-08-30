@@ -32,6 +32,7 @@ def _is_transient_navigation_error(exc: Exception) -> bool:
     return any(
         marker in message
         for marker in (
+            "err_aborted",
             "err_empty_response",
             "err_connection_reset",
             "err_connection_closed",

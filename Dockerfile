@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
     CLOAKBROWSER_CACHE_DIR=/opt/cloakbrowser \
-    CLOAK_EXTRA_ARGS=--disable-crashpad-for-testing \
+    CLOAK_EXTRA_ARGS="[\"--disable-crashpad-for-testing\",\"--single-process\"]" \
     HOME=/home/app
 
 WORKDIR /app
