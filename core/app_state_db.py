@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-APP_STATE_DB_PATH = PROJECT_ROOT / "app_state.sqlite3"
+# The origin database name remains the single runtime source of truth. The
+# app-state module owns fork-added schemas, but it does not introduce a second
+# runtime database.
+APP_STATE_DB_PATH = PROJECT_ROOT / "turb.sqlite3"
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS app_documents (
     document_key TEXT PRIMARY KEY,

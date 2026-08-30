@@ -11,8 +11,10 @@ Cách lấy file .conf:
 
 Cách dùng wireproxy:
     https://github.com/pufferffish/wireproxy
-    Windows: wireproxy.exe không cần admin, dùng userspace WireGuard.
-    Đặt wireproxy.exe vào PATH hoặc điền đường dẫn vào NORDVPN_WG_WIREPROXY_EXE.
+    Windows/Linux: wireproxy dùng userspace WireGuard, không cần tạo interface
+    kernel hoặc cấp CAP_NET_ADMIN cho container.
+    Đặt wireproxy (wireproxy.exe trên Windows) vào PATH hoặc điền đường dẫn vào
+    NORDVPN_WG_WIREPROXY_EXE.
 """
 from config.env_loader import apply_env_overrides
 
@@ -23,8 +25,8 @@ NORDVPN_WG_ENABLED: bool = False
 # Ví dụ: C:\nordvpn-wg-configs  → chứa us9999.nordvpn.com.conf, jp123.nordvpn.com.conf, ...
 NORDVPN_WG_CONFIGS_DIR: str = ""
 
-# Đường dẫn đến wireproxy.exe (có thể là tên nếu đã có trong PATH)
-NORDVPN_WG_WIREPROXY_EXE: str = "wireproxy.exe"
+# Tên binary (có thể là tên nếu đã có trong PATH). Docker dùng "wireproxy".
+NORDVPN_WG_WIREPROXY_EXE: str = "wireproxy"
 # Không tìm thấy trên PATH thì tải release đã pin + verify SHA-256 vào data/tools
 NORDVPN_WG_AUTO_DOWNLOAD: bool = True
 

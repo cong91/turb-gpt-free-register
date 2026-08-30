@@ -18,7 +18,7 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 
 ### Runtime state database
 
-应用业务状态统一保存在根目录的 `app_state.sqlite3`：账号、邮箱池、注册任务、provider quota、batch assignment、OTP 去重和 Roxy profile catalog 都以它为 source of truth。JSON/TXT/HTML、Codex credential 文件以及 Roxy archive/log 仅作为导出或 artefact；运行时不会从旧版 SQLite、JSON、TXT 或 ledger 文件隐式导入状态。
+应用业务状态统一保存在根目录的 `turb.sqlite3`：origin 的账号、邮箱池、注册任务、Codex 凭证以及 fork 新增的 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 都以它为 source of truth。`app_state.sqlite3` 只作为 fork state 的离线 migration source，不是运行时数据库。JSON/TXT/HTML、Codex credential 文件以及 Roxy archive/log 仅作为导出或 artefact；运行时不会从旧版 SQLite、JSON、TXT 或 ledger 文件隐式导入状态。
 
 ---
 
@@ -110,10 +110,10 @@ ROTATING_PROXY_WHITELIST=
 
 ### 数据存储
 
-- 迁移完成后，账号、邮箱库、任务、Codex 凭证以及 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 运行时统一存储在项目根目录 `app_state.sqlite3`。核心业务表包括 `accounts`、`email_pool`、`registration_jobs`、`codex_accounts` 和 `codex_agent_accounts`。
+- 迁移完成后，账号、邮箱库、任务、Codex 凭证以及 provider quota、batch assignment、OTP 去重和 Roxy profile catalog 运行时统一存储在项目根目录 `turb.sqlite3`。它保留 origin 的全部表和数据，并补充 `app_state.sqlite3` 中 fork 独有的表。
 - 中央数据库使用 rollback journal（`journal_mode=DELETE`）、`synchronous=FULL`、超时等待和常用字段索引，以兼容 CDK/Gmail CDK 等 provider store。WebUI 的账号、套餐状态、邮箱池、Codex 和任务分页直接执行 SQLite `COUNT(*) + LIMIT/OFFSET`。
-- `turb.sqlite3` 是迁移前 origin 的离线输入，不是迁移后的运行时 source of truth。应用启动不会再从旧 SQLite、JSON、TXT 或 Codex credential 文件隐式导入状态。
-- `app_state.sqlite3*` 和 `turb.sqlite3*` 属于运行时/迁移数据，已加入 `.gitignore`，必须纳入备份策略；迁移完成后仍应保留原始 `turb.sqlite3` 和 SQLite snapshot，直到 smoke test 通过。
+- `app_state.sqlite3` 是 fork 的离线 migration input；如果某个表同时存在于两边，`turb.sqlite3` 的 schema 和 rows 优先，任何不一致都会中止 migration，绝不静默覆盖 origin。
+- `app_state.sqlite3*` 和 `turb.sqlite3*` 属于运行时/迁移数据，已加入 `.gitignore`，必须纳入备份策略；迁移完成后仍应保留 app-state source、原始 turb snapshot 和 rollback copy，直到 smoke test 通过。
 
 #### Split SQLite migration runbook
 
@@ -131,7 +131,7 @@ Sau đó chạy rehearsal không ghi file bằng `--dry-run`:
 python -m core.sqlite_state_migration migrate `
   --app-state .\app_state.sqlite3 `
   --turb .\turb.sqlite3 `
-  --target .\app_state.migrated.sqlite3 `
+  --target .\turb.migrated.sqlite3 `
   --backup-dir .\migration-backups `
   --dry-run
 ```
@@ -142,28 +142,28 @@ Khi audit đúng, tạo target mới và snapshot trong một thư mục backup 
 python -m core.sqlite_state_migration migrate `
   --app-state .\app_state.sqlite3 `
   --turb .\turb.sqlite3 `
-  --target .\app_state.migrated.sqlite3 `
+  --target .\turb.migrated.sqlite3 `
   --backup-dir .\migration-backups
 ```
 
-Service dùng SQLite backup API để snapshot, giữ nguyên toàn bộ bảng của `app_state.sqlite3`, rồi chỉ merge năm bảng authoritative từ `turb.sqlite3`. Duplicate cùng khóa và cùng nội dung được bỏ qua; schema hoặc row khác nội dung sẽ dừng và xóa target sinh ra. Kết quả có integrity check, foreign-key check, schema/count/digest verification và migration marker `migration:application_state:1`, không chứa payload row.
+Service dùng SQLite backup API để snapshot, khởi tạo target từ toàn bộ `turb.sqlite3`, rồi copy tất cả bảng chỉ có trong `app_state.sqlite3`. Bảng trùng tên phải có schema và row giống nhau; nếu khác, migration dừng và xóa target sinh ra để giữ nguyên origin. Kết quả có integrity check, foreign-key check, schema/count/digest verification và migration marker `migration:fork_state_into_turb:1`, không chứa payload row.
 
-Sau khi target validation thành công, giữ nguyên source và snapshot. Dừng application, giữ lại app-state cũ rồi promote target; các lệnh PowerShell sau cố ý không dùng `-Force`:
-
-```powershell
-if (Test-Path .\app_state.sqlite3.pre-unified) { throw "rollback copy already exists" }
-Move-Item -LiteralPath .\app_state.sqlite3 -Destination .\app_state.sqlite3.pre-unified
-Move-Item -LiteralPath .\app_state.migrated.sqlite3 -Destination .\app_state.sqlite3
-```
-
-Sau đó mới khởi động smoke test; marker trong target khiến core repository chuyển sang `app_state.sqlite3`. Nếu smoke test lỗi, dừng application và rollback bằng cách giữ target lỗi để điều tra rồi khôi phục bản cũ:
+Sau khi target validation thành công, giữ nguyên source và snapshot. Dừng application, giữ lại origin `turb.sqlite3` rồi promote target; các lệnh PowerShell sau cố ý không dùng `-Force`:
 
 ```powershell
-Move-Item -LiteralPath .\app_state.sqlite3 -Destination .\app_state.sqlite3.failed-unified
-Move-Item -LiteralPath .\app_state.sqlite3.pre-unified -Destination .\app_state.sqlite3
+if (Test-Path .\turb.sqlite3.pre-fork-merge) { throw "rollback copy already exists" }
+Move-Item -LiteralPath .\turb.sqlite3 -Destination .\turb.sqlite3.pre-fork-merge
+Move-Item -LiteralPath .\turb.migrated.sqlite3 -Destination .\turb.sqlite3
 ```
 
-Không xóa source hoặc snapshot. `turb.sqlite3` chỉ được archive sau khi đã xác nhận runtime đọc đúng `app_state.sqlite3`.
+Sau đó mới khởi động smoke test; core repository luôn đọc `turb.sqlite3`, không cần marker để đổi database. Nếu smoke test lỗi, dừng application và rollback bằng cách giữ target lỗi để điều tra rồi khôi phục bản cũ:
+
+```powershell
+Move-Item -LiteralPath .\turb.sqlite3 -Destination .\turb.sqlite3.failed-fork-merge
+Move-Item -LiteralPath .\turb.sqlite3.pre-fork-merge -Destination .\turb.sqlite3
+```
+
+Không xóa `app_state.sqlite3` source hoặc snapshot. Chỉ archive rollback copy sau khi đã xác nhận runtime đọc đúng `turb.sqlite3`.
 
 ---
 
@@ -173,7 +173,7 @@ Không xóa source hoặc snapshot. `turb.sqlite3` chỉ được archive sau kh
 - Node.js 18+
 - 可用代理、系统代理/VPN，或 RoxyBrowser 代理环境
 - 如使用 Roxy 注册：需要本机 RoxyBrowser API 可访问
-- 如使用 Cloak 注册：首次运行会自动下载 Cloak Chromium binary；`CLOAK_GEOIP=True` 需要 `cloakbrowser[geoip]` 依赖
+- 如使用 Cloak 注册：本地首次运行会自动下载 Cloak Chromium binary；Docker image 会在 build 阶段预装并在 `/opt/cloakbrowser` 持久化 cache；`CLOAK_GEOIP=True` 需要 `cloakbrowser[geoip]` 依赖
 - 如启用 Codex 自动授权：需要接码平台配置
 
 安装依赖：
@@ -182,6 +182,33 @@ Không xóa source hoặc snapshot. `turb.sqlite3` chỉ được archive sau kh
 pip install -r requirements.txt
 node --version
 ```
+
+### Production Docker / CI-CD
+
+Production uses `compose.yaml`: the application image is immutable, while the
+single runtime database and all generated exports/logs live in the named volume
+`turb_gpt_runtime`. The CloakBrowser binary cache is kept separately in
+`turb_gpt_cloak_cache`. Deploys never copy either volume into GitHub or rebuild
+them from source.
+
+The production secret file must be created only on the server at
+`/srv/turb-gpt-free-register/secrets/.env`, with mode `600`. The container reads
+it through `TURB_ENV_FILE=/run/secrets/turb.env`; it is not passed as Docker
+build context or as a GitHub Actions log value. Set `WEBUI_SECURE_COOKIE=True`
+and keep `NORDVPN_WG_ENABLED=False` until a valid NordVPN access token is
+configured.
+
+The GitHub Actions workflow runs the deployment gate tests, builds and smoke
+tests the Docker image including CloakBrowser and Linux `wireproxy`, then SSHs
+to `ovh-sing` with a pinned `known_hosts` entry. The server-side deploy script
+creates a SQLite backup before replacing the container. Configure these
+repository secrets without placing their values in source: `OVH_HOST`,
+`OVH_USER`, `OVH_SSH_PRIVATE_KEY`, and `OVH_KNOWN_HOSTS`.
+
+The public endpoint is intentionally not published by Docker. Nginx must
+terminate HTTPS for `gpt-acc.v-claw.org` and proxy to `127.0.0.1:5057`; do not
+expose port `5057` directly. The DNS A/AAAA record and certificate issuance are
+environment setup steps and must succeed before entering the WebUI password.
 
 ### 密钥配置（.env）
 
@@ -312,7 +339,7 @@ EMAIL_SOURCE = "gmail_api_url"
 - `{"code": 602}` — 提供商错误，标记邮箱为失败并记录退款提示
 - `{"code": 0, "data": {"code": "123456"}}` — 成功，返回验证码
 
-邮箱池业务状态保存在 `app_state.sqlite3`；`用于注册的Gmail API邮箱.json` 仅为同步导出。
+邮箱池业务状态保存在 `turb.sqlite3`；`用于注册的Gmail API邮箱.json` 仅为同步导出。
 
 #### QAN8 Gmail API lazy provider
 
@@ -450,7 +477,7 @@ Mỗi task sẽ thực hiện theo thứ tự:
 4. Ghi SOCKS5 vào `proxyInfo` của `/browser/create`, sau đó mới `/browser/open`.
 5. Dừng `wireproxy` và xóa file config tạm khi task kết thúc.
 
-Nếu máy chưa có `wireproxy.exe`, chương trình tự tải release đã pin và kiểm tra
+Nếu máy chưa có `wireproxy` (hoặc `wireproxy.exe` trên Windows), chương trình tự tải release đã pin và kiểm tra
 SHA-256 vào `data/tools/wireproxy/`. Có thể tắt bằng
 `NORDVPN_WG_AUTO_DOWNLOAD=False` hoặc điền đường dẫn riêng tại
 `NORDVPN_WG_WIREPROXY_EXE`.
@@ -667,7 +694,7 @@ H_ADMIN_AUTH_CODE = "你的H后台授权码"
 
 ViOTP 在 `/session/getv2` 返回完成或过期状态；其公开 API 没有主动 `cancel` / `complete` 接口，因此程序失败换号时只清理本地会话记录并等待平台自动过期。
 
-HeroSMS 在 `HERO_SMS_COUNTRY=auto` 时先调用 `getPrices&service=dr`，过滤库存大于 0 且 `cost <= HERO_SMS_MAX_PRICE` 的全部国家；`HERO_SMS_MAX_PRICE` 是唯一的硬价格上限，当前示例为 `0.1`，不会自动超过该值，也不是一个起始价。候选直接按当前 offer 的实际 `cost` 从低到高排序，有多少个低于 `0.05` 就按实际价格逐个尝试，再继续到 `0.1`，不使用固定价格档位；多 worker 只在完全相同的 cost 中轮换，避免并发分配打乱低价优先顺序。每个 worker lane 都有独立的 country 记忆：本 lane 最近成功的 country 若仍有库存且与当前最低价相同，则优先复用；如果它更贵，则先让更低价候选尝试，低价候选失败后才回到 sticky country；任何 `NO_NUMBERS`/`WRONG_MAX_PRICE` 都会继续扫描当前候选池，直到取号成功或候选耗尽。每个 country 的 Codex 手机验证成功/失败，以及取号时的即时无库存结果都会写入 `app_state.sqlite3`，health 会跨不同价格 profile 汇总。单次收不到 OTP 或 verify 错误不会立即高风险封禁，默认累计至少 4 次且失败率达到 75% 才降为低优先级兜底 country；后续成功会清除该 country 的最近失败标记并恢复本 lane 复用。拿到验证码后使用 `setStatus=6` 完成，失败时使用 `setStatus=8` 取消。价格和库存是动态数据，已成功 country 仍会重新经过当前价格/库存筛选，不能把某个 country ID 视为永久最低价。
+HeroSMS 在 `HERO_SMS_COUNTRY=auto` 时先调用 `getPrices&service=dr`，过滤库存大于 0 且 `cost <= HERO_SMS_MAX_PRICE` 的全部国家；`HERO_SMS_MAX_PRICE` 是唯一的硬价格上限，当前示例为 `0.1`，不会自动超过该值，也不是一个起始价。候选直接按当前 offer 的实际 `cost` 从低到高排序，有多少个低于 `0.05` 就按实际价格逐个尝试，再继续到 `0.1`，不使用固定价格档位；多 worker 只在完全相同的 cost 中轮换，避免并发分配打乱低价优先顺序。每个 worker lane 都有独立的 country 记忆：本 lane 最近成功的 country 若仍有库存且与当前最低价相同，则优先复用；如果它更贵，则先让更低价候选尝试，低价候选失败后才回到 sticky country；任何 `NO_NUMBERS`/`WRONG_MAX_PRICE` 都会继续扫描当前候选池，直到取号成功或候选耗尽。每个 country 的 Codex 手机验证成功/失败，以及取号时的即时无库存结果都会写入 `turb.sqlite3`，health 会跨不同价格 profile 汇总。单次收不到 OTP 或 verify 错误不会立即高风险封禁，默认累计至少 4 次且失败率达到 75% 才降为低优先级兜底 country；后续成功会清除该 country 的最近失败标记并恢复本 lane 复用。拿到验证码后使用 `setStatus=6` 完成，失败时使用 `setStatus=8` 取消。价格和库存是动态数据，已成功 country 仍会重新经过当前价格/库存筛选，不能把某个 country ID 视为永久最低价。
 在 Cloak/Roxy 浏览器流程中，Hero 返回的 E.164 号码还用于自动选择 OpenAI 表单的对应国家/区号，避免号码前缀和 country selector 不一致导致 `whatsapp_channel` 或号码发送失败。
 
 CPA 授权地址来源：
@@ -867,8 +894,8 @@ WebUI 配置页保存后会调用热加载；Roxy、Codex、邮箱、代理、�
 
 | 路径 | 内容 |
 |---|---|
-| `app_state.sqlite3` | 迁移后的唯一运行时数据库，包含核心业务表和 provider state |
-| `turb.sqlite3` | 迁移前 origin；仅作为受控离线 migration input，保留作 rollback 证据 |
+| `turb.sqlite3` | origin 与 fork state 合并后的唯一运行时数据库 |
+| `app_state.sqlite3` | fork state 的离线 migration input；迁移后不再由 runtime 读取 |
 | 旧 JSON/TXT/Codex 文件 | 导出或 legacy 输入；central runtime 不会隐式导入 |
 | `注册日志/` | 注册任务日志、Codex 补跑日志 |
 

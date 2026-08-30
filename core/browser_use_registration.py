@@ -1139,7 +1139,7 @@ def _click_continue_with_password_if_present(page) -> bool:
     if _click_first(page, selectors, timeout_ms=1800):
         return True
     try:
-        return bool(page.evaluate(
+        result = page.evaluate(
             """() => {
               const visible = el => {
                 if (!el) return false;
@@ -1174,7 +1174,8 @@ def _click_continue_with_password_if_present(page) -> bool:
               }
               return true;
             }"""
-        ))
+        )
+        return result is True
     except Exception:
         return False
 
@@ -1221,7 +1222,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
         try:
             quick = _quick_auth_state(page)
             if str(quick.get("state") or "") == "email_verification":
-                if not (_click_continue_with_password_if_present(page) or _click_continue_with_password_link(page)):
+                if not _click_continue_with_password_link(page):
                     raise RuntimeError("邮箱验证码页无法切换到注册密码页")
                 continue
         except Exception:
@@ -1345,6 +1346,31 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
             }""",
             password,
         ) or {}
+        if not isinstance(submit_result, dict):
+            filled = _fill_first(
+                page,
+                [
+                    "input[type='password']",
+                    "input[name='password']",
+                    "input[autocomplete='new-password']",
+                ],
+                password,
+                timeout_ms=5000,
+            )
+            clicked = _click_first(
+                page,
+                [
+                    "button[data-dd-action-name='Continue']",
+                    "button[data-login-web-auth-control='true'][type='submit']",
+                    "button[type='submit']",
+                    "form button",
+                ],
+                timeout_ms=4000,
+            )
+            if not filled or not clicked:
+                raise RuntimeError(f"密码页 DOM 结果无效且 locator fallback 失败：state={state_info}")
+            logger.info("[BrowserUse] 已通过 locator fallback 填写并提交密码页")
+            return password
         if not submit_result.get("ok"):
             raise RuntimeError(f"密码页找不到可点击的 Continue 按钮：{submit_result} state={state_info}")
         logger.info("[BrowserUse] 已填写并点击密码页 Continue：detail=%s", {k: v for k, v in submit_result.items() if k != "button"})

@@ -12,15 +12,11 @@ from typing import Any
 
 from core import app_state_db
 
-FORMAT_VERSION = 1
-MIGRATION_KEY = "migration:application_state:1"
-CORE_TABLES = (
-    "accounts",
-    "email_pool",
-    "registration_jobs",
-    "codex_accounts",
-    "codex_agent_accounts",
-)
+FORMAT_VERSION = 2
+MIGRATION_KEY = "migration:fork_state_into_turb:1"
+# These tables are created by the fork runtime before the one-time merge. They
+# are allowed to overlap, but their schemas still must match exactly.
+FORK_OWNED_OVERLAP_TABLES = frozenset({"app_documents", "app_state_migrations"})
 
 
 class SqliteStateMigrationError(RuntimeError):
@@ -122,6 +118,16 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
     )
 
 
+def _table_names(connection: sqlite3.Connection) -> tuple[str, ...]:
+    return tuple(
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+        )
+    )
+
+
 def _table_schema_signature(connection: sqlite3.Connection, table: str) -> dict[str, Any]:
     columns = [
         (
@@ -155,6 +161,32 @@ def _schema_objects(connection: sqlite3.Connection, table: str) -> list[tuple[st
     ]
 
 
+def _merge_table_order(
+    connection: sqlite3.Connection,
+    tables: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Return a parent-before-child order for the source table graph."""
+    pending = set(tables)
+    ordered: list[str] = []
+    while pending:
+        ready = sorted(
+            table
+            for table in pending
+            if all(
+                str(row[2]) not in pending
+                for row in connection.execute(
+                    f"PRAGMA foreign_key_list({_quote_identifier(table)})"
+                )
+            )
+        )
+        if not ready:
+            cycle = ", ".join(sorted(pending))
+            raise SqliteStateConflict(f"SQLite foreign-key cycle prevents table merge: {cycle}")
+        ordered.extend(ready)
+        pending.difference_update(ready)
+    return tuple(ordered)
+
+
 def _row_values(row: sqlite3.Row, columns: list[str]) -> tuple[Any, ...]:
     return tuple(row[column] for column in columns)
 
@@ -182,7 +214,7 @@ def _copy_table_definitions(
 ) -> None:
     for table in tables:
         if not _table_exists(source_connection, table):
-            raise SqliteStateMigrationError(f"Authoritative SQLite table is missing: {table}")
+            raise SqliteStateMigrationError(f"SQLite source table is missing: {table}")
         source_sql_row = source_connection.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name=?",
             (table,),
@@ -345,49 +377,44 @@ def _snapshot_path(source_path: Path, backup_dir: Path) -> Path:
 def _verify_target_metadata(
     source_audit: dict[str, Any],
     target_audit: dict[str, Any],
-    table_merge: dict[str, dict[str, int]],
 ) -> dict[str, Any]:
     target_tables = target_audit["tables"]
     app_tables = source_audit["sources"]["app_state"]["tables"]
-    preserved_tables: list[str] = []
-    for table, metadata in app_tables.items():
-        if table == "app_state_migrations" or table in CORE_TABLES:
+    turb_tables = source_audit["sources"]["turb"]["tables"]
+    fork_owned_overlaps = set(app_tables) & set(turb_tables) & FORK_OWNED_OVERLAP_TABLES
+
+    for table, metadata in turb_tables.items():
+        if table in fork_owned_overlaps:
             continue
         actual = target_tables.get(table)
         if actual is None or actual != metadata:
-            raise SqliteStateMigrationError(f"Target metadata mismatch for app-state table {table}")
-        preserved_tables.append(table)
+            raise SqliteStateMigrationError(f"Target metadata mismatch for origin table {table}")
 
-    merged_tables: dict[str, dict[str, int]] = {}
-    for table in CORE_TABLES:
+    merged_tables: dict[str, dict[str, Any]] = {}
+    for table, metadata in app_tables.items():
         actual = target_tables.get(table)
         if actual is None:
-            raise SqliteStateMigrationError(f"Target is missing authoritative table {table}")
-        source_metadata = source_audit["sources"]["turb"]["tables"].get(table)
-        if source_metadata is None or actual["schema_digest"] != source_metadata["schema_digest"]:
-            raise SqliteStateMigrationError(f"Target schema digest mismatch for table {table}")
-        app_count = int(app_tables.get(table, {}).get("row_count", 0))
-        expected_count = app_count + int(table_merge[table]["inserted"])
-        if actual["row_count"] != expected_count:
-            raise SqliteStateMigrationError(f"Target row count mismatch for table {table}")
+            raise SqliteStateMigrationError(f"Target metadata missing for fork table {table}")
+        # The migration marker is intentionally added after copying the fork
+        # source, so its row digest is expected to change in the target.
+        if table not in FORK_OWNED_OVERLAP_TABLES and actual != metadata:
+            raise SqliteStateMigrationError(f"Target metadata mismatch for fork table {table}")
         merged_tables[table] = {
             "row_count": actual["row_count"],
             "row_digest": actual["row_digest"],
         }
-    return {"preserved_app_tables": preserved_tables, "merged_core_tables": merged_tables}
+    return {
+        "preserved_origin_tables": list(turb_tables),
+        "merged_fork_tables": merged_tables,
+        "origin_authority": "turb",
+    }
 
 
 def audit_database(path: str | Path, source_name: str) -> dict[str, Any]:
     """Return non-sensitive schema and row metadata for one SQLite database."""
     source_path = Path(path)
     with closing(_readonly_connection(source_path)) as connection:
-        tables = [
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
-            )
-        ]
+        tables = _table_names(connection)
         return {
             "source": source_name,
             "file_name": source_path.name,
@@ -400,13 +427,18 @@ def audit_database(path: str | Path, source_name: str) -> dict[str, Any]:
 
 def audit_databases(app_state_path: str | Path, turb_path: str | Path) -> dict[str, Any]:
     """Audit both source databases without exposing row values."""
+    app_audit = audit_database(app_state_path, "app_state")
+    turb_audit = audit_database(turb_path, "turb")
+    app_tables = set(app_audit["tables"])
+    turb_tables = set(turb_audit["tables"])
     return {
         "format_version": FORMAT_VERSION,
         "sources": {
-            "app_state": audit_database(app_state_path, "app_state"),
-            "turb": audit_database(turb_path, "turb"),
+            "app_state": app_audit,
+            "turb": turb_audit,
         },
-        "authoritative_turb_tables": list(CORE_TABLES),
+        "authoritative_turb_tables": sorted(turb_tables),
+        "app_state_extra_tables": sorted(app_tables - turb_tables),
     }
 
 
@@ -455,15 +487,19 @@ def migrate_databases(
 
         target.parent.mkdir(parents=True, exist_ok=True)
         target_created = True
-        _backup_database(app_snapshot, target)
+        # Start from origin so every existing turb table and row remains
+        # authoritative. Fork state is added only after this snapshot.
+        _backup_database(turb_snapshot, target)
         target_connection = app_state_db.connect(target, busy_timeout_ms=30000)
         app_state_db.ensure_schema(target_connection)
         target_connection.execute("BEGIN IMMEDIATE")
-        with closing(_readonly_connection(turb_snapshot)) as turb_connection:
-            _copy_table_definitions(turb_connection, target_connection, CORE_TABLES)
+        app_tables = tuple(source_audit["sources"]["app_state"]["tables"])
+        with closing(_readonly_connection(app_snapshot)) as app_connection:
+            _copy_table_definitions(app_connection, target_connection, app_tables)
+            merge_order = _merge_table_order(app_connection, app_tables)
             table_merge = {
-                table: _merge_table_rows(turb_connection, target_connection, table)
-                for table in CORE_TABLES
+                table: _merge_table_rows(app_connection, target_connection, table)
+                for table in merge_order
             }
         validation_before_marker = _validate_connection(target_connection)
         if validation_before_marker["integrity_check"] != "ok":
@@ -485,7 +521,6 @@ def migrate_databases(
         metadata_verification = _verify_target_metadata(
             source_audit,
             validation["database"],
-            table_merge,
         )
         source_audit_after = audit_databases(app_source, turb_source)
         source_unchanged = (

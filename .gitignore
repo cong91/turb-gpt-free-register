@@ -58,13 +58,21 @@ roxy_profile_archives/
 roxy_profile_staging/
 
 # ============================================================
-# Central application state database (runtime source of truth)
+# Canonical application database (origin + fork state runtime source of truth)
+turb.sqlite3
+turb.sqlite3-journal
+turb.sqlite3-wal
+turb.sqlite3-shm
+turb.sqlite3.*
+
+# Fork migration input retained for audit and rollback
 app_state.sqlite3
 app_state.sqlite3-journal
 app_state.sqlite3-wal
 app_state.sqlite3-shm
+app_state.sqlite3.*
 
-# Legacy runtime databases retained only for migration/rollback
+# Fork migration input and rollback/legacy runtime databases
 用于注册的Gmail API邮箱_batches.db
 registration_jobs.db
 
@@ -121,6 +129,7 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+secrets/
 webui.log
 webui.pid
 logs/

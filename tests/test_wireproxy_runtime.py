@@ -32,10 +32,13 @@ class _Response:
             yield self.content[index:index + chunk_size]
 
 
-def _archive(executable: bytes = b"fake-wireproxy-executable") -> bytes:
+def _archive(
+    executable: bytes = b"fake-wireproxy-executable",
+    executable_name: str = "wireproxy.exe",
+) -> bytes:
     output = io.BytesIO()
     with tarfile.open(fileobj=output, mode="w:gz") as bundle:
-        member = tarfile.TarInfo("wireproxy.exe")
+        member = tarfile.TarInfo(executable_name)
         member.size = len(executable)
         bundle.addfile(member, io.BytesIO(executable))
     return output.getvalue()
@@ -79,7 +82,7 @@ class WireproxyRuntimeTests(unittest.TestCase):
         archive = _archive()
         archive_sha256 = hashlib.sha256(archive).hexdigest()
         executable = b"fake-wireproxy-executable"
-        assets = {"amd64": ("wireproxy_windows_amd64.tar.gz", archive_sha256)}
+        assets = {"Windows": {"amd64": ("wireproxy_windows_amd64.tar.gz", archive_sha256)}}
 
         with mock.patch.object(runtime, "_INSTALL_ROOT", self.install_root), \
              mock.patch.object(runtime, "_ASSETS", assets), \
@@ -100,7 +103,7 @@ class WireproxyRuntimeTests(unittest.TestCase):
     def test_tampered_installed_binary_is_rejected_without_overwrite(self):
         archive = _archive()
         archive_sha256 = hashlib.sha256(archive).hexdigest()
-        assets = {"amd64": ("wireproxy_windows_amd64.tar.gz", archive_sha256)}
+        assets = {"Windows": {"amd64": ("wireproxy_windows_amd64.tar.gz", archive_sha256)}}
         install_dir = self.install_root / runtime._VERSION / "amd64"
         install_dir.mkdir(parents=True)
         executable = install_dir / "wireproxy.exe"
@@ -125,6 +128,24 @@ class WireproxyRuntimeTests(unittest.TestCase):
 
         self.assertEqual(executable.read_bytes(), b"tampered")
         get.assert_not_called()
+
+    def test_installs_pinned_linux_release_with_native_executable_name(self):
+        executable = b"linux-wireproxy-executable"
+        archive = _archive(executable=executable, executable_name="wireproxy")
+        archive_sha256 = hashlib.sha256(archive).hexdigest()
+        assets = {"Linux": {"amd64": ("wireproxy_linux_amd64.tar.gz", archive_sha256)}}
+
+        with mock.patch.object(runtime, "_INSTALL_ROOT", self.install_root), \
+             mock.patch.object(runtime, "_ASSETS", assets), \
+             mock.patch.object(runtime.platform, "system", return_value="Linux"), \
+             mock.patch.object(runtime, "_architecture", return_value="amd64"), \
+             mock.patch.object(runtime.requests, "get", return_value=_Response(archive)) as get:
+            installed = runtime._install_pinned_release()
+
+        self.assertEqual(installed.name, "wireproxy")
+        self.assertEqual(installed.read_bytes(), executable)
+        self.assertEqual(installed.parent.name, "linux-amd64")
+        get.assert_called_once()
 
     def test_auto_download_can_be_disabled(self):
         with mock.patch.object(runtime.shutil, "which", return_value=None), \

@@ -13,7 +13,9 @@ import re
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
-_ENV_PATH = _PROJECT_ROOT / ".env"
+# Production containers keep secrets outside the immutable application image.
+# The default remains the repository-root .env for local development.
+_ENV_PATH = Path(os.getenv("TURB_ENV_FILE", str(_PROJECT_ROOT / ".env"))).expanduser()
 _LOADED = False
 
 # 这些多行列表字段允许用空值显式覆盖为 []。
@@ -165,6 +167,9 @@ def write_env_values(updates: dict[str, str]) -> list[str]:
     text = "\n".join(out_lines).rstrip() + "\n"
     tmp = _ENV_PATH.with_suffix(".env.tmp")
     tmp.write_text(text, encoding="utf-8")
+    if _ENV_PATH.exists():
+        # Preserve the operator's restrictive secret-file mode across atomic replacement.
+        tmp.chmod(_ENV_PATH.stat().st_mode & 0o777)
     tmp.replace(_ENV_PATH)
 
     # 让当前进程立刻看到新值

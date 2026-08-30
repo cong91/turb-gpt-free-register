@@ -50,9 +50,13 @@ def init_auth(app: Any, *, auth_code: str | None = None) -> str:
         # 授权码来自 .env 时，用带命名空间的摘要生成稳定签名密钥；修改授权码会自然注销旧会话。
         session_secret = hashlib.sha256(f"turb-gpt-webui-session:{code}".encode("utf-8")).hexdigest()
     app.secret_key = session_secret
+    secure_cookie = (os.getenv("WEBUI_SECURE_COOKIE") or "").strip().lower() in (
+        "1", "true", "yes", "on", "y"
+    )
     app.config.update(
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
+        SESSION_COOKIE_SECURE=secure_cookie,
         PERMANENT_SESSION_LIFETIME=timedelta(days=30),
     )
     return code
