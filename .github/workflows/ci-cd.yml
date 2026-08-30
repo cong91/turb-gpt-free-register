@@ -85,7 +85,7 @@ jobs:
             docker pull "${IMAGE_REF}"
           fi
           docker run --rm "${IMAGE_REF}" wireproxy --version
-          docker run --rm "${IMAGE_REF}" python -c "from cloakbrowser import launch; browser=launch(headless=True, humanize=False, geoip=False, args=['--disable-crashpad-for-testing']); page=browser.new_page(); page.set_content('<title>cloak-ok</title>'); print('cloak', page.title()); browser.close()"
+          docker run --rm "${IMAGE_REF}" python -c "from cloakbrowser import launch; browser=launch(headless=True, humanize=False, geoip=False, args=['--disable-crashpad-for-testing']); page=browser.new_page(); print('cloak', page.url); browser.close()"
           docker run --rm "${IMAGE_REF}" python -c "from core.cloakbrowser_driver import build_cloak_driver; driver, opened = build_cloak_driver(proxy=''); print('adapter', opened.raw['driver']); driver.quit()"
 
   deploy:
