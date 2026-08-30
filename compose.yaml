@@ -18,6 +18,9 @@ services:
       CLOAK_EXTRA_ARGS: '["--disable-crashpad-for-testing", "--single-process"]'
       NORDVPN_WG_WIREPROXY_EXE: wireproxy
       NORDVPN_WG_CONFIGS_DIR: /var/lib/turb/nordvpn-wireguard
+    networks:
+      - default
+      - sub2api-internal
     volumes:
       - turb_runtime:/var/lib/turb
       - turb_cloak_cache:/opt/cloakbrowser
@@ -45,4 +48,9 @@ volumes:
     external: true
   turb_cloak_cache:
     name: turb_gpt_cloak_cache
+    external: true
+
+networks:
+  sub2api-internal:
+    name: deploy_sub2api-network
     external: true

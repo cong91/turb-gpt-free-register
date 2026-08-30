@@ -28,6 +28,11 @@ docker compose config --quiet
 
 docker volume create turb_gpt_runtime >/dev/null
 docker volume create turb_gpt_cloak_cache >/dev/null
+callback_network="deploy_sub2api-network"
+if ! docker network inspect "${callback_network}" >/dev/null 2>&1; then
+  echo "Refusing deploy: required external network ${callback_network} is missing" >&2
+  exit 1
+fi
 
 docker compose pull web
 docker run --rm --user 0:0 --entrypoint /bin/chown \
