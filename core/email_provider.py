@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 邮箱来源调度层。
 
@@ -16,7 +15,7 @@ EMAIL_SOURCE 支持单个或多个来源：
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
 import logging
-from typing import Iterable
+from collections.abc import Iterable
 
 from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
 
@@ -38,7 +37,10 @@ def _current_otp_job_id() -> int | None:
 def _get_code_url_account(email: str, source: str):
     """Resolve a Gmail API URL account for either URL-backed provider."""
     if source == "gmail_api_url":
-        from core.gmail_api_url_client import get_account_context, get_batch_account_context
+        from core.gmail_api_url_client import (
+            get_account_context,
+            get_batch_account_context,
+        )
 
         account = get_account_context(email) or get_batch_account_context(email)
     elif source == "qan8_gmail_api":
@@ -81,7 +83,9 @@ def acknowledge_verification_code(
     if source not in {"gmail_api_url", "qan8_gmail_api"}:
         return
 
-    from core.gmail_api_url_client import acknowledge_verification_code as acknowledge_code
+    from core.gmail_api_url_client import (
+        acknowledge_verification_code as acknowledge_code,
+    )
 
     account = _get_code_url_account(email, source)
     acknowledge_code(account, otp)
@@ -272,7 +276,7 @@ def acquire_email(
         try:
             from config import email as _email_cfg
             paymesh_routed_domains = list(getattr(_email_cfg, "PAYMESH_ROUTED_DOMAINS", []) or [])
-        except Exception:
+        except (AttributeError, ImportError, TypeError):
             paymesh_routed_domains = []
     last_exc: Exception | None = None
     for source in sources:
@@ -292,7 +296,7 @@ def acquire_email(
             )
             logger.info(f"[EmailProvider] 使用邮箱来源: {source}, email={email}")
             return email
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - try the next configured provider.
             last_exc = exc
             logger.warning(f"[EmailProvider] 来源 {source} 领取邮箱失败: {type(exc).__name__}: {exc}")
             continue
@@ -365,8 +369,8 @@ def resolve_email_source(email: str) -> str:
         domain = (_email_cfg.EMAIL_DOMAIN or "").lower().strip()
         if domain and domain != "-" and email.lower().endswith("@" + domain):
             return "cloudflare_domain"
-    except Exception:
-        pass
+    except (AttributeError, TypeError, ValueError):
+        logger.debug("[EmailProvider] EMAIL_DOMAIN fallback unavailable", exc_info=True)
     return parse_email_sources()[0]
 
 
@@ -398,8 +402,12 @@ def _wait_for_code_url_otp(
     contract. Normalize both account types before polling so OTP persistence
     is always keyed by the original mailbox URL, never by an alias.
     """
-    from core.gmail_api_url_client import GmailApiUrlAccount, poll_verification_code
     from config import email as _email_cfg
+    from core.gmail_api_url_client import (
+        GmailApiUrlAccount,
+        GmailApiUrlError,
+        poll_verification_code,
+    )
 
     normalized_account = GmailApiUrlAccount(
         email=str(account.email),
@@ -415,7 +423,29 @@ def _wait_for_code_url_otp(
     }
     if before_code is not _BEFORE_CODE_UNSET:
         poll_kwargs["before_code"] = before_code
-    return poll_verification_code(normalized_account, **poll_kwargs)
+    try:
+        return poll_verification_code(normalized_account, **poll_kwargs)
+    except GmailApiUrlError as exc:
+        if "code=602" in str(exc).lower():
+            try:
+                from core import registration_service
+
+                job_id = _current_otp_job_id()
+                if job_id is not None:
+                    registration_service.quarantine_provider_lane(
+                        job_id=job_id,
+                        source=source,
+                        code_url=normalized_account.code_url,
+                        provider_batch_id=getattr(account, "batch_id", None),
+                        provider_lane_id=getattr(account, "lane_id", None),
+                        reason=str(exc),
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "[EmailProvider] Không thể quarantine lane sau lỗi code=602: email=%s",
+                    normalized_account.email,
+                )
+        raise
 
 
 def wait_for_otp(
@@ -440,18 +470,18 @@ def wait_for_otp(
     try:
         from config import email as _email_cfg
         use_service = bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
-    except Exception:
+    except (AttributeError, ImportError, TypeError):
         use_service = True
 
     if not use_service:
-        from core.manual_otp import wait_for_manual_otp
         from config import email as _email_cfg
+        from core.manual_otp import wait_for_manual_otp
         timeout = int(max_wait if max_wait is not None else (getattr(_email_cfg, "OTP_MAX_WAIT", 60) or 60))
         job_id = None
         try:
             from core import registration_service as svc
             job_id = getattr(svc._THREAD_CTX, "job_id", None)
-        except Exception:
+        except (AttributeError, ImportError, TypeError, ValueError):
             job_id = None
         return wait_for_manual_otp(email, timeout=timeout, job_id=job_id)
 
@@ -568,8 +598,13 @@ def release_email(email: str, status: str = "available", note: str | None = None
     return source
 
 
-def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
-    """回收仍停留在 used 的任务领取，且绝不覆盖已注册/已判废状态。"""
+def release_email_if_unconsumed(
+    email: str,
+    note: str | None = None,
+    *,
+    discard_on_failure: bool = False,
+) -> bool:
+    """回收未消耗的任务邮箱；注册失败时废弃 Gmail API/QAN8 alias。"""
     if not (email or "").strip():
         return False
 
@@ -587,6 +622,18 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
     elif source == "generic_api":
         changed = db.release_unconsumed_generic_api_email(email, note=note)
     elif source == "gmail_api_url":
+        from core.gmail_api_url_client import get_batch_account_context, release_account
+
+        batch_context = get_batch_account_context(email)
+        if discard_on_failure and batch_context:
+            changed = release_account(email, status="failed", note=note or "")
+            if changed:
+                logger.warning(
+                    "[EmailProvider] Đã loại bỏ Gmail API alias sau lỗi đăng ký: %s",
+                    email,
+                )
+            return bool(changed)
+
         provider_failed = "Provider error code=602" in str(note or "")
         if provider_failed:
             existing = db.get_gmail_api_url_email_by_email(email)
@@ -594,19 +641,17 @@ def release_email_if_unconsumed(email: str, note: str | None = None) -> bool:
             changed = existing is not None
         else:
             changed = db.release_unconsumed_gmail_api_url_email(email, note=note)
-        if not changed:
-            from core.gmail_api_url_client import get_batch_account_context, release_account
-            if get_batch_account_context(email):
-                changed = release_account(
-                    email,
-                    status="failed" if provider_failed else "available",
-                    note=note or "",
-                )
+        if not changed and batch_context:
+            changed = release_account(
+                email,
+                status="failed" if provider_failed else "available",
+                note=note or "",
+            )
     elif source == "qan8_gmail_api":
-        provider_failed = "Provider error code=602" in str(note or "")
+        provider_failed = "code=602" in str(note or "").lower()
         changed = Qan8GmailApiAllocator().release_account(
             email,
-            status="failed" if provider_failed else "available",
+            status="failed" if discard_on_failure or provider_failed else "available",
             reason=str(note or ""),
         )
     elif source == "cloudflare_domain":

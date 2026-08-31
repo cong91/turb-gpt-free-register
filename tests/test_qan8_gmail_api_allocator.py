@@ -147,6 +147,64 @@ class Qan8GmailApiAllocatorTests(unittest.TestCase):
         self.assertNotIn("source1@gmail.com", [item["alias"] for item in aliases])
         self.assertEqual(context.code_url, account.code_url)
 
+    def test_failed_aliases_exhaust_source_and_trigger_next_source(self):
+        batch = self.allocator.create_batch(3, requested_workers=1, aliases_per_source=2)
+        batch_id = batch["batch_id"]
+
+        first = self.allocator.acquire_account(batch_id, "job-failed-1", 0)
+        self.assertTrue(
+            self.allocator.release_account(
+                first.email,
+                status="failed",
+                reason="registration blocked",
+            )
+        )
+        second = self.allocator.acquire_account(batch_id, "job-failed-2", 0)
+        self.assertNotEqual(first.email, second.email)
+        self.assertTrue(
+            self.allocator.release_account(
+                second.email,
+                status="failed",
+                reason="registration blocked",
+            )
+        )
+
+        third = self.allocator.acquire_account(batch_id, "job-next-source", 0)
+
+        self.assertEqual(third.code_url, "https://mail.example/source/2")
+        self.assertEqual(len(self.client.created), 2)
+
+    def test_fail_account_discards_only_the_failed_alias(self):
+        batch = self.allocator.create_batch(2, requested_workers=1, aliases_per_source=2)
+        batch_id = batch["batch_id"]
+
+        failed = self.allocator.acquire_account(batch_id, "job-failed", 0)
+        self.assertTrue(
+            self.allocator.fail_account(batch_id, "job-failed", reason="registration blocked")
+        )
+
+        next_account = self.allocator.acquire_account(batch_id, "job-next", 0)
+
+        self.assertNotEqual(next_account.email, failed.email)
+        self.assertEqual(next_account.code_url, failed.code_url)
+        self.assertEqual(len(self.client.created), 1)
+
+    def test_quarantined_lane_is_not_purchased_again(self):
+        batch = self.allocator.create_batch(1, requested_workers=1, aliases_per_source=12)
+        batch_id = batch["batch_id"]
+        self.store.create_source_group(
+            batch_id,
+            0,
+            "broken@gmail.com",
+            "https://mail.example/broken",
+            ["broken+one@gmail.com"],
+        )
+        self.store.quarantine_lane(batch_id, 0, "Provider error code=602")
+
+        with self.assertRaisesRegex(RuntimeError, "quarantined"):
+            self.allocator.acquire_account(batch_id, "job-after-602", 0)
+        self.assertEqual(self.client.created, [])
+
     @patch("core.db.record_gmail_api_url_email")
     def test_purchased_source_is_mirrored_to_gmail_api_url_pool(self, record_email):
         batch = self.allocator.create_batch(1, requested_workers=1, aliases_per_source=12)
@@ -178,7 +236,7 @@ class Qan8GmailApiAllocatorTests(unittest.TestCase):
 
         account = self.allocator.acquire_account(batch["batch_id"], "job-1", 0)
 
-        self.assertTrue(account.email.endswith("@gmail.com"))
+        self.assertTrue(account.email.endswith(("@gmail.com", "@googlemail.com")))
         self.assertEqual(len(self.client.created), 1)
         self.assertEqual(len(self.client.lookups), 1)
 

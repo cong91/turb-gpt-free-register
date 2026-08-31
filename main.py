@@ -1,46 +1,46 @@
-# -*- coding: utf-8 -*-
 """
 ChatGPT 协议注册全流程入口
 串联 12 个步骤，自动完成 ChatGPT 账号注册
 """
-import sys
 import argparse
 import logging
+import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
 from config import REGISTER_EMAIL, REGISTER_NAME  # 这两个一般不在 WebUI 改
+from config import email as _email_cfg
+from config import openai_protocol as _protocol_cfg
+from config import roxybrowser as _roxy_cfg
+
 # 可热改的，按模块属性方式读
 from config import twofa as _twofa_cfg
-from config import email as _email_cfg
-from config import roxybrowser as _roxy_cfg
-from config import openai_protocol as _protocol_cfg
-from core.session import BrowserSession
-from core.chatgpt_auth import get_providers, get_csrf_token, signin_openai
-from core.openai_auth import (
-    follow_authorize,
-    request_sentinel_token,
-    build_sentinel_header,
-    validate_email_otp,
-    send_email_otp,
-    network_preflight,
-    navigate_about_you,
-    EmailOtpInvalidError,
-    create_account,
-)
+from core import db
 from core.account_export import (
     checkpoint_account_data,
-    follow_oauth_callback,
-    fetch_session,
-    setup_2fa_for_registration,
-    save_account_data,
     create_batch_archive_dir,
+    fetch_session,
+    follow_oauth_callback,
+    save_account_data,
+    setup_2fa_for_registration,
 )
-from core import db
+from core.chatgpt_auth import get_csrf_token, get_providers, signin_openai
 from core.email_provider import acquire_email, wait_for_otp
 from core.humanize import delay as human_delay
 from core.name_samples import random_display_name
+from core.openai_auth import (
+    EmailOtpInvalidError,
+    build_sentinel_header,
+    create_account,
+    follow_authorize,
+    navigate_about_you,
+    network_preflight,
+    request_sentinel_token,
+    send_email_otp,
+    validate_email_otp,
+)
 from core.profile_utils import generate_random_birthday
+from core.session import BrowserSession
 
 # 配置日志
 logging.basicConfig(
@@ -105,7 +105,7 @@ def _finalize_registration_session(
                 raise RuntimeError("session 响应缺少 accessToken")
             logger.info(f"[登录态] 已拿到 accessToken：{email}")
             return session_info, access_token
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - OAuth finalization has bounded retries.
             last_exc = exc
             if attempt >= _FINALIZE_SESSION_MAX_ATTEMPTS:
                 break
@@ -160,13 +160,13 @@ def run_registration(
     email: str,
     name: str,
     birthday: str | None = None,
-    proxy: str = None,
-    otp_code: str = None,
+    proxy: str | None = None,
+    otp_code: str | None = None,
     batch_dir=None,
     proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
 ):
-    """Run registration and release its rotating-proxy lane when it completes."""
+    """Run registration while retaining its rotating-proxy lane until TTL expiry."""
     from core.rotating_proxy_runtime import (
         REGISTRATION_PROXY_SCOPE,
         release_rotating_proxy,
@@ -202,8 +202,8 @@ def _run_registration_impl(
     email: str,
     name: str,
     birthday: str | None = None,
-    proxy: str = None,
-    otp_code: str = None,
+    proxy: str | None = None,
+    otp_code: str | None = None,
     batch_dir=None,
     proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
@@ -321,7 +321,10 @@ def _run_registration_impl(
     # Protocol driver: nếu PROXY_POOL rỗng nhưng NordVPN WireGuard đang bật
     # → dùng proxy_for_registration() giống Roxy driver
     if proxy is None:
-        from core.nordvpn_wireguard import is_per_profile_proxy_enabled, proxy_for_registration
+        from core.nordvpn_wireguard import (
+            is_per_profile_proxy_enabled,
+            proxy_for_registration,
+        )
         if is_per_profile_proxy_enabled():
             from core.nordvpn_wireguard import proxy_for_registration as _pfr
             proxy_context = (
@@ -353,7 +356,7 @@ def _run_registration_impl(
                 "***",
             )
             proxy_label = f"{session.proxy.split('://')[0]}://...sid-{sid_part}...@{session.proxy.split('@')[-1]}"
-        except Exception:
+        except (AttributeError, IndexError, ValueError):
             proxy_label = "已配置"
 
     if not birthday:
@@ -381,7 +384,7 @@ def _run_registration_impl(
 
         # ==================== 阶段1: ChatGPT 认证 ====================
         # 步骤1: 获取 providers
-        providers = get_providers(session)
+        get_providers(session)
         human_delay("api")
 
         # 步骤2: 获取 CSRF token
@@ -581,7 +584,7 @@ def _run_registration_impl(
             try:
                 totp_secret = setup_2fa_for_registration(session, email)
                 twofa_status = "active"
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - provider failure is recorded and flow continues.
                 twofa_status = "failed"
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 logger.error(f"2FA 设置失败: {twofa_error}")
@@ -618,7 +621,7 @@ def _run_registration_impl(
                 twofa_status=twofa_status,
             )
             codex_result = auto_codex["codex"]
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - Codex is a post-registration best effort.
             codex_result = {
                 "status": "failed",
                 "ok": False,
@@ -671,7 +674,7 @@ def _run_registration_impl(
         try:
             from core.flow_trigger import trigger_flow
             flow_result = trigger_flow(access_token)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - flow telemetry must not undo account persistence.
             flow_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {exc}"}
 
         if flow_result.get("ok"):
@@ -714,26 +717,41 @@ def _run_registration_impl(
         #   3. 创建接口通过前的普通失败：邮箱还可以下次继续尝试，放回 available。
         from core.openai_auth import AccountUnusableError
         account_dead = isinstance(e, AccountUnusableError)
+        alias_provider = False
+        try:
+            from core.email_provider import resolve_email_source
+
+            source = resolve_email_source(email) if email else ""
+            alias_provider = source == "qan8_gmail_api"
+            if source == "gmail_api_url":
+                from core.gmail_api_url_client import get_batch_account_context
+
+                alias_provider = get_batch_account_context(email) is not None
+        except Exception as exc:
+            logger.debug("[邮箱] failed to inspect alias provider: %s", exc, exc_info=True)
         try:
             if email:
                 from core.email_provider import release_email
-                if account_dead:
+                if account_dead or create_acknowledged or alias_provider:
+                    if account_dead:
+                        note = f"账号已废弃，邮箱不可用: {str(e)[:180]}"
+                        reason = "账号已废弃"
+                    elif create_acknowledged:
+                        note = f"创建接口已通过但后续失败，已废弃: {str(e)[:180]}"
+                        reason = "创建后失败"
+                    else:
+                        note = f"注册 alias 已失败，禁止复用: {str(e)[:180]}"
+                        reason = "注册 alias 不再复用"
                     src = release_email(
                         email, status="failed",
-                        note=f"账号已废弃，邮箱不可用: {str(e)[:180]}",
+                        note=note,
                     )
-                    logger.warning(f"[邮箱:{src}] {email} 账号已废弃，标记为 failed，不再重新注册")
-                elif create_acknowledged:
-                    src = release_email(
-                        email, status="failed",
-                        note=f"创建接口已通过但后续失败，已废弃: {str(e)[:180]}",
-                    )
-                    logger.warning(f"[邮箱:{src}] {email} 已创建但后续失败，标记为 failed，不再重新注册")
+                    logger.warning(f"[邮箱:{src}] {email} {reason}，标记为 failed，不再重新注册")
                 else:
                     src = release_email(email, status="available", note=f"上次失败: {str(e)[:180]}")
                     logger.info(f"[邮箱:{src}] {email} 已恢复 available")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("[邮箱] failed to update provider state: %s", exc, exc_info=True)
         return {"success": False, "email": email, "error": str(e)}
 
 
@@ -842,7 +860,10 @@ def run_one_batch_item(index: int, total: int, batch_dir=None, proxy_lane_id: in
 
 def run_serial_batch(count: int, delay: float, continue_on_fail: bool, batch_dir=None) -> list[dict]:
     """按原有串行方式执行批量注册。"""
-    from core.rotating_proxy_runtime import REGISTRATION_PROXY_SCOPE, prepare_rotating_proxy_lanes
+    from core.rotating_proxy_runtime import (
+        REGISTRATION_PROXY_SCOPE,
+        prepare_rotating_proxy_lanes,
+    )
 
     if count > 0:
         prepare_rotating_proxy_lanes(1, scope=REGISTRATION_PROXY_SCOPE)
@@ -869,7 +890,10 @@ def run_parallel_batch(
 ) -> list[dict]:
     """使用线程池并发执行批量注册。"""
     logger.info(f"[批量] 启用多线程注册：目标 {count}，并发 {workers}")
-    from core.rotating_proxy_runtime import REGISTRATION_PROXY_SCOPE, prepare_rotating_proxy_lanes
+    from core.rotating_proxy_runtime import (
+        REGISTRATION_PROXY_SCOPE,
+        prepare_rotating_proxy_lanes,
+    )
 
     if count > 0:
         prepare_rotating_proxy_lanes(min(max(1, workers), count), scope=REGISTRATION_PROXY_SCOPE)

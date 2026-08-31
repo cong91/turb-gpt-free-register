@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS qan8_lanes (
     current_source_group_id TEXT,
     next_sequence INTEGER NOT NULL DEFAULT 0,
     active_job_id TEXT,
+    state TEXT NOT NULL DEFAULT 'active',
+    failure_reason TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (batch_id, lane_id),
     FOREIGN KEY (batch_id) REFERENCES qan8_batches(batch_id) ON DELETE CASCADE
 );
@@ -154,7 +156,12 @@ class Qan8GmailApiStore:
                 "SELECT * FROM qan8_lanes WHERE batch_id = ? ORDER BY lane_id",
                 (str(batch_id),),
             ).fetchall()
-        return [self._row(row) for row in rows]
+        items: list[dict] = []
+        for row in rows:
+            item = self._row(row)
+            if item is not None:
+                items.append(item)
+        return items
 
     def get_lane(self, batch_id: str, lane_id: int) -> dict | None:
         with closing(self._connection()) as connection:
@@ -179,7 +186,7 @@ class Qan8GmailApiStore:
         now = time.time()
         expires = now + max(1, int(lease_seconds))
         with self._transaction() as connection:
-            self._require_lane(connection, batch_id, lane_id)
+            self._require_active_lane(connection, batch_id, lane_id)
             row = connection.execute(
                 "SELECT owner, expires_at FROM qan8_leases "
                 "WHERE batch_id = ? AND lane_id = ? AND lease_kind = ?",
@@ -216,7 +223,7 @@ class Qan8GmailApiStore:
         now = time.time()
         order_id = uuid.uuid4().hex
         with self._transaction() as connection:
-            self._require_lane(connection, batch_id, lane_id)
+            self._require_active_lane(connection, batch_id, lane_id)
             connection.execute(
                 "INSERT INTO qan8_orders "
                 "(order_id, batch_id, lane_id, out_order_no, sku_id, created_at, updated_at) "
@@ -252,7 +259,12 @@ class Qan8GmailApiStore:
                 "SELECT * FROM qan8_orders WHERE batch_id = ? ORDER BY created_at, order_id",
                 (str(batch_id),),
             ).fetchall()
-        return [self._row(row) for row in rows]
+        items: list[dict] = []
+        for row in rows:
+            item = self._row(row)
+            if item is not None:
+                items.append(item)
+        return items
 
     def update_order(
         self,
@@ -304,7 +316,7 @@ class Qan8GmailApiStore:
         source_group_id = uuid.uuid4().hex
         try:
             with self._transaction() as connection:
-                self._require_lane(connection, batch_id, lane_id)
+                self._require_active_lane(connection, batch_id, lane_id)
                 connection.execute(
                     "INSERT INTO qan8_sources "
                     "(source_group_id, batch_id, lane_id, source_email, code_url, capacity, created_at) "
@@ -348,7 +360,8 @@ class Qan8GmailApiStore:
             row = connection.execute(
                 "SELECT s.* FROM qan8_lanes l JOIN qan8_sources s "
                 "ON s.source_group_id = l.current_source_group_id "
-                "WHERE l.batch_id = ? AND l.lane_id = ? AND s.state = 'active'",
+                "WHERE l.batch_id = ? AND l.lane_id = ? AND l.state = 'active' "
+                "AND s.state = 'active'",
                 (str(batch_id), int(lane_id)),
             ).fetchone()
         return self._row(row)
@@ -359,7 +372,12 @@ class Qan8GmailApiStore:
                 "SELECT * FROM qan8_aliases WHERE source_group_id = ? ORDER BY ordinal",
                 (str(source_group_id),),
             ).fetchall()
-        return [self._row(row) for row in rows]
+        items: list[dict] = []
+        for row in rows:
+            item = self._row(row)
+            if item is not None:
+                items.append(item)
+        return items
 
     def claim_alias(self, batch_id: str, lane_id: int, job_id: int | str) -> dict | None:
         job = str(job_id)
@@ -383,8 +401,10 @@ class Qan8GmailApiStore:
             row = connection.execute(
                 "SELECT x.*, s.code_url FROM qan8_aliases x "
                 "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                "WHERE s.batch_id = ? AND s.lane_id = ? AND s.state = 'active' "
-                "AND x.state = 'available' ORDER BY x.ordinal LIMIT 1",
+                "JOIN qan8_lanes l ON l.batch_id = s.batch_id AND l.lane_id = s.lane_id "
+                "WHERE s.batch_id = ? AND s.lane_id = ? AND l.state = 'active' "
+                "AND s.state = 'active' "
+                "AND x.state = 'available' ORDER BY RANDOM() LIMIT 1",
                 (str(batch_id), int(lane_id)),
             ).fetchone()
             if row is None:
@@ -465,6 +485,47 @@ class Qan8GmailApiStore:
                 (row["batch_id"], row["lane_id"], str(source_group_id)),
             )
         return True
+
+    def quarantine_lane(self, batch_id: str, lane_id: int, reason: str = "") -> int:
+        """Permanently disable one batch lane after its source URL returns 602."""
+        batch = str(batch_id or "").strip()
+        lane = int(lane_id)
+        message = str(reason or "")[:300]
+        now = time.time()
+        with self._transaction() as connection:
+            lane_row = connection.execute(
+                "SELECT 1 FROM qan8_lanes WHERE batch_id = ? AND lane_id = ?",
+                (batch, lane),
+            ).fetchone()
+            if lane_row is None:
+                return 0
+            assignment_count = connection.execute(
+                "SELECT COUNT(*) FROM qan8_assignments "
+                "WHERE batch_id = ? AND lane_id = ? AND state = 'active'",
+                (batch, lane),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE qan8_assignments SET state = 'failed', reason = ?, updated_at = ? "
+                "WHERE batch_id = ? AND lane_id = ? AND state = 'active'",
+                (message, now, batch, lane),
+            )
+            connection.execute(
+                "UPDATE qan8_aliases SET state = 'failed' WHERE source_group_id IN ("
+                "SELECT source_group_id FROM qan8_sources WHERE batch_id = ? AND lane_id = ?) "
+                "AND state IN ('available', 'active')",
+                (batch, lane),
+            )
+            connection.execute(
+                "UPDATE qan8_sources SET state = 'retired', retired_at = ? "
+                "WHERE batch_id = ? AND lane_id = ? AND state = 'active'",
+                (now, batch, lane),
+            )
+            connection.execute(
+                "UPDATE qan8_lanes SET current_source_group_id = NULL, active_job_id = NULL, "
+                "state = 'quarantined', failure_reason = ? WHERE batch_id = ? AND lane_id = ?",
+                (message, batch, lane),
+            )
+        return int(assignment_count or 0)
 
     def get_account_context(self, alias: str) -> dict | None:
         with closing(self._connection()) as connection:
@@ -557,6 +618,26 @@ class Qan8GmailApiStore:
                 "AND active_job_id = ?",
                 (row["batch_id"], row["lane_id"], str(job_id)),
             )
+            if alias_state == "failed":
+                source = connection.execute(
+                    "SELECT s.source_group_id FROM qan8_sources s "
+                    "WHERE s.source_group_id = (SELECT source_group_id FROM qan8_aliases "
+                    "WHERE alias_id = ?) AND s.state = 'active' AND NOT EXISTS "
+                    "(SELECT 1 FROM qan8_aliases x WHERE x.source_group_id = s.source_group_id "
+                    "AND x.state IN ('available', 'active'))",
+                    (row["alias_id"],),
+                ).fetchone()
+                if source:
+                    connection.execute(
+                        "UPDATE qan8_sources SET state = 'exhausted', retired_at = ? "
+                        "WHERE source_group_id = ?",
+                        (time.time(), source["source_group_id"]),
+                    )
+                    connection.execute(
+                        "UPDATE qan8_lanes SET current_source_group_id = NULL "
+                        "WHERE batch_id = ? AND lane_id = ? AND current_source_group_id = ?",
+                        (row["batch_id"], row["lane_id"], source["source_group_id"]),
+                    )
             if state == "completed":
                 connection.execute(
                     "UPDATE qan8_sources SET completed_count = completed_count + 1 "
@@ -587,6 +668,7 @@ class Qan8GmailApiStore:
         connection = connect(self.path)
         ensure_schema(connection)
         connection.executescript(_SCHEMA)
+        self._ensure_lane_columns(connection)
         return connection
 
     def _transaction(self):
@@ -602,6 +684,32 @@ class Qan8GmailApiStore:
         ).fetchone()
         if row is None:
             raise ValueError("QAN8 lane does not exist")
+
+    @staticmethod
+    def _require_active_lane(connection: sqlite3.Connection, batch_id: str, lane_id: int) -> None:
+        row = connection.execute(
+            "SELECT state FROM qan8_lanes WHERE batch_id = ? AND lane_id = ?",
+            (str(batch_id), int(lane_id)),
+        ).fetchone()
+        if row is None:
+            raise ValueError("QAN8 lane does not exist")
+        if str(row["state"] or "active") != "active":
+            raise RuntimeError("QAN8 lane is quarantined")
+
+    @staticmethod
+    def _ensure_lane_columns(connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(qan8_lanes)").fetchall()
+        }
+        if "state" not in columns:
+            connection.execute(
+                "ALTER TABLE qan8_lanes ADD COLUMN state TEXT NOT NULL DEFAULT 'active'"
+            )
+        if "failure_reason" not in columns:
+            connection.execute(
+                "ALTER TABLE qan8_lanes ADD COLUMN failure_reason TEXT NOT NULL DEFAULT ''"
+            )
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict | None:

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Gmail API URL 邮箱池客户端
 
 通过轮询取码URL获取验证码，支持响应码处理：
@@ -19,23 +18,22 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Optional
 
 import requests
 
+from core.app_state_db import APP_STATE_DB_PATH
 from core.gmail_api_url_batch_store import (
-    GmailApiUrlBatchStore,
     GmailApiUrlBatchConflict,
     GmailApiUrlBatchError,
+    GmailApiUrlBatchStore,
 )
-from core.app_state_db import APP_STATE_DB_PATH
 
 logger = logging.getLogger(__name__)
 _BEFORE_CODE_UNSET = object()
 
 # Batch store singleton
 _BATCH_STORE_PATH = APP_STATE_DB_PATH
-_batch_store_instance: Optional[GmailApiUrlBatchStore] = None
+_batch_store_instance: GmailApiUrlBatchStore | None = None
 
 
 def _batch_store() -> GmailApiUrlBatchStore:
@@ -55,7 +53,6 @@ class GmailApiUrlAccount:
 
 class GmailApiUrlError(Exception):
     """Gmail API URL 客户端异常"""
-    pass
 
 
 def _fetch_code_once(code_url: str) -> tuple[int, str | None]:
@@ -116,7 +113,7 @@ def _record_latest_otp(account: GmailApiUrlAccount, otp: str) -> None:
                 "[GmailApiUrl] %s: no canonical mailbox row for validated OTP",
                 account.email,
             )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - cache persistence must not fail OTP delivery.
         logger.warning("[GmailApiUrl] %s: failed to persist latest OTP: %s", account.email, exc)
 
 
@@ -130,8 +127,8 @@ def acknowledge_verification_code(account: GmailApiUrlAccount, otp: str) -> None
 
 def poll_verification_code(
     account: GmailApiUrlAccount,
-    max_wait: int = 60,
-    poll_interval: int = 2,
+    max_wait: float = 60.0,
+    poll_interval: float = 2.0,
     after_ts: float | None = None,
     before_code: str | None | object = _BEFORE_CODE_UNSET,
     *,
@@ -215,7 +212,7 @@ def poll_verification_code(
 
         except GmailApiUrlError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - transient polling errors are retriable.
             last_error = str(exc)
             logger.warning("[GmailApiUrl] %s: 意外异常 %s (%s)", account.email, exc, log_context)
 
@@ -248,7 +245,7 @@ def pick_account() -> GmailApiUrlAccount:
     )
 
 
-def get_account_context(email: str) -> Optional[GmailApiUrlAccount]:
+def get_account_context(email: str) -> GmailApiUrlAccount | None:
     """根据邮箱地址获取账户上下文
     
     Args:
@@ -318,7 +315,7 @@ def release_account(email: str, status: str = "available", note: str = "") -> bo
 # TẤT CẢ dùng chung code_url của email gốc để lấy OTP.
 # Học từ Gmail CDK, nhưng nguồn là kho email----url, KHÔNG dùng CDK.
 
-def create_registration_batch(count: int, aliases_per_email: int = None) -> str:
+def create_registration_batch(count: int, aliases_per_email: int | None = None) -> str:
     """Claim đủ email gốc từ pool để tạo `count` alias, mỗi email sinh tối đa
     `aliases_per_email` alias (share code_url của email đó).
 
@@ -339,10 +336,11 @@ def create_registration_batch(count: int, aliases_per_email: int = None) -> str:
         GmailApiUrlBatchError: pool không đủ email, hoặc tham số sai.
     """
     from core.gmail_aliases import (
-        GmailAliasError,
         MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
+        GmailAliasError,
         generate_gmail_dual_domain_aliases,
     )
+
     from . import db
 
     if count < 1:
@@ -404,8 +402,8 @@ def create_registration_batch(count: int, aliases_per_email: int = None) -> str:
                 db.release_gmail_api_url_email(
                     source_email, "available", "Tạo batch thất bại"
                 )
-            except Exception:
-                logger.warning("Không thể release email %s về pool", source_email)
+            except Exception as exc:  # noqa: BLE001 - rollback must not hide the original failure.
+                logger.warning("Không thể release email %s về pool: %s", source_email, exc)
         raise
 
     try:
@@ -416,8 +414,8 @@ def create_registration_batch(count: int, aliases_per_email: int = None) -> str:
                 db.release_gmail_api_url_email(
                     source_email, "available", "Tạo batch thất bại"
                 )
-            except Exception:
-                logger.warning("Không thể release email %s về pool", source_email)
+            except Exception as exc:  # noqa: BLE001 - rollback must not hide the original failure.
+                logger.warning("Không thể release email %s về pool: %s", source_email, exc)
         raise
 
     total_aliases = sum(len(g["aliases"]) for g in groups)
@@ -548,6 +546,18 @@ def get_email_from_batch(
     last_status = None
     last_log_at = 0.0
     while True:
+        try:
+            numeric_job_id = int(job_id)
+        except (TypeError, ValueError):
+            numeric_job_id = None
+        if numeric_job_id is not None:
+            from core import registration_service
+
+            if registration_service.is_stop_requested(numeric_job_id):
+                store.cancel_waiter(batch_id, job_id, "job stopped by email lane quarantine")
+                raise registration_service.StopRequested(
+                    f"任务 #{job_id} 已因邮箱 lane 被禁用而停止"
+                )
         _reconcile_batch_queue(store, batch_id)
         try:
             assignment = store.claim_waiting(batch_id, job_id)
@@ -564,7 +574,7 @@ def get_email_from_batch(
                 "Job %s vẫn đang chờ batch %s sau %.1fs; giữ waiter trong DB để retry tiếp",
                 job_id,
                 batch_id,
-                max(0.0, float(wait_timeout)),
+                max(0.0, float(wait_timeout or 0.0)),
             )
             raise GmailApiUrlBatchConflict(
                 "Gmail API URL batch đang bận; job đã được lưu vào hàng đợi"
@@ -607,7 +617,7 @@ def get_email_from_batch(
     )
 
 
-def get_batch_account_context(alias: str) -> Optional[GmailApiUrlAccount]:
+def get_batch_account_context(alias: str) -> GmailApiUrlAccount | None:
     """Tra code_url cho một alias thuộc batch (dùng khi wait_for_otp)."""
     result = _batch_store().find_item_by_alias(alias)
     if not result:
@@ -671,3 +681,8 @@ def release_batch_assignment(batch_id: str, job_id: str, reason: str = "") -> bo
             alias, assignment.assignment_id, job_id, reason,
         )
     return success
+
+
+def quarantine_code_url(batch_id: str, code_url: str, *, reason: str = "") -> int:
+    """Retire every alias in a batch that shares a broken provider URL."""
+    return _batch_store().quarantine_code_url(batch_id, code_url, reason=reason)

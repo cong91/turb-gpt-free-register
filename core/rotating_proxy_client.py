@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urlencode, urljoin
 
 import requests
 
@@ -50,7 +50,7 @@ def _response_documents(response) -> list[dict[str, Any]]:
 
 def _status(document: dict[str, Any]) -> int:
     try:
-        return int(document.get("status"))
+        return int(str(document.get("status") or "0"))
     except (TypeError, ValueError):
         return 0
 
@@ -107,6 +107,9 @@ def _proxy_url(value: object, scheme: str) -> str:
 class RotatingProxyClient:
     """Call provider endpoints while keeping provider response parsing local."""
 
+    _HEALTHCHECK_URL = "https://chatgpt.com/"
+    _HEALTHCHECK_TIMEOUT = 5.0
+
     def __init__(self, http_client=None):
         self._http = http_client or requests
 
@@ -127,20 +130,37 @@ class RotatingProxyClient:
         base = str(getattr(proxy_config, "ROTATING_PROXY_PROXY_API_BASE", "") or "").strip()
         return urljoin(base.rstrip("/") + "/", "get.php")
 
-    def _get(self, url: str, params: dict[str, object]) -> list[dict[str, Any]]:
+    def _request_get(
+        self,
+        request_url: str,
+        *,
+        endpoint: str,
+        params: dict[str, object] | None = None,
+    ) -> list[dict[str, Any]]:
         try:
-            response = self._http.get(url, params=params, timeout=self._timeout())
+            if params is None:
+                response = self._http.get(request_url, timeout=self._timeout())
+            else:
+                response = self._http.get(request_url, params=params, timeout=self._timeout())
             response.raise_for_status()
         except requests.HTTPError as exc:
             response = getattr(exc, "response", None)
             status_code = getattr(response, "status_code", None)
             status = f"HTTP {status_code}" if status_code is not None else "HTTP error"
             raise RotatingProxyApiError(
-                f"proxy.vn 请求失败: {status}, endpoint={url}"
+                f"proxy.vn 请求失败: {status}, endpoint={endpoint}"
             ) from exc
         except requests.RequestException as exc:
             raise RotatingProxyApiError(f"proxy.vn 请求失败: {type(exc).__name__}") from exc
         return _response_documents(response)
+
+    def _get(self, url: str, params: dict[str, object]) -> list[dict[str, Any]]:
+        return self._request_get(url, endpoint=url, params=params)
+
+    def _get_raw(self, url: str, params: dict[str, object]) -> list[dict[str, Any]]:
+        query = urlencode(params).replace("&", "&&")
+        request_url = f"{url}?{query}" if query else url
+        return self._request_get(request_url, endpoint=url)
 
     @staticmethod
     def _api_key() -> str:
@@ -175,8 +195,8 @@ class RotatingProxyClient:
             raise ValueError("quantity must be a positive integer") from exc
         if amount < 1:
             raise ValueError("quantity must be a positive integer")
-        documents = self._get(
-            self._provider_url("apimuangngay.php"),
+        documents = self._get_raw(
+            self._provider_url("apimuangay.php"),
             {"key": self._api_key(), "thoigian": 1, "soluong": amount},
         )
         result = []
@@ -238,3 +258,21 @@ class RotatingProxyClient:
                 "raw": document,
             }
         raise RotatingProxyApiError("proxy.vn 未返回可用 proxy")
+
+    def check_proxy(self, proxy_url: str) -> bool:
+        """Check a cached or newly fetched proxy without rotating its IP."""
+        value = str(proxy_url or "").strip()
+        if not value:
+            return False
+        try:
+            response = self._http.get(
+                self._HEALTHCHECK_URL,
+                proxies={"http": value, "https": value},
+                timeout=self._HEALTHCHECK_TIMEOUT,
+                allow_redirects=False,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            return 100 <= status_code < 500 and status_code != 407
+        except (requests.RequestException, TypeError, ValueError):
+            return False

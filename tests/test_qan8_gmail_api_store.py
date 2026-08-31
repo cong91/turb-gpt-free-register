@@ -64,6 +64,54 @@ class Qan8GmailApiStoreTests(unittest.TestCase):
         next_assignment = reopened.claim_alias(batch_id, 0, 102)
         self.assertIsNotNone(next_assignment)
 
+    def test_failed_assignment_is_not_reused(self):
+        batch = self.store.create_batch(2, requested_workers=1, aliases_per_source=2)
+        batch_id = batch["batch_id"]
+        self.store.create_source_group(
+            batch_id,
+            0,
+            "source@gmail.com",
+            "https://mail.example/source",
+            ["source+one@gmail.com", "source+two@gmail.com"],
+        )
+
+        failed = self.store.claim_alias(batch_id, 0, "job-failed")
+        self.assertIsNotNone(failed)
+        self.assertTrue(self.store.fail_assignment("job-failed", reason="registration failed"))
+
+        next_assignment = self.store.claim_alias(batch_id, 0, "job-next")
+
+        self.assertIsNotNone(next_assignment)
+        self.assertNotEqual(next_assignment["alias"], failed["alias"])
+        self.assertEqual(
+            self.store.get_account_context(failed["alias"])["alias_state"],
+            "failed",
+        )
+
+    def test_exhausted_failed_source_is_removed_from_lane(self):
+        batch = self.store.create_batch(3, requested_workers=1, aliases_per_source=2)
+        batch_id = batch["batch_id"]
+        source = self.store.create_source_group(
+            batch_id,
+            0,
+            "source@gmail.com",
+            "https://mail.example/source",
+            ["source+one@gmail.com", "source+two@gmail.com"],
+        )
+
+        first = self.store.claim_alias(batch_id, 0, "job-failed-1")
+        self.assertIsNotNone(first)
+        self.assertTrue(self.store.fail_assignment("job-failed-1", reason="blocked"))
+        second = self.store.claim_alias(batch_id, 0, "job-failed-2")
+        self.assertIsNotNone(second)
+        self.assertTrue(self.store.fail_assignment("job-failed-2", reason="blocked"))
+
+        self.assertEqual(
+            self.store.get_source_group(source["source_group_id"])["state"],
+            "exhausted",
+        )
+        self.assertIsNone(self.store.get_current_source(batch_id, 0))
+
     def test_source_ownership_is_exclusive_and_status_reports_active_count(self):
         batch = self.store.create_batch(4, requested_workers=2, aliases_per_source=2)
         batch_id = batch["batch_id"]
@@ -82,6 +130,40 @@ class Qan8GmailApiStoreTests(unittest.TestCase):
         status = self.store.batch_status(batch_id)
         self.assertEqual(status["active_sources"], 1)
         self.assertEqual(status["effective_workers"], 2)
+
+    def test_quarantine_lane_retires_source_and_blocks_future_claims(self):
+        batch = self.store.create_batch(3, requested_workers=2, aliases_per_source=2)
+        batch_id = batch["batch_id"]
+        source = self.store.create_source_group(
+            batch_id,
+            0,
+            "broken@gmail.com",
+            "https://mail.example/broken",
+            ["broken+one@gmail.com", "broken+two@gmail.com"],
+        )
+        healthy = self.store.create_source_group(
+            batch_id,
+            1,
+            "healthy@gmail.com",
+            "https://mail.example/healthy",
+            ["healthy+one@gmail.com"],
+        )
+        assignment = self.store.claim_alias(batch_id, 0, "job-broken")
+
+        assert assignment is not None
+        assert self.store.quarantine_lane(batch_id, 0, "Provider error code=602") == 1
+        self.assertEqual(self.store.get_lane(batch_id, 0)["state"], "quarantined")
+        self.assertIsNone(self.store.get_current_source(batch_id, 0))
+        self.assertEqual(self.store.get_source_group(source["source_group_id"])["state"], "retired")
+        self.assertEqual(
+            {row["state"] for row in self.store.list_source_aliases(source["source_group_id"])},
+            {"failed"},
+        )
+        self.assertEqual(self.store.get_assignment("job-broken")["state"], "failed")
+        self.assertIsNone(self.store.claim_alias(batch_id, 0, "job-next"))
+
+        self.assertEqual(self.store.get_source_group(healthy["source_group_id"])["state"], "active")
+        self.assertIsNotNone(self.store.get_current_source(batch_id, 1))
 
 
 if __name__ == "__main__":
