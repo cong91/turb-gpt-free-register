@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from core import db, registration_service
@@ -221,6 +222,66 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertEqual(completed["account_id"], account_id)
         release_email.assert_not_called()
         disable_email.assert_not_called()
+
+    def test_qan8_registration_exception_discards_unconsumed_alias(self):
+        job = db.create_job(
+            email_source="qan8_gmail_api",
+            provider_context={
+                "qan8_gmail_api_batch_id": "batch-1",
+                "qan8_gmail_api_lane_id": 0,
+            },
+        )
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch("main.run_registration", side_effect=RuntimeError("registration failed")), patch.object(
+            registration_service, "_release_unconsumed_job_email"
+        ) as release_email:
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        release_email.assert_called_once_with(
+            "alias+one@gmail.com",
+            "RuntimeError: registration failed",
+            discard_on_failure=True,
+        )
+
+    def test_qan8_alias_is_failed_when_registration_fails_before_create(self):
+        import main
+
+        with (
+            patch.object(
+                main,
+                "BrowserSession",
+                return_value=SimpleNamespace(
+                    proxy="http://proxy.example:8080",
+                    device_id="device-test",
+                    auth_session_logging_id="session-test",
+                ),
+            ),
+            patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", "protocol"),
+            patch.object(
+                main,
+                "network_preflight",
+                side_effect=RuntimeError("preflight failed"),
+            ),
+            patch(
+                "core.email_provider.resolve_email_source",
+                return_value="qan8_gmail_api",
+            ),
+            patch("core.email_provider.release_email") as release_email,
+        ):
+            result = main._run_registration_impl(
+                "alias+one@gmail.com",
+                "Test User",
+                birthday="1990-01-01",
+                proxy="http://proxy.example:8080",
+            )
+
+        self.assertFalse(result["success"])
+        release_email.assert_called_once()
+        self.assertEqual(release_email.call_args.kwargs["status"], "failed")
 
     def test_recoverable_qan8_twofa_failure_consumes_alias_and_frees_lane(self):
         store = Qan8GmailApiStore(Path(self.temp_dir.name) / "qan8.sqlite3")

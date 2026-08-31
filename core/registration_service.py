@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 注册任务服务层：
     - 线程池并发执行 run_registration
@@ -12,7 +11,7 @@
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +20,11 @@ from core.openai_auth import account_unusable_message
 from core.registration_maintenance_barrier import RegistrationMaintenanceBarrier
 
 logger = logging.getLogger(__name__)
+
+
+def _local_now() -> datetime:
+    """Return local wall time without changing the persisted naive timestamp format."""
+    return datetime.now(timezone.utc).astimezone().replace(tzinfo=None)
 
 # 全局线程池，最大并发数（WebUI 每次提交时可按最新 workers 重建）
 _DEFAULT_MAX_WORKERS = 4
@@ -158,12 +162,11 @@ def _deactivate_job(job_id: int) -> None:
     with _STOP_LOCK:
         _STOP_EVENTS.pop(int(job_id), None)
         _ACTIVE_JOBS.discard(int(job_id))
-        remaining_active = len(_ACTIVE_JOBS)
     _clear_job_email_inputs(job_id)
     try:
         delattr(_THREAD_CTX, "job_id")
-    except Exception:
-        pass
+    except AttributeError:
+        logger.debug("[Service] job thread context was already cleared")
     # Deferred NordVPN rotation: close the gate immediately when a
     # rotation is pending so replacement workers cannot start.
     # deferred_rotation drains remaining workers, rotates, and reopens.
@@ -253,13 +256,13 @@ def _append_job_log(
         if not log_file:
             return
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        ts = datetime.now().strftime("%H:%M:%S")
+        ts = _local_now().strftime("%H:%M:%S")
         normalized_level = str(level or "INFO").strip().upper()
         normalized_marker = str(marker or "service").strip() or "service"
         with Path(log_file).open("a", encoding="utf-8") as f:
             f.write(f"{ts} [{normalized_level}] [{normalized_marker}] {message}\n")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("[Service] append job log failed: %s", exc, exc_info=True)
 
 
 def _random_display_name() -> str:
@@ -272,7 +275,8 @@ def _random_display_name() -> str:
 def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
-    from config import register as _r, email as _e
+    from config import email as _e
+    from config import register as _r
     from core.email_provider import acquire_email
     from core.profile_utils import generate_random_birthday
 
@@ -338,16 +342,202 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
     return email, name, birthday
 
 
-def _release_unconsumed_job_email(email: str | None, reason: str) -> None:
-    """任务失败兜底：只回收尚未生成账号、仍处于 used 的邮箱领取。"""
+def _release_unconsumed_job_email(
+    email: str | None,
+    reason: str,
+    *,
+    discard_on_failure: bool = False,
+) -> None:
+    """任务结束时回收邮箱；真正注册失败时废弃 Gmail API/QAN8 alias。"""
     if not email:
         return
     try:
         from core.email_provider import release_email_if_unconsumed
 
-        release_email_if_unconsumed(email, note=f"任务未消耗，已自动回收: {reason[:180]}")
+        release_email_if_unconsumed(
+            email,
+            note=f"任务未消耗，已自动回收: {reason[:180]}",
+            discard_on_failure=discard_on_failure,
+        )
     except Exception:
         logger.exception("[Service] 回收未消耗邮箱失败: %s", email)
+
+
+def quarantine_provider_lane(
+    *,
+    job_id: int,
+    source: str,
+    code_url: str,
+    provider_batch_id: str | None = None,
+    provider_lane_id: int | None = None,
+    reason: str,
+) -> dict[str, int | str | None]:
+    """Quarantine a failed URL lane and stop every job assigned to that lane."""
+    current = db.get_job(int(job_id)) or {}
+    context = current.get("provider_context") if isinstance(current, dict) else {}
+    if not isinstance(context, dict):
+        context = {}
+
+    normalized_source = str(source or "").strip().lower()
+    batch_id = str(
+        provider_batch_id
+        or context.get(
+            "gmail_api_url_batch_id"
+            if normalized_source == "gmail_api_url"
+            else "qan8_gmail_api_batch_id"
+        )
+        or ""
+    ).strip()
+    if normalized_source == "gmail_api_url":
+        lane_value = context.get("proxy_lane_id")
+    else:
+        lane_value = provider_lane_id
+        if lane_value is None:
+            lane_value = context.get("qan8_gmail_api_lane_id")
+    try:
+        lane_id = int(lane_value) if lane_value is not None else None
+    except (TypeError, ValueError):
+        lane_id = None
+
+    provider_items = 0
+    if normalized_source == "gmail_api_url" and batch_id and str(code_url or "").strip():
+        from core.gmail_api_url_client import quarantine_code_url
+
+        provider_items = int(
+            quarantine_code_url(batch_id, str(code_url).strip(), reason=str(reason or ""))
+            or 0
+        )
+    elif normalized_source == "qan8_gmail_api" and batch_id and lane_id is not None:
+        from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
+
+        provider_items = int(
+            Qan8GmailApiAllocator().quarantine_lane(
+                batch_id,
+                lane_id,
+                reason=str(reason or ""),
+            )
+            or 0
+        )
+    else:
+        logger.warning(
+            "[Service] Không thể quarantine email lane: source=%s batch=%s lane=%s job=%s",
+            normalized_source,
+            batch_id or "-",
+            lane_id if lane_id is not None else "-",
+            job_id,
+        )
+
+    # Gmail API URL batches do not have provider lanes. `proxy_lane_id` is a
+    # network lane and must never be used to cancel unrelated jobs. The
+    # provider quarantine above already exhausts every alias for this URL;
+    # the current job will enter its normal failure path.
+    if normalized_source == "gmail_api_url":
+        logger.warning(
+            "[Service] Quarantined Gmail API URL: batch=%s code_url=%s provider_items=%s reason=%s",
+            batch_id or "-",
+            str(code_url or "")[:180],
+            provider_items,
+            str(reason or "")[:180],
+        )
+        return {
+            "source": normalized_source,
+            "batch_id": batch_id or None,
+            "lane_id": None,
+            "provider_items": provider_items,
+            "cancelled": 0,
+            "stopping": 0,
+        }
+
+    lane_error = (
+        f"Email provider code=602; lane {lane_id if lane_id is not None else '-'} "
+        "đã bị vô hiệu hóa và các job cùng lane đã được hủy"
+    )
+    cancelled = 0
+    stopping = 0
+    now_iso = _local_now().isoformat(timespec="seconds")
+    jobs = db.list_jobs(limit=100000)
+    for job in jobs:
+        candidate_id = int(job.get("id") or 0)
+        if not candidate_id:
+            continue
+        candidate_context = job.get("provider_context")
+        if not isinstance(candidate_context, dict):
+            candidate_context = {}
+        if str(job.get("email_source") or "").strip().lower() != normalized_source:
+            continue
+        candidate_batch = str(
+            candidate_context.get(
+                "gmail_api_url_batch_id"
+                if normalized_source == "gmail_api_url"
+                else "qan8_gmail_api_batch_id"
+            )
+            or ""
+        ).strip()
+        if batch_id:
+            if candidate_batch != batch_id:
+                continue
+        elif candidate_batch:
+            continue
+        candidate_lane_value = candidate_context.get(
+            "proxy_lane_id"
+            if normalized_source == "gmail_api_url"
+            else "qan8_gmail_api_lane_id"
+        )
+        try:
+            candidate_lane = int(candidate_lane_value)
+        except (TypeError, ValueError):
+            continue
+        if lane_id is None or candidate_lane != lane_id:
+            continue
+
+        status = str(job.get("status") or "").strip().lower()
+        if status == "pending":
+            db.update_job(
+                candidate_id,
+                status="cancelled",
+                completed_at=now_iso,
+                error=lane_error,
+            )
+            cancelled += 1
+        elif status in {"running", "stopping"}:
+            with _STOP_LOCK:
+                event = _STOP_EVENTS.get(candidate_id)
+                if candidate_id in _ACTIVE_JOBS and event is not None:
+                    event.set()
+                    is_live = True
+                else:
+                    is_live = False
+            if is_live:
+                db.update_job(candidate_id, status="stopping", error=lane_error)
+                stopping += 1
+            else:
+                db.update_job(
+                    candidate_id,
+                    status="cancelled",
+                    completed_at=now_iso,
+                    error=lane_error,
+                )
+                cancelled += 1
+
+    logger.warning(
+        "[Service] Quarantined email lane: source=%s batch=%s lane=%s provider_items=%s "
+        "cancelled=%s stopping=%s reason=%s",
+        normalized_source,
+        batch_id or "-",
+        lane_id if lane_id is not None else "-",
+        provider_items,
+        cancelled,
+        stopping,
+        str(reason or "")[:180],
+    )
+    return {
+        "source": normalized_source,
+        "batch_id": batch_id or None,
+        "lane_id": lane_id,
+        "provider_items": provider_items,
+        "cancelled": cancelled,
+        "stopping": stopping,
+    }
 
 
 def _consume_recoverable_twofa_assignment(email: str | None, reason: str) -> bool:
@@ -645,7 +835,7 @@ def _run_local_test_job(job_id: int, log_file: str, email: str) -> None:
                 job_id,
                 status="success",
                 email=email,
-                completed_at=datetime.now().isoformat(timespec="seconds"),
+                completed_at=_local_now().isoformat(timespec="seconds"),
             )
             log_logger.info("[Job %s] Local test dry-run completed", job_id)
     except StopRequested as exc:
@@ -654,7 +844,7 @@ def _run_local_test_job(job_id: int, log_file: str, email: str) -> None:
             job_id,
             status="stopped",
             error="用户手动停止",
-            completed_at=datetime.now().isoformat(timespec="seconds"),
+            completed_at=_local_now().isoformat(timespec="seconds"),
         )
     except Exception as exc:
         log_logger.exception("[Job %s] Local test failed", job_id)
@@ -662,7 +852,7 @@ def _run_local_test_job(job_id: int, log_file: str, email: str) -> None:
             job_id,
             status="failed",
             error=f"{type(exc).__name__}: {exc}"[:500],
-            completed_at=datetime.now().isoformat(timespec="seconds"),
+            completed_at=_local_now().isoformat(timespec="seconds"),
         )
 
 
@@ -689,7 +879,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         _notify_sub2api_automation_job(job_id)
         return
 
-    db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+    db.update_job(job_id, status="running", started_at=_local_now().isoformat(timespec="seconds"))
 
     if str(current.get("job_type") or "registration") == "local_test":
         try:
@@ -739,13 +929,16 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     email=result_dict.get("email") or email,
                     account_id=result_dict.get("account_id") if recoverable_twofa else None,
                     error="用户手动停止",
-                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                    completed_at=_local_now().isoformat(timespec="seconds"),
                 )
                 log_logger.warning(f"[Job {job_id}] 已按用户请求停止")
                 return
             if isinstance(result, dict) and result.get("success"):
                 try:
-                    from core.email_provider import mark_email_consumed, resolve_email_source
+                    from core.email_provider import (
+                        mark_email_consumed,
+                        resolve_email_source,
+                    )
 
                     if resolve_email_source(email or "") == "qan8_gmail_api":
                         mark_email_consumed(email or "")
@@ -757,7 +950,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     email=result.get("email"),
                     account_id=result.get("account_id"),
                     network_identity=result.get("network_identity"),
-                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                    completed_at=_local_now().isoformat(timespec="seconds"),
                 )
                 log_logger.info(f"[Job {job_id}] 成功: {result.get('email')}")
                 # NordVPN auto IP rotation counter
@@ -786,7 +979,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     account_id=(result or {}).get("account_id") if isinstance(result, dict) else None,
                     network_identity=(result or {}).get("network_identity") if isinstance(result, dict) else None,
                     error=str(err)[:500],
-                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                    completed_at=_local_now().isoformat(timespec="seconds"),
                 )
                 email_to_handle = str(result_email or email or "").strip()
                 recoverable_twofa = bool(
@@ -796,7 +989,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 if not recoverable_twofa and _should_disable_failed_registration_email(err):
                     _disable_job_email(email_to_handle, str(err))
                 elif not recoverable_twofa:
-                    _release_unconsumed_job_email(email_to_handle, str(err))
+                    _release_unconsumed_job_email(
+                        email_to_handle,
+                        str(err),
+                        discard_on_failure=True,
+                    )
                 elif email_to_handle:
                     _consume_recoverable_twofa_assignment(email_to_handle, str(err))
                     log_logger.info(
@@ -822,7 +1019,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             email=email,
             account_id=(linked_account or {}).get("id") if recoverable_twofa else None,
             error="用户手动停止",
-            completed_at=datetime.now().isoformat(timespec="seconds"),
+            completed_at=_local_now().isoformat(timespec="seconds"),
         )
     except Exception as exc:
         err_text = f"{type(exc).__name__}: {exc}"
@@ -834,7 +1031,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         if not recoverable_twofa and _should_disable_failed_registration_email(err_text):
             _disable_job_email(email, err_text)
         elif not recoverable_twofa:
-            _release_unconsumed_job_email(email, err_text)
+            _release_unconsumed_job_email(
+                email,
+                err_text,
+                discard_on_failure=not is_stop_requested(job_id),
+            )
         elif email:
             _consume_recoverable_twofa_assignment(email, err_text)
         if is_stop_requested(job_id):
@@ -845,7 +1046,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 email=email,
                 account_id=(linked_account or {}).get("id") if recoverable_twofa else None,
                 error="用户手动停止",
-                completed_at=datetime.now().isoformat(timespec="seconds"),
+                completed_at=_local_now().isoformat(timespec="seconds"),
             )
             return
         log_logger.exception(f"[Job {job_id}] 异常")
@@ -855,7 +1056,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             email=email,
             account_id=(linked_account or {}).get("id") if recoverable_twofa else None,
             error=f"{type(exc).__name__}: {exc}"[:500],
-            completed_at=datetime.now().isoformat(timespec="seconds"),
+            completed_at=_local_now().isoformat(timespec="seconds"),
         )
     finally:
         _deactivate_job(job_id)
@@ -886,14 +1087,14 @@ def _run_twofa_retry_job(
     if not current or current.get("status") == "cancelled":
         _deactivate_job(job_id)
         return
-    db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+    db.update_job(job_id, status="running", started_at=_local_now().isoformat(timespec="seconds"))
     try:
         account = db.get_account(account_id)
         if not account:
             raise RuntimeError("目标账号不存在，无法补做 2FA")
         with _JobLogContext(log_file):
             result = _run_configured_twofa_retry(account, proxy_lane_id=proxy_lane_id)
-        now_iso = datetime.now().isoformat(timespec="seconds")
+        now_iso = _local_now().isoformat(timespec="seconds")
         if is_stop_requested(job_id):
             db.update_job(
                 job_id,
@@ -927,7 +1128,7 @@ def _run_twofa_retry_job(
             email=email,
             account_id=account_id,
             error=f"{type(exc).__name__}: {exc}"[:500],
-            completed_at=datetime.now().isoformat(timespec="seconds"),
+            completed_at=_local_now().isoformat(timespec="seconds"),
         )
         logger.exception("[Job %s] 2FA 补做异常", job_id)
     finally:
@@ -979,7 +1180,7 @@ def _run_codex_retry_job(
                 email=email,
                 account_id=account_id,
                 error=reason,
-                completed_at=datetime.now().isoformat(timespec="seconds"),
+                completed_at=_local_now().isoformat(timespec="seconds"),
             )
             logger.warning("[Job %s] %s: %s", job_id, reason, email)
             codex_retry_service.release(email)
@@ -987,7 +1188,7 @@ def _run_codex_retry_job(
             _notify_sub2api_automation_job(job_id)
             return
 
-    db.update_job(job_id, status="running", started_at=datetime.now().isoformat(timespec="seconds"))
+    db.update_job(job_id, status="running", started_at=_local_now().isoformat(timespec="seconds"))
     try:
         sub2_callback_context = None
         if provider_context.get("sub2api_automation_kind") == "reauthorization":
@@ -1006,7 +1207,7 @@ def _run_codex_retry_job(
             lease_owner_id=f"codex-retry-job:{job_id}",
             sub2_callback_context=sub2_callback_context,
         )
-        now_iso = datetime.now().isoformat(timespec="seconds")
+        now_iso = _local_now().isoformat(timespec="seconds")
         if is_stop_requested(job_id) or result.get("status") == "stopped":
             db.update_job(job_id, status="stopped", email=email, account_id=account_id, error=str(result.get("message") or "用户手动停止")[:500], completed_at=now_iso)
         elif result.get("ok"):
@@ -1031,7 +1232,7 @@ def _run_codex_retry_job(
             job_id,
             status="failed",
             error=f"{type(exc).__name__}: {exc}"[:500],
-            completed_at=datetime.now().isoformat(timespec="seconds"),
+            completed_at=_local_now().isoformat(timespec="seconds"),
         )
         codex_retry_service.release(email)
         logger.exception("[Job %s] Codex 补跑异常", job_id)
@@ -1125,7 +1326,7 @@ def submit_codex_retry_for_account(
                 int(job["id"]),
                 status="failed",
                 error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
-                completed_at=datetime.now().isoformat(timespec="seconds"),
+                completed_at=_local_now().isoformat(timespec="seconds"),
             )
         db.update_account_codex_status(email, "failed", f"队列提交失败：{type(exc).__name__}: {exc}"[:500])
         logger.exception("[Service] 自动 Codex 补跑任务提交失败: %s", email)
@@ -1165,7 +1366,6 @@ def submit_registration(
     Returns:
         N 个新创建的 job dict
     """
-    requested_email_source = email_source
     if email_source is None:
         from config import email as _email_cfg
         email_source = _email_cfg.EMAIL_SOURCE
@@ -1183,7 +1383,9 @@ def submit_registration(
     gmail_api_url_batch_id: str | None = None
     aliases_per_email = int(gmail_api_url_aliases_per_email or 1)
     if email_source == "gmail_api_url" and aliases_per_email > 1:
-        from core.gmail_api_url_client import create_registration_batch as create_gmail_api_url_batch
+        from core.gmail_api_url_client import (
+            create_registration_batch as create_gmail_api_url_batch,
+        )
 
         gmail_api_url_batch_id = create_gmail_api_url_batch(
             count, aliases_per_email=aliases_per_email
@@ -1293,7 +1495,7 @@ def submit_registration(
                 gmail_api_url_batch_id=gmail_api_url_batch_id,
                 qan8_gmail_api_batch_id=qan8_batch_id,
                 qan8_gmail_api_lane_id=qan8_lane_id,
-                email_source=requested_email_source,
+                email_source=email_source,
                 paymesh_inventory_id=paymesh_inventory_id,
                 paymesh_routed_domains=paymesh_routed_domains,
             )
@@ -1305,7 +1507,7 @@ def submit_registration(
                     int(job["id"]),
                     status="failed",
                     error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
-                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                    completed_at=_local_now().isoformat(timespec="seconds"),
                 )
                 logger.exception("[Service] 注册任务 #%s 提交线程池失败", job["id"])
             jobs.append(db.get_job(int(job["id"])) or job)
@@ -1339,7 +1541,7 @@ def submit_local_test_registration(
                     int(job["id"]),
                     status="failed",
                     error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
-                    completed_at=datetime.now().isoformat(timespec="seconds"),
+                    completed_at=_local_now().isoformat(timespec="seconds"),
                 )
                 logger.exception("[Service] Local test job #%s 提交线程池失败", job["id"])
             jobs.append(db.get_job(int(job["id"])) or job)
@@ -1516,9 +1718,8 @@ def retry_job(
     email = str((account or {}).get("email") or source.get("email") or "").strip()
     account_id = int(account["id"]) if account and account.get("id") is not None else None
     reserved_codex = False
-    if action in {"codex", "2fa"}:
-        if not email or account_id is None:
-            return {"ok": False, "error": "已注册账号信息不完整，无法执行账号恢复操作", "status": 409}
+    if action in {"codex", "2fa"} and (not email or account_id is None):
+        return {"ok": False, "error": "已注册账号信息不完整，无法执行账号恢复操作", "status": 409}
     if action == "codex":
         if not codex_retry_service.reserve(email):
             return {"ok": False, "error": "该账号正在补跑 Codex，请稍候", "status": 409}
@@ -1604,7 +1805,7 @@ def retry_job(
             int(job["id"]),
             status="failed",
             error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
-            completed_at=datetime.now().isoformat(timespec="seconds"),
+            completed_at=_local_now().isoformat(timespec="seconds"),
         )
         logger.exception("[Service] 重试任务 #%s 提交线程池失败", job["id"])
         return {"ok": False, "error": "重试任务创建成功，但提交执行失败", "status": 500, "job": db.get_job(int(job["id"]))}
@@ -1699,7 +1900,7 @@ def cancel_pending_jobs() -> int:
     """
     jobs = db.list_jobs(limit=1000)
     cancelled = 0
-    now_iso = datetime.now().isoformat(timespec="seconds")
+    now_iso = _local_now().isoformat(timespec="seconds")
     for job in jobs:
         if job.get("status") == "pending":
             db.update_job(
@@ -1719,7 +1920,7 @@ def request_stop_job(job_id: int) -> dict:
     if not job:
         return {"ok": False, "error": "任务不存在", "status": 404}
     status = job.get("status")
-    now_iso = datetime.now().isoformat(timespec="seconds")
+    now_iso = _local_now().isoformat(timespec="seconds")
     if status == "pending":
         db.update_job(job_id, status="cancelled", completed_at=now_iso, error="用户手动停止/取消排队")
         _append_job_log(

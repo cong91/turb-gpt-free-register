@@ -1,8 +1,8 @@
-# -*- coding: utf-8 -*-
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 from unittest.mock import patch
 
 import core.account_liveness as liveness
@@ -18,7 +18,7 @@ class _DummyHttpSession:
 
 
 class _DummyBrowserSession:
-    created = []
+    created: ClassVar[list] = []
 
     def __init__(self, proxy=None, **kwargs):
         self.proxy = proxy
@@ -67,9 +67,11 @@ class AccountLivenessTests(unittest.TestCase):
         _DummyBrowserSession.created = []
 
     def test_preflight_preserves_explicit_direct_route_and_skips_providers(self):
-        with patch.object(liveness, "BrowserSession", _DummyBrowserSession), \
-             patch.object(liveness, "get_csrf_token", return_value="csrf"), \
-             patch.object(liveness, "signin_openai", return_value="https://auth.example/authorize"):
+        with (
+            patch.object(liveness, "BrowserSession", _DummyBrowserSession),
+            patch.object(liveness, "get_csrf_token", return_value="csrf"),
+            patch.object(liveness, "signin_openai", return_value="https://auth.example/authorize"),
+        ):
             session, authorize_url = liveness._network_preflight_with_retry(
                 "user@example.com", "", max_attempts=1
             )
@@ -80,10 +82,12 @@ class AccountLivenessTests(unittest.TestCase):
 
     def test_preflight_retries_with_new_session_when_csrf_is_blocked(self):
         csrf_errors = [RuntimeError("HTTP Error 403"), "csrf"]
-        with patch.object(liveness, "BrowserSession", _DummyBrowserSession), \
-             patch.object(liveness, "get_csrf_token", side_effect=csrf_errors), \
-             patch.object(liveness, "signin_openai", return_value="authorize"), \
-             patch.object(liveness.time, "sleep"):
+        with (
+            patch.object(liveness, "BrowserSession", _DummyBrowserSession),
+            patch.object(liveness, "get_csrf_token", side_effect=csrf_errors),
+            patch.object(liveness, "signin_openai", return_value="authorize"),
+            patch.object(liveness.time, "sleep"),
+        ):
             session, _ = liveness._network_preflight_with_retry(
                 "user@example.com", None, max_attempts=2
             )
@@ -104,10 +108,12 @@ class AccountLivenessTests(unittest.TestCase):
         error.response = response
         session = _DummyBrowserSession(proxy="proxy")
 
-        with patch.object(liveness, "_validate_reauth_otp", side_effect=error), \
-             patch.object(liveness, "wait_for_otp", return_value="123456"):
-            with self.assertRaises(liveness.AccountUnusableError) as ctx:
-                liveness._validate_reauth_with_retry(session, "user@example.com", 1.0)
+        with (
+            patch.object(liveness, "_validate_reauth_otp", side_effect=error),
+            patch.object(liveness, "wait_for_otp", return_value="123456"),
+            self.assertRaises(liveness.AccountUnusableError) as ctx,
+        ):
+            liveness._validate_reauth_with_retry(session, "user@example.com", 1.0)
 
         self.assertEqual(ctx.exception.error_code, "account_deactivated")
 
@@ -140,6 +146,7 @@ class AccountLivenessTests(unittest.TestCase):
              patch.object(live_service.db, "mark_account_live_check_running", return_value=True), \
              patch.object(live_service.db, "update_account_liveness"), \
              patch.object(live_service, "_append_log"), \
+             patch("config.proxy.ROTATING_PROXY_ENABLED", False), \
              patch.object(live_service, "resolve_plan_check_route", return_value={
                  "proxy": "socks5://proxy.example:1080",
                  "network_route": "proxy",

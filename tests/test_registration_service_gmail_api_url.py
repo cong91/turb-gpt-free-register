@@ -1,10 +1,10 @@
-# -*- coding: utf-8 -*-
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from config import email as email_config
+from config import proxy as proxy_config
 from core import db, registration_service
 from webui.registration_jobs_api import create_registration_jobs
 
@@ -34,7 +34,7 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
 
         with patch.object(registration_service, "get_executor", return_value=ImmediateExecutor()), patch.object(
             registration_service, "get_executor_workers", return_value=3
-        ):
+        ), patch.object(proxy_config, "ROTATING_PROXY_ENABLED", False):
             jobs = registration_service.submit_registration(
                 count=12,
                 workers=3,
@@ -51,6 +51,8 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
                 persisted["provider_context"]["gmail_api_url_batch_id"],
                 "batch-gmail-api",
             )
+            self.assertFalse(persisted["email"])
+            self.assertNotIn("alias", persisted["provider_context"])
 
     def test_webui_count_one_with_alias_cap_submits_expanded_jobs(self):
         service = MagicMock()

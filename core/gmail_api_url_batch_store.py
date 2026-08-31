@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Gmail API URL batch store - manages Gmail accounts accessed via API URL.
 Supports multi-alias batches (1-12 aliases per account).
@@ -10,16 +9,13 @@ import sqlite3
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
 from .gmail_batch_store_base import (
-    GmailBatchStoreBase,
-    GmailBatchError,
-    GmailBatchConflict,
     Assignment,
+    GmailBatchConflict,
+    GmailBatchError,
+    GmailBatchStoreBase,
 )
-
 
 # Backward compatibility aliases
 GmailApiUrlBatchError = GmailBatchError
@@ -149,7 +145,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 "AND a2.inventory_id = i2.inventory_id "
                 "WHERE a2.batch_id = i.batch_id AND i2.code_url = i.code_url "
                 "AND a2.state = 'active') "
-                "ORDER BY i.position LIMIT 1",
+                "ORDER BY RANDOM() LIMIT 1",
                 (batch,),
             ).fetchone()
             
@@ -171,12 +167,13 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             ).fetchone()
             return self._assignment(created)
 
-    def claim_waiting(self, batch_id: str, job_id: str) -> Optional[Assignment]:
+    def claim_waiting(self, batch_id: str, job_id: str) -> Assignment | None:
         """Claim through the durable FIFO queue, returning None while waiting.
 
         A waiting job is persisted before it competes for a code URL. This keeps
         concurrent workers from treating a temporary URL lock as exhaustion and
-        gives the next process a recoverable queue after a worker restart.
+        gives the next process a recoverable queue after a worker restart. The
+        waiter order stays FIFO while the eligible alias is selected randomly.
         """
         batch, owner = self._required(batch_id, job_id)
         prefix = self._table_prefix()
@@ -242,7 +239,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 "AND a2.inventory_id = i2.inventory_id "
                 "WHERE a2.batch_id = i.batch_id AND i2.code_url = i.code_url "
                 "AND a2.state = 'active') "
-                "ORDER BY i.position LIMIT 1",
+                "ORDER BY RANDOM() LIMIT 1",
                 (batch,),
             ).fetchone()
             if row is None:
@@ -303,14 +300,43 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             )
         return True
 
+    def quarantine_code_url(self, batch_id: str, code_url: str, *, reason: str = "") -> int:
+        """Exhaust every alias backed by a provider URL that returned code 602."""
+        batch = str(batch_id or "").strip()
+        url = str(code_url or "").strip()
+        if not batch or not url:
+            raise GmailBatchError("Batch ID and code URL are required")
+
+        message = str(reason or "")[:300]
+        with self._transaction() as connection:
+            item_count = connection.execute(
+                "SELECT COUNT(*) FROM gmail_api_url_batch_items "
+                "WHERE batch_id = ? AND code_url = ? AND state != 'exhausted'",
+                (batch, url),
+            ).fetchone()[0]
+            connection.execute(
+                "UPDATE gmail_api_url_assignments SET state = 'failed', reason = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE batch_id = ? "
+                "AND state IN ('active', 'failed', 'released') AND inventory_id IN ("
+                "SELECT inventory_id FROM gmail_api_url_batch_items "
+                "WHERE batch_id = ? AND code_url = ?)",
+                (message, batch, batch, url),
+            )
+            connection.execute(
+                "UPDATE gmail_api_url_batch_items SET state = 'exhausted', failure_reason = ? "
+                "WHERE batch_id = ? AND code_url = ?",
+                (message, batch, url),
+            )
+        return int(item_count or 0)
+
     def poll_otp(
         self,
         assignment: Assignment,
         *,
-        after_ts: Optional[float] = None,
+        after_ts: float | None = None,
         timeout: float = 60.0,
         poll_interval: float = 2.0,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Poll OTP via Gmail API URL client."""
         from . import gmail_api_url_client
         
@@ -619,7 +645,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         """Mark assignment and item as exhausted (API URL-specific)."""
         return self._finish(assignment_id, "exhausted", item_state="exhausted", reason=reason)
 
-    def get_assignment(self, assignment_id: str) -> Optional[Assignment]:
+    def get_assignment(self, assignment_id: str) -> Assignment | None:
         """Get assignment by ID."""
         with closing(self._connect()) as connection:
             row = connection.execute(
@@ -628,7 +654,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             ).fetchone()
         return self._assignment(row) if row else None
 
-    def get_item(self, batch_id: str, inventory_id: str) -> Optional[GmailApiUrlBatchItem]:
+    def get_item(self, batch_id: str, inventory_id: str) -> GmailApiUrlBatchItem | None:
         """Get batch item details."""
         with closing(self._connect()) as connection:
             row = connection.execute(
