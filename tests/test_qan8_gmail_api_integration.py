@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from config import email as email_config
+from config import proxy as proxy_config
 from config import register as register_config
 from core import db, email_provider, registration_service
 from webui import config_editor
@@ -126,15 +127,19 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
 
         self.assertTrue(
             email_provider.release_email_if_unconsumed(
-                "alias+one@gmail.com", note="registration failed"
+                "alias+one@gmail.com",
+                note="registration failed",
+                discard_on_failure=True,
             )
         )
+        allocator.release_account.assert_called_once_with(
+            "alias+one@gmail.com", status="failed", reason="registration failed"
+        )
+
+        allocator.reset_mock()
         self.assertTrue(email_provider.mark_email_consumed("alias+one@gmail.com"))
 
-        allocator.release_account.assert_any_call(
-            "alias+one@gmail.com", status="available", reason="registration failed"
-        )
-        allocator.release_account.assert_any_call(
+        allocator.release_account.assert_called_once_with(
             "alias+one@gmail.com", status="used", reason=""
         )
 
@@ -209,7 +214,9 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
 
         with patch.object(
             registration_service, "get_executor", return_value=ImmediateExecutor()
-        ), patch.object(registration_service, "get_executor_workers", return_value=3):
+        ), patch.object(registration_service, "get_executor_workers", return_value=3), patch.object(
+            proxy_config, "ROTATING_PROXY_ENABLED", False
+        ):
             jobs = registration_service.submit_registration(
                 count=5,
                 workers=3,
@@ -230,6 +237,38 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
                 for job in jobs
             ],
             [(0, "batch-1"), (1, "batch-1"), (2, "batch-1"), (0, "batch-1"), (1, "batch-1")],
+        )
+        self.assertTrue(all(not db.get_job(job["id"])["email"] for job in jobs))
+        self.assertTrue(
+            all("alias" not in (db.get_job(job["id"]) or {}).get("provider_context", {}) for job in jobs)
+        )
+
+    @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator")
+    def test_submit_uses_configured_source_for_lazy_worker_inputs(self, allocator_factory):
+        allocator_factory.return_value.create_batch.return_value = {
+            "batch_id": "batch-1",
+            "effective_workers": 1,
+        }
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                return None
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(registration_service, "get_executor_workers", return_value=1), patch.object(
+            proxy_config, "ROTATING_PROXY_ENABLED", False
+        ), patch.object(email_config, "EMAIL_SOURCE", "qan8_gmail_api"):
+            jobs = registration_service.submit_registration(
+                count=1,
+                workers=1,
+                email_source=None,
+                qan8_aliases_per_source=12,
+            )
+
+        self.assertEqual(
+            registration_service._JOB_EMAIL_INPUTS[jobs[0]["id"]]["email_source"],
+            "qan8_gmail_api",
         )
 
     @patch("core.email_provider.mark_email_consumed", return_value=True)

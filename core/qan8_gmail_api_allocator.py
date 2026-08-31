@@ -33,7 +33,7 @@ class Qan8GmailApiAllocator:
     def __init__(
         self,
         *,
-        client: Qan8GmailApiClient | object | None = None,
+        client: Qan8GmailApiClient | None = None,
         store: Qan8GmailApiStore | None = None,
         poll_interval: float = 2.0,
         order_timeout: float | None = None,
@@ -85,8 +85,11 @@ class Qan8GmailApiAllocator:
         if batch is None:
             raise ValueError("QAN8 batch does not exist")
         lane = int(lane_id)
-        if self.store.get_lane(batch_id, lane) is None:
+        lane_record = self.store.get_lane(batch_id, lane)
+        if lane_record is None:
             raise ValueError("QAN8 lane does not exist")
+        if str(lane_record.get("state") or "active") != "active":
+            raise RuntimeError("QAN8 lane is quarantined")
         deadline = None if wait_timeout is None else time.monotonic() + max(0.0, float(wait_timeout))
         while True:
             current = self.store.get_current_source(batch_id, lane)
@@ -129,11 +132,7 @@ class Qan8GmailApiAllocator:
         return self.store.release_assignment(job_id, reason=reason)
 
     def fail_account(self, batch_id: str, job_id: int | str, reason: str = "") -> bool:
-        assignment = self.store.get_assignment(job_id)
-        changed = self.store.fail_assignment(job_id, reason=reason)
-        if changed and assignment:
-            self.store.retire_source(assignment["source_group_id"], reason=reason)
-        return changed
+        return self.store.fail_assignment(job_id, reason=reason)
 
     def release_account(self, alias: str, *, status: str = "available", reason: str = "") -> bool:
         assignment = self.store.get_active_assignment_for_alias(alias)
@@ -161,6 +160,10 @@ class Qan8GmailApiAllocator:
             lane_id=int(context["lane_id"]),
             job_id="",
         )
+
+    def quarantine_lane(self, batch_id: str, lane_id: int, *, reason: str = "") -> int:
+        """Disable a QAN8 lane and retire all source aliases assigned to it."""
+        return self.store.quarantine_lane(batch_id, lane_id, reason=reason)
 
     def status(self, batch_id: str) -> dict:
         return self.store.batch_status(batch_id)

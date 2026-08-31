@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Gmail API URL provider 集成测试（全程 mock）。"""
 import unittest
 from unittest.mock import patch
@@ -140,6 +139,26 @@ class GmailApiUrlProviderTests(unittest.TestCase):
         self.assertTrue(result)
         mock_release.assert_called_once_with(
             "alias@gmail.com", status="available", note="registration failed"
+        )
+
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.db.release_unconsumed_gmail_api_url_email", return_value=False)
+    @patch("core.gmail_api_url_client.get_batch_account_context", return_value=object())
+    @patch("core.gmail_api_url_client.release_account", return_value=True)
+    def test_registration_failure_discards_batch_alias_assignment(
+        self, mock_release, _mock_context, _mock_db_release, _mock_source
+    ):
+        result = email_provider.release_email_if_unconsumed(
+            "alias@gmail.com",
+            note="password step failed",
+            discard_on_failure=True,
+        )
+
+        self.assertTrue(result)
+        mock_release.assert_called_once_with(
+            "alias@gmail.com",
+            status="failed",
+            note="password step failed",
         )
 
     @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")

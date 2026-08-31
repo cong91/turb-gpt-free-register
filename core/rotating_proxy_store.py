@@ -246,6 +246,13 @@ class RotatingProxyStore:
             )
         return cursor.rowcount
 
+    def clear_leases(self) -> int:
+        """Clear leases left by a previous application process."""
+        with closing(self._connect()) as connection:
+            cursor = connection.execute("DELETE FROM rotating_proxy_scoped_leases")
+            legacy_cursor = connection.execute("DELETE FROM rotating_proxy_leases")
+        return int(cursor.rowcount or 0) + int(legacy_cursor.rowcount or 0)
+
     def list_leases(self) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:
             rows = connection.execute(

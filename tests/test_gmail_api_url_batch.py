@@ -1,9 +1,14 @@
 """
 Test Gmail API URL batch assignment system.
 """
-import pytest
 from unittest.mock import patch
-from core.gmail_api_url_batch_store import GmailApiUrlBatchStore, GmailApiUrlBatchConflict
+
+import pytest
+
+from core.gmail_api_url_batch_store import (
+    GmailApiUrlBatchConflict,
+    GmailApiUrlBatchStore,
+)
 from core.gmail_api_url_client import GmailApiUrlAccount
 
 
@@ -115,6 +120,47 @@ def test_discard_exhausts_failed_alias_and_claims_next_alias(tmp_path):
     status = store.batch_status(batch_id)
     assert status["pending"] == 1
     assert status["exhausted"] == 1
+
+
+def test_quarantine_code_url_exhausts_every_alias_for_that_mailbox(tmp_path):
+    """A provider 602 retires every alias sharing the broken code URL."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    batch_id = store.create_batch_multi(
+        [
+            {
+                "source_email": "broken-source@gmail.com",
+                "code_url": "https://api.mail.com/broken",
+                "aliases": ["broken-one@gmail.com", "broken-two@gmail.com"],
+            },
+            {
+                "source_email": "healthy-source@gmail.com",
+                "code_url": "https://api.mail.com/healthy",
+                "aliases": ["healthy-one@gmail.com"],
+            },
+        ]
+    )
+
+    broken = store.claim(batch_id, "job-broken")
+
+    assert store.quarantine_code_url(
+        batch_id,
+        "https://api.mail.com/broken",
+        reason="Provider error code=602",
+    ) == 2
+    assert store.get_assignment(broken.assignment_id).state == "failed"
+    assert store.get_item(
+        batch_id,
+        "broken-one@gmail.com----https://api.mail.com/broken",
+    ).state == "exhausted"
+    assert store.get_item(
+        batch_id,
+        "broken-two@gmail.com----https://api.mail.com/broken",
+    ).state == "exhausted"
+    assert store.batch_status(batch_id)["pending"] == 1
+
+    healthy = store.claim(batch_id, "job-healthy")
+    assert healthy.inventory_id.startswith("healthy-one@gmail.com----")
+
 
 
 def test_has_pending_items_distinguishes_temporary_lock_from_exhaustion(tmp_path):
@@ -295,10 +341,10 @@ def test_capacity_validation(tmp_path):
     store.create_batch([("test@gmail.com", "https://api.mail.com/code")], capacity=12)
     
     # Invalid capacities should fail
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         store.create_batch([("test@gmail.com", "https://api.mail.com/code")], capacity=0)
-    
-    with pytest.raises(Exception):
+
+    with pytest.raises(ValueError):
         store.create_batch([("test@gmail.com", "https://api.mail.com/code")], capacity=13)
 
 

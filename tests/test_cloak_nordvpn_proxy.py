@@ -23,6 +23,7 @@ class MainCloakNordVPNProxyLifecycleTests(unittest.TestCase):
             return {"success": True}
 
         with mock.patch("config.roxybrowser.REGISTRATION_DRIVER", "cloak"), \
+             mock.patch("config.proxy.ROTATING_PROXY_ENABLED", False), \
              mock.patch(
                  "core.nordvpn_wireguard.proxy_for_registration",
                  side_effect=proxy_context,

@@ -1,25 +1,29 @@
-# -*- coding: utf-8 -*-
 """Gmail API URL 取码客户端单元测试（全程 mock HTTP 请求）。"""
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
+from core import registration_service
+from core.gmail_aliases import generate_gmail_dual_domain_aliases
+from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 from core.gmail_api_url_client import (
     GmailApiUrlAccount,
     GmailApiUrlBatchError,
     GmailApiUrlError,
-    create_registration_batch,
-    get_email_from_batch,
     _reconcile_batch_queue,
-    poll_verification_code,
     acknowledge_verification_code,
-    pick_account,
+    create_registration_batch,
     get_account_context,
+    get_email_from_batch,
+    pick_account,
+    poll_verification_code,
     release_account,
 )
-from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
-from core.gmail_aliases import generate_gmail_dual_domain_aliases
 from core.gmail_batch_store_base import Assignment
+
+
+class FakeHttpError(RuntimeError):
+    """HTTP error used only by the response test double."""
 
 
 class _Response:
@@ -36,7 +40,7 @@ class _Response:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise Exception(f"HTTP {self.status_code}")
+            raise FakeHttpError(f"HTTP {self.status_code}")
 
 
 class GmailApiUrlClientTests(unittest.TestCase):
@@ -174,6 +178,21 @@ class GmailApiUrlClientTests(unittest.TestCase):
         self.assertEqual(account.email, "alias@gmail.com")
         self.assertEqual(store.claim_waiting.call_count, 2)
         mock_sleep.assert_called_once_with(0)
+
+    @patch("core.registration_service.is_stop_requested", return_value=True)
+    @patch("core.gmail_api_url_client._batch_store")
+    def test_get_email_from_batch_stops_queued_job_after_lane_quarantine(
+        self, mock_store_factory, _mock_is_stop_requested
+    ):
+        store = mock_store_factory.return_value
+
+        with self.assertRaises(registration_service.StopRequested):
+            get_email_from_batch("batch-1", "7", wait_timeout=30, poll_interval=0)
+
+        store.claim_waiting.assert_not_called()
+        store.cancel_waiter.assert_called_once_with(
+            "batch-1", "7", "job stopped by email lane quarantine"
+        )
 
     @patch("core.db.get_account_by_email", return_value={"id": 91})
     @patch("core.db.get_job")

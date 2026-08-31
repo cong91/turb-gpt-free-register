@@ -22,7 +22,7 @@ def release_rotating_proxy(
     lane_id: int | None = None,
     proxy_url: str | None = None,
 ) -> bool:
-    """Release a rotating-proxy lane after its account workflow completes."""
+    """Retain a rotating-proxy lane until TTL expiry after its workflow completes."""
     return _release_rotating_proxy(
         scope=scope,
         lane_id=default_proxy_lane_id() if lane_id is None else lane_id,
