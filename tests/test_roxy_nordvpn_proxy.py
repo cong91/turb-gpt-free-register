@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Regression tests for NordVPN SOCKS5 attachment to Roxy profiles."""
 import unittest
 from contextlib import contextmanager
@@ -97,12 +96,14 @@ class RoxyProxyAttachmentTests(unittest.TestCase):
 
     def test_profile_proxy_mismatch_fails_before_open(self):
         client = RoxyBrowserClient()
-        with mock.patch.object(client, "create_profile", return_value="404"), \
-             mock.patch.object(client, "_verify_profile_proxy", side_effect=RuntimeError("mismatch")), \
-             mock.patch.object(client, "request") as request, \
-             mock.patch.object(client, "cleanup_profile"):
-            with self.assertRaisesRegex(RuntimeError, "mismatch"):
-                client.open_profile(proxy="socks5://127.0.0.1:25000")
+        with (
+            mock.patch.object(client, "create_profile", return_value="404"),
+            mock.patch.object(client, "_verify_profile_proxy", side_effect=RuntimeError("mismatch")),
+            mock.patch.object(client, "request") as request,
+            mock.patch.object(client, "cleanup_profile"),
+            self.assertRaisesRegex(RuntimeError, "mismatch"),
+        ):
+            client.open_profile(proxy="socks5://127.0.0.1:25000")
 
         request.assert_not_called()
 
@@ -224,6 +225,7 @@ class MainNordVPNProxyLifecycleTests(unittest.TestCase):
             return {"success": True}
 
         with mock.patch("config.roxybrowser.REGISTRATION_DRIVER", "roxy"), \
+             mock.patch("config.proxy.ROTATING_PROXY_ENABLED", False), \
              mock.patch("core.nordvpn_wireguard.proxy_for_registration", side_effect=proxy_context), \
              mock.patch("core.roxy_registration.run_roxy_registration", side_effect=run_roxy):
             result = main.run_registration("user@example.com", "Test User", "1990-01-01")

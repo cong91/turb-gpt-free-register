@@ -320,6 +320,7 @@ class BrowserEmailChangeRunnerTests(unittest.TestCase):
         driver = Mock()
         profile = Mock(driver=driver, provider="roxy")
         with (
+            patch("config.proxy.ROTATING_PROXY_ENABLED", False),
             patch.object(browser_email_change, "open_browser_profile", return_value=profile),
             patch.object(
                 browser_email_change,
@@ -358,6 +359,7 @@ class BrowserEmailChangeRunnerTests(unittest.TestCase):
         driver = Mock()
         profile = Mock(driver=driver, provider="roxy")
         with (
+            patch("config.proxy.ROTATING_PROXY_ENABLED", False),
             patch.object(browser_email_change, "open_browser_profile", return_value=profile),
             patch.object(browser_email_change, "change_email_in_browser", return_value={"ok": False, "error": "verification failed"}),
             patch.object(browser_email_change.db, "update_account_email") as update_email,
@@ -385,7 +387,7 @@ class BrowserEmailChangeRunnerTests(unittest.TestCase):
         peak: dict[str, int] = {}
         lock = threading.Lock()
 
-        def run_one(item):
+        def run_one(item, proxy_lane_id=None):
             with lock:
                 active[item.code_url] = active.get(item.code_url, 0) + 1
                 peak[item.code_url] = max(peak.get(item.code_url, 0), active[item.code_url])

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -13,6 +14,7 @@ from core.rotating_proxy_store import RotatingProxyStore
 
 logger = logging.getLogger(__name__)
 _PURCHASED_KEY_TTL_SECONDS = 24 * 60 * 60
+_COOLDOWN_SECONDS_RE = re.compile(r"\b(?:con|còn)\s+(\d+)\s*s\b", re.IGNORECASE)
 
 
 class RotatingProxyError(RuntimeError):
@@ -91,6 +93,25 @@ class RotatingProxyManager:
             return False
         key = str(lease.get("rotating_key") or "").strip()
         return bool(key) and not self._key_expired(self.store.get_key(key))
+
+    def _proxy_healthy(self, proxy_url: str) -> bool:
+        checker = getattr(self.client, "check_proxy", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker(proxy_url))
+        except Exception as exc:  # noqa: BLE001 - a failed health probe means unhealthy.
+            logger.warning(
+                "[RotatingProxy] proxy health-check failed: %s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
+            return False
+
+    @staticmethod
+    def _cooldown_seconds(error: Exception) -> int | None:
+        match = _COOLDOWN_SECONDS_RE.search(str(error or ""))
+        return max(1, int(match.group(1))) if match else None
 
     def _refresh_keys(self) -> list[dict[str, Any]]:
         try:
@@ -241,25 +262,49 @@ class RotatingProxyManager:
         lane = self._lane_id(lane_id)
         lane_scope = self._scope(scope)
         with self._lock:
-            self.store.delete_expired_leases(self.clock())
             now = self.clock()
+            previous = self.store.get_lease(lane, scope=lane_scope)
+            previous_key = str(previous.get("rotating_key") or "").strip() if previous else ""
+            previous_key_info = self.store.get_key(previous_key) if previous_key else None
+            fallback = None
+            if (
+                previous
+                and str(previous.get("proxy_url") or "").strip()
+                and float(previous.get("proxy_expires_at") or 0) <= now
+                and not self._key_expired(previous_key_info)
+                and self._proxy_healthy(str(previous["proxy_url"]))
+            ):
+                fallback = previous
+
+            self.store.delete_expired_leases(now)
             existing = self.store.get_lease(lane, scope=lane_scope)
-            key_info = self.store.get_key(existing.get("rotating_key")) if existing else None
+            existing_key = str(existing.get("rotating_key") or "").strip() if existing else ""
+            key_info = self.store.get_key(existing_key) if existing_key else None
             if (
                 existing
                 and float(existing.get("proxy_expires_at") or 0) > now
                 and not self._key_expired(key_info)
             ):
-                return RotatingProxyLease(
+                if self._proxy_healthy(str(existing["proxy_url"])):
+                    return RotatingProxyLease(
+                        scope=lane_scope,
+                        lane_id=lane,
+                        key=str(existing["rotating_key"]),
+                        proxy_url=str(existing["proxy_url"]),
+                        proxy_expires_at=float(existing["proxy_expires_at"]),
+                        key_expires_at=existing.get("key_expires_at"),
+                    )
+                self.store.delete_lease(
+                    lane,
                     scope=lane_scope,
-                    lane_id=lane,
-                    key=str(existing["rotating_key"]),
+                    rotating_key=str(existing["rotating_key"]),
                     proxy_url=str(existing["proxy_url"]),
-                    proxy_expires_at=float(existing["proxy_expires_at"]),
-                    key_expires_at=existing.get("key_expires_at"),
                 )
+                existing = None
 
             excluded_keys: set[str] = set()
+            failed_attempts: dict[str, int] = {}
+            last_error: Exception | None = None
             for _ in range(3):
                 key_info = self._key_for_lane(existing, excluded=excluded_keys)
                 key = str(key_info.get("rotating_key") or "").strip()
@@ -267,11 +312,68 @@ class RotatingProxyManager:
                     raise RotatingProxyError("Không xác định được keyxoay cho lane")
                 try:
                     proxy = self.client.get_proxy(key)
-                except Exception as exc:
-                    raise RotatingProxyError(f"Không lấy được proxy cho keyxoay: {exc}") from exc
+                except Exception as exc:  # noqa: BLE001 - retry another rotating key.
+                    last_error = exc
+                    cooldown = self._cooldown_seconds(exc)
+                    if cooldown and fallback:
+                        fallback_expiry = now + cooldown
+                        restored = self.store.try_upsert_lease(
+                            lane,
+                            scope=lane_scope,
+                            rotating_key=str(fallback["rotating_key"]),
+                            proxy_url=str(fallback["proxy_url"]),
+                            proxy_expires_at=fallback_expiry,
+                            key_expires_at=fallback.get("key_expires_at"),
+                            assigned_at=fallback.get("assigned_at") or now,
+                        )
+                        if restored:
+                            logger.warning(
+                                "[RotatingProxy] provider cooldown còn %ss; giữ proxy hiện tại cho scope=%s lane=%s",
+                                cooldown,
+                                lane_scope,
+                                lane,
+                            )
+                            return RotatingProxyLease(
+                                scope=lane_scope,
+                                lane_id=lane,
+                                key=str(fallback["rotating_key"]),
+                                proxy_url=str(fallback["proxy_url"]),
+                                proxy_expires_at=fallback_expiry,
+                                key_expires_at=fallback.get("key_expires_at"),
+                            )
+                    failed_attempts[key] = failed_attempts.get(key, 0) + 1
+                    if failed_attempts[key] >= 2:
+                        excluded_keys.add(key)
+                    existing = None
+                    logger.warning(
+                        "[RotatingProxy] get proxy failed; retrying another proxy: key=%s attempt=%s error=%s",
+                        _mask_key(key),
+                        failed_attempts[key],
+                        str(exc)[:180],
+                    )
+                    continue
                 proxy_url = str(proxy.get("proxy_url") or "").strip()
                 if not proxy_url:
-                    raise RotatingProxyError("proxy.vn không trả proxy_url")
+                    last_error = RotatingProxyError("proxy.vn không trả proxy_url")
+                    failed_attempts[key] = failed_attempts.get(key, 0) + 1
+                    if failed_attempts[key] >= 2:
+                        excluded_keys.add(key)
+                    existing = None
+                    continue
+                if not self._proxy_healthy(proxy_url):
+                    last_error = RotatingProxyError(
+                        "proxy.vn trả proxy nhưng health-check thất bại"
+                    )
+                    failed_attempts[key] = failed_attempts.get(key, 0) + 1
+                    if failed_attempts[key] >= 2:
+                        excluded_keys.add(key)
+                    existing = None
+                    logger.warning(
+                        "[RotatingProxy] proxy health-check failed; retrying: key=%s attempt=%s",
+                        _mask_key(key),
+                        failed_attempts[key],
+                    )
+                    continue
                 ttl = proxy.get("ttl_seconds")
                 try:
                     ttl_seconds = max(1, int(ttl)) if ttl is not None else 1800
@@ -304,6 +406,10 @@ class RotatingProxyManager:
                     lane_scope,
                     lane,
                 )
+            if last_error is not None:
+                raise RotatingProxyError(
+                    f"Không lấy được proxy khả dụng sau khi thử lại: {last_error}"
+                ) from last_error
             raise RotatingProxyError(
                 "rotating proxy key vừa được lane khác claim, không tìm được key thay thế"
             )
@@ -342,6 +448,7 @@ class RotatingProxyManager:
     def status(self) -> dict[str, Any]:
         from config import proxy as proxy_config
 
+        self.store.delete_expired_leases(self.clock())
         keys = self.store.list_keys()
         leases = self.store.list_leases()
         return {
@@ -378,7 +485,11 @@ def get_rotating_proxy_manager() -> RotatingProxyManager:
     global _DEFAULT_MANAGER
     with _DEFAULT_MANAGER_LOCK:
         if _DEFAULT_MANAGER is None:
-            _DEFAULT_MANAGER = RotatingProxyManager()
+            manager = RotatingProxyManager()
+            cleared = manager.store.clear_leases()
+            if cleared:
+                logger.info("[RotatingProxy] cleared %s lease(s) from previous process", cleared)
+            _DEFAULT_MANAGER = manager
         return _DEFAULT_MANAGER
 
 

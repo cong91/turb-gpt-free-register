@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 from unittest.mock import patch
 
@@ -126,6 +125,7 @@ class ChatgptPlanTests(unittest.TestCase):
         ]
 
         with (
+            patch("config.proxy.ROTATING_PROXY_ENABLED", False),
             patch.object(chatgpt_plan, "resolve_plan_check_route", side_effect=routes) as resolve,
             patch.object(chatgpt_plan, "BrowserSession", side_effect=sessions),
             patch.object(chatgpt_plan.time, "sleep"),
@@ -258,6 +258,7 @@ class ChatgptPlanTests(unittest.TestCase):
         ]
 
         with (
+            patch("config.proxy.ROTATING_PROXY_ENABLED", False),
             patch.object(chatgpt_plan, "resolve_plan_check_route", side_effect=routes) as resolve,
             patch.object(chatgpt_plan, "BrowserSession", side_effect=[failed, working]),
             patch.object(chatgpt_plan.time, "sleep"),
@@ -299,6 +300,7 @@ class ChatgptPlanTests(unittest.TestCase):
         ]
 
         with (
+            patch("config.proxy.ROTATING_PROXY_ENABLED", False),
             patch.object(chatgpt_plan, "resolve_plan_check_route", side_effect=routes) as resolve,
             patch.object(chatgpt_plan, "BrowserSession", side_effect=sessions),
             patch.object(chatgpt_plan.time, "sleep"),

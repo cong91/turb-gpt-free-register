@@ -78,8 +78,16 @@ def release_rotating_proxy(
     scope: str,
     lane_id: int | None = None,
     proxy_url: str | None = None,
+    retire: bool = False,
 ) -> bool:
-    """Release a completed rotating-proxy lane while retaining the purchased key."""
+    """Keep a lane lease until proxy expiry; retire it only when explicitly requested."""
+    if not retire:
+        logger.debug(
+            "[RotatingProxy] retaining lease until expiry: scope=%s lane=%s",
+            scope,
+            lane_id if lane_id is not None else "thread",
+        )
+        return False
     from core.rotating_proxy_manager import get_rotating_proxy_manager
 
     try:
@@ -89,7 +97,7 @@ def release_rotating_proxy(
             scope=scope,
             proxy_url=proxy_url,
         )
-    except Exception as exc:  # cleanup must not hide the workflow result
+    except Exception as exc:  # noqa: BLE001 - cleanup must not hide the workflow result.
         logger.warning(
             "[RotatingProxy] release lease failed: scope=%s lane=%s error=%s: %s",
             scope,
@@ -98,6 +106,21 @@ def release_rotating_proxy(
             str(exc)[:180],
         )
         return False
+
+
+def retire_rotating_proxy(
+    *,
+    scope: str,
+    lane_id: int | None = None,
+    proxy_url: str | None = None,
+) -> bool:
+    """Explicitly discard a lane lease before its provider TTL expires."""
+    return release_rotating_proxy(
+        scope=scope,
+        lane_id=lane_id,
+        proxy_url=proxy_url,
+        retire=True,
+    )
 
 
 def prepare_rotating_proxy_lanes(lane_count: int, *, scope: str) -> None:
