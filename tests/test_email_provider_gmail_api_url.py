@@ -36,6 +36,27 @@ class GmailApiUrlProviderTests(unittest.TestCase):
         self.assertEqual(source, "gmail_api_url")
         mock_get.assert_called_once_with("test@gmail.com")
 
+    @patch("core.email_provider._current_otp_job_id", return_value=17)
+    @patch(
+        "core.db.get_job",
+        return_value={
+            "id": 17,
+            "email": "alias@gmail.com",
+            "email_source": "gmail_api_url",
+        },
+    )
+    @patch("core.email_provider._registered_email_source", return_value=None)
+    @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator.get_account_context")
+    def test_active_job_source_wins_when_alias_exists_in_two_providers(
+        self, mock_qan8_context, _mock_registered, _mock_job, _mock_job_id
+    ):
+        mock_qan8_context.return_value = object()
+
+        source = email_provider.resolve_email_source("alias@gmail.com")
+
+        self.assertEqual(source, "gmail_api_url")
+        mock_qan8_context.assert_not_called()
+
     @patch("core.db.get_gmail_api_url_email_by_email")
     @patch("core.gmail_api_url_client.poll_verification_code", return_value="654321")
     def test_wait_for_otp_routes_to_gmail_api_url_client(self, mock_poll, mock_get):

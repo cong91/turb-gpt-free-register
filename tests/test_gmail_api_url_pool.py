@@ -115,6 +115,36 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "available")
 
+    @patch("core.db._load_accounts", return_value=[])
+    @patch("core.db.GmailApiUrlBatchStore.alias_usage_for_code_urls")
+    @patch("core.db._load_gmail_api_url_emails")
+    def test_list_exposes_alias_inventory_for_gmail_api_url(
+        self, mock_load, usage_for_urls, _accounts
+    ):
+        """Gmail API URL pool rows expose total/available/used alias counts."""
+        mock_load.return_value = [{
+            "id": 1,
+            "email": "source@gmail.com",
+            "code_url": "http://example.com/otp",
+            "status": "available",
+        }]
+        usage_for_urls.return_value = {
+            "http://example.com/otp": {
+                "allocated": set(),
+                "consumed": set(),
+                "failed": set(),
+                "reserved": set(),
+            },
+        }
+
+        row = db.list_gmail_api_url_email_pool()[0]
+
+        self.assertEqual(row["alias_total"], 12)
+        self.assertEqual(row["alias_available"], 12)
+        self.assertEqual(row["alias_used"], 0)
+        self.assertEqual(row["alias_reserved"], 0)
+        usage_for_urls.assert_called_once_with({"http://example.com/otp"})
+
     @patch("core.db._load_gmail_api_url_emails")
     @patch("core.db._save_gmail_api_url_emails")
     def test_delete_removes_email_and_returns_true(self, mock_save, mock_load):
@@ -180,6 +210,74 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         row = db.get_gmail_api_url_email_by_email("missing@gmail.com")
 
         self.assertIsNone(row)
+
+    @patch("core.db._attach_gmail_api_url_alias_stats")
+    @patch("core.db.GmailApiUrlBatchStore")
+    @patch("core.db.release_gmail_api_url_email")
+    @patch("core.db._load_accounts", return_value=[])
+    @patch("core.db._load_gmail_api_url_emails")
+    def test_reset_aliases_releases_source_and_returns_inventory(
+        self, mock_load, _accounts, release_email, store_class, attach_stats
+    ):
+        """Reset removes unused batch slots and returns refreshed counts."""
+        record = {
+            "email": "source@gmail.com",
+            "code_url": "http://example.com/otp",
+            "status": "used",
+        }
+        mock_load.return_value = [record]
+        store_class.return_value.reset_unused_aliases_for_code_url.return_value = 10
+        attach_stats.return_value = [{
+            **record,
+            "alias_total": 12,
+            "alias_allocated": 2,
+            "alias_available": 10,
+            "alias_used": 2,
+            "alias_failed": 0,
+            "alias_reserved": 0,
+        }]
+
+        result = db.reset_gmail_api_url_aliases("source@gmail.com")
+
+        self.assertEqual(result["reset_aliases"], 10)
+        self.assertEqual(result["alias_available"], 10)
+        release_email.assert_called_once_with(
+            "source@gmail.com",
+            status="available",
+            note="手动重置未消费 alias：10",
+        )
+
+    @patch("core.db._load_gmail_api_url_emails")
+    @patch("core.db._load_accounts", return_value=[])
+    @patch("core.db.GmailApiUrlBatchStore")
+    @patch("core.db.release_gmail_api_url_email")
+    @patch("core.db._attach_gmail_api_url_alias_stats")
+    def test_reset_aliases_with_no_unused_slots_keeps_source_state(
+        self, attach_stats, release_email, store_class, _accounts, mock_load
+    ):
+        """A no-op reset must not reopen a source with no remaining aliases."""
+        record = {
+            "email": "source@gmail.com",
+            "code_url": "http://example.com/otp",
+            "status": "used",
+        }
+        mock_load.return_value = [record]
+        store_class.return_value.reset_unused_aliases_for_code_url.return_value = 0
+        attach_stats.return_value = [{
+            **record,
+            "alias_total": 12,
+            "alias_allocated": 12,
+            "alias_available": 0,
+            "alias_used": 12,
+            "alias_failed": 0,
+            "alias_reserved": 0,
+        }]
+
+        result = db.reset_gmail_api_url_aliases("source@gmail.com")
+
+        self.assertEqual(result["reset_aliases"], 0)
+        self.assertEqual(result["source_status"], "used")
+        release_email.assert_not_called()
 
 
 if __name__ == "__main__":

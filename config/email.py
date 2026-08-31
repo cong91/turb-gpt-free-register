@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Outlook 邮箱账号池配置。
+邮箱服务配置。
 
-注册邮箱与 OTP 均只走 Outlook 账号池：
+Outlook 注册邮箱与 OTP 的默认池行为：
     1. 首次启动会把旧的 `用于注册的邮箱.txt` 迁移到 SQLite
     2. 运行期间通过 WebUI「邮箱库」导入和管理邮箱
     3. 注册时直接从 SQLite 邮箱库领取可用邮箱
@@ -14,7 +14,7 @@ from config.env_loader import env_str, apply_env_overrides
 # False: 走人工输入邮箱 + 人工填 OTP 的流程
 USE_EMAIL_SERVICE = False
 
-# 可选值（也可以用英文逗号配置多个，按顺序兜底，例如 "outlook,generic_api,mailnest"）：
+# 可选值（也可以用英文逗号配置多个，按顺序兜底，例如 "outlook,generic_api,mailnest,remail"）：
 #   "outlook"           — 外购 Outlook 账号池 + mail.chatai.codes 远端取信
 #   "cloudflare_domain" — Cloudflare 域名邮箱（转发到 QQ 邮箱），通过 IMAP 取信
 #   "cloudflare" — Cloudflare Worker 临时邮箱（cloudflare_temp_email），API 创建并取码
@@ -24,7 +24,7 @@ USE_EMAIL_SERVICE = False
 #   "cloudmail"         — CloudMail/Cloud Mail API（自动从平台获取域名并随机生成邮箱）
 #   "tinyhost"          — TinyHost 临时邮箱 API（全量 domain + user 并自动收码）
 #   "qan8_gmail_api"    — QAN8 Gmail API URL，按 worker lane 懒购买 source 并生成 client alias
-#   "remail"            — Remail 开放 API，按项目下单并自动收取验证码
+#   "remail"            — Remail 开放 API（按项目购买邮箱并自动收码）
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
 
 
@@ -199,18 +199,32 @@ TINYHOST_API_BASE = "https://tinyhost.shop"
 TINYHOST_REQUEST_TIMEOUT = 20
 TINYHOST_RANDOM_LOCAL_LENGTH = 12
 
-
 # ============================================================
 # Remail 开放 API：https://remail.aishop6.com/docs
 # ============================================================
 
+# API 根地址；也兼容填写 https://remail.aishop6.com/docs，客户端会自动规范化。
 REMAIL_API_BASE = "https://remail.aishop6.com"
+
+# Remail 控制台生成的 rk- 开头 API Key。
 REMAIL_API_KEY = env_str("REMAIL_API_KEY", "")
+
+# 在 Remail 项目列表中选择用于 ChatGPT/OpenAI 验证码的项目 ID，默认使用项目 2。
 REMAIL_PROJECT_ID = 2
+
+# 项目下单的邮箱后缀；outlook.com 为微软邮箱商品的常用选择。
 REMAIL_EMAIL_SUFFIX = "outlook.com"
+
+# code 为短效接码；purchase 为可重复收件的长效购买，默认使用 purchase。
 REMAIL_SERVICE_MODE = "purchase"
+
+# private_first 优先使用自己的库存；public_only 只使用公开库存，默认使用 public_only。
 REMAIL_SUPPLY_POLICY = "public_only"
+
+# 下单响应未立即返回 service token 时，等待订单详情补齐凭证的最长秒数。
 REMAIL_ORDER_WAIT_SECONDS = 30
+
+# Remail HTTP 请求超时。
 REMAIL_REQUEST_TIMEOUT = 20
 
 # ---- .env overrides for WebUI editable fields ----

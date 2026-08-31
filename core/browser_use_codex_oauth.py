@@ -1286,8 +1286,9 @@ def _wait_after_phone_send(page, timeout: int = 18) -> str:
             return "callback"
         err = _phone_error_text(page)
         if err:
-            logger.warning("[Codex][BrowserUse] 手机号提交后页面错误提示：%s", err[:240])
-            return "rejected"
+            reason = _codex_proto._phone_failure_reason(err) or "phone_rejected"
+            logger.warning("[Codex][BrowserUse] 手机号提交后页面错误提示 reason=%s：%s", reason, err[:240])
+            return f"rejected:{reason}"
         if _has_visible_phone_code_input(page):
             return "code_page"
         phone_value = _read_phone_input_value(page)
@@ -1629,7 +1630,11 @@ def _do_phone_verification_if_present(page) -> None:
             logger.warning("[Codex][BrowserUse] 手机验证失败（%s/%s）：%s", attempt, max_retries, last_error)
             if activation_id:
                 try:
-                    sms_provider.cancel(activation_id, http)
+                    sms_provider.cancel(
+                        activation_id,
+                        http,
+                        reason=_codex_proto._phone_failure_reason(str(exc)) or str(exc)[:120],
+                    )
                 except Exception:
                     pass
             if attempt >= max_retries:

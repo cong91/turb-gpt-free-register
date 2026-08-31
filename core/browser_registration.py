@@ -658,7 +658,7 @@ def _wait_for_email_input(driver, timeout: int | None = None):
         else:
             el = _find_visible_email_input_js(driver)
             if el:
-                return el
+                return
         last_state = _email_entry_state(driver)
         if not clicked_email_option and _click_email_entry_option(driver):
             clicked_email_option = True
@@ -670,7 +670,7 @@ def _wait_for_email_input(driver, timeout: int | None = None):
 
 
 def _type_email_address(driver, email: str, timeout: int | None = None) -> None:
-    """进入邮箱登录/注册方式并填写邮箱。"""
+    """进入邮箱登录/注册方式并填写邮箱。全程不依赖页面可见文字，避免非日本出口本地化后误点 Google。"""
     _human_type_text(driver, _wait_for_email_input(driver, timeout=timeout), email, clear=True)
 
 
@@ -1157,41 +1157,25 @@ def _reset_login_page_for_retry(driver) -> None:
     _assert_not_external_idp(driver, "retry login page")
 
 
-def _submit_email_and_wait_next(
-    driver,
-    email: str | None,
-    attempts: int = 3,
-    allow_login_password: bool = False,
-    email_supplier=None,
-) -> str:
+def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, allow_login_password: bool = False, email_supplier=None) -> str:
     """填写并提交邮箱，必须确认进入 password/otp/logged_in。"""
     last_state = None
     for attempt in range(1, attempts + 1):
         try:
             _wait_for_browser_challenge(driver, timeout=_registration_timeout(driver))
-            current_email = str(email or "").strip()
-            if current_email:
-                _type_email_address(driver, current_email, timeout=20)
-            else:
-                email_input = _wait_for_email_input(driver, timeout=20)
-                if email_supplier is None:
-                    raise RuntimeError("已找到邮箱输入框，但未提供邮箱分配器")
-                current_email = str(email_supplier() or "").strip()
-                if not current_email:
-                    raise RuntimeError("邮箱分配器返回了空邮箱地址")
-                _human_type_text(driver, email_input, current_email, clear=True)
+            _type_email_address(driver, email, timeout=20)
             state = _email_input_value_state(driver)
             last_state = state
             values = [str(i.get("value") or "") for i in (state.get("inputs") or [])]
-            if not any(v.strip().lower() == current_email.lower() for v in values):
+            if not any(v.strip().lower() == email.strip().lower() for v in values):
                 logger.warning("%s 邮箱写入校验失败，准备重试：attempt=%s/%s state=%s", _log_prefix(driver), attempt, attempts, state)
                 time.sleep(0.8)
                 continue
-            logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), current_email)
+            logger.info("%s 已填写邮箱并校验通过：%s", _log_prefix(driver), email)
             human_delay("form")
-            _submit_email_step(driver, current_email)
+            _submit_email_step(driver, email)
             logger.info("%s 已提交邮箱，等待进入密码页或验证码页（%s/%s）", _log_prefix(driver), attempt, attempts)
-            state_name = _wait_email_submit_next_state(driver, current_email, timeout=20)
+            state_name = _wait_email_submit_next_state(driver, email, timeout=20)
             if state_name == "login_password" and not allow_login_password:
                 raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}")
             if state_name in ("password", "otp", "logged_in", "login_password"):
@@ -1216,8 +1200,60 @@ def _submit_email_and_wait_next(
     raise RuntimeError(f"邮箱提交后未进入密码页/验证码页，最后状态={last_state}")
 
 
+def _otp_input_value(driver) -> str:
+    """Return the concatenated value of visible OTP inputs in DOM order."""
+    state = _email_otp_page_state(driver)
+    values = []
+    for item in state.get("inputs") or []:
+        if not isinstance(item, dict):
+            continue
+        attrs = " ".join(
+            str(item.get(key) or "")
+            for key in ("type", "name", "id", "autocomplete", "inputmode", "ariaLabel")
+        ).lower()
+        if any(marker in attrs for marker in ("one-time", "otp", "code", "numeric", "tel")):
+            values.append(str(item.get("value") or ""))
+    return "".join(values)
+
+
+def _wait_for_otp_input_value(driver, expected: str, timeout: float = 2.0) -> bool:
+    """Wait briefly until React/native input state contains the complete OTP."""
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if _otp_input_value(driver) == expected:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _type_otp_with_verification(driver, expected: str, writer, input_kind: str) -> None:
+    """Write an OTP and retry when the browser drops a key during React updates."""
+    last_error = None
+    for attempt in range(1, 4):
+        try:
+            writer()
+        except Exception as exc:  # noqa: BLE001 - Selenium and Playwright adapters expose different transient errors.
+            last_error = exc
+        if _wait_for_otp_input_value(driver, expected):
+            return
+        actual = _otp_input_value(driver)
+        if attempt < 3:
+            logger.warning(
+                "%s[OTP] 输入校验不匹配，清空后重试：kind=%s attempt=%s/3 expected_len=%s actual_len=%s",
+                _log_prefix(driver), input_kind, attempt, len(expected), len(actual),
+            )
+            _clear_otp_inputs(driver)
+    detail = f": {type(last_error).__name__}: {last_error}" if last_error else ""
+    raise RuntimeError(f"OTP 输入校验失败，浏览器未保留完整验证码{detail}")
+
+
 def _type_otp(driver, code: str) -> None:
     from selenium.webdriver.common.by import By
+
+    expected = str(code or "").strip()
+    if not expected:
+        raise RuntimeError("邮箱验证码为空")
 
     # 单输入框
     for selector in [
@@ -1228,7 +1264,21 @@ def _type_otp(driver, code: str) -> None:
     ]:
         els = [e for e in driver.find_elements(By.CSS_SELECTOR, selector) if _visible(e)]
         if len(els) == 1:
-            _human_type_text(driver, els[0], code, clear=True)
+            def write_single_otp(selector=selector) -> None:
+                current = [
+                    e for e in driver.find_elements(By.CSS_SELECTOR, selector)
+                    if _visible(e)
+                ]
+                if len(current) != 1:
+                    raise RuntimeError("OTP 输入框在重试期间已重新挂载")
+                _human_type_text(driver, current[0], expected, clear=True)
+
+            _type_otp_with_verification(
+                driver,
+                expected,
+                write_single_otp,
+                "single",
+            )
             return
 
     # 6 个分格输入框
@@ -1238,14 +1288,30 @@ def _type_otp(driver, code: str) -> None:
         attrs = " ".join(str(e.get_attribute(k) or "") for k in ("inputmode", "autocomplete", "aria-label", "name", "id", "type"))
         if any(x in attrs.lower() for x in ("numeric", "one-time", "code", "otp", "tel")):
             numeric_boxes.append(e)
-    if len(numeric_boxes) >= len(code):
-        for e, ch in zip(numeric_boxes, code):
-            if _browser_actions_enabled():
-                _human_scroll_to(driver, e)
-                time.sleep(random.uniform(0.04, 0.18))
-            e.send_keys(ch)
-            if _browser_actions_enabled():
-                human_delay("keystroke")
+    if len(numeric_boxes) >= len(expected):
+        def write_segmented_otp() -> None:
+            current_boxes = [
+                e for e in driver.find_elements(By.CSS_SELECTOR, "input")
+                if _visible(e)
+                and any(
+                    marker in " ".join(
+                        str(e.get_attribute(k) or "")
+                        for k in ("inputmode", "autocomplete", "aria-label", "name", "id", "type")
+                    ).lower()
+                    for marker in ("numeric", "one-time", "code", "otp", "tel")
+                )
+            ]
+            if len(current_boxes) < len(expected):
+                raise RuntimeError("OTP 分格输入框在重试期间未完整挂载")
+            for e, ch in zip(current_boxes, expected):
+                if _browser_actions_enabled():
+                    _human_scroll_to(driver, e)
+                    time.sleep(random.uniform(0.04, 0.18))
+                e.send_keys(ch)
+                if _browser_actions_enabled():
+                    human_delay("keystroke")
+
+        _type_otp_with_verification(driver, expected, write_segmented_otp, "segmented")
         return
 
     raise RuntimeError("找不到 OTP 输入框")
@@ -1258,6 +1324,7 @@ def _email_otp_page_state(driver) -> dict:
         const inputs = [...document.querySelectorAll('input')].filter(visible).map(el => ({
           type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: el.id || '',
           autocomplete: el.getAttribute('autocomplete') || '', inputmode: el.getAttribute('inputmode') || '',
+          ariaLabel: el.getAttribute('aria-label') || '',
           ariaInvalid: el.getAttribute('aria-invalid') || '', value: el.value || ''
         }));
         const buttons = [...document.querySelectorAll('button,a,[role=button],input[type=button],input[type=submit]')].filter(visible).map(el => ({
@@ -1414,7 +1481,7 @@ def _complete_email_otp(
                     "after_ts": otp_after_ts,
                     "stage": "registration_email_otp",
                 }
-                if otp_before_code is not _OTP_BEFORE_CODE_UNSET:
+                if otp_before_code is not _OTP_BEFORE_CODE_UNSET and otp_before_code:
                     wait_kwargs["before_code"] = otp_before_code
                 elif previous_submitted_otp:
                     wait_kwargs["before_code"] = previous_submitted_otp
@@ -1444,6 +1511,7 @@ def _complete_email_otp(
             logger.info("%s[OTP] 收到验证码：%s", _log_prefix(driver), current_otp)
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
+            previous_submitted_otp = current_otp
             logger.info("%s[OTP] 已填写邮箱验证码", _log_prefix(driver))
             _check_manual_stop()
             human_delay("otp_input")
@@ -1485,7 +1553,9 @@ def _complete_email_otp(
         otp_before_code = snapshot_verification_code(
             email,
             stage="registration_email_resend",
-        ) or current_otp
+        )
+        if previous_submitted_otp and not otp_before_code:
+            otp_before_code = current_otp
         _click_resend_email_otp(driver, timeout=25)
         human_delay("api")
         current_otp = None

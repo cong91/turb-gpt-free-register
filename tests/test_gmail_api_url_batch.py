@@ -453,6 +453,70 @@ def test_find_item_by_alias_returns_alias_and_code_url(tmp_path):
     assert store.find_item_by_alias("nonexistent@gmail.com") is None
 
 
+def test_alias_usage_reports_available_reserved_and_used_slots(tmp_path):
+    """Alias inventory separates free slots from a live assignment and consumed slots."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.test/inventory"
+    batch_id = store.create_batch_multi([
+        {
+            "source_email": "source@gmail.com",
+            "code_url": code_url,
+            "aliases": ["one@gmail.com", "two@gmail.com", "three@gmail.com"],
+        },
+    ])
+
+    reserved = store.claim_waiting(batch_id, "job-1")
+    assert reserved is not None
+    usage = store.alias_usage_for_code_urls({code_url})[code_url]
+    assert len(usage["allocated"]) == 3
+    assert len(usage["reserved"]) == 1
+    assert not usage["consumed"]
+
+    store.complete(reserved.assignment_id)
+    usage = store.alias_usage_for_code_urls({code_url})[code_url]
+    assert len(usage["consumed"]) == 1
+    assert len(usage["reserved"]) == 0
+
+
+def test_reset_unused_aliases_preserves_consumed_slots(tmp_path):
+    """Reset removes only unconsumed, unassigned aliases from a Gmail URL batch."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.test/reset"
+    batch_id = store.create_batch_multi([
+        {
+            "source_email": "source@gmail.com",
+            "code_url": code_url,
+            "aliases": ["used@gmail.com", "free-one@gmail.com", "free-two@gmail.com"],
+        },
+    ])
+    consumed = store.claim_waiting(batch_id, "job-1")
+    assert consumed is not None
+    consumed_alias = consumed.inventory_id.split("----", 1)[0]
+    store.complete(consumed.assignment_id)
+
+    assert store.reset_unused_aliases_for_code_url(code_url) == 2
+    usage = store.alias_usage_for_code_urls({code_url})[code_url]
+    assert usage["allocated"] == {consumed_alias}
+    assert usage["consumed"] == {consumed_alias}
+
+
+def test_reset_unused_aliases_rejects_live_assignments(tmp_path):
+    """Reset cannot invalidate an alias currently owned by a running job."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.test/reset-live"
+    batch_id = store.create_batch_multi([
+        {
+            "source_email": "source@gmail.com",
+            "code_url": code_url,
+            "aliases": ["live@gmail.com", "free@gmail.com"],
+        },
+    ])
+    assert store.claim_waiting(batch_id, "job-1") is not None
+
+    with pytest.raises(GmailApiUrlBatchConflict):
+        store.reset_unused_aliases_for_code_url(code_url)
+
+
 def test_poll_otp_uses_gmail_api_url_client(tmp_path):
     """The batch adapter must delegate to the client's public polling API."""
     store = GmailApiUrlBatchStore(tmp_path / "batch.db")

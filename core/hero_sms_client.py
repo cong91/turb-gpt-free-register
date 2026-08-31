@@ -359,11 +359,12 @@ def record_country_unusable(metadata: dict | None, reason: str = "") -> None:
     if not isinstance(metadata, dict) or not metadata.get("remember_country"):
         return
     try:
-        _COUNTRY_STORE.mark_unusable(
-            str(metadata.get("profile_key") or ""),
-            str(metadata.get("country") or ""),
-            reason,
-        )
+        profile_key = str(metadata.get("profile_key") or "")
+        country = str(metadata.get("country") or "")
+        if str(reason or "").startswith("phone_used_or_max"):
+            _COUNTRY_STORE.mark_number_rejected(profile_key, country, reason)
+        else:
+            _COUNTRY_STORE.mark_unusable(profile_key, country, reason)
     except HeroSmsCountryStoreError as exc:
         logger.warning("HeroSMS 失败国家记忆写入失败：%s", exc)
 

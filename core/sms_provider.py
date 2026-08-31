@@ -744,7 +744,13 @@ def _do_cancel_sync(activation_id: str, http_factory) -> None:
             pass
 
 
-def cancel(activation_id: str, http: CurlSession | None = None, background: bool = True) -> None:
+def cancel(
+    activation_id: str,
+    http: CurlSession | None = None,
+    background: bool = True,
+    *,
+    reason: str = "",
+) -> None:
     """
     取消激活（status=8），释放号码避免白扣费。
 
@@ -758,7 +764,10 @@ def cancel(activation_id: str, http: CurlSession | None = None, background: bool
     """
     hero_metadata = _ACQUIRED_METADATA.pop(activation_id, None)
     if hero_metadata is not None:
-        hero_sms_client.record_country_unusable(hero_metadata, "Codex 手机验证未完成")
+        hero_sms_client.record_country_unusable(
+            hero_metadata,
+            reason or "Codex 手机验证未完成",
+        )
     if _provider() == "hero":
         acquired_at = _ACQUIRED_AT.get(activation_id)
         if acquired_at is not None and time.time() - acquired_at < _MIN_CANCEL_DELAY:
