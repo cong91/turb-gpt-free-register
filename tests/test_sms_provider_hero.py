@@ -77,6 +77,7 @@ class HeroSmsProviderTests(unittest.TestCase):
         fields = {field["key"]: field for field in config_editor.EDITABLE_FIELDS}
         self.assertEqual(fields["HERO_SMS_SERVICE"]["type"], "str")
         self.assertEqual(fields["HERO_SMS_COUNTRY"]["type"], "str")
+        self.assertEqual(fields["HERO_SMS_NUMBER_REJECT_THRESHOLD"]["type"], "int")
         self.assertTrue(fields["HERO_SMS_API_KEY"].get("secret"))
         self.assertIn("'HeroSMS'", Path("webui/templates/index.html").read_text(encoding="utf-8"))
 
@@ -412,6 +413,34 @@ class HeroSmsProviderTests(unittest.TestCase):
             sms_provider.cancel("hero-failed-1", background=False)
 
         self.assertEqual(self._country_store.blocked_countries(profile), set())
+
+    def test_auto_country_avoids_repeatedly_used_phone_country(self):
+        profile = hero_sms_client.make_profile_key(
+            "https://hero.test/stubs/handler_api.php", "dr", ""
+        )
+        for _ in range(3):
+            hero_sms_client.record_country_unusable(
+                {
+                    "remember_country": True,
+                    "profile_key": profile,
+                    "country": "52",
+                },
+                "phone_used_or_max",
+            )
+        http = _Http([
+            _Resp(json.dumps({
+                "52": {"dr": {"cost": 0.03, "count": 2}},
+                "16": {"dr": {"cost": 0.08, "count": 5}},
+            })),
+            _Resp("ACCESS_NUMBER:hero-fallback-country:165500000001"),
+        ])
+
+        with self._config(HERO_SMS_NUMBER_REJECT_THRESHOLD=3):
+            activation_id, phone = sms_provider.acquire_number(http=http)
+
+        self.assertEqual((activation_id, phone), ("hero-fallback-country", "165500000001"))
+        get_number_calls = [call for call in http.calls if call["params"].get("action") == "getNumber"]
+        self.assertEqual([call["params"]["country"] for call in get_number_calls], ["16"])
 
     def test_complete_persists_the_selected_country_as_verified(self):
         profile = hero_sms_client.make_profile_key("https://hero.test/stubs/handler_api.php", "dr", "")

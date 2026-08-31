@@ -17,6 +17,12 @@ from pathlib import Path
 from typing import Any
 
 from core import app_state_db
+from core.gmail_aliases import (
+    GmailAliasError,
+    MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
+    generate_gmail_dual_domain_aliases,
+)
+from core.gmail_api_url_batch_store import GmailApiUrlBatchConflict, GmailApiUrlBatchStore
 from core.openai_auth import account_unusable_message
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -432,10 +438,11 @@ def _account_filter_sql(
     plan_filter: str | None = None,
     codex_filter: str | None = None,
     free_plus_export_filter: str | None = None,
+    totp_filter: str | None = None,
 ) -> tuple[list[str], list[Any]]:
-    """把账号列表的兼容过滤条件下推到 SQLite。
+    """把账号列表的套餐、Codex、2FA 过滤条件下推到 SQLite。
 
-    套餐、Codex 状态仍保存在账号 payload 中，因此这里使用 SQLite JSON1
+    套餐、Codex、2FA 状态仍保存在账号 payload 中，因此这里使用 SQLite JSON1
     直接过滤，而不是先把整张 accounts 表反序列化到 Python 再切页。
     """
     where: list[str] = []
@@ -443,6 +450,7 @@ def _account_filter_sql(
     plan = str(plan_filter or "").strip().lower()
     codex = str(codex_filter or "").strip().lower()
     free_plus_export = str(free_plus_export_filter or "").strip().lower()
+    totp = str(totp_filter or "").strip().lower()
 
     plan_expr = (
         "lower(COALESCE(NULLIF(CAST(json_extract(payload, '$.current_plan_type') AS TEXT), ''), "
@@ -481,6 +489,26 @@ def _account_filter_sql(
         else:
             where.append(f"{status_expr} = ?")
         params.append(codex)
+
+    totp_secret_expr = "lower(COALESCE(CAST(json_extract(payload, '$.totp_secret') AS TEXT), ''))"
+    totp_setup_expr = "lower(COALESCE(CAST(json_extract(payload, '$.totp_setup_status') AS TEXT), ''))"
+    if totp and totp not in {"all", "*"}:
+        if totp in {"enabled", "on", "active"}:
+            where.append(f"length(trim({totp_secret_expr})) > 0")
+        elif totp in {"disabled", "off", "not_enabled", "unset"}:
+            where.append(f"length(trim({totp_secret_expr})) = 0")
+        elif totp in {"pending", "setup", "setting", "queued", "running"}:
+            where.append(f"{totp_setup_expr} IN (?, ?)")
+            params.extend(["queued", "running"])
+        elif totp == "failed":
+            where.append(f"{totp_setup_expr} = ?")
+            params.append("failed")
+        elif totp == "stopped":
+            where.append(f"{totp_setup_expr} = ?")
+            params.append("stopped")
+        else:
+            where.append(f"{totp_setup_expr} = ?")
+            params.append(totp)
     return where, params
 
 
@@ -1362,6 +1390,39 @@ def _decorate_gmail_api_url_email(row: dict, account_by_email: dict[str, dict] |
     return out
 
 
+def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
+    """Attach alias inventory counts without exposing the source code URL."""
+    result = [dict(row) for row in rows]
+    code_urls = {
+        str(row.get("code_url") or "").strip()
+        for row in result
+        if str(row.get("code_url") or "").strip()
+    }
+    usage_by_url = GmailApiUrlBatchStore(_SQLITE_PATH).alias_usage_for_code_urls(code_urls)
+    empty_usage = {"allocated": set(), "consumed": set(), "failed": set(), "reserved": set()}
+    for row in result:
+        try:
+            candidates = generate_gmail_dual_domain_aliases(
+                row.get("email"), limit=MAX_GMAIL_DUAL_DOMAIN_VARIANTS
+            )
+        except GmailAliasError:
+            candidates = []
+        candidate_set = {str(alias).strip().casefold() for alias in candidates if alias}
+        usage = usage_by_url.get(str(row.get("code_url") or "").strip(), empty_usage)
+        consumed = candidate_set & usage["consumed"]
+        failed = (candidate_set & usage["failed"]) - consumed
+        reserved = (candidate_set & usage["reserved"]) - consumed - failed
+        row.update({
+            "alias_total": len(candidate_set),
+            "alias_allocated": len(candidate_set & usage["allocated"]),
+            "alias_available": max(0, len(candidate_set) - len(consumed) - len(failed) - len(reserved)),
+            "alias_used": len(consumed),
+            "alias_failed": len(failed),
+            "alias_reserved": len(reserved),
+        })
+    return result
+
+
 def _row_to_dict(row: dict | None) -> dict | None:
     return dict(row) if row is not None else None
 
@@ -2022,6 +2083,24 @@ def _account_matches_twofa_filter(row: dict, twofa_filter: str | None = None) ->
     return status == aliases.get(value, value)
 
 
+def _matches_totp_status_filter(row: dict, totp_filter: str | None = None) -> bool:
+    """按 TOTP 密钥及设置任务状态过滤账号。"""
+    value = str(totp_filter or "").strip().lower()
+    if not value or value in {"all", "*"}:
+        return True
+    enabled = bool(str(row.get("totp_secret") or "").strip())
+    setup_status = str(row.get("totp_setup_status") or "").strip().lower()
+    if value in {"enabled", "on", "active"}:
+        return enabled
+    if value in {"disabled", "off", "not_enabled", "unset"}:
+        return not enabled
+    if value in {"pending", "setup", "setting", "queued", "running"}:
+        return setup_status in {"queued", "running"}
+    if value in {"failed", "stopped"}:
+        return setup_status == value
+    return setup_status == value
+
+
 def _account_matches_locale_filter(row: dict, locale_filter: str | None = None) -> bool:
     value = str(locale_filter or "").strip().lower()
     if not value or value in {"all", "any", "*"}:
@@ -2047,6 +2126,7 @@ def _filtered_decorated_accounts(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    totp_filter: str | None = None,
 ) -> list[dict]:
     rows = _load_accounts()
     if archived in (True, "1", "true", "yes", "only"):
@@ -2059,6 +2139,7 @@ def _filtered_decorated_accounts(
     decorated = [r for r in decorated if _account_matches_plan_filter(r, plan_filter)]
     decorated = [r for r in decorated if _matches_codex_status_filter(r, codex_filter)]
     decorated = [r for r in decorated if _account_matches_twofa_filter(r, twofa_filter)]
+    decorated = [r for r in decorated if _matches_totp_status_filter(r, totp_filter)]
     decorated = [r for r in decorated if _account_matches_locale_filter(r, account_locale_filter)]
     decorated = [r for r in decorated if _account_matches_email_source_filter(r, email_source_filter)]
     decorated = [r for r in decorated if _account_matches_email_domain_filter(r, email_domain_filter)]
@@ -2097,6 +2178,7 @@ def list_account_plan_check_statuses(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    totp_filter: str | None = None,
 ) -> dict:
     """返回不含 Token/邮箱密码的套餐查询轻量状态快照。"""
     fields = (
@@ -2131,7 +2213,7 @@ def list_account_plan_check_statuses(
         offset = max(0, int(offset or 0))
         extended_filters = any(
             str(value or "").strip()
-            for value in (twofa_filter, account_locale_filter, email_source_filter, email_domain_filter)
+            for value in (twofa_filter, account_locale_filter, email_source_filter, email_domain_filter, totp_filter)
         )
         if extended_filters:
             all_rows = _filtered_decorated_accounts(
@@ -2146,6 +2228,7 @@ def list_account_plan_check_statuses(
                 account_locale_filter=account_locale_filter,
                 email_source_filter=email_source_filter,
                 email_domain_filter=email_domain_filter,
+                totp_filter=totp_filter,
             )
             total = len(all_rows)
             latest = max((str(row.get("updated_at") or "") for row in all_rows), default="")
@@ -2155,6 +2238,7 @@ def list_account_plan_check_statuses(
                 plan_filter,
                 codex_filter,
                 free_plus_export_filter,
+                totp_filter,
             )
             candidates, total, latest = _query_collection_page(
                 "accounts",
@@ -2237,9 +2321,10 @@ def list_accounts(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    totp_filter: str | None = None,
 ) -> list[dict]:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter, totp_filter=totp_filter)
         return rows[max(0, int(offset or 0)): max(0, int(offset or 0)) + max(1, int(limit))]
 
 
@@ -2257,9 +2342,10 @@ def list_accounts_page(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    totp_filter: str | None = None,
 ) -> dict:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter, totp_filter=totp_filter)
         total = len(rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
@@ -3453,7 +3539,8 @@ def list_gmail_api_url_email_pool(status: str | None = None, limit: int = 500) -
         if status:
             rows = [r for r in rows if r.get("status") == status]
         rows = sorted(rows, key=lambda x: int(x.get("id") or 0), reverse=True)
-        return [_decorate_gmail_api_url_email(r, account_by_email) for r in rows[:limit]]
+        decorated = [_decorate_gmail_api_url_email(r, account_by_email) for r in rows[:limit]]
+        return _attach_gmail_api_url_alias_stats(decorated)
 
 
 def generic_api_email_pool_summary() -> dict:
@@ -3464,10 +3551,14 @@ def generic_api_email_pool_summary() -> dict:
 def gmail_api_url_email_pool_summary() -> dict:
     with _LOCK:
         out = {"available": 0, "used": 0, "failed": 0}
-        for row in _load_gmail_api_url_emails():
+        rows = _load_gmail_api_url_emails()
+        for row in rows:
             status = row.get("status") or "available"
             out[status] = out.get(status, 0) + 1
         out["total"] = sum(v for k, v in out.items() if k != "total")
+        alias_rows = _attach_gmail_api_url_alias_stats(rows)
+        for key in ("alias_total", "alias_available", "alias_used", "alias_failed", "alias_reserved"):
+            out[key] = sum(int(row.get(key) or 0) for row in alias_rows)
         return out
 
 
@@ -3481,6 +3572,43 @@ def get_gmail_api_url_email_by_email(email: str) -> dict | None:
     with _LOCK:
         row = _find_by_email(_load_gmail_api_url_emails(), email)
         return _decorate_gmail_api_url_email(row) if row else None
+
+
+def reset_gmail_api_url_aliases(email: str) -> dict:
+    """Reset unused aliases for one Gmail source while preserving consumed aliases."""
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        raise ValueError("Gmail API URL email is required")
+
+    with _LOCK:
+        record = _find_by_email(_load_gmail_api_url_emails(), normalized_email)
+        if record is None:
+            raise ValueError("Gmail API URL email not found")
+        if _find_by_email(_load_accounts(), normalized_email) is not None:
+            raise GmailBatchConflict("该 Gmail 源邮箱已存在注册账号，不能重置")
+        code_url = str(record.get("code_url") or "").strip()
+        if not code_url:
+            raise ValueError("Gmail API URL code_url is missing")
+
+        reset_count = GmailApiUrlBatchStore(_SQLITE_PATH).reset_unused_aliases_for_code_url(code_url)
+        if reset_count:
+            release_gmail_api_url_email(
+                normalized_email,
+                status="available",
+                note=f"手动重置未消费 alias：{reset_count}",
+            )
+        current = _find_by_email(_load_gmail_api_url_emails(), normalized_email) or record
+        stats = _attach_gmail_api_url_alias_stats([current])[0]
+        return {
+            "reset_aliases": reset_count,
+            "source_status": current.get("status"),
+            "alias_total": int(stats.get("alias_total") or 0),
+            "alias_allocated": int(stats.get("alias_allocated") or 0),
+            "alias_available": int(stats.get("alias_available") or 0),
+            "alias_used": int(stats.get("alias_used") or 0),
+            "alias_failed": int(stats.get("alias_failed") or 0),
+            "alias_reserved": int(stats.get("alias_reserved") or 0),
+        }
 
 
 # ============================================================

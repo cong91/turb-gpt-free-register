@@ -146,6 +146,8 @@ HERO_SMS_MAX_PRICE: str = env_str("HERO_SMS_MAX_PRICE", "")
 HERO_SMS_COUNTRY_MIN_ATTEMPTS: int = 4
 # 达到该失败率才暂时排除；后续成功会重新计算并允许恢复
 HERO_SMS_COUNTRY_HIGH_FAILURE_RATE: float = 0.75
+# Liên tiếp số HeroSMS bị OpenAI báo đã dùng thì tạm đổi country sau ngưỡng này.
+HERO_SMS_NUMBER_REJECT_THRESHOLD: int = 3
 
 # ============================================================
 # ViOTP（SMS_PROVIDER="viotp" 时使用）
@@ -192,4 +194,4 @@ L_ADMIN_AUTH_CODE: str = env_str("L_ADMIN_AUTH_CODE", "")
 L_PHONE_PREFIX: str = ""
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_RETRY_NETWORK_ATTEMPTS': 'int', 'CODEX_RETRY_NETWORK_DELAY': 'float', 'CODEX_AUTH_URL_SOURCE': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'HERO_SMS_API_BASE': 'str', 'HERO_SMS_API_KEY': 'str', 'HERO_SMS_SERVICE': 'str', 'HERO_SMS_COUNTRY': 'str', 'HERO_SMS_MAX_PRICE': 'str', 'HERO_SMS_COUNTRY_MIN_ATTEMPTS': 'int', 'HERO_SMS_COUNTRY_HIGH_FAILURE_RATE': 'float', 'VIOTP_API_BASE': 'str', 'VIOTP_API_TOKEN': 'str', 'VIOTP_SERVICE_ID': 'str', 'VIOTP_COUNTRY': 'str', 'VIOTP_NETWORK': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})
+apply_env_overrides(globals(), {'ENABLE_CODEX_AUTO': 'bool', 'CODEX_OAUTH_DRIVER': 'str', 'CODEX_RETRY_NETWORK_ATTEMPTS': 'int', 'CODEX_RETRY_NETWORK_DELAY': 'float', 'CODEX_AUTH_URL_SOURCE': 'str', 'CPA_MANAGEMENT_URL': 'str', 'CPA_MANAGEMENT_KEY': 'str', 'CPA_REQUEST_TIMEOUT': 'int', 'CPA_CALLBACK_SUBMIT_RETRIES': 'int', 'CPA_CALLBACK_SUBMIT_RETRY_DELAY': 'int', 'CPA_SAVE_CALLBACK_RECEIPT': 'bool', 'SMS_PROVIDER': 'str', 'SMS_COUNTRY': 'str', 'SMS_SERVICE': 'str', 'SMS_MAX_RETRIES': 'int', 'SMS_CODE_WAIT': 'int', 'SMS_API_KEY': 'str', 'HERO_SMS_API_BASE': 'str', 'HERO_SMS_API_KEY': 'str', 'HERO_SMS_SERVICE': 'str', 'HERO_SMS_COUNTRY': 'str', 'HERO_SMS_MAX_PRICE': 'str', 'HERO_SMS_COUNTRY_MIN_ATTEMPTS': 'int', 'HERO_SMS_COUNTRY_HIGH_FAILURE_RATE': 'float', 'HERO_SMS_NUMBER_REJECT_THRESHOLD': 'int', 'VIOTP_API_BASE': 'str', 'VIOTP_API_TOKEN': 'str', 'VIOTP_SERVICE_ID': 'str', 'VIOTP_COUNTRY': 'str', 'VIOTP_NETWORK': 'str', 'H_API_BASE': 'str', 'H_ADMIN_AUTH_CODE': 'str', 'H_PHONE_PREFIX': 'str', 'H_PHONE_ACQUIRE_MODE': 'str', 'L_API_BASE': 'str', 'L_ADMIN_AUTH_CODE': 'str', 'L_PHONE_PREFIX': 'str'})

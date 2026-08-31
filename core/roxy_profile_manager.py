@@ -100,14 +100,15 @@ class RoxyProfileManager:
     def enabled(self) -> bool:
         return bool(_manager_cfg.ROXY_PROFILE_MANAGER_ENABLED)
 
-    def status(self) -> dict[str, Any]:
+    def status(self, *, include_remote: bool = False) -> dict[str, Any]:
         profiles = self.store.list_profiles()
         remote_error = ""
         remote_profiles: list[dict[str, Any]] = []
-        try:
-            remote_profiles = self.client.list_profiles()
-        except Exception as exc:
-            remote_error = self._safe_error(exc)
+        if include_remote:
+            try:
+                remote_profiles = self.client.list_profiles()
+            except Exception as exc:
+                remote_error = self._safe_error(exc)
         return {
             "enabled": self.enabled,
             "workspace_configured": bool(str(_roxy_cfg.ROXY_WORKSPACE_ID or "").strip()),

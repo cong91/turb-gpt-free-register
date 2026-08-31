@@ -210,6 +210,10 @@ def _compact_job_for_list(row: dict) -> dict:
     if err:
         # 列表只需要摘要；完整错误和堆栈看“任务日志”。
         out["error_message"] = err[:240] + ("…" if len(err) > 240 else "")
+    traffic = row.get("network_traffic")
+    if isinstance(traffic, dict) and traffic.get("available"):
+        # 流量统计只包含字节计数，不带 URL/Header/请求体，可直接随任务列表返回。
+        out["network_traffic"] = traffic
     return out
 
 
@@ -378,6 +382,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             "outlook_failed": pool.get("failed", 0),
             "gmail_api_url_total": gmail_api_url_pool.get("total", 0),
             "gmail_api_url_available": gmail_api_url_pool.get("available", 0),
+            "gmail_api_url_alias_total": gmail_api_url_pool.get("alias_total", 0),
+            "gmail_api_url_alias_available": gmail_api_url_pool.get("alias_available", 0),
             "domain_total": domain_pool.get("total", 0),
             "domain_available": domain_pool.get("available", 0),
             "domain_used": domain_pool.get("used", 0),
@@ -394,6 +400,12 @@ def create_app(auth_code: str | None = None) -> Flask:
         plan_filter = str(request.args.get("plan", default="") or "").lower()
         twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
         codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
+        totp_filter = str(
+            request.args.get("totp_status")
+            or request.args.get("totp_filter")
+            or request.args.get("twofa_status")
+            or ""
+        ).strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
@@ -423,6 +435,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 account_locale_filter=account_locale_filter,
                 email_source_filter=email_source_filter,
                 email_domain_filter=email_domain_filter,
+                totp_filter=totp_filter,
             )
             result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
             result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
@@ -506,6 +519,12 @@ def create_app(auth_code: str | None = None) -> Flask:
         plan_filter = str(request.args.get("plan", default="") or "").lower()
         twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
         codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
+        totp_filter = str(
+            request.args.get("totp_status")
+            or request.args.get("totp_filter")
+            or request.args.get("twofa_status")
+            or ""
+        ).strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
         date_from = str(request.args.get("date_from", default="") or "").strip() or None
         date_to = str(request.args.get("date_to", default="") or "").strip() or None
@@ -535,6 +554,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 account_locale_filter=account_locale_filter,
                 email_source_filter=email_source_filter,
                 email_domain_filter=email_domain_filter,
+                totp_filter=totp_filter,
             )
             snapshot.update({"page": page, "page_size": page_size})
         else:
@@ -1857,6 +1877,21 @@ def create_app(auth_code: str | None = None) -> Flask:
         else:
             db.release_outlook(email, status=status, note=data.get("note"))
         return jsonify({"ok": True})
+
+    @app.post("/api/outlook/gmail-aliases/reset")
+    def api_gmail_api_url_aliases_reset():
+        """Reset unused aliases for one Gmail API URL source."""
+        data = request.get_json(silent=True) or {}
+        email = str(data.get("email") or "").strip()
+        if not email:
+            return jsonify({"ok": False, "error": "email 为空"}), 400
+        try:
+            result = db.reset_gmail_api_url_aliases(email)
+        except GmailApiUrlBatchConflict as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        except ValueError as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 404
+        return jsonify({"ok": True, **result})
 
     @app.post("/api/outlook/status-bulk")
     def api_outlook_status_bulk():

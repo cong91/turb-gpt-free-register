@@ -59,6 +59,7 @@ class RoxyProfilesApiTests(unittest.TestCase):
             reconcile=False, search="demo", state="TRASHED", page=2, page_size=20
         )
         manager.count_profiles.assert_called_once_with(search="demo", state="TRASHED")
+        manager.status.assert_called_once_with(include_remote=False)
         self.assertEqual(response.get_json()["total"], 41)
         self.assertTrue(response.get_json()["has_next"])
 

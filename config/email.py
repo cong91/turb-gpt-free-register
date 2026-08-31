@@ -19,12 +19,52 @@ USE_EMAIL_SERVICE = False
 #   "cloudflare_domain" — Cloudflare 域名邮箱（转发到 QQ 邮箱），通过 IMAP 取信
 #   "cloudflare" — Cloudflare Worker 临时邮箱（cloudflare_temp_email），API 创建并取码
 #   "generic_api"       — 通用 API 取码邮箱池（邮箱----取码地址）
-#   "imap"              — 通用 IMAP 邮箱池（每条素材包含服务器和登录凭证）
 #   "gptmail"           — GPTMail 临时邮箱 API（运行时随机生成邮箱并自动收码）
 #   "mailnest"          — MailNest/迈巢临时邮箱 API（运行时购买邮箱并自动收码）
 #   "cloudmail"         — CloudMail/Cloud Mail API（自动从平台获取域名并随机生成邮箱）
-#   "remail"            — Remail 开放 API（按项目下单并自动收取验证码）
+#   "tinyhost"          — TinyHost 临时邮箱 API（全量 domain + user 并自动收码）
+#   "qan8_gmail_api"    — QAN8 Gmail API URL，按 worker lane 懒购买 source 并生成 client alias
+#   "remail"            — Remail 开放 API（按项目购买邮箱并自动收码）
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
+
+
+# ============================================================
+# QAN8 Gmail API URL: shop.qan8.com
+# ============================================================
+
+QAN8_API_BASE = "https://shop.qan8.com"
+QAN8_API_KEY = env_str("QAN8_API_KEY", "")
+QAN8_GMAIL_SKU_ID = env_str("QAN8_GMAIL_SKU_ID", "")
+QAN8_REQUEST_TIMEOUT = 15
+QAN8_ORDER_TIMEOUT = 120
+QAN8_ALIASES_PER_SOURCE = 12
+
+
+# ============================================================
+# Gmail CDK: gmail.123452026.xyz
+# ============================================================
+
+GMAIL_123452026_API_BASE = "http://gmail.123452026.xyz/api"
+GMAIL_123452026_REQUEST_TIMEOUT = 30
+GMAIL_123452026_ACCOUNTS_PER_CDK = 6
+# Gmail CDK API cố định dùng HTTP; CDK được gửi theo contract của provider.
+GMAIL_123452026_ALLOW_INSECURE_HTTP = True
+
+
+# ============================================================
+# Paymesh MAIL card: sms.paymesh.cn
+# ============================================================
+
+PAYMESH_API_BASE = "https://sms.paymesh.cn"
+PAYMESH_REQUEST_TIMEOUT = 30
+PAYMESH_OTP_MAX_WAIT = 60
+PAYMESH_ACCOUNTS_PER_CDK = 6
+
+# Domain tùy chỉnh để tạo thêm alias local test cho Paymesh MAIL card.
+# Mỗi domain thêm N alias xxx+hash@<domain> ngoài N alias xxx+hash@<domain gốc>.
+# Mỗi dòng/逗号 một domain, tối đa 2; cho phép .test/.invalid/.example/localhost.
+# Ví dụ: PAYMESH_ROUTED_DOMAINS=test.com → ngoài user+abc@gmail.com còn tạo user+abc@test.com.
+PAYMESH_ROUTED_DOMAINS: list[str] = []
 
 
 # ============================================================
@@ -47,14 +87,11 @@ OUTLOOK_API_BASE = "https://mail.chatai.codes"
 # OTP 轮询参数
 # ============================================================
 
-OTP_POLL_INTERVAL = 3
-OTP_MAX_WAIT = 90
+OTP_POLL_INTERVAL = 2
+OTP_MAX_WAIT = 60
 
 # Outlook 双协议取件：抓到一封 OTP 后再多等多少秒看是否有更晚到达的邮件。
 OTP_SETTLE_SECONDS = 5
-
-# 通用 IMAP 邮箱默认收件箱目录；服务器、端口和凭证随邮箱素材导入。
-IMAP_MAILBOX = "INBOX"
 
 
 # ============================================================
@@ -154,6 +191,15 @@ CLOUDMAIL_RANDOM_LOCAL_LENGTH = 12
 
 
 # ============================================================
+# TinyHost 临时邮箱 API：https://tinyhost.shop
+# ============================================================
+
+# TinyHost 不需要 API Key；地址由随机在线域名 + 随机 local-part 组成。
+TINYHOST_API_BASE = "https://tinyhost.shop"
+TINYHOST_REQUEST_TIMEOUT = 20
+TINYHOST_RANDOM_LOCAL_LENGTH = 12
+
+# ============================================================
 # Remail 开放 API：https://remail.aishop6.com/docs
 # ============================================================
 
@@ -182,4 +228,4 @@ REMAIL_ORDER_WAIT_SECONDS = 30
 REMAIL_REQUEST_TIMEOUT = 20
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'IMAP_MAILBOX': 'str', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'QAN8_API_BASE': 'str', 'QAN8_API_KEY': 'str', 'QAN8_GMAIL_SKU_ID': 'str', 'QAN8_REQUEST_TIMEOUT': 'int', 'QAN8_ORDER_TIMEOUT': 'int', 'QAN8_ALIASES_PER_SOURCE': 'int', 'GMAIL_123452026_API_BASE': 'str', 'GMAIL_123452026_REQUEST_TIMEOUT': 'int', 'GMAIL_123452026_ACCOUNTS_PER_CDK': 'int', 'GMAIL_123452026_ALLOW_INSECURE_HTTP': 'bool', 'PAYMESH_API_BASE': 'str', 'PAYMESH_REQUEST_TIMEOUT': 'int', 'PAYMESH_OTP_MAX_WAIT': 'int', 'PAYMESH_ACCOUNTS_PER_CDK': 'int', 'PAYMESH_ROUTED_DOMAINS': 'list_str_multiline', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'TINYHOST_API_BASE': 'str', 'TINYHOST_REQUEST_TIMEOUT': 'int', 'TINYHOST_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})

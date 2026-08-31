@@ -82,6 +82,30 @@ class HeroSmsCountryStoreTests(unittest.TestCase):
             self.assertEqual(store.sticky_countries(lane_a), ["52"])
             self.assertEqual(store.sticky_countries(lane_b), ["16"])
 
+    def test_repeated_phone_used_failures_block_country_at_dedicated_threshold(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HeroSmsCountryStore(Path(temp_dir) / "state.sqlite3")
+            profile = make_profile_key("https://hero.test/api", "dr", "")
+
+            for _ in range(2):
+                store.mark_number_rejected(profile, "52", "phone_used_or_max")
+            self.assertEqual(store.blocked_countries(profile), set())
+
+            store.mark_number_rejected(profile, "52", "phone_used_or_max")
+            self.assertEqual(store.blocked_countries(profile), {"52"})
+
+    def test_success_resets_dedicated_phone_rejection_counter(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HeroSmsCountryStore(Path(temp_dir) / "state.sqlite3")
+            profile = make_profile_key("https://hero.test/api", "dr", "")
+
+            for _ in range(3):
+                store.mark_number_rejected(profile, "52", "phone_used_or_max")
+            store.mark_verified(profile, "52", "0.03")
+
+            self.assertEqual(store.blocked_countries(profile), set())
+            self.assertEqual(store.country_health(profile)["52"]["number_rejected_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -392,6 +392,25 @@ class RoxyProfileManagerTests(unittest.TestCase):
             payload = manager.status()
         self.assertNotIn(self.key, repr(payload))
 
+    def test_status_is_local_only_by_default(self):
+        manager = self._manager()
+        self.client.list_profiles = Mock(side_effect=AssertionError("Roxy must not be probed"))
+
+        payload = manager.status()
+
+        self.client.list_profiles.assert_not_called()
+        self.assertEqual(payload["active_remote_count"], 0)
+        self.assertEqual(payload["remote_error"], "")
+
+    def test_status_can_probe_remote_when_requested(self):
+        manager = self._manager()
+        self.client.list_profiles = Mock(return_value=[{"dirId": "dir-1"}])
+
+        payload = manager.status(include_remote=True)
+
+        self.client.list_profiles.assert_called_once_with()
+        self.assertEqual(payload["active_remote_count"], 1)
+
     def test_offline_open_can_be_disabled_by_config(self):
         profile = self.store.create_profile(
             local_id="local-2",

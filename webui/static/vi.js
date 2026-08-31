@@ -420,6 +420,7 @@
     'HeroSMS 国家': 'Quốc gia HeroSMS',
     'auto=按实时价格从低到高扫描；sticky country 只在同价位优先，较贵 sticky 等低价候选失败后再试；也可填固定 country ID': 'auto=quét theo giá hiện tại từ thấp lên cao; sticky country chỉ được ưu tiên trong cùng mức giá, sticky đắt hơn sẽ chờ các ứng viên rẻ hơn thất bại; cũng có thể nhập country ID cố định',
     'HeroSMS 最高价': 'Giá tối đa HeroSMS',
+    'HeroSMS 已用号码换国家阈值': 'Ngưỡng đổi quốc gia khi HeroSMS trả số đã dùng',
     '可选硬上限；先尝试低价 offer，逐级升到该价格，绝不超过它；留空不限': 'Giới hạn giá cứng tùy chọn; thử offer giá thấp trước rồi tăng dần tới mức này, tuyệt đối không vượt quá; để trống là không giới hạn',
     'grizzly / viotp / l / h；viotp 使用 ViOTP API，l/h 使用本地取号服务': 'grizzly / viotp / l / h; viotp dùng ViOTP API, l/h dùng dịch vụ lấy số cục bộ',
     '国家代码': 'Mã quốc gia',

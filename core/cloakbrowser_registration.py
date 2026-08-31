@@ -189,6 +189,8 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
     opened = None
     create_acknowledged = False
     openai_password: str | None = None
+    traffic_tracker: PlaywrightTrafficTracker | None = None
+    network_traffic: dict | None = None
     try:
         driver, opened = build_cloak_driver(proxy=proxy)
         tunnel = getattr(proxy, "tunnel", None)
@@ -213,7 +215,20 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         _maybe_accept(driver)
         _check_manual_stop()
 
-        next_state = _submit_email_and_wait_next(driver, email, attempts=3)
+        def _email_supplier_after_input() -> str:
+            nonlocal email
+            _check_manual_stop()
+            email = acquire_email_after_input(email)
+            if on_email_acquired:
+                on_email_acquired(email)
+            return email
+
+        next_state = _submit_email_and_wait_next(
+            driver,
+            email,
+            attempts=3,
+            email_supplier=_email_supplier_after_input,
+        )
         _check_manual_stop()
 
         # 如果邮箱提交后直接进入验证码页，也尝试点击“使用密码继续”进入密码创建页；
@@ -411,6 +426,10 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         except Exception as exc:
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
+        # 统计注册浏览器关闭前的完整会话；注册后停留期间的网络请求也计入。
+        post_register_dwell(email, label="Cloak注册")
+        if traffic_tracker is not None:
+            network_traffic = traffic_tracker.stop()
         account_id = save_account_data(
             email=email,
             access_token=access_token,
@@ -430,12 +449,17 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                 "twofa_status": twofa_status,
                 "twofa_error": twofa_error,
                 "codex": codex_result,
+                "network_traffic": network_traffic,
             },
         )
-        post_register_dwell(email, label="Cloak注册")
         codex_ok = codex_result.get("ok") or codex_result.get("status") == "skipped"
         return {"success": bool(codex_ok), "email": email, "account_id": account_id, "access_token": access_token, "totp_secret": totp_secret, "twofa_status": twofa_status, "twofa_error": twofa_error, "codex": codex_result, "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}"}
     except Exception as exc:
+        if traffic_tracker is not None:
+            try:
+                network_traffic = traffic_tracker.stop()
+            except Exception:
+                pass
         logger.error("[Cloak注册] 失败：%s: %s", type(exc).__name__, exc)
         logger.debug("[Cloak注册] 失败详情", exc_info=True)
         try:
@@ -452,8 +476,18 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
             release_email(email, status=release_status, note=note_text[:180])
         except Exception:
             pass
-        return {"success": False, "email": email, "error": f"{type(exc).__name__}: {str(exc)[:300]}"}
+        return {
+            "success": False,
+            "email": email,
+            "network_traffic": network_traffic,
+            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+        }
     finally:
+        if traffic_tracker is not None:
+            try:
+                traffic_tracker.stop()
+            except Exception:
+                pass
         if driver and not bool(_cfg.CLOAK_KEEP_BROWSER_OPEN):
             try:
                 driver.quit()

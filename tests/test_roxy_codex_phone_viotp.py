@@ -2,6 +2,7 @@ import json
 import subprocess
 import types
 import unittest
+from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
 from core import roxy_codex_oauth, roxy_phone_country
@@ -195,6 +196,85 @@ class RoxyCodexPhoneViOtpTests(unittest.TestCase):
             lane_key=roxy_codex_oauth.sms_provider.default_lane_key(),
         )
 
+    def test_phone_otp_still_on_code_page_is_not_completed(self):
+        driver = Mock()
+        http = Mock()
+        config = types.SimpleNamespace(
+            SMS_PROVIDER="viotp",
+            SMS_MAX_RETRIES=1,
+            SMS_CODE_WAIT=30,
+            SMS_POLL_INTERVAL=1,
+        )
+        phone_fill = {
+            "e164": "+84987654321",
+            "actualVisible": "987654321",
+            "hiddenValue": "+84987654321",
+            "dialCode": "84",
+            "selectedText": "Vietnam +84",
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(roxy_codex_oauth.sms_provider, "_cfg", config))
+            stack.enter_context(patch.object(roxy_codex_oauth.sms_provider, "_http", return_value=http))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_has_strict_add_phone_form", return_value=True))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_ensure_add_phone_input"))
+            stack.enter_context(patch.object(
+                roxy_codex_oauth.sms_provider,
+                "acquire_number",
+                return_value=("request-1", "84987654321"),
+            ))
+            stack.enter_context(patch.object(roxy_codex_oauth, "select_vietnam_country", return_value={"ok": True}))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_set_phone_value", return_value=phone_fill))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_blur_active_input_and_wait"))
+            stack.enter_context(patch.object(
+                roxy_codex_oauth,
+                "_verify_add_phone_value_before_submit",
+                return_value={"ok": True},
+            ))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_select_sms_channel_or_raise"))
+            stack.enter_context(patch.object(
+                roxy_codex_oauth,
+                "_click_add_phone_continue_button",
+                return_value={"ok": True},
+            ))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_wait_page_settle_after_submit"))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_wait_after_phone_send"))
+            stack.enter_context(patch.object(roxy_codex_oauth.sms_provider, "set_status"))
+            stack.enter_context(patch.object(
+                roxy_codex_oauth.sms_provider,
+                "wait_for_sms_code",
+                return_value="123456",
+            ))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_type_otp"))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_click_if_present", return_value=True))
+            stack.enter_context(patch.object(
+                roxy_codex_oauth,
+                "_wait_after_phone_otp_submit",
+                return_value="still_code_page",
+            ))
+            complete = stack.enter_context(patch.object(roxy_codex_oauth.sms_provider, "complete"))
+            stack.enter_context(patch.object(roxy_codex_oauth.sms_provider, "cancel"))
+            stack.enter_context(patch.object(roxy_codex_oauth, "_is_phone_code_page", return_value=True))
+            stack.enter_context(patch.object(
+                roxy_codex_oauth,
+                "_find_any",
+                side_effect=RuntimeError("not on phone page"),
+            ))
+            stack.enter_context(patch.object(roxy_codex_oauth.time, "sleep"))
+            with self.assertRaisesRegex(RuntimeError, "phone_otp_not_accepted"):
+                roxy_codex_oauth._do_phone_verification_if_present(driver)
+
+        complete.assert_not_called()
+
+    def test_wait_for_callback_fails_immediately_when_browser_target_is_closed(self):
+        class ClosedDriver:
+            @property
+            def current_url(self):
+                raise RuntimeError("Page.goto: Target page, context or browser has been closed")
+
+        with self.assertRaisesRegex(RuntimeError, "browser target closed"):
+            roxy_codex_oauth._wait_for_callback(ClosedDriver(), timeout=60)
+
 
 class RoxyCodexPhoneRetryTests(unittest.TestCase):
     def test_set_phone_value_reads_custom_country_combobox_dial_code(self):
@@ -238,6 +318,20 @@ class RoxyCodexPhoneRetryTests(unittest.TestCase):
             "whatsapp_channel",
         )
 
+    def test_phone_body_used_number_is_classified_for_country_rotation(self):
+        state = {
+            "url": "https://auth.openai.com/add-phone",
+            "radios": [{"value": "sms", "checked": True}],
+            "inputs": [],
+            "forms": [],
+            "bodyText": "Số điện thoại này đã được sử dụng. Vui lòng dùng số điện thoại khác.",
+        }
+
+        self.assertEqual(
+            roxy_codex_oauth._classify_phone_page_failure(state),
+            "phone_used_or_max",
+        )
+
     def test_phone_body_copy_without_radio_metadata_is_not_channel_failure(self):
         state = {"radios": [], "bodyText": "Phone number and WhatsApp"}
 
@@ -268,6 +362,18 @@ class RoxyCodexPhoneRetryTests(unittest.TestCase):
 
         driver.back.assert_called_once_with()
         driver.refresh.assert_not_called()
+        driver.get.assert_not_called()
+
+    def test_refresh_phone_retry_restarts_oauth_when_navigation_hits_browser_error(self):
+        driver = Mock(current_url="https://auth.openai.com/phone-verification")
+        driver.refresh.side_effect = RuntimeError(
+            "Page.reload: net::ERR_HTTP_RESPONSE_CODE_FAILURE"
+        )
+
+        with patch.object(roxy_codex_oauth, "_history_back_to_add_phone_input", return_value=None), \
+             self.assertRaisesRegex(RuntimeError, "phone_auth_state_reset_required"):
+            roxy_codex_oauth._refresh_add_phone_for_retry(driver, reason="sms-timeout")
+
         driver.get.assert_not_called()
 
     def test_phone_auth_state_failure_is_marked_for_full_oauth_retry(self):

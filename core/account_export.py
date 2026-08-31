@@ -913,7 +913,25 @@ def save_account_data(
     返回新插入/更新的 row id。
     """
     from core.db import insert_account
-    extra = extra or {}
+    extra = dict(extra or {})
+    # Remail service token 只存在进程内上下文中；注册成功后持久化订单上下文，
+    # 让服务重启后的查活流程可以恢复取件凭证。
+    if str(email_source or "").strip().lower() == "remail":
+        try:
+            from core.remail_client import get_account_context_metadata
+
+            remail_metadata = get_account_context_metadata(email)
+            if remail_metadata:
+                existing_service = extra.get("email_service")
+                merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
+                merged_service.update(remail_metadata)
+                extra["email_service"] = merged_service
+        except Exception as exc:
+            logger.warning(
+                "[Save] 保存 Remail 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
     from core.account_locale import derive_account_locale
 
     locale_fields = derive_account_locale(extra=extra)

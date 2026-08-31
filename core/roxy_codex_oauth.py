@@ -174,10 +174,25 @@ def _wait_for_callback(driver, timeout: int | None = None) -> str:
             callback = _extract_callback_url_from_any_window(driver)
             if callback:
                 return callback
-        except Exception:
-            pass
+        except Exception as exc:
+            if _is_browser_target_closed_error(exc):
+                raise RuntimeError(
+                    "Codex browser target closed while waiting for callback"
+                ) from exc
         time.sleep(0.5)
     raise RuntimeError("等待 Codex callback 超时")
+
+
+def _is_browser_target_closed_error(exc: BaseException | str) -> bool:
+    """识别浏览器 target/context 已关闭，避免把生命周期错误吞成超时。"""
+    text = str(exc or "").lower()
+    return any(marker in text for marker in (
+        "targetclosed",
+        "target page",
+        "context or browser has been closed",
+        "browser has been closed",
+        "page.is_closed",
+    ))
 
 
 def _click_if_present(driver, selectors: list[str], timeout: int = 3) -> bool:
@@ -1078,6 +1093,16 @@ def _refresh_add_phone_for_retry(driver, *, reason: str = "") -> None:
         human_delay("navigate")
         _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=8)
     except Exception as exc:
+        error_text = str(exc).lower()
+        try:
+            current_url = str(getattr(driver, "current_url", "") or "").lower()
+        except Exception:
+            current_url = ""
+        if "net::err_" in error_text or current_url.startswith("chrome-error://"):
+            raise PhoneAuthStateResetRequired(
+                "phone_auth_state_reset_required: 手机号重试导航失败，浏览器已进入错误页；"
+                "必须重新开启完整 OAuth 授权"
+            ) from exc
         logger.info("[Codex][Browser] 刷新手机号页失败，下一轮会再次尝试回到 add-phone：%s", str(exc)[:180])
 
 
@@ -1269,6 +1294,11 @@ def _classify_phone_page_failure(state: dict) -> str:
     if any(k in text for k in ('invalid phone', 'not a valid phone', 'phone number is not valid', '号码无效', '手机号无效')):
         return 'invalid_phone'
     if any(k in text for k in (
+        'already used', 'used too many', 'phone number has been used', '已被使用',
+        'số điện thoại này đã được sử dụng', 'so dien thoai nay da duoc su dung',
+    )):
+        return 'phone_used_or_max'
+    if any(k in text for k in (
         'cannot send', 'could not send', 'unable to send', 'failed to send', 'send failed',
         '发送失败', '发送失败了', '无法发送', '不能发送', '无法向',
         '送信できません', '送信に失敗', '送信できなかった',
@@ -1372,6 +1402,10 @@ def _do_phone_verification_if_present(driver) -> None:
                 logger.info("[Codex][Browser] 已提交手机 OTP，等待验证结果")
                 otp_outcome = _wait_after_phone_otp_submit(driver, timeout=25)
                 logger.info("[Codex][Browser] 手机 OTP 提交后状态：%s", otp_outcome)
+                if otp_outcome not in {"callback", "left_phone_flow"}:
+                    raise RuntimeError(
+                        f"phone_otp_not_accepted: OTP 提交后状态未确认成功：{otp_outcome}"
+                    )
                 sms_provider.complete(activation_id, http)
                 return
             except Exception as exc:
@@ -1380,7 +1414,11 @@ def _do_phone_verification_if_present(driver) -> None:
                 logger.warning("[Codex][Browser] 手机验证尝试失败，换号：%s", err_text[:240])
                 if activation_id:
                     try:
-                        sms_provider.cancel(activation_id, http)
+                        sms_provider.cancel(
+                            activation_id,
+                            http,
+                            reason=err_text.split(":", 1)[0],
+                        )
                     except Exception:
                         pass
                 # 余额不足 / 无可用号码：重试多少次都不会成功，立即失败止损，
