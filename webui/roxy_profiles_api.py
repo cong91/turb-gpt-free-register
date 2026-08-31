@@ -107,7 +107,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({
                 "ok": True,
                 "profiles": profiles,
-                "status": current_manager.status(),
+                "status": current_manager.status(include_remote=reconcile),
                 "page": page,
                 "page_size": page_size,
                 "total": total,

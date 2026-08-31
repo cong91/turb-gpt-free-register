@@ -876,10 +876,13 @@ def _phone_failure_reason(text: str, status_code: int | None = None) -> str:
         '无法发送', '不能发送', '无法向', '发送验证码', '发送短信',
     )):
         return 'delivery_refused'
+    if any(k in low for k in (
+        'already used', 'used too many', 'phone number has been used', 'phone_used_or_max', 'maximum', '上限', '已被使用',
+        'số điện thoại này đã được sử dụng', 'so dien thoai nay da duoc su dung',
+    )):
+        return 'phone_used_or_max'
     if any(k in low for k in ('too many', 'rate limit', 'throttle', 'limited', '频繁', '限流')):
         return 'send_limited'
-    if any(k in low for k in ('already used', 'used too many', 'maximum', '上限', '已被使用')):
-        return 'phone_used_or_max'
     if status_code and status_code >= 500:
         return 'server_error'
     if status_code and status_code >= 400:
@@ -1037,7 +1040,7 @@ def _do_phone_verification(session: BrowserSession) -> None:
                         f"[Codex] add-phone/send 未成功 reason={send_reason or 'unknown'}, "
                         f"status={send_resp.status_code}: {send_text[:240]}，换号重试"
                     )
-                    sms_provider.cancel(activation_id, http)
+                    sms_provider.cancel(activation_id, http, reason=send_reason or "send_rejected")
                     _sleep_before_phone_retry(attempt, max_retries)
                     continue
 
@@ -1054,7 +1057,7 @@ def _do_phone_verification(session: BrowserSession) -> None:
                     sms_code = sms_provider.wait_for_sms_code(activation_id, http)
                 except sms_provider.SmsCodeTimeout:
                     logger.warning(f"[Codex] 号码 +{phone} 在 {_cfg.SMS_CODE_WAIT}s 内未收到短信，取消换号")
-                    sms_provider.cancel(activation_id, http)
+                    sms_provider.cancel(activation_id, http, reason="sms_timeout")
                     _sleep_before_phone_retry(attempt, max_retries)
                     continue
 
@@ -1072,7 +1075,7 @@ def _do_phone_verification(session: BrowserSession) -> None:
                         f"[Codex] phone-otp/validate 失败 reason={val_reason}, status={val_resp.status_code}: "
                         f"{val_text[:240]}，换号重试"
                     )
-                    sms_provider.cancel(activation_id, http)
+                    sms_provider.cancel(activation_id, http, reason=val_reason)
                     _sleep_before_phone_retry(attempt, max_retries)
                     continue
 
@@ -1088,7 +1091,7 @@ def _do_phone_verification(session: BrowserSession) -> None:
                 last_err = exc
                 logger.warning(f"[Codex] 接码尝试 {attempt} 失败：{exc}")
                 if activation_id:
-                    sms_provider.cancel(activation_id, http)
+                    sms_provider.cancel(activation_id, http, reason=str(exc)[:120])
                 _sleep_before_phone_retry(attempt, max_retries)
                 continue
 

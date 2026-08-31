@@ -516,6 +516,110 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             if str(row["email"] or "").strip()
         }
 
+    def alias_usage_for_code_urls(
+        self, code_urls: set[str]
+    ) -> dict[str, dict[str, set[str]]]:
+        """Return allocated, consumed, failed, and reserved aliases by code URL."""
+        normalized = {
+            str(code_url or "").strip()
+            for code_url in (code_urls or set())
+            if str(code_url or "").strip()
+        }
+        usage = {
+            code_url: {
+                "allocated": set(),
+                "consumed": set(),
+                "failed": set(),
+                "reserved": set(),
+            }
+            for code_url in normalized
+        }
+        if not normalized:
+            return usage
+
+        normalized_urls = sorted(normalized)
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            rows = []
+            for start in range(0, len(normalized_urls), 500):
+                url_chunk = normalized_urls[start : start + 500]
+                placeholders = ",".join("?" for _ in url_chunk)
+                rows.extend(
+                    connection.execute(
+                        "SELECT i.code_url, i.email, i.state, i.completed_count, b.capacity, "
+                        "EXISTS (SELECT 1 FROM gmail_api_url_assignments a "
+                        "WHERE a.batch_id = i.batch_id AND a.inventory_id = i.inventory_id "
+                        "AND a.state = 'active') AS is_reserved "
+                        "FROM gmail_api_url_batch_items i "
+                        "JOIN gmail_api_url_batches b ON b.batch_id = i.batch_id "
+                        f"WHERE i.code_url IN ({placeholders})",
+                        tuple(url_chunk),
+                    ).fetchall()
+                )
+
+        for row in rows:
+            code_url = str(row["code_url"] or "").strip()
+            alias = str(row["email"] or "").strip().casefold()
+            if not alias or code_url not in usage:
+                continue
+            usage[code_url]["allocated"].add(alias)
+            consumed = (
+                str(row["state"] or "") == "exhausted"
+                or int(row["completed_count"] or 0) >= int(row["capacity"] or 1)
+            )
+            if consumed:
+                usage[code_url]["consumed"].add(alias)
+            elif str(row["state"] or "") == "failed":
+                usage[code_url]["failed"].add(alias)
+            elif bool(row["is_reserved"]):
+                usage[code_url]["reserved"].add(alias)
+        return usage
+
+    def reset_unused_aliases_for_code_url(self, code_url: str) -> int:
+        """Remove unconsumed aliases that are not owned by a live or queued job."""
+        value = str(code_url or "").strip()
+        if not value:
+            return 0
+
+        with self._transaction() as connection:
+            active_assignments = connection.execute(
+                "SELECT COUNT(*) FROM gmail_api_url_assignments a "
+                "JOIN gmail_api_url_batch_items i ON i.batch_id = a.batch_id "
+                "AND i.inventory_id = a.inventory_id "
+                "JOIN gmail_api_url_batches b ON b.batch_id = i.batch_id "
+                "WHERE i.code_url = ? AND i.state = 'active' "
+                "AND i.completed_count < b.capacity AND a.state = 'active'",
+                (value,),
+            ).fetchone()[0]
+            if active_assignments:
+                raise GmailBatchConflict(
+                    "Gmail API URL alias đang được job chạy sử dụng"
+                )
+
+            waiting_jobs = connection.execute(
+                "SELECT COUNT(*) FROM gmail_api_url_waiters w "
+                "JOIN gmail_api_url_batch_items i ON i.batch_id = w.batch_id "
+                "WHERE i.code_url = ? AND w.state = 'waiting'",
+                (value,),
+            ).fetchone()[0]
+            if waiting_jobs:
+                raise GmailBatchConflict(
+                    "Gmail API URL alias đang có job chờ trong hàng đợi"
+                )
+
+            cursor = connection.execute(
+                "DELETE FROM gmail_api_url_batch_items "
+                "WHERE code_url = ? AND state = 'active' AND completed_count = 0 "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM gmail_api_url_assignments a "
+                "WHERE a.batch_id = gmail_api_url_batch_items.batch_id "
+                "AND a.inventory_id = gmail_api_url_batch_items.inventory_id "
+                "AND a.state = 'active'"
+                ")",
+                (value,),
+            )
+            return max(0, int(cursor.rowcount or 0))
+
     def has_pending_items(self, batch_id: str) -> bool:
         """Return whether the batch still has an alias that is not consumed."""
         with closing(self._connect()) as connection:

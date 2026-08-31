@@ -10,7 +10,6 @@ EMAIL_SOURCE 支持单个或多个来源：
     "mailnest"
     "cloudmail"
     "tinyhost"
-    "remail"
     "outlook,generic_api,mailnest,cloudmail"          # 按顺序兜底
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
@@ -117,6 +116,48 @@ def normalize_email_source(value: str) -> str:
 
 def is_valid_email_source(value: str) -> bool:
     return normalize_email_source(value) in _VALID_SOURCES
+
+
+def _normalize_explicit_email_source(value: str | None) -> str | None:
+    """规范化调用方明确指定的邮箱来源。"""
+    if value is None:
+        return None
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    for item in raw.replace(";", ",").replace("|", ",").split(","):
+        source = str(item or "").strip().strip("\"'").lower()
+        source = normalize_email_source(source)
+        if source in _VALID_SOURCES:
+            return source
+    return None
+
+
+def _registered_email_source(email: str) -> str | None:
+    """读取已注册账号落库的邮箱来源。"""
+    try:
+        from core import db
+        account = db.get_account_by_email(email)
+    except Exception:
+        return None
+    return _normalize_explicit_email_source((account or {}).get("email_source"))
+
+
+def _active_job_email_source(email: str) -> str | None:
+    """优先使用当前注册 job 的来源，避免不同 provider 生成同名 alias 时串源。"""
+    job_id = _current_otp_job_id()
+    if job_id is None:
+        return None
+    try:
+        from core import db
+
+        job = db.get_job(job_id) or {}
+        job_email = str(job.get("email") or "").strip().casefold()
+        if job_email and job_email == str(email or "").strip().casefold():
+            return _normalize_explicit_email_source(job.get("email_source"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return None
 
 
 def parse_email_sources(value=None) -> list[str]:
@@ -304,10 +345,15 @@ def acquire_email(
 
 
 def acquire_email_after_input(email: str | None = None) -> str:
-    """在浏览器已找到邮箱输入框后才领取邮箱，避免页面失败时提前消耗库存。"""
+    """在浏览器已找到邮箱输入框后领取邮箱。
+
+    浏览器驱动把“找到输入框”和“领取邮箱”拆成两个阶段，避免页面加载、风控
+    或入口识别失败时提前消耗邮箱。传入已有邮箱时不重复领取，兼容固定邮箱模式。
+    """
     current = str(email or "").strip()
     if current:
         return current
+
     from config import email as _email_cfg
 
     if not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", False)):
@@ -320,7 +366,13 @@ def acquire_email_after_input(email: str | None = None) -> str:
 
 
 def resolve_email_source(email: str) -> str:
-    """根据邮箱在各池中的归属判断实际来源。"""
+    """根据邮箱判断实际来源，已注册账号优先使用落库来源。"""
+    registered_source = _registered_email_source(email)
+    if registered_source:
+        return registered_source
+    active_job_source = _active_job_email_source(email)
+    if active_job_source:
+        return active_job_source
     if Qan8GmailApiAllocator().get_account_context(email):
         return "qan8_gmail_api"
 
@@ -456,6 +508,7 @@ def wait_for_otp(
     settle_seconds: int | None = None,
     before_code: str | None | object = _BEFORE_CODE_UNSET,
     stage: str | None = None,
+    email_source: str | None = None,
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 
@@ -485,7 +538,11 @@ def wait_for_otp(
             job_id = None
         return wait_for_manual_otp(email, timeout=timeout, job_id=job_id)
 
-    source = resolve_email_source(email)
+    source = (
+        _normalize_explicit_email_source(email_source)
+        or _registered_email_source(email)
+        or resolve_email_source(email)
+    )
     extra_kwargs = {}
     if max_wait is not None or source == "paymesh":
         extra_kwargs["max_wait"] = otp_max_wait_for_source(source, max_wait)

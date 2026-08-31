@@ -90,6 +90,7 @@ EMAIL_SOURCE = "outlook,generic_api,gmail_api_url"
 - 动态调整注册线程数，提交后新任务立即使用最新值。
 - 批量补跑 Codex，补跑线程数每次提交即时生效。
 - 管理账号、邮箱池、Codex 凭证；账号页支持复制全部/选中整行，邮箱池列表展示导入时间、已用时间和状态。
+- Roxy/Cloak/Browser Use/Skyvern 浏览器注册完成后统计整个浏览器会话的上传、下载和总流量，任务列表与账号扩展信息均会保存结果。
 - 配置页支持热加载，保存后无需重启。
 - Roxy 团队/项目可在配置页获取并保存。
 - 代理池配置支持 Proxy.vn 代理旋转：注册、Codex OAuth/补跑、查活、套餐、提链、2FA、改邮箱和 Codex Agent 等账号 workflow 都通过持久 lease 取 proxy；同一 `scope/lane` 复用 proxy TTL，`keyxoay` 在所有 scope 之间全局不重复。
@@ -122,6 +123,16 @@ Migration split SQLite đã hoàn tất trước khi runtime hiện tại chạy
 `core.sqlite_state_migration` và bộ test vẫn giữ khả năng kiểm tra một source
 backup được truyền tường minh, nhưng không có đường khởi động nào tự tìm,
 import hoặc fallback sang `app_state.sqlite3`.
+
+### 浏览器网络流量统计
+
+浏览器驱动会从打开注册页开始统计，到注册后停留结束、浏览器关闭前完成汇总。结果包含：
+
+- 上传字节、下载字节、总字节数；
+- HTTP 请求数、失败/未完成请求数；
+- WebSocket 帧 payload 字节（如流程使用 WebSocket）。
+
+现代/Legacy WebUI 的注册任务列表会显示总流量，完整结构保存在任务记录的 `network_traffic` 和成功账号的 `extra_json` 中。统计为浏览器侧可观测的请求/响应流量，不包含 TLS/IP/代理隧道额外开销，也不包含邮箱 API、Roxy API 或 CDP 控制通道流量。
 
 ---
 
@@ -195,6 +206,7 @@ cp .env.example .env
 - `ROXY_API_TOKEN`
 - `QQ_IMAP_PASSWORD`
 - `CLOUDFLARE_API_KEY` / `CLOUDFLARE_CUSTOM_AUTH`（`EMAIL_SOURCE=cloudflare` 时）
+- `REMAIL_API_KEY`（`EMAIL_SOURCE=remail` 时）
 - `CPA_MANAGEMENT_KEY`
 - `SMS_API_KEY`
 - `L_ADMIN_AUTH_CODE`
@@ -403,6 +415,34 @@ Cloudflare Email Routing 需要把域名邮件转发到 QQ 邮箱。此模式不
 
 - `api-key`获取页面：https://mailnest.top/account
 - 项目代码获取页面：https://mailnest.top/buy-email。默认为`chatgpt001`，可以直接使用
+
+#### Remail 开放 API
+
+Remail API 文档：[https://remail.aishop6.com/docs](https://remail.aishop6.com/docs)。该服务使用 API Key
+按项目创建短效接码订单，订单返回的邮箱和 service token 会自动用于后续取码。
+
+在 WebUI「配置 → 邮箱 / OTP」填写：
+
+- `REMAIL_API_KEY`：Remail 控制台生成的 `rk-` 开头 API Key；
+- `REMAIL_PROJECT_ID`：Remail「项目」列表中用于 ChatGPT/OpenAI 验证码的 `projectId`；
+- `REMAIL_EMAIL_SUFFIX`：下单后缀，微软邮箱通常填 `outlook.com`。
+
+然后设置：
+
+```dotenv
+USE_EMAIL_SERVICE=True
+EMAIL_SOURCE=remail
+REMAIL_API_BASE=https://remail.aishop6.com
+REMAIL_API_KEY=你的_Remail_API_Key
+REMAIL_PROJECT_ID=项目ID
+REMAIL_EMAIL_SUFFIX=outlook.com
+REMAIL_SERVICE_MODE=purchase
+REMAIL_SUPPLY_POLICY=public_only
+```
+
+`REMAIL_SERVICE_MODE` 默认为 `purchase`（长效购买，可重复收件），也可改为 `code`（短效接码）。
+`REMAIL_SUPPLY_POLICY` 默认为 `public_only`，也可改为 `private_first`。每个注册任务会创建一个
+对应模式的订单，验证码通过 `/v1/pickup` 获取；Remail 订单余额和对应项目库存需可用。
 
 ---
 
@@ -651,6 +691,7 @@ HERO_SMS_COUNTRY = "auto"
 HERO_SMS_MAX_PRICE = "0.1"
 HERO_SMS_COUNTRY_MIN_ATTEMPTS = 4
 HERO_SMS_COUNTRY_HIGH_FAILURE_RATE = 0.75
+HERO_SMS_NUMBER_REJECT_THRESHOLD = 3
 
 # 若 SMS_PROVIDER="h"，H 固定复用：
 #   SMS_SERVICE -> H projectId
@@ -661,7 +702,7 @@ H_ADMIN_AUTH_CODE = "你的H后台授权码"
 
 ViOTP 在 `/session/getv2` 返回完成或过期状态；其公开 API 没有主动 `cancel` / `complete` 接口，因此程序失败换号时只清理本地会话记录并等待平台自动过期。
 
-HeroSMS 在 `HERO_SMS_COUNTRY=auto` 时先调用 `getPrices&service=dr`，过滤库存大于 0 且 `cost <= HERO_SMS_MAX_PRICE` 的全部国家；`HERO_SMS_MAX_PRICE` 是唯一的硬价格上限，当前示例为 `0.1`，不会自动超过该值，也不是一个起始价。候选直接按当前 offer 的实际 `cost` 从低到高排序，有多少个低于 `0.05` 就按实际价格逐个尝试，再继续到 `0.1`，不使用固定价格档位；多 worker 只在完全相同的 cost 中轮换，避免并发分配打乱低价优先顺序。每个 worker lane 都有独立的 country 记忆：本 lane 最近成功的 country 若仍有库存且与当前最低价相同，则优先复用；如果它更贵，则先让更低价候选尝试，低价候选失败后才回到 sticky country；任何 `NO_NUMBERS`/`WRONG_MAX_PRICE` 都会继续扫描当前候选池，直到取号成功或候选耗尽。每个 country 的 Codex 手机验证成功/失败，以及取号时的即时无库存结果都会写入 `turb.sqlite3`，health 会跨不同价格 profile 汇总。单次收不到 OTP 或 verify 错误不会立即高风险封禁，默认累计至少 4 次且失败率达到 75% 才降为低优先级兜底 country；后续成功会清除该 country 的最近失败标记并恢复本 lane 复用。拿到验证码后使用 `setStatus=6` 完成，失败时使用 `setStatus=8` 取消。价格和库存是动态数据，已成功 country 仍会重新经过当前价格/库存筛选，不能把某个 country ID 视为永久最低价。
+HeroSMS 在 `HERO_SMS_COUNTRY=auto` 时先调用 `getPrices&service=dr`，过滤库存大于 0 且 `cost <= HERO_SMS_MAX_PRICE` 的全部国家；`HERO_SMS_MAX_PRICE` 是唯一的硬价格上限，当前示例为 `0.1`，不会自动超过该值，也不是一个起始价。候选直接按当前 offer 的实际 `cost` 从低到高排序，有多少个低于 `0.05` 就按实际价格逐个尝试，再继续到 `0.1`，不使用固定价格档位；多 worker 只在完全相同的 cost 中轮换，避免并发分配打乱低价优先顺序。每个 worker lane 都有独立的 country 记忆：本 lane 最近成功的 country 若仍有库存且与当前最低价相同，则优先复用；如果它更贵，则先让更低价候选尝试，低价候选失败后才回到 sticky country；任何 `NO_NUMBERS`/`WRONG_MAX_PRICE` 都会继续扫描当前候选池，直到取号成功或候选耗尽。每个 country 的 Codex 手机验证成功/失败，以及取号时的即时无库存结果都会写入 `turb.sqlite3`，health 会跨不同价格 profile 汇总。单次收不到 OTP 或 verify 错误不会立即高风险封禁，默认累计至少 4 次且失败率达到 75% 才降为低优先级兜底 country；若页面明确报“số điện thoại đã được sử dụng”，会单独累计；达到 `HERO_SMS_NUMBER_REJECT_THRESHOLD`（默认 3）后 country 暂时降为低优先级，优先尝试其他 country，但不会永久删除；当主候选失败或进入恢复探测时，仍可将该 country 作为 fallback 重新 warm，确认库存是否恢复。后续成功会清除该 country 的最近失败标记和该专用计数并恢复本 lane 复用。拿到验证码后使用 `setStatus=6` 完成，失败时使用 `setStatus=8` 取消。价格和库存是动态数据，已成功 country 仍会重新经过当前价格/库存筛选，不能把某个 country ID 视为永久最低价。
 在 Cloak/Roxy 浏览器流程中，Hero 返回的 E.164 号码还用于自动选择 OpenAI 表单的对应国家/区号，避免号码前缀和 country selector 不一致导致 `whatsapp_channel` 或号码发送失败。
 
 CPA 授权地址来源：
@@ -991,6 +1032,7 @@ ENABLE_CODEX_AUTO = False
 │   ├── register.py                 # 默认注册信息
 │   └── ...
 ├── core/
+│   ├── browser_traffic.py          # 浏览器注册 HTTP/WebSocket 流量统计
 │   ├── roxy_registration.py        # Roxy / 浏览器注册页面流程
 │   ├── cloakbrowser_registration.py # Cloak 注册入口
 │   ├── cloakbrowser_driver.py      # Cloak Playwright→Selenium 风格适配层

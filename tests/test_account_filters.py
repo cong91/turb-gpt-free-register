@@ -194,6 +194,28 @@ class AccountFilterTests(unittest.TestCase):
         self.assertEqual(list_statuses.call_args.kwargs["email_source_filter"], "gmail_api_url")
         self.assertEqual(list_statuses.call_args.kwargs["twofa_filter"], "failed")
 
+    @patch("webui.app.db.list_account_plan_check_statuses")
+    def test_plan_status_api_passes_totp_filter(self, list_statuses):
+        list_statuses.return_value = {"items": [], "total": 0, "offset": 0, "limit": 50, "revision": "0"}
+        client = create_app(auth_code="test-auth").test_client()
+
+        response = client.get(
+            "/api/accounts/plan-check-status?page=1&page_size=50&totp_status=enabled",
+            headers={"X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list_statuses.call_args.kwargs["totp_filter"], "enabled")
+
+    def test_plan_status_snapshot_with_empty_filters_uses_sql_path(self):
+        expected = {"items": [], "total": 0, "offset": 0, "limit": 20, "revision": "0"}
+        with patch.object(db, "_query_collection_page", return_value=([], 0, "")) as query_page:
+            result = db.list_account_plan_check_statuses(limit=20, archived="0")
+
+        self.assertEqual(result["items"], expected["items"])
+        self.assertEqual(result["total"], expected["total"])
+        query_page.assert_called_once()
+
     @patch("core.free_plus_export.db.list_accounts")
     def test_free_plus_filtered_export_passes_source_filter(self, list_accounts):
         list_accounts.return_value = []

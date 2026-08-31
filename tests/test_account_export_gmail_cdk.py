@@ -39,6 +39,44 @@ class GmailCdkAccountExportTests(unittest.TestCase):
         self.assertEqual(insert_account.call_args.kwargs["source_cdk"], "CDK-EXACT")
         mark_consumed.assert_called_once_with("abcdef@gmail.com")
 
+    @patch("core.remail_client.get_account_context_metadata")
+    @patch("core.email_provider.mark_email_consumed", return_value=True)
+    @patch("core.account_export._append_batch_archive", return_value="batch")
+    @patch("core.db.insert_account", return_value=23)
+    def test_successful_persistence_saves_remail_service_metadata(
+        self, insert_account, _archive, mark_consumed, get_metadata
+    ):
+        get_metadata.return_value = {
+            "source": "remail",
+            "email": "fresh@outlook.test",
+            "service_token": "st-test-token",
+            "order_no": "R-EXACT",
+            "project_id": 2,
+            "email_suffix": "outlook.com",
+        }
+
+        row_id = save_account_data(
+            email="fresh@outlook.test",
+            access_token="access-token",
+            email_source="remail",
+            extra={"email_service": {"existing": "value"}},
+        )
+
+        self.assertEqual(row_id, 23)
+        self.assertEqual(
+            insert_account.call_args.kwargs["extra"]["email_service"],
+            {
+                "existing": "value",
+                "source": "remail",
+                "email": "fresh@outlook.test",
+                "service_token": "st-test-token",
+                "order_no": "R-EXACT",
+                "project_id": 2,
+                "email_suffix": "outlook.com",
+            },
+        )
+        mark_consumed.assert_called_once_with("fresh@outlook.test")
+
     def test_batch_archive_uses_canonical_account_line(self):
         from core import account_export
 
