@@ -23,7 +23,8 @@ class RegistrationSettingsUiTests(unittest.TestCase):
     def test_proxy_settings_render_rotating_proxy_status_tools(self):
         source = INDEX_TEMPLATE.read_text(encoding="utf-8")
 
-        self.assertIn("Proxy.vn 代理旋转状态", source)
+        self.assertIn("Trạng thái Proxy.vn Proxy xoay", source)
+        self.assertIn("Đang đọc trạng thái key/lease local…", source)
         self.assertIn("/api/proxy/rotating/refresh", source)
         self.assertIn("bindRotatingProxyToolsV2", source)
 
@@ -32,8 +33,18 @@ class RegistrationSettingsUiTests(unittest.TestCase):
 
         self.assertIn("let CONFIG_PROXY_ACTIVE_SECTION_V2 = '代理池';", source)
         self.assertIn("function proxyConfigSectionForKey(key)", source)
-        self.assertIn("['代理池', 'Proxy.vn 代理旋转']", source)
+        self.assertIn("['代理池', 'Proxy.vn Proxy xoay']", source)
+        self.assertIn("active === 'Proxy.vn Proxy xoay'", source)
         self.assertIn("data-proxy-section-v2", source)
+
+    def test_rotating_proxy_settings_are_vietnamese(self):
+        source = CONFIG_EDITOR.read_text(encoding="utf-8")
+
+        self.assertIn('"label": "Bật proxy xoay Proxy.vn"', source)
+        self.assertIn('"label": "API Key chính của Proxy.vn"', source)
+        self.assertIn('"label": "Nhà mạng"', source)
+        self.assertIn('"label": "Mã tỉnh/thành"', source)
+        self.assertNotIn('"label": "启用 Proxy.vn 代理旋转"', source)
 
     def test_rotating_proxy_tab_has_vietnamese_label(self):
         source = VI_TRANSLATION.read_text(encoding="utf-8")

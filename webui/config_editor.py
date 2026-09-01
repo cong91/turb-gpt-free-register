@@ -627,73 +627,73 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "ROTATING_PROXY_ENABLED", "file": "proxy.py", "type": "bool", "group": "代理池",
-        "label": "启用 Proxy.vn 代理旋转", "help": "注册、Codex、查活、套餐、提链、2FA、改邮箱和 Agent 等 workflow lane 共用持久 lease；同一 scope/lane 复用 proxy，keyxoay 全局不重复",
+        "label": "Bật proxy xoay Proxy.vn", "help": "Đăng ký, Codex, kiểm tra tài khoản, kiểm tra gói, lấy link, 2FA, đổi email và Agent dùng lease bền vững theo từng lane; cùng scope + lane sẽ dùng lại proxy, key xoay không trùng giữa các lane đang hoạt động",
     },
     {
         "key": "ROTATING_PROXY_API_KEY", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "Proxy.vn 主 API Key", "help": "用于查询、购买和续期 keyxoay；只保存到 .env，不写入 config 源码",
+        "label": "API Key chính của Proxy.vn", "help": "Dùng để xem danh sách, mua và gia hạn key xoay; chỉ lưu vào .env, không ghi vào mã nguồn cấu hình",
         "storage": "env", "secret": True,
     },
     {
         "key": "ROTATING_PROXY_PROTOCOL", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "代理协议", "help": "http 使用 proxyhttp；socks5 使用 proxysocks5",
+        "label": "Giao thức proxy", "help": "http dùng proxyhttp; socks5 dùng proxysocks5",
     },
     {
         "key": "ROTATING_PROXY_NHAMANG", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "运营商", "help": "传给 proxy.vn 的 nhamang；默认 random，也可按供应商支持值填写",
+        "label": "Nhà mạng", "help": "Giá trị nhamang gửi tới proxy.vn; mặc định random, có thể nhập giá trị nhà cung cấp hỗ trợ",
     },
     {
         "key": "ROTATING_PROXY_TINHTHANH", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "省/市代码", "help": "传给 proxy.vn 的 tinhthanh；0 表示 random",
+        "label": "Mã tỉnh/thành", "help": "Giá trị tinhthanh gửi tới proxy.vn; 0 nghĩa là random",
     },
     {
         "key": "ROTATING_PROXY_WHITELIST", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "IPv4 白名单", "help": "需要供应商白名单时填写允许使用的 IPv4；不需要则留空",
+        "label": "Danh sách IPv4 cho phép", "help": "Nhập các IPv4 được nhà cung cấp cho phép nếu cần; không cần thì để trống",
     },
     {
         "key": "ROTATING_PROXY_REQUEST_TIMEOUT", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "代理 API 超时(秒)", "help": "查询/购买/续期/取 proxy 的单次 HTTP 超时",
+        "label": "Thời gian chờ API proxy (giây)", "help": "Thời gian chờ cho mỗi lần xem danh sách, mua, gia hạn hoặc lấy proxy",
     },
     {
         "key": "PLAN_CHECK_PROXY_MODE", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "套餐/Agent网络模式", "help": "用于查套餐和生成 Agent Token；auto=本地代理可用则走代理、未监听则直连；proxy=强制代理；direct=强制直连",
+        "label": "Chế độ mạng khi kiểm tra gói/Agent", "help": "Dùng để kiểm tra gói và tạo Agent Token; auto dùng proxy khi có proxy cục bộ, nếu không thì kết nối trực tiếp; proxy luôn dùng proxy; direct luôn kết nối trực tiếp",
     },
     {
         "key": "PLAN_CHECK_PROXY", "file": "proxy.py", "type": "str", "group": "代理池",
-        "label": "套餐/Agent专用代理", "help": "用于查套餐和生成 Agent Token；留空时 auto/proxy 从代理池选择。可能包含认证信息，仅保存到 .env",
+        "label": "Proxy riêng khi kiểm tra gói/Agent", "help": "Dùng để kiểm tra gói và tạo Agent Token; khi để trống, auto/proxy sẽ chọn từ kho proxy. Có thể chứa thông tin xác thực, chỉ lưu vào .env",
         "storage": "env", "secret": True,
     },
     {
         "key": "PLAN_CHECK_TIMEOUT", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent超时(秒)", "help": "查套餐和生成 Agent Token 的单次请求超时，建议 10-20 秒；独立于注册请求超时",
+        "label": "Thời gian chờ kiểm tra gói/Agent (giây)", "help": "Thời gian chờ cho mỗi lần kiểm tra gói và tạo Agent Token; nên dùng 10-20 giây, độc lập với thời gian chờ đăng ký",
     },
     {
         "key": "PLAN_CHECK_MAX_ATTEMPTS", "file": "proxy.py", "type": "int", "group": "代理池",
-        "label": "套餐/Agent最大尝试次数", "help": "查套餐和生成 Agent Token 遇到网络错误、429、5xx 等临时错误时的重试次数，建议 2 次",
+        "label": "Số lần thử tối đa khi kiểm tra gói/Agent", "help": "Số lần thử lại khi kiểm tra gói và tạo Agent Token gặp lỗi mạng, 429, 5xx hoặc lỗi tạm thời khác; nên dùng 2 lần",
     },
     {
         "key": "PLAN_CHECK_RETRY_DELAY", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent重试间隔(秒)", "help": "查套餐和生成 Agent Token 的重试间隔，按尝试次数递增；服务端 Retry-After 优先",
+        "label": "Khoảng chờ thử lại gói/Agent (giây)", "help": "Khoảng chờ giữa các lần thử lại khi kiểm tra gói và tạo Agent Token; tăng theo số lần thử, ưu tiên Retry-After từ máy chủ",
     },
     {
         "key": "PLAN_CHECK_REGISTRATION_RECHECK_DELAY", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "新账号资格复查延迟(秒)", "help": "新注册 free 账号未发现试用资格或首次查询失败时复查一次；0 表示关闭",
+        "label": "Độ trễ kiểm tra lại tài khoản mới (giây)", "help": "Kiểm tra lại một lần khi tài khoản free mới đăng ký chưa có thông tin dùng thử hoặc lần kiểm tra đầu thất bại; 0 nghĩa là tắt",
     },
     {
         "key": "PLAN_CHECK_WORKERS", "file": "proxy.py", "type": "int", "group": "代理池",
-        "label": "套餐查询并发数", "help": "自动、手动和批量查套餐共用；Agent Token 生成使用独立队列；建议 2-4 个线程",
+        "label": "Số luồng kiểm tra gói", "help": "Dùng chung cho kiểm tra tự động, thủ công và hàng loạt; tạo Agent Token dùng hàng đợi riêng; nên dùng 2-4 luồng",
     },
     {
         "key": "PLAN_CHECK_QUEUE_LIMIT", "file": "proxy.py", "type": "int", "group": "代理池",
-        "label": "套餐查询队列上限", "help": "防止异常批量操作无限堆积，建议 100-1000",
+        "label": "Giới hạn hàng đợi kiểm tra gói", "help": "Ngăn thao tác hàng loạt bất thường xếp hàng vô hạn; nên dùng 100-1000",
     },
     {
         "key": "PLAN_CHECK_MIN_INTERVAL", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent请求最小间隔(秒)", "help": "限制查套餐和生成 Agent Token 的请求启动频率，降低 429 风险",
+        "label": "Khoảng tối thiểu giữa yêu cầu gói/Agent (giây)", "help": "Giới hạn tần suất bắt đầu yêu cầu kiểm tra gói và tạo Agent Token để giảm nguy cơ 429",
     },
     {
         "key": "PLAN_CHECK_JITTER", "file": "proxy.py", "type": "float", "group": "代理池",
-        "label": "套餐/Agent请求随机抖动(秒)", "help": "在查套餐和生成 Agent Token 的最小间隔上增加随机延迟，避免请求过于规律",
+        "label": "Độ trễ ngẫu nhiên của yêu cầu gói/Agent (giây)", "help": "Thêm độ trễ ngẫu nhiên vào khoảng tối thiểu giữa các yêu cầu kiểm tra gói và tạo Agent Token để tránh lịch gọi quá đều",
     },
     # ---- 提链 ----
     {
