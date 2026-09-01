@@ -92,6 +92,9 @@ class WebuiTwofaReactivateTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("data-account-twofa-reactivate", html)
         self.assertIn("twofa_reactivate_available", html)
+        self.assertIn("const twofaStatus", html)
+        self.assertIn("const twofaError", html)
+        self.assertIn("Lỗi 2FA", html)
 
 
 if __name__ == "__main__":

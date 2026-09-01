@@ -110,6 +110,41 @@ class AccountFilterTests(unittest.TestCase):
         self.assertEqual([row["email"] for row in plus_rows], ["plus@example.com"])
         self.assertEqual([row["email"] for row in unknown_rows], ["unknown@example.com"])
 
+    def test_plan_check_to_free_without_plus_trial_resets_export_and_unarchives_account(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self._db_context(root):
+                account_id = db.insert_account(
+                    email="rechecked@example.com",
+                    access_token="token",
+                    plan_type="free",
+                )
+                db.update_account_plan_check(
+                    acc_id=account_id,
+                    result={"ok": True, "current_plan_type": "free", "plus_trial_eligible": True},
+                )
+                updated, skipped = db.mark_accounts_free_plus_exported(
+                    [account_id], format_name="modern"
+                )
+                self.assertEqual(len(updated), 1)
+                self.assertEqual(skipped, [])
+                self.assertTrue(db.get_account(account_id)["free_plus_exported_at"])
+                self.assertTrue(db.get_account(account_id)["archived"])
+
+                db.update_account_plan_check(
+                    acc_id=account_id,
+                    result={"ok": True, "current_plan_type": "free", "plus_trial_eligible": False},
+                )
+                row = db.get_account(account_id)
+
+        self.assertIsNotNone(row)
+        self.assertIsNone(row["free_plus_exported_at"])
+        self.assertEqual(row["free_plus_export_count"], 0)
+        self.assertIsNone(row["free_plus_export_format"])
+        self.assertIsNone(row["free_plus_export_source"])
+        self.assertFalse(row["archived"])
+        self.assertIsNone(row["archived_at"])
+
     @patch("webui.app.db.list_accounts_page")
     def test_accounts_api_passes_source_filter(self, list_accounts_page):
         list_accounts_page.return_value = {"items": [], "total": 0, "offset": 0, "limit": 50, "revision": "0"}

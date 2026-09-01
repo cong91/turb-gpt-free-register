@@ -3862,6 +3862,8 @@ function _codexCellV2(r) {
 }
 function _totpCellV2(r) {
   const enabled = !!r.totp_enabled;
+  const twofaStatus = String(r.twofa_status || (enabled ? 'active' : 'disabled')).trim().toLowerCase();
+  const twofaError = r.twofa_error || '';
   const status = r.totp_setup_status || '';
   const titleText = r.totp_setup_message || r.totp_setup_error || '';
   const titleAttr = titleText ? ` title="${esc(titleText)}"` : '';
@@ -3880,6 +3882,10 @@ function _totpCellV2(r) {
   const btn = r.has_access_token
     ? `<button type="button" class="acc-v2-twofa-btn" data-account-totp-setup="${esc(r.id)}"${btnTitle}>开启2FA</button>`
     : `<span class="acc-v2-muted">无Token</span>`;
+  if (twofaStatus === 'failed') {
+    const failureTitle = esc(twofaError || '2FA 设置失败，但没有保存具体原因');
+    return `<div class="agent-token-cell"><span class="pill status-failed" title="${failureTitle}">Lỗi 2FA</span>${btn}</div>`;
+  }
   return `<div class="agent-token-cell">${btn}</div>`;
 }
 function _codexAgentCell(r) {
@@ -6727,9 +6733,9 @@ function smsConfigSectionForKey(key) {
 
 function proxyConfigSectionForKey(key) {
   if (String(key || '').startsWith('ROTATING_PROXY_')) {
-    return ['Proxy.vn 代理旋转', 'Proxy.vn keyxoay、出口代理和 lane lease 配置'];
+    return ['Proxy.vn Proxy xoay', 'Cấu hình key xoay, proxy đầu ra và lease theo lane của Proxy.vn'];
   }
-  return ['代理池', '静态代理池与套餐/Agent 的代理策略配置'];
+  return ['代理池', 'Kho proxy tĩnh và chính sách proxy cho kiểm tra gói/Agent'];
 }
 
 function codexConfigSectionForKey(key) {
@@ -6828,7 +6834,7 @@ function configSectionIntro(name) {
   if (name === '接码平台') return '接码通道、国家代码与本地取号服务参数。';
   if (name === '人工节奏') return '注册流程中的随机停顿节奏。';
   if (name === '浏览器画像') return '浏览器语言、时区与出口 IP 画像。';
-  if (name === '代理池') return '静态代理池、Proxy.vn 代理旋转与套餐/Agent 网络模式。';
+  if (name === '代理池') return 'Kho proxy tĩnh, Proxy.vn Proxy xoay và chế độ mạng cho kiểm tra gói/Agent.';
   if (name === '提链') return '提链服务地址、CDK 与并发参数。';
   return '';
 }
@@ -7149,13 +7155,13 @@ function renderSectionedConfigSectionV2(name, fields, sectionForKey, preferred, 
         <div id="viOtpServiceStatusV2" class="muted" style="font-size:12px;">默认 ID 1234 · OpenAI | ChatGPT</div>
         </div>`;
   }
-  if (name === '代理池' && active === 'Proxy.vn 代理旋转') {
+  if (name === '代理池' && active === 'Proxy.vn Proxy xoay') {
     extra = `
       <div class="nordvpn-status-v2 is-muted" id="rotatingProxyStatusV2" aria-live="polite">
-        <div class="nordvpn-status-v2-title">Proxy.vn 代理旋转状态</div>
-        <div class="nordvpn-status-v2-meta" id="rotatingProxyStatusMetaV2">正在读取本地 key/lease 状态…</div>
+        <div class="nordvpn-status-v2-title">Trạng thái Proxy.vn Proxy xoay</div>
+        <div class="nordvpn-status-v2-meta" id="rotatingProxyStatusMetaV2">Đang đọc trạng thái key/lease local…</div>
         <div class="nordvpn-status-v2-actions">
-          <button type="button" class="btn" id="btnRefreshRotatingProxyV2">刷新 key 列表</button>
+          <button type="button" class="btn" id="btnRefreshRotatingProxyV2">Làm mới danh sách key</button>
         </div>
         <div id="rotatingProxyKeysV2"></div>
       </div>`;
@@ -7367,7 +7373,7 @@ function renderConfigSectionV2(name, fields) {
       name,
       fields,
       proxyConfigSectionForKey,
-      ['代理池', 'Proxy.vn 代理旋转'],
+      ['代理池', 'Proxy.vn Proxy xoay'],
       { get: () => CONFIG_PROXY_ACTIVE_SECTION_V2, set: v => { CONFIG_PROXY_ACTIVE_SECTION_V2 = v; } },
       'proxy-section-v2'
     );
@@ -7602,8 +7608,26 @@ function bindViOtpServiceToolsV2() {
 
 function rotatingProxyDateV2(value) {
   const timestamp = Number(value);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) return '未知';
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return 'Chưa rõ';
   return new Date(timestamp * 1000).toLocaleString();
+}
+
+function rotatingProxyScopeLabelV2(value) {
+  const labels = {
+    registration: 'Đăng ký',
+    codex_oauth: 'Đăng nhập Codex',
+    codex_retry: 'Chạy bù Codex',
+    codex_agent: 'Codex Agent',
+    plan_check: 'Kiểm tra gói',
+    live_check: 'Kiểm tra tài khoản',
+    extract_link: 'Lấy link',
+    twofa_setup: 'Thiết lập 2FA',
+    twofa_retry: 'Chạy lại 2FA',
+    twofa_change: 'Đổi 2FA',
+    email_change: 'Đổi email',
+  };
+  const scope = String(value || '').trim();
+  return labels[scope.toLowerCase()] || scope || 'Không xác định';
 }
 
 function renderRotatingProxyStatusV2(data) {
@@ -7615,22 +7639,22 @@ function renderRotatingProxyStatusV2(data) {
   status.classList.toggle('is-warning', !!data.enabled && !data.configured);
   status.classList.toggle('is-muted', !data.enabled || !data.configured);
   meta.textContent = data.enabled
-    ? (data.configured ? `已启用 · ${data.keys?.length || 0} 个本地 key · ${data.leases?.length || 0} 个 lane lease` : '已开启但未配置 API Key')
-    : '未启用';
+    ? (data.configured ? `Đã bật · ${data.keys?.length || 0} key local · ${data.leases?.length || 0} lease lane` : 'Đã bật nhưng chưa cấu hình API Key')
+    : 'Chưa bật';
   const keys = Array.isArray(data.keys) ? data.keys : [];
   const leases = Array.isArray(data.leases) ? data.leases : [];
   if (!keys.length && !leases.length) {
-    list.innerHTML = '<div class="config-section-v2-subhelp">暂无本地 key/lease</div>';
+    list.innerHTML = '<div class="config-section-v2-subhelp">Chưa có key/lease local</div>';
     return;
   }
   list.innerHTML = `
-    <div class="config-section-v2-subhelp">Key 列表</div>
+    <div class="config-section-v2-subhelp">Danh sách key</div>
     <div class="mono" style="display:grid;gap:4px;margin-top:6px;">
-      ${keys.map(item => `<div>${esc(item.key)} · 到期 ${esc(rotatingProxyDateV2(item.expires_at))} · lane ${esc((item.assignments || []).map(one => `${one.scope}:${one.lane_id}`).join(', ') || '未分配')}</div>`).join('')}
+      ${keys.map(item => `<div>${esc(item.key)} · hết hạn ${esc(rotatingProxyDateV2(item.expires_at))} · lane ${esc((item.assignments || []).map(one => `${rotatingProxyScopeLabelV2(one.scope)}:${one.lane_id}`).join(', ') || 'Chưa gán')}</div>`).join('')}
     </div>
-    ${leases.length ? `<div class="config-section-v2-subhelp" style="margin-top:12px;">当前 lane lease</div>
+    ${leases.length ? `<div class="config-section-v2-subhelp" style="margin-top:12px;">Lease lane hiện tại</div>
       <div class="mono" style="display:grid;gap:4px;margin-top:6px;">
-        ${leases.map(item => `<div>${esc(item.scope || 'registration')}:${esc(item.lane_id)} · ${esc(item.key)} · ${esc(item.proxy)} · 到期 ${esc(rotatingProxyDateV2(item.proxy_expires_at))}</div>`).join('')}
+        ${leases.map(item => `<div>${esc(rotatingProxyScopeLabelV2(item.scope || 'registration'))}:${esc(item.lane_id)} · ${esc(item.key)} · ${esc(item.proxy)} · hết hạn ${esc(rotatingProxyDateV2(item.proxy_expires_at))}</div>`).join('')}
       </div>` : ''}
   `;
 }
@@ -7645,7 +7669,7 @@ async function loadRotatingProxyStatusV2(refresh = false) {
     });
     renderRotatingProxyStatusV2(result);
   } catch (e) {
-    if (meta) meta.textContent = `读取失败: ${e.message}`;
+    if (meta) meta.textContent = `Đọc thất bại: ${e.message}`;
   } finally {
     if (button) button.disabled = false;
   }

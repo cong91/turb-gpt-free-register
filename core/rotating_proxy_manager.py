@@ -118,6 +118,7 @@ class RotatingProxyManager:
             keys = list(self.client.list_keys())
         except Exception as exc:
             raise RotatingProxyError(f"无法获取 proxy.vn keyxoay 列表: {exc}") from exc
+        logger.debug("[RotatingProxy] provider inventory refreshed: active_keys=%s", len(keys))
         self.store.sync_keys(keys)
         refreshed_key_set = {
             str(item.get("key") or "").strip()
@@ -143,6 +144,8 @@ class RotatingProxyManager:
         lease: dict[str, Any] | None,
         *,
         excluded: set[str] | None = None,
+        scope: str = "registration",
+        lane_id: int | None = None,
     ) -> dict[str, Any]:
         if lease:
             key = str(lease.get("rotating_key") or "").strip()
@@ -164,6 +167,11 @@ class RotatingProxyManager:
         if candidate is not None:
             return candidate
         try:
+            logger.info(
+                "[RotatingProxy] purchasing one key: scope=%s lane=%s no unclaimed key remains",
+                scope,
+                lane_id if lane_id is not None else "-",
+            )
             return self._purchase_and_store(1)[0]
         except Exception as exc:
             raise RotatingProxyError(f"没有可用 keyxoay，购买新 key thất bại: {exc}") from exc
@@ -232,8 +240,21 @@ class RotatingProxyManager:
                     occupied_keys.add(key)
 
             missing = max(0, target - len(active_keys - occupied_keys))
+            logger.info(
+                "[RotatingProxy] inventory check: scope=%s target_lanes=%s active_keys=%s occupied_keys=%s missing=%s",
+                lane_scope,
+                target,
+                len(active_keys),
+                len(occupied_keys),
+                missing,
+            )
             known_keys = {str(item.get("rotating_key") or "").strip() for item in self.store.list_keys()}
             while missing:
+                logger.info(
+                    "[RotatingProxy] purchasing missing keys: scope=%s quantity=%s",
+                    lane_scope,
+                    missing,
+                )
                 purchased = self._purchase_and_store(missing)
                 new_keys = []
                 for item in purchased:
@@ -286,6 +307,13 @@ class RotatingProxyManager:
                 and not self._key_expired(key_info)
             ):
                 if self._proxy_healthy(str(existing["proxy_url"])):
+                    logger.info(
+                        "[RotatingProxy] reuse cached proxy: scope=%s lane=%s key=%s ttl=%ss",
+                        lane_scope,
+                        lane,
+                        _mask_key(existing.get("rotating_key")),
+                        max(0, int(float(existing.get("proxy_expires_at") or 0) - now)),
+                    )
                     return RotatingProxyLease(
                         scope=lane_scope,
                         lane_id=lane,
@@ -306,7 +334,12 @@ class RotatingProxyManager:
             failed_attempts: dict[str, int] = {}
             last_error: Exception | None = None
             for _ in range(3):
-                key_info = self._key_for_lane(existing, excluded=excluded_keys)
+                key_info = self._key_for_lane(
+                    existing,
+                    excluded=excluded_keys,
+                    scope=lane_scope,
+                    lane_id=lane,
+                )
                 key = str(key_info.get("rotating_key") or "").strip()
                 if not key:
                     raise RotatingProxyError("Không xác định được keyxoay cho lane")
@@ -391,6 +424,13 @@ class RotatingProxyManager:
                     assigned_at=existing.get("assigned_at") if existing else now,
                 )
                 if persisted:
+                    logger.info(
+                        "[RotatingProxy] assigned new proxy: scope=%s lane=%s key=%s ttl=%ss",
+                        lane_scope,
+                        lane,
+                        _mask_key(key),
+                        ttl_seconds,
+                    )
                     return RotatingProxyLease(
                         scope=lane_scope,
                         lane_id=lane,
