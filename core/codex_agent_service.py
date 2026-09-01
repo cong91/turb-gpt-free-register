@@ -69,7 +69,7 @@ def _prepare_proxy_inventory() -> None:
         return
     with _PROXY_INVENTORY_LOCK:
         if not _PROXY_INVENTORY_READY:
-            prepare_rotating_proxy_lanes(_WORKERS, scope=CODEX_AGENT_PROXY_SCOPE)
+            prepare_rotating_proxy_lanes(1, scope=CODEX_AGENT_PROXY_SCOPE)
             _PROXY_INVENTORY_READY = True
 
 

@@ -362,6 +362,15 @@ class RotatingProxyManagerTests(unittest.TestCase):
             ["key-1", "purchased-1-1", "purchased-1-2"],
         )
 
+    def test_repeated_inventory_prepare_does_not_purchase_again_for_same_scope(self):
+        client = _FakeRotatingProxyClient([])
+        manager = self._manager(client)
+
+        manager.ensure_key_inventory(1, scope="plan_check")
+        manager.ensure_key_inventory(1, scope="plan_check")
+
+        self.assertEqual(client.purchase_calls, 1)
+
     def test_ensure_key_inventory_excludes_keys_claimed_by_another_scope(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
         manager = self._manager(client)
@@ -800,7 +809,7 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
         ), patch.object(twofa_service, "prepare_rotating_proxy_lanes") as prepare:
             twofa_service._prepare_proxy_inventory()
 
-        prepare.assert_called_once_with(2, scope="twofa_setup")
+        prepare.assert_called_once_with(1, scope="twofa_setup")
 
     def test_totp_setup_worker_uses_rotating_proxy_lease(self):
         from core import twofa_service

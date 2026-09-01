@@ -77,6 +77,7 @@ _LEGACY_TABLES = {"outlook": "outlook_pool", "generic_api": "generic_api_pool", 
 _CODEX_EXPORT_STATE = _LEGACY_CODEX_EXPORT_STATE
 _PERSONAL_INFO_CHANGE_STATE_KEY = "personal_info_change_batches"
 _MAX_PERSONAL_INFO_CHANGE_BATCHES = 32
+_REGISTRATION_JOB_SEQUENCE_KEY = "registration_job_next_id"
 
 _LEGACY_SQLITE = _LEGACY_DATA_DIR / "registrations.db"
 _LEGACY_OUTLOOK_JSON = _LEGACY_DATA_DIR / "outlook_accounts.json"
@@ -565,6 +566,43 @@ def _write_json(path: Path, data: Any) -> None:
 def _next_id(items: list[dict]) -> int:
     ids = [int(item.get("id") or 0) for item in items]
     return (max(ids) if ids else 0) + 1
+
+
+def _next_registration_job_id(rows: list[dict]) -> int:
+    """Reserve a job ID that remains unique after job records are deleted."""
+    current_max = max((int(item.get("id") or 0) for item in rows), default=0)
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            stored = conn.execute(
+                "SELECT value FROM storage_meta WHERE key = ?",
+                (_REGISTRATION_JOB_SEQUENCE_KEY,),
+            ).fetchone()
+            try:
+                stored_next = int(stored["value"]) if stored else 1
+            except (TypeError, ValueError):
+                stored_next = 1
+
+            qan8_max = 0
+            if _table_exists(conn, "qan8_assignments"):
+                for item in conn.execute("SELECT job_id FROM qan8_assignments"):
+                    try:
+                        qan8_max = max(qan8_max, int(str(item["job_id"])))
+                    except (TypeError, ValueError):
+                        continue
+
+            next_id = max(stored_next, current_max + 1, qan8_max + 1, 1)
+            conn.execute(
+                "INSERT INTO storage_meta(key, value) VALUES(?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_REGISTRATION_JOB_SEQUENCE_KEY, str(next_id + 1)),
+            )
+            conn.commit()
+            return next_id
+        except Exception:
+            conn.rollback()
+            raise
 
 
 def _outlook_line(row: dict) -> str:
@@ -1894,6 +1932,21 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
             row["eligible_offer_ids"] = result.get("eligible_offer_ids") or []
             row["plan_last_success_at"] = result.get("checked_at") or _now()
             row["plan_last_success_result_json"] = json.dumps(result, ensure_ascii=False)
+
+            if (
+                str(result.get("current_plan_type") or "").strip().lower() == "free"
+                and result.get("plus_trial_eligible") is False
+                and row.get("free_plus_exported_at")
+            ):
+                # A fresh plan check confirms that a previously exported account no
+                # longer has the Plus trial; clear the stale export marker and archive flag.
+                row["free_plus_exported_at"] = None
+                row["free_plus_export_count"] = 0
+                row["free_plus_export_format"] = None
+                row["free_plus_export_source"] = None
+                if row.get("archived"):
+                    row["archived"] = False
+                    row["archived_at"] = None
         row["plan_check_proxy_mode"] = result.get("proxy_mode")
         row["plan_check_network_route"] = result.get("network_route")
         row["plan_check_proxy_used"] = result.get("proxy_used")
@@ -3877,7 +3930,7 @@ def _new_job_row(
     log_file = str(_LOG_DIR / f"{job_uuid}.log")
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
     return {
-        "id": _next_id(rows),
+        "id": _next_registration_job_id(rows),
         "job_uuid": job_uuid,
         "job_type": job_type,
         "parent_job_id": parent_job_id,

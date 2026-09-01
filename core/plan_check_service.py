@@ -319,7 +319,7 @@ def enqueue_account_plan_check(
     try:
         with _EXECUTOR_LOCK:
             if _EXECUTOR is None:
-                prepare_rotating_proxy_lanes(_WORKERS, scope=PLAN_CHECK_PROXY_SCOPE)
+                prepare_rotating_proxy_lanes(1, scope=PLAN_CHECK_PROXY_SCOPE)
             executor = _get_executor_locked()
             _ACTIVE_TASKS += 1
             task_counted = True
