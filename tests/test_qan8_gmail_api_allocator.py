@@ -1,6 +1,7 @@
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,9 +18,12 @@ class _FakeClient:
     def __init__(self):
         self.created = []
         self.lookups = []
+        self.proxy_url = ""
+        self.seen_proxy_urls = []
 
     def create_order(self, out_order_no, *, quantity=1):
         self.created.append((out_order_no, quantity))
+        self.seen_proxy_urls.append(self.proxy_url)
         number = len(self.created)
         return Qan8Order(
             order_no=out_order_no,
@@ -29,6 +33,7 @@ class _FakeClient:
 
     def get_order(self, order_no):
         self.lookups.append(order_no)
+        self.seen_proxy_urls.append(self.proxy_url)
         number = next(index for index, item in enumerate(self.created, 1) if item[0] == order_no)
         return Qan8Order(
             order_no=order_no,
@@ -64,6 +69,31 @@ class Qan8GmailApiAllocatorTests(unittest.TestCase):
         self.assertEqual(batch["effective_workers"], 3)
         self.assertEqual(len(self.client.created), 0)
         self.assertEqual(self.store.batch_status(batch["batch_id"])["active_sources"], 0)
+
+    def test_purchase_uses_one_nordvpn_route_for_the_full_cycle(self):
+        batch = self.allocator.create_batch(1, requested_workers=1, aliases_per_source=12)
+
+        @contextmanager
+        def proxy_context(*, owner_id):
+            self.assertTrue(owner_id.startswith("qan8-api:"))
+            yield "socks5://127.0.0.1:25000"
+
+        with patch("core.nordvpn_wireguard.proxy_for_qan8_api", side_effect=proxy_context), \
+             patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=True):
+            self.allocator.acquire_account(batch["batch_id"], "job-1", 0)
+
+        self.assertEqual(self.client.seen_proxy_urls, ["socks5://127.0.0.1:25000"])
+        self.assertEqual(self.client.proxy_url, "")
+
+    def test_explicit_qan8_proxy_skips_nordvpn_route(self):
+        self.client.proxy_url = "http://proxy.example:8080"
+        batch = self.allocator.create_batch(1, requested_workers=1, aliases_per_source=12)
+
+        with patch("core.nordvpn_wireguard.proxy_for_qan8_api") as wireguard_proxy:
+            self.allocator.acquire_account(batch["batch_id"], "job-1", 0)
+
+        wireguard_proxy.assert_not_called()
+        self.assertEqual(self.client.seen_proxy_urls, ["http://proxy.example:8080"])
 
     def test_three_lanes_get_distinct_sources(self):
         batch = self.allocator.create_batch(3, requested_workers=3, aliases_per_source=12)

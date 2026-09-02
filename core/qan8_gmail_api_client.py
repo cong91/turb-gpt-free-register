@@ -12,6 +12,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_QAN8_API_BASE = "https://shop.qan8.com"
 DEFAULT_QAN8_REQUEST_TIMEOUT = 15
+DEFAULT_QAN8_API_PROXY = ""
+_QAN8_PROXY_SCHEMES = {"http", "https", "socks5", "socks5h"}
 _GMAIL_EMAIL = re.compile(r"^[a-z0-9][a-z0-9.+'-]*@(gmail\.com|googlemail\.com)$")
 
 
@@ -51,6 +53,30 @@ def _config_value(name: str, default: object) -> object:
         return default
 
 
+def _normalize_proxy_url(value: object) -> str:
+    """Normalize and validate the optional proxy used only for QAN8 HTTP calls."""
+    text = str(value or "").strip()
+    if not text:
+        return DEFAULT_QAN8_API_PROXY
+    try:
+        if "://" not in text:
+            from config.proxy import normalize_proxy_url
+
+            text = normalize_proxy_url(text)
+        parsed = urlsplit(text)
+        if (
+            parsed.scheme.lower() not in _QAN8_PROXY_SCHEMES
+            or not parsed.hostname
+            or parsed.port is None
+        ):
+            raise ValueError("unsupported proxy URL")
+    except (TypeError, ValueError) as exc:
+        raise Qan8GmailApiError(
+            "QAN8 API proxy must be a valid http(s):// or socks5(h):// URL"
+        ) from exc
+    return text
+
+
 class Qan8GmailApiClient:
     """HTTP-only adapter for QAN8's documented simple API."""
 
@@ -61,6 +87,7 @@ class Qan8GmailApiClient:
         api_key: str | None = None,
         sku_id: int | str | None = None,
         request_timeout: float | None = None,
+        proxy_url: str | None = None,
     ) -> None:
         self.api_base = str(
             api_base if api_base is not None else _config_value("QAN8_API_BASE", DEFAULT_QAN8_API_BASE)
@@ -77,6 +104,10 @@ class Qan8GmailApiClient:
             self.request_timeout = max(1, int(raw_timeout))
         except (TypeError, ValueError):
             self.request_timeout = DEFAULT_QAN8_REQUEST_TIMEOUT
+        raw_proxy = proxy_url if proxy_url is not None else _config_value(
+            "QAN8_API_PROXY", DEFAULT_QAN8_API_PROXY
+        )
+        self.proxy_url = _normalize_proxy_url(raw_proxy)
 
     def list_products(self) -> list[dict]:
         payload = self._get("/api/v1/open/products", authenticated=False)
@@ -189,6 +220,11 @@ class Qan8GmailApiClient:
     def _request(self, method: str, path: str, **kwargs: object) -> object:
         url = f"{self.api_base}{path}"
         kwargs.setdefault("timeout", self.request_timeout)
+        if self.proxy_url:
+            kwargs.setdefault(
+                "proxies",
+                {"http": self.proxy_url, "https": self.proxy_url},
+            )
         if method == "GET":
             response = requests.get(url, **kwargs)
         elif method == "POST":
