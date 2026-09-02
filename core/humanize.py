@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """随机化操作节奏，让协议流程更接近人工浏览器操作。"""
 import logging
 import random
@@ -24,7 +23,7 @@ def delay(kind: str = "api", *, minimum: float | None = None, maximum: float | N
             minimum = lo if minimum is None else minimum
             maximum = hi if maximum is None else maximum
         factor = float(getattr(_cfg, "HUMANIZE_DELAY_FACTOR", 1.0) or 1.0)
-    except Exception:
+    except Exception:  # noqa: BLE001
         minimum = 0.4 if minimum is None else minimum
         maximum = 1.2 if maximum is None else maximum
         factor = 1.0

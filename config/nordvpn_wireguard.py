@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """NordVPN WireGuard proxy configuration.
 
 Thay thế NordVPN CLI bằng cách dùng trực tiếp WireGuard .conf của NordVPN

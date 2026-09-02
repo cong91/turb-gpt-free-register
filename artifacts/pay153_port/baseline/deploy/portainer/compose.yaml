@@ -1,0 +1,22 @@
+services:
+  portainer:
+    container_name: portainer
+    image: portainer/portainer-ce:lts@sha256:511f3f06c96fe3b993ebeaafde311c1959cae73a7ef825dba6397d51b450dffa
+    restart: unless-stopped
+    command: --no-setup-token
+    ports:
+      - "127.0.0.1:9443:9443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - portainer_data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  portainer_data:
+    name: portainer_data

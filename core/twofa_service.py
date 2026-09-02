@@ -1,11 +1,9 @@
-# -*- coding: utf-8 -*-
 """账号 2FA/TOTP 后台设置队列。"""
 from __future__ import annotations
 
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
 
 from config import email as _email_cfg
@@ -18,6 +16,7 @@ from core.rotating_proxy_runtime import (
     resolve_rotating_proxy,
 )
 from core.session import BrowserSession
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +71,7 @@ def is_running(acc_id: int) -> bool:
 def _append_log(email: str, line: str, *, clear: bool = False) -> None:
     p = log_path(email)
     p.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%H:%M:%S")
+    stamp = local_now().strftime("%H:%M:%S")
     mode = "w" if clear else "a"
     with p.open(mode, encoding="utf-8") as f:
         f.write(f"{stamp} [INFO] {line}\n")
@@ -133,7 +132,7 @@ def _run_twofa(
             logger.exception("[2FA] 写回失败状态失败: account_id=%s", account_id)
         try:
             _append_log(email, f"[2FA] 失败：{result['error']}")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         logger.exception("[2FA] 后台异常: %s", email)
         return result
@@ -148,7 +147,7 @@ def _run_twofa(
             try:
                 root_logger.removeHandler(fh)
                 fh.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         with _LOCK:
             _RUNNING.discard(int(account_id))
@@ -192,7 +191,7 @@ def enqueue_account_totp_setup(
             proxy_lane_id=proxy_lane_id,
         )
         return {"accepted": True, "busy": False, "future": future, "log_path": str(log_path(email))}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         _QUEUE_SLOTS.release()
         db.update_account_totp_secret(account_id, {"ok": False, "status": "failed", "error": f"{type(exc).__name__}: {exc}"})
         return {"accepted": False, "busy": False, "error": f"{type(exc).__name__}: {exc}"}

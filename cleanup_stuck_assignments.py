@@ -1,11 +1,11 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Clean up stuck active assignments in batch database."""
 import sqlite3
 import sys
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from core.app_state_db import APP_STATE_DB_PATH
+from core.time_utils import local_now
 
 db_path = APP_STATE_DB_PATH
 
@@ -21,7 +21,7 @@ print("Cleanup Stuck Active Assignments")
 print("=" * 70)
 
 # Find stuck active assignments (older than 10 minutes)
-cutoff = (datetime.now() - timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
+cutoff = (local_now() - timedelta(minutes=10)).strftime('%Y-%m-%d %H:%M:%S')
 
 stuck = conn.execute('''
     SELECT assignment_id, job_id, created_at

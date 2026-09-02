@@ -94,6 +94,7 @@ EMAIL_SOURCE = "outlook,generic_api,gmail_api_url"
 - 配置页支持热加载，保存后无需重启。
 - Roxy 团队/项目可在配置页获取并保存。
 - 代理池配置支持 Proxy.vn 代理旋转：注册、Codex OAuth/补跑、查活、套餐、提链、2FA、改邮箱和 Codex Agent 等账号 workflow 都通过持久 lease 取 proxy；同一 `scope/lane` 复用 proxy TTL，`keyxoay` 在所有 scope 之间全局不重复。
+- 独立「Extract URL」工作区只列出 `free + Plus 试用资格` 账号，可单选/多选并选择 PAY.153 支付方式。`auto` 固定走本地 PAY.153；代理模式支持旋转、代理池下拉或手动输入。MoMo/PIX/Hosted 使用 1 条线路，PH/GCash 使用 checkout + promotion 两条线路，PayPal/UPI/Kakao 使用 payment + promotion 两条线路，iDEAL/TWINT 使用 entry + payment 两条线路。
 
 ### Proxy.vn 代理旋转
 

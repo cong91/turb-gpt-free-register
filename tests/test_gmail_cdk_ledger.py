@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import json
 import tempfile
 import threading
@@ -59,7 +58,7 @@ class GmailCdkLedgerTests(unittest.TestCase):
                     "SECRET-CDK", self.variants, f"job-{index}", remote_remaining=6, configured_limit=6
                 )
                 emails.append(slot.email)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
 
         threads = [threading.Thread(target=reserve, args=(index,)) for index in range(6)]

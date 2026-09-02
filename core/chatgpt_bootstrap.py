@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """ChatGPT 前端 bootstrap 预热链路。
 
 根据 docs/protocol_fingerprint_har_analysis.md / protocol_har_summary.json
@@ -9,10 +8,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Iterable
+from collections.abc import Iterable
 
-from core.session import BrowserSession
 from core.sentinel import generate_requirements_token
+from core.session import BrowserSession
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +67,7 @@ def _maybe_chat_requirements_finalize(session: BrowserSession, base: str, refere
         return None
     try:
         data = prepare_resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     if not isinstance(data, dict):
         return None

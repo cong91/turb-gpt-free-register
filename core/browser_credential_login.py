@@ -195,7 +195,7 @@ def _select_matching_account(driver, email: str, timeout: float = 12.0) -> bool:
                     element.click()
                     logger.info("[Codex][Credential] 已选择匹配的 OAuth account chooser 项")
                     return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Codex][Credential] account chooser 选择失败，继续等待：%s", str(exc)[:120])
         time.sleep(0.4)
     return False

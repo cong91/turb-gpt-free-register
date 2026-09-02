@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 RoxyBrowser 指纹浏览器自动化注册配置。
 
@@ -7,8 +6,7 @@ RoxyBrowser 指纹浏览器自动化注册配置。
 - 所有接口请求头必须带 token
 - 可配合 Selenium / Puppeteer / Playwright 自动化
 """
-from config.env_loader import env_str, apply_env_overrides
-
+from config.env_loader import apply_env_overrides, env_str
 
 # 注册驱动：
 #   "protocol"     = 原有 curl_cffi 纯协议注册（容易封号，不建议）

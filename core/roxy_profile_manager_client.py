@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Strict, normalized RoxyBrowser API adapter for profile management."""
 from __future__ import annotations
 

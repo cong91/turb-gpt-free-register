@@ -12,7 +12,6 @@ import logging
 import random
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode, urlparse
@@ -21,6 +20,7 @@ import pyotp
 
 from core.humanize import delay as human_delay
 from core.session import BrowserSession
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ def _post_register_dwell_seconds() -> float:
         from config import register as _register_cfg
 
         raw = str(getattr(_register_cfg, "POST_REGISTER_DWELL_SECONDS_RANGE", "18,45") or "0,0").strip()
-    except Exception:
+    except Exception:  # noqa: BLE001
         raw = "0,0"
     try:
         parts = [float(x.strip()) for x in raw.replace(";", ",").replace("|", ",").split(",") if x.strip()]
@@ -45,7 +45,7 @@ def _post_register_dwell_seconds() -> float:
             lo = hi = parts[0]
         else:
             lo, hi = parts[0], parts[1]
-    except Exception:
+    except Exception:  # noqa: BLE001
         lo = hi = 0.0
     lo, hi = max(0.0, lo), max(0.0, hi)
     if hi < lo:
@@ -107,7 +107,7 @@ def _json_object_response(response, *, action: str) -> dict:
             f"url={str(getattr(response, 'url', '') or '')[:160]}"
         ) from exc
     if not isinstance(payload, dict):
-        raise RuntimeError(
+        raise RuntimeError(  # noqa: TRY004 - public transport errors preserve the existing API contract.
             f"{action} response is not a JSON object: "
             f"status={getattr(response, 'status_code', 0)}"
         )
@@ -123,19 +123,19 @@ class BrowserPageTransport:
         try:
             cookie = self.driver.get_cookie("oai-did") or {}
             self.device_id = str(cookie.get("value") or "")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def navigator_language(self) -> str:
         try:
             return str(self.driver.execute_script("return navigator.language") or "en-US")
-        except Exception:
+        except Exception:  # noqa: BLE001
             return "en-US"
 
     def js_timezone_offset_min(self) -> int:
         try:
             return int(self.driver.execute_script("return new Date().getTimezoneOffset()") or 0)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return 0
 
     def _request(self, method: str, url: str, headers: dict | None = None, data: str | None = None):
@@ -164,7 +164,7 @@ class BrowserPageTransport:
             try:
                 previous_timeout = getattr(self.driver, "script_timeout", None)
                 set_timeout(timeout)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 previous_timeout = None
         try:
             payload = self.driver.execute_async_script(script, method, url, headers or {}, data)
@@ -172,7 +172,7 @@ class BrowserPageTransport:
             if callable(set_timeout) and previous_timeout is not None:
                 try:
                     set_timeout(previous_timeout)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
         return _ScriptResponse(payload or {"status": 0, "text": "browser request returned no response"})
 
@@ -223,20 +223,20 @@ class BrowserContextTransport:
             for cookie in cookies:
                 if cookie.get("name") == name:
                     return str(cookie.get("value") or "")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return ""
 
     def navigator_language(self) -> str:
         try:
             return str(self.page.evaluate("() => navigator.language") or "en-US")
-        except Exception:
+        except Exception:  # noqa: BLE001
             return "en-US"
 
     def js_timezone_offset_min(self) -> int:
         try:
             return int(self.page.evaluate("() => new Date().getTimezoneOffset()") or 0)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return 0
 
     def _headers(self, headers: dict | None) -> dict:
@@ -305,7 +305,7 @@ def _account_material_line(email: str, row: dict | None = None) -> str:
             try:
                 extra = json.loads(str(row.get("extra_json") or ""))
                 password = str(extra.get("registration_password") or "").strip()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 password = ""
         if not password:
             password = str(row.get("password") or "").strip()
@@ -348,7 +348,7 @@ def _account_copy_line(
 
 def create_batch_archive_dir(count: int, workers: int = 1) -> Path:
     """为一次运行创建只读导出批次目录；SQLite 仍是唯一运行时 source of truth。"""
-    day = datetime.now().strftime("%Y%m%d")
+    day = local_now().strftime("%Y%m%d")
     base_name = f"{day}-{count}个" if workers <= 1 else f"{day}-{count}个-{workers}线程"
     folder = _ACCOUNTS_DIR / base_name
     suffix = 2
@@ -403,7 +403,7 @@ def _append_batch_archive(
         "totp_secret": totp_secret,
         "material_line": material_line,
         "copy_line": copy_line,
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "saved_at": local_now().isoformat(timespec="seconds"),
         "row": row,
         "extra": archive_extra,
     }
@@ -724,7 +724,7 @@ def setup_2fa(
             authenticated_bootstrap(session, access_token, strict=False)
             human_delay("navigate")
             logger.info("[2FA] accessToken 预热完成")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[2FA] accessToken 预热失败，继续按当前登录态执行：%s: %s", type(exc).__name__, str(exc)[:180])
 
     if reauth:
@@ -794,7 +794,7 @@ def setup_2fa(
                 )
                 try:
                     _reset_reauth_context(session)
-                except Exception as reset_exc:
+                except Exception as reset_exc:  # noqa: BLE001
                     logger.warning(
                         "[2FA] re-auth retry session reset failed: %s: %s",
                         type(reset_exc).__name__,
@@ -926,7 +926,7 @@ def save_account_data(
                 merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
                 merged_service.update(remail_metadata)
                 extra["email_service"] = merged_service
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[Save] 保存 Remail 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
                 type(exc).__name__,
@@ -997,7 +997,7 @@ def save_account_data(
         from config import twofa as _twofa_cfg
 
         auto_twofa = bool(getattr(_twofa_cfg, "ENABLE_2FA", False))
-    except Exception:
+    except Exception:  # noqa: BLE001
         auto_twofa = False
     if auto_twofa and not str(totp_secret or "").strip():
         try:
@@ -1016,7 +1016,7 @@ def save_account_data(
                 logger.info(f"[2FA] 账号已有 2FA 任务，注册流程不重复入队: id={row_id}, email={email}")
             else:
                 logger.warning(f"[2FA] 注册后自动开启 2FA 入队失败（不影响注册结果）: {email}, {queued.get('error')}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[2FA] 注册后自动开启 2FA 入队异常（不影响注册结果）: "
                 f"{email}, {type(exc).__name__}: {str(exc)[:180]}"
@@ -1030,7 +1030,7 @@ def save_account_data(
                 getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                 or getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
             )
-        except Exception:
+        except Exception:  # noqa: BLE001
             auto_plan_check = False
     if not auto_plan_check:
         logger.info(
@@ -1055,7 +1055,7 @@ def save_account_data(
             logger.info(f"[Plan] 账号已有套餐查询，注册流程不重复入队: id={row_id}, email={email}")
         else:
             logger.warning(f"[Plan] 注册后自动查询入队失败（不影响注册结果）: {email}, {queued.get('error')}")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             f"[Plan] 注册后自动查询入队异常（不影响注册结果）: "
             f"{email}, {type(exc).__name__}: {str(exc)[:180]}"

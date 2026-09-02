@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """浏览器注册流程的网络流量统计。
 
 统计的是浏览器侧能观察到的 HTTP 请求/响应字节，不会读取或保存请求内容。
@@ -13,8 +12,8 @@ import logging
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
 from typing import Any
+from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
@@ -167,7 +166,7 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
         try:
             emitter.on(event, callback)
             self._listeners.append((emitter, event, callback))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[%s] 注册流量监听失败 event=%s：%s", self.label, event, exc)
 
     def _attach(self) -> None:
@@ -198,24 +197,24 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
         """失败请求没有 sizes() 时，尽量估算已经发出的头/体。"""
         try:
             method = str(getattr(request, "method", "GET") or "GET")
-        except Exception:
+        except Exception:  # noqa: BLE001
             method = "GET"
         try:
             url = str(getattr(request, "url", "") or "")
-        except Exception:
+        except Exception:  # noqa: BLE001
             url = ""
-        header_bytes = len(f"{method} {url} HTTP/1.1\r\n".encode("utf-8"))
+        header_bytes = len(f"{method} {url} HTTP/1.1\r\n".encode())
         try:
             headers = request.headers or {}
             header_bytes += sum(
                 _value_size(name) + _value_size(value) + 4
                 for name, value in headers.items()
             ) + 2
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         try:
             body = request.post_data
-        except Exception:
+        except Exception:  # noqa: BLE001
             body = None
         return header_bytes + _payload_size(body) if body else header_bytes
 
@@ -231,7 +230,7 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
 
         try:
             sizes = request.sizes()
-        except Exception:
+        except Exception:  # noqa: BLE001
             # requestfailed 没有 response，sizes() 通常不可用。
             upload = self._request_fallback_upload(request)
             with self._lock:
@@ -294,7 +293,7 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
         for emitter, event, callback in self._listeners:
             try:
                 emitter.remove_listener(event, callback)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         self._listeners.clear()
 
@@ -334,7 +333,7 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
             # 对已经连接到指纹浏览器的 debuggerAddress 也尽量开启 Network 域；
             # 是否能读到 performance log 仍由对应的 ChromeDriver 决定。
             self.driver.execute_cdp_cmd("Network.enable", {})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[%s] Network.enable 失败，将尝试读取现有 performance log：%s", label, exc)
 
     @staticmethod
@@ -351,7 +350,7 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
         try:
             parsed = urlsplit(url)
             target = (parsed.path or "/") + (f"?{parsed.query}" if parsed.query else "")
-        except Exception:
+        except Exception:  # noqa: BLE001
             target = url
         headers = request.get("headers") or {}
         header_size = cls._header_size(headers, start_line=f"{method} {target} HTTP/1.1\r\n")
@@ -485,7 +484,7 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
         try:
             entries = self.driver.get_log("performance")
             self._log_supported = True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             if self._log_supported is not False:
                 logger.debug("[%s] 无法读取 performance log：%s", self.label, exc)
             self._log_supported = False
@@ -509,7 +508,8 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                     continue
                 self._handle_cdp_event(method, message.get("params") or {})
                 parsed += 1
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("解析 Chrome performance log 事件失败：%s: %s", type(exc).__name__, exc)
                 continue
         return parsed
 
@@ -539,7 +539,7 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
         """
         try:
             data = self.driver.execute_script(script)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return
         if not isinstance(data, dict):
             return

@@ -1,14 +1,13 @@
-# -*- coding: utf-8 -*-
 import unittest
-from datetime import date
 from unittest.mock import patch
 
 from core import profile_utils
+from core.time_utils import local_today
 
 
 class ProfileUtilsTests(unittest.TestCase):
     def test_default_birthday_range_is_strictly_under_thirty(self):
-        today = date.today()
+        today = local_today()
         oldest = profile_utils._shift_year_safe(today, -29)
         youngest = profile_utils._shift_year_safe(today, -18)
         span_days = (youngest - oldest).days
@@ -20,7 +19,7 @@ class ProfileUtilsTests(unittest.TestCase):
         randint.assert_called_once_with(0, span_days)
 
     def test_default_birthday_upper_boundary_is_eighteen(self):
-        today = date.today()
+        today = local_today()
         oldest = profile_utils._shift_year_safe(today, -29)
         youngest = profile_utils._shift_year_safe(today, -18)
         span_days = (youngest - oldest).days

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 QQ 邮箱 IMAP 客户端（Cloudflare 域名邮箱模式）
 
@@ -8,8 +7,8 @@ QQ 邮箱 IMAP 客户端（Cloudflare 域名邮箱模式）
 
 依赖：Python 标准库（imaplib, email, ssl），无新增第三方包。
 """
-import imaplib
 import email as email_lib
+import imaplib
 import logging
 import random
 import string
@@ -19,7 +18,7 @@ from email.header import decode_header
 from pathlib import Path
 
 from config import email as _email_cfg
-from core.otp_utils import looks_like_openai_email, extract_otp
+from core.otp_utils import extract_otp, looks_like_openai_email
 
 logger = logging.getLogger(__name__)
 
@@ -62,14 +61,14 @@ def _parse_email_date(msg) -> float | None:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         parsed = email_lib.utils.parsedate(date_str)
         if parsed:
             import calendar
             return calendar.timegm(parsed)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return None
 
@@ -89,7 +88,7 @@ def _get_msg_text(msg) -> str:
                     if payload:
                         charset = part.get_content_charset() or "utf-8"
                         text_parts.append(payload.decode(charset, errors="replace"))
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
         if text_parts:
             return "\n".join(text_parts)
@@ -106,7 +105,7 @@ def _get_msg_text(msg) -> str:
                     if payload:
                         charset = part.get_content_charset() or "utf-8"
                         return payload.decode(charset, errors="replace")
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
         return ""
 
@@ -116,7 +115,7 @@ def _get_msg_text(msg) -> str:
         if payload:
             charset = msg.get_content_charset() or "utf-8"
             return payload.decode(charset, errors="replace")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return ""
 
@@ -168,7 +167,7 @@ def _connect_imap() -> imaplib.IMAP4_SSL:
         return mail
     except imaplib.IMAP4.error as exc:
         raise QQMailClientError(f"QQ 邮箱 IMAP 登录失败: {exc}")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         raise QQMailClientError(f"QQ 邮箱 IMAP 连接失败: {exc}")
 
 
@@ -201,7 +200,7 @@ def _search_messages(mail: imaplib.IMAP4_SSL, after_dt: datetime | None = None) 
             msg = email_lib.message_from_bytes(raw_email)
             item = _msg_to_dict(msg)
             messages.append(item)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug(f"[QQMail] 解析邮件 {mid} 失败: {exc}")
             continue
 
@@ -293,7 +292,7 @@ def fetch_latest_otp(
             if mail:
                 try:
                     mail.logout()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
         # 按时间降序排列
@@ -323,7 +322,7 @@ def fetch_latest_otp(
                         datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
                         .timestamp()
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001
                     ts = 0.0
 
             if after_ts and ts < after_ts - 30:

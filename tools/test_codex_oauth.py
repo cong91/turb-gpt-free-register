@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Codex OAuth 单独验证脚本（2026-06-15 重写：全新 session + 接码方案）。
 
@@ -83,7 +82,7 @@ def main() -> int:
         return 0
     else:
         logger.error("=" * 60)
-        logger.error(f"❌ [FAIL] Codex OAuth 验证失败")
+        logger.error("❌ [FAIL] Codex OAuth 验证失败")
         logger.error(f"    status  = {result.get('status')}")
         logger.error(f"    message = {result.get('message')}")
         logger.error("=" * 60)

@@ -17,7 +17,6 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime
 
 import requests
 
@@ -27,6 +26,7 @@ from core.gmail_api_url_batch_store import (
     GmailApiUrlBatchError,
     GmailApiUrlBatchStore,
 )
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 _BEFORE_CODE_UNSET = object()
@@ -446,7 +446,7 @@ def _reconcile_batch_queue(store: GmailApiUrlBatchStore, batch_id: str) -> None:
                 int(assignment.job_id),
                 status="failed",
                 error="Worker registration không còn tồn tại sau khi tiến trình dừng",
-                completed_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                completed_at=local_now().astimezone().isoformat(timespec="seconds"),
             )
             job_status = "failed"
         if job is not None and job_status not in terminal_states:

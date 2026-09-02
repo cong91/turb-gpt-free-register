@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """RoxyBrowser 本地 API 客户端。"""
 from __future__ import annotations
 
@@ -207,7 +206,7 @@ class RoxyBrowserClient:
                 text = resp.text or ""
                 try:
                     payload = resp.json()
-                except Exception:
+                except Exception:  # noqa: BLE001
                     payload = {"raw": text}
                 if not (200 <= resp.status_code < 300):
                     raise RuntimeError(f"Roxy API 请求失败 {method_u} {path} HTTP {resp.status_code}: {text[:500]}")
@@ -238,7 +237,7 @@ class RoxyBrowserClient:
         """宽松请求：用于探测不同 Roxy 版本接口，失败不抛出。"""
         try:
             return True, self.request(method, path, params=params, json_body=json_body)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return False, f"{type(exc).__name__}: {exc}"
 
     @staticmethod
@@ -305,7 +304,7 @@ class RoxyBrowserClient:
             return wid, name
 
         def looks_like_workspace(item: dict) -> bool:
-            keys = {str(k).lower() for k in item.keys()}
+            keys = {str(k).lower() for k in item}
             joined = " ".join(keys)
             return any(x in joined for x in ("workspace", "team", "company", "org")) or ("id" in keys and "name" in keys)
 
@@ -323,7 +322,7 @@ class RoxyBrowserClient:
         walk(payload)
         dedup = {}
         for item in out:
-            raw_keys = {str(k).lower() for k in (item.get("raw") or {}).keys()}
+            raw_keys = {str(k).lower() for k in (item.get("raw") or {})}
             if "dirid" in raw_keys and not any(k in raw_keys for k in ("workspaceid", "teamid", "companyid")):
                 continue
             key = f"{item.get('id')}::{item.get('projectId','')}"
@@ -517,7 +516,7 @@ class RoxyBrowserClient:
         detail = rows[0] if isinstance(rows, list) and rows else _dig(payload, "data")
         actual = detail.get("proxyInfo") if isinstance(detail, dict) else None
         if not isinstance(actual, dict):
-            raise RuntimeError("Roxy 环境详情未返回 proxyInfo，拒绝在未验证代理时打开浏览器")
+            raise TypeError("Roxy 环境详情未返回 proxyInfo，拒绝在未验证代理时打开浏览器")
         actual_protocol = str(actual.get("protocol") or "").upper()
         actual_host = str(actual.get("host") or "").strip().lower()
         actual_port = str(actual.get("port") or "").strip()
@@ -586,7 +585,7 @@ class RoxyBrowserClient:
             params = dict(getattr(_cfg, "ROXY_OPEN_EXTRA_PARAMS", {}) or {})
             args = list(params.get("args") or [])
             if proxy and getattr(proxy, "tunnel", None) is not None:
-                proxy_arg = f"--proxy-server={str(proxy)}"
+                proxy_arg = f"--proxy-server={proxy!s}"
                 if proxy_arg not in args:
                     args.append(proxy_arg)
                 if "--proxy-bypass-list=<-loopback>" not in args:
@@ -649,7 +648,7 @@ class RoxyBrowserClient:
                 json_body=body if str(_cfg.ROXY_CLOSE_METHOD).upper() != "GET" else None,
             )
             logger.info("[Roxy] 已关闭环境：%s", profile_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[Roxy] 关闭环境失败：%s", exc)
 
     def delete_profile(self, profile_id: str) -> None:
@@ -669,7 +668,7 @@ class RoxyBrowserClient:
                 json_body=body if method.upper() != "GET" else None,
             )
             logger.info("[Roxy] 已删除环境：%s", profile_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[Roxy] 删除环境失败：%s", exc)
 
     def cleanup_profile(self, opened: RoxyOpenResult | None) -> None:
@@ -722,8 +721,7 @@ class RoxyBrowserClient:
         ])
         if port:
             port = str(port).strip()
-            if port.startswith(":"):
-                port = port[1:]
+            port = port.removeprefix(":")
             if port.isdigit():
                 return f"127.0.0.1:{port}"
         return None

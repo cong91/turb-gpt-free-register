@@ -1,8 +1,6 @@
-# -*- coding: utf-8 -*-
 import unittest
 
 from core.paymesh_aliases import (
-    MAX_PAYMESH_ROUTED_DOMAINS,
     PaymeshAliasError,
     alias_suffix,
     build_paymesh_alias_plan,

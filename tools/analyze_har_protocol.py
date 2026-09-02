@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """从 Reqorder/HAR JSON 抽取纯协议链路、指纹 p 数组、JS 入口与接口清单。"""
 from __future__ import annotations
 
@@ -24,7 +23,7 @@ def decode_sentinel_p(value: str):
     text = text.split("~", 1)[0]
     try:
         return json.loads(base64.b64decode(text).decode("utf-8"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -43,7 +42,7 @@ def short_body(text: str, limit: int = 260):
                 else:
                     out[k] = v
             return out
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return text[:limit]
 
@@ -122,7 +121,7 @@ def main():
         # body.p
         try:
             body = json.loads(post_text) if post_text else None
-        except Exception:
+        except Exception:  # noqa: BLE001
             body = None
         if isinstance(body, dict) and isinstance(body.get("p"), str):
             arr = decode_sentinel_p(body["p"])
@@ -135,7 +134,7 @@ def main():
             if h.get("name", "").lower() == "openai-sentinel-token":
                 try:
                     token = json.loads(h.get("value") or "{}")
-                except Exception:
+                except Exception:  # noqa: BLE001
                     token = {}
                 arr = decode_sentinel_p(token.get("p", ""))
                 if isinstance(arr, list):

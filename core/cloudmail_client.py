@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """CloudMail/Cloud Mail API 邮箱客户端。"""
 from __future__ import annotations
 
@@ -44,7 +43,7 @@ def _base_url(value: str | None = None) -> str:
     base = str(value if value is not None else getattr(_email_cfg, "CLOUDMAIL_API_BASE", "") or "").strip().rstrip("/")
     if not base:
         raise CloudMailError("CloudMail API 地址未配置，请填写 CLOUDMAIL_API_BASE（例如 https://你的worker自定义域）。")
-    if not re.match(r"^https?://", base, re.I):
+    if not re.match(r"^https?://", base, re.IGNORECASE):
         base = "https://" + base
     return base
 
@@ -103,7 +102,7 @@ def gen_token(email: str | None = None, password: str | None = None, path: str |
                 timeout=REQUEST_TIMEOUT,
             )
             payload = resp.json()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = f"{token_path}: {type(exc).__name__}: {exc}"
             continue
         code = payload.get("code") if isinstance(payload, dict) else None
@@ -264,7 +263,7 @@ def fetch_domains(force: bool = False) -> list[str]:
                 logger.info("[CloudMail] 已从平台获取可用域名：%s", ",".join(domains))
                 return list(domains)
             errors.append(f"{path}: 响应中没有 domainList")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             errors.append(f"{path}: {type(exc).__name__}: {exc}")
 
     raise CloudMailError("CloudMail 自动获取域名失败：" + "；".join(errors))
@@ -404,7 +403,7 @@ def fetch_latest_otp(
                 return best_otp
         except CloudMailError as exc:
             last_error = str(exc)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}: {exc}"
 
         remaining = deadline - time.monotonic()

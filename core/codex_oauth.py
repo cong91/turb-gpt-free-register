@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 注册成功后的 Codex OAuth 授权模块（2026-06-15 改造：协议模式全新 session + 接码）。
 
@@ -19,7 +18,6 @@ caller 明确传入现有 driver/session 时才复用，并会先清理授权状
 build_codex_storage / save_codex_credential）沿用原流程。
 """
 import base64
-from contextlib import contextmanager
 import contextvars
 import hashlib
 import json
@@ -27,8 +25,9 @@ import logging
 import random
 import secrets
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urlparse, parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import pyotp
 
@@ -36,7 +35,6 @@ import pyotp
 # 协议级常量（CLIENT_ID/URL/SCOPE/OUTPUT_DIRNAME）虽然不会改，统一从 _cfg 读，
 # 这样 reload 后立即生效，不用再分两套导入。
 from config import codex as _cfg
-
 
 _SUB2_CALLBACK_OVERRIDE: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "sub2_callback_override",
@@ -62,22 +60,22 @@ def sub2_callback_override(path: str, extra_body: dict[str, object]):
         yield
     finally:
         _SUB2_CALLBACK_OVERRIDE.reset(token)
-from core.session import BrowserSession
+from curl_cffi import requests as curl_requests
+
+from core import db, sms_provider
 from core.humanize import delay as human_delay
 from core.openai_auth import (
-    _is_transient_network_error,
+    AccountUnusableError,
     _extract_error_code,
-    detect_account_unusable_response_body,
+    _is_transient_network_error,
     account_unusable_error_message,
     account_unusable_message,
-    AccountUnusableError,
-    request_sentinel_token,
     build_sentinel_header,
+    detect_account_unusable_response_body,
     network_preflight,
+    request_sentinel_token,
 )
-from core import db
-from core import sms_provider
-from curl_cffi import requests as curl_requests
+from core.session import BrowserSession
 
 logger = logging.getLogger(__name__)
 
@@ -146,12 +144,12 @@ def _account_registration_password(email: str) -> str:
         if isinstance(extra_raw, str) and extra_raw.strip():
             try:
                 extra = json.loads(extra_raw)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 extra = {}
         elif isinstance(extra_raw, dict):
             extra = extra_raw
         return str(extra.get("registration_password") or acc.get("registration_password") or "").strip()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -162,7 +160,7 @@ def _account_totp_secret(email: str) -> str:
         if not acc:
             return ""
         return str(acc.get("totp_secret") or "").strip()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -225,7 +223,7 @@ def _ensure_oai_context_url(auth_url: str, session: BrowserSession) -> str:
             return auth_url
         query = urlencode(params, doseq=True)
         return parsed._replace(query=query).geturl()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return auth_url
 
 
@@ -280,7 +278,7 @@ def _cpa_request_json(method: str, path: str, body: dict | None = None) -> dict:
         )
         try:
             payload = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             payload = {}
         if resp.status_code < 200 or resp.status_code >= 300:
             msg = ""
@@ -294,7 +292,7 @@ def _cpa_request_json(method: str, path: str, body: dict | None = None) -> dict:
     finally:
         try:
             session.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -357,7 +355,7 @@ def _sub2_codex_request_json(
         )
         try:
             payload = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             payload = {}
         if resp.status_code < 200 or resp.status_code >= 300:
             msg = ""
@@ -371,7 +369,7 @@ def _sub2_codex_request_json(
     finally:
         try:
             session.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -421,7 +419,7 @@ def _summarize_sub2_response(payload: dict) -> str:
         if isinstance(payload, dict):
             compact = {k: payload.get(k) for k in ("code", "message", "success") if k in payload}
             return str(compact or payload)[:300]
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return str(payload)[:300]
 
@@ -522,7 +520,7 @@ def _submit_sub2_callback(callback_url: str, *, session_id: str = "", redirect_u
             if mode in {"create_from_oauth", "create-from-oauth", "create_oauth_account"} and model_mapping:
                 try:
                     _apply_sub2_model_mapping(payload, model_mapping)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     logger.warning("[Codex][sub2] 账号已创建，但模型映射设置失败: %s", exc)
             logger.info("[Codex][sub2] callback 已上传并处理完成（第 %s 次成功）响应=%s", attempt, _summarize_sub2_response(payload))
             return payload
@@ -566,7 +564,7 @@ def _cpa_request_raw(method: str, path: str, body: dict | None = None, *, respon
                 payload = resp.json()
                 if isinstance(payload, dict):
                     msg = payload.get("error") or payload.get("message") or payload.get("detail") or payload.get("reason") or ""
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             raise RuntimeError(
                 f"[Codex][CPA] 管理接口失败 {method.upper()} {path} status={resp.status_code}: "
@@ -578,7 +576,7 @@ def _cpa_request_raw(method: str, path: str, body: dict | None = None, *, respon
     finally:
         try:
             session.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -605,7 +603,7 @@ def find_cpa_codex_auth_file(*, email: str = "", local_filename: str = "") -> di
     """按本地回执/凭证文件名或邮箱匹配 CPA 侧 codex auth 文件。"""
     email_l = str(email or "").strip().lower()
     local_name_l = str(local_filename or "").strip().lower()
-    local_stem_l = local_name_l[:-5] if local_name_l.endswith(".json") else local_name_l
+    local_stem_l = local_name_l.removesuffix(".json")
     files = list_cpa_codex_auth_files()
     if not files:
         return None
@@ -657,7 +655,7 @@ def download_cpa_codex_auth_text(*, cpa_name: str | None = None, email: str = ""
     except Exception as exc:
         raise RuntimeError(f"[Codex][CPA] CPA 下载内容不是有效 JSON: {name}") from exc
     if not isinstance(parsed, dict):
-        raise RuntimeError(f"[Codex][CPA] CPA 下载内容不是 JSON 对象: {name}")
+        raise TypeError(f"[Codex][CPA] CPA 下载内容不是 JSON 对象: {name}")
     return json.dumps(parsed, ensure_ascii=False, indent=2) + "\n", name, (meta or {"name": name})
 
 def _first_non_empty(*values) -> str:
@@ -671,7 +669,7 @@ def _first_non_empty(*values) -> str:
 def _extract_state_from_auth_url(auth_url: str) -> str:
     try:
         return parse_qs(urlparse(auth_url).query).get("state", [""])[0]
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -788,7 +786,7 @@ def _is_redirect_uri(location: str) -> bool:
     """判断 Location 是否指向注册的 redirect_uri（localhost:1455/auth/callback）。"""
     try:
         parsed = urlparse(location)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return parsed.scheme in ("http", "https") and \
         parsed.hostname in ("localhost", "127.0.0.1") and \
@@ -820,7 +818,7 @@ def _decode_jwt_segment(seg: str) -> dict:
     try:
         padding = "=" * (-len(seg) % 4)
         return json.loads(base64.urlsafe_b64decode(seg + padding))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
 
 
@@ -838,7 +836,7 @@ def _post_json(session: BrowserSession, url: str, payload: dict, referer: str,
 def _resp_json(resp) -> dict:
     try:
         return resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
 
 
@@ -856,7 +854,7 @@ def _response_text(resp) -> str:
                     parts.append(str(x))
             walk(data)
             return " ".join(parts)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return str(getattr(resp, 'text', '') or '')
 
@@ -1119,13 +1117,13 @@ def _get_workspace_id(session: BrowserSession) -> str:
             if c.name == "oai-client-auth-session":
                 raw = c.value
                 break
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     if not raw:
         # 退而求其次：从 cookies 字典拿
         try:
             raw = session.session.cookies.get("oai-client-auth-session")
-        except Exception:
+        except Exception:  # noqa: BLE001
             raw = None
     if not raw:
         raise RuntimeError("[Codex] 找不到 oai-client-auth-session cookie，无法取 workspace_id")
@@ -1255,7 +1253,7 @@ def _parse_id_token(id_token: str) -> dict:
         if len(parts) < 2:
             return {}
         claims = _decode_jwt_segment(parts[1])
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"[Codex] id_token 解析失败: {exc}")
         return {}
 
@@ -1414,7 +1412,7 @@ def _save_sub2_local_record(
     fname = f"codex-{safe_email}-sub2-callback.json"
     try:
         sub2_origin = _sub2_codex_base()
-    except Exception:
+    except Exception:  # noqa: BLE001
         sub2_origin = ""
     record = {
         "type": "codex_sub2_callback",
@@ -1505,7 +1503,7 @@ def run_codex_oauth(
             scope=CODEX_OAUTH_PROXY_SCOPE,
             lane_id=proxy_lane_id,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return _codex_result(
             status="failed",
             email=email,
@@ -1597,6 +1595,7 @@ def _run_codex_oauth_impl(
             existing_session_info,
         )
     )
+    has_reusable_browser_context = has_roxy_context or has_cloud_context
     if fresh_browser_profile and (has_roxy_context or has_cloud_context):
         return _codex_result(
             status="failed",
@@ -1762,7 +1761,7 @@ def _run_codex_oauth_impl(
                 if not bool(getattr(_cloak_cfg, "CLOAK_KEEP_BROWSER_OPEN", False)):
                     try:
                         driver.quit()
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
         if selected_oauth_driver not in ("protocol", "api", "http"):
             raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={selected_oauth_driver!r}，可选 protocol / roxy / cloak / browser_use / skyvern")
@@ -1792,7 +1791,6 @@ def _run_codex_oauth_impl(
                 message=f"Codex credential driver unavailable: {type(exc).__name__}",
             )
         # 没装 selenium / 未提供 roxy 配置时继续走协议模式，保持旧行为。
-        pass
 
     if otp_provider is None:
         from core.email_provider import wait_for_otp as otp_provider

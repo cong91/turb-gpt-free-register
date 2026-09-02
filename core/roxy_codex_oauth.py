@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """通过 RoxyBrowser 指纹浏览器执行 Codex OAuth 授权。"""
 from __future__ import annotations
 
@@ -9,6 +8,7 @@ from contextvars import ContextVar
 from urllib.parse import urlparse
 
 from config import roxybrowser as _roxy_cfg
+from core import codex_oauth as _codex_proto
 from core import sms_provider
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
@@ -18,29 +18,25 @@ from core.openai_auth import (
     account_unusable_message,
     detect_account_unusable_response_body,
 )
-from core.roxybrowser_client import RoxyBrowserClient
-from core import codex_oauth as _codex_proto
 from core.roxy_phone_country import select_phone_country, select_vietnam_country
 from core.roxy_registration import (
     _build_driver,
     _center_browser_window,
+    _clear_otp_inputs,
     _click_any,
-    _click_continue,
+    _click_passwordless_signup_if_present,
+    _email_otp_page_state,
     _find_any,
-    _maybe_accept,
     _human_click,
     _human_type_text,
-    _type_any,
-    _type_email_address,
-    _submit_email_step,
-    _click_email_entry_option,
-    _type_otp,
-    _clear_otp_inputs,
-    _email_otp_page_state,
     _is_email_verification_page,
     _is_login_password_page,
-    _click_passwordless_signup_if_present,
+    _maybe_accept,
+    _submit_email_step,
+    _type_email_address,
+    _type_otp,
 )
+from core.roxybrowser_client import RoxyBrowserClient
 
 _base_logger = logging.getLogger(__name__)
 _CODEX_BROWSER_KIND: ContextVar[str] = ContextVar("codex_browser_kind", default="Roxy")
@@ -63,7 +59,7 @@ def _detect_browser_kind(opened=None) -> str:
         raw = getattr(opened, "raw", None) or {}
         if isinstance(raw, dict) and str(raw.get("driver") or "").lower().startswith("cloak"):
             return "Cloak"
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return "Roxy"
 
@@ -101,7 +97,7 @@ logger = _CodexLogger(_base_logger)
 def _is_callback_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return (
         parsed.scheme in ("http", "https")
@@ -122,7 +118,7 @@ def _extract_callback_url_from_page(driver) -> str:
         current = str(driver.current_url or "")
         if _is_callback_url(current):
             return current
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         urls = driver.execute_script(r"""
@@ -139,7 +135,7 @@ def _extract_callback_url_from_page(driver) -> str:
             if _is_callback_url(str(url)):
                 logger.info("[Codex][Browser] 已从浏览器性能记录提取 callback URL")
                 return str(url)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[Codex][Browser] 从页面提取 callback URL 失败：%s", exc)
     return ""
 
@@ -155,9 +151,10 @@ def _extract_callback_url_from_any_window(driver) -> str:
                 found = _extract_callback_url_from_page(driver)
                 if found:
                     return found
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Roxy callback window probe failed: %s: %s", type(exc).__name__, exc)
                 continue
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return ""
 
@@ -199,7 +196,7 @@ def _click_if_present(driver, selectors: list[str], timeout: int = 3) -> bool:
     try:
         _click_any(driver, selectors, timeout=timeout)
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -231,7 +228,7 @@ def _maybe_click_passwordless_after_email(driver, email: str, timeout: int = 18)
                     logger.info("[Codex][Browser] 已点击一次性验证码入口：email=%s detail=%s", email, result)
                     human_delay("form")
                     continue
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Codex][Browser] 密码页一次性验证码入口探测失败：%s", str(exc)[:140])
         time.sleep(0.5)
     if clicked:
@@ -272,14 +269,14 @@ def _wait_for_otp_input(driver, timeout: int = 30) -> None:
 def _account_password_for_email(email: str) -> str:
     try:
         return _codex_proto._account_registration_password(email)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
 def _account_totp_code_for_email(email: str) -> str:
     try:
         return _codex_proto._account_totp_code(email)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -296,7 +293,7 @@ def _is_mfa_challenge_page(driver) -> bool:
         return {ok: !!(form && input), url: location.href};
         """) or {}
         return bool(state.get("ok"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -336,7 +333,7 @@ def _fill_mfa_challenge_if_present(driver, email: str, timeout: int = 15) -> boo
                     return True
                 time.sleep(0.4)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Codex][Browser] MFA challenge 处理失败：%s", str(exc)[:160])
             time.sleep(0.5)
     return False
@@ -425,7 +422,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
             logger.info("[Codex][Browser] 密码登录后仍进入邮箱 OTP 页面")
         else:
             _maybe_click_passwordless_after_email(driver, email, timeout=18)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.info("[Codex][Browser] 未检测到邮箱输入框，可能已登录或进入下一步：%s", str(exc)[:120])
         return
 
@@ -456,7 +453,7 @@ def _fill_email_and_otp(driver, email: str, otp_provider, auth_url: str) -> None
                 return
             if pw_result != "email_otp":
                 _maybe_click_passwordless_after_email(driver, email, timeout=12)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # 如果重进授权地址后已经停在验证码/下一步页面，就不要再强行提交。
             if not _is_email_verification_page(driver):
                 logger.warning("[Codex][Browser] 重新提交邮箱失败，继续按当前页面轮询：%s", str(exc)[:180])
@@ -612,14 +609,14 @@ def _install_email_otp_validate_hook(driver) -> None:
     """
     try:
         driver.execute_script(script)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[Codex][Browser] 注入 email-otp/validate 响应 hook 失败：%s", exc)
 
 
 def _read_email_otp_validate_dead_code(driver) -> str:
     try:
         rows = driver.execute_script("return window.__codexEmailOtpValidateResponses || [];") or []
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
     if not isinstance(rows, list):
         return ""
@@ -689,7 +686,7 @@ def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
             if time.time() - last_log > 6:
                 logger.info("[Codex][Browser] 邮箱 OTP 后仍在 email-verification，继续等待页面自动跳转")
                 last_log = time.time()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         time.sleep(0.5)
     logger.warning("[Codex][Browser] 邮箱 OTP 后等待跳转超时，按验证码无效/过期处理")
@@ -712,7 +709,7 @@ def _phone_page_state(driver) -> dict:
         const bodyText = (document.body?.innerText || '').slice(0, 1200);
         return {url: location.href, radios, inputs, forms, bodyText};
         """) or {}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}", "url": getattr(driver, 'current_url', '')}
 
 
@@ -796,7 +793,7 @@ def _has_strict_add_phone_form(driver) -> bool:
         if (!form) return false;
         return !![...form.querySelectorAll('input[type="tel"], input[name="__reservedForPhoneNumberInput_tel"], input[autocomplete="tel"], input[name="phone"], input[name="phone_number"]')].find(visible);
         """))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -805,7 +802,7 @@ def _auth_origin(driver) -> str:
         parsed = urlparse(str(driver.current_url or ""))
         if parsed.scheme and parsed.netloc and parsed.hostname and parsed.hostname.endswith("openai.com"):
             return f"{parsed.scheme}://{parsed.netloc}"
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return "https://auth.openai.com"
 
@@ -817,7 +814,7 @@ def _history_back_to_add_phone_input(driver, *, reason: str = ""):
     if not is_phone_code:
         try:
             is_phone_code = _is_phone_code_page(driver)
-        except Exception:
+        except Exception:  # noqa: BLE001
             is_phone_code = False
     if not is_phone_code:
         return None
@@ -829,7 +826,7 @@ def _history_back_to_add_phone_input(driver, *, reason: str = ""):
         driver.back()
         human_delay("navigate")
         return _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=8)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.info(
             "[Codex][Browser] history back 未返回手机号输入页，继续尝试刷新/重新打开：%s",
             str(exc)[:180],
@@ -866,14 +863,14 @@ def _ensure_add_phone_input(driver, *, reason: str = ""):
         driver.get(target)
         human_delay("navigate")
         return _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=10)
-    except Exception as first_exc:
+    except Exception as first_exc:  # noqa: BLE001
         # 某些流程不允许直接打开 /add-phone，尝试浏览器返回到上一页。
         logger.info("[Codex][Browser] 直接打开 add-phone 未拿到输入框，尝试 history back：%s", str(first_exc)[:160])
         try:
             driver.back()
             human_delay("navigate")
             return _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=8)
-        except Exception as back_exc:
+        except Exception as back_exc:  # noqa: BLE001
             raise RuntimeError(
                 f"无法回到手机号输入页以重新换号: direct={type(first_exc).__name__}: {first_exc}; "
                 f"back={type(back_exc).__name__}: {back_exc}; state={_phone_page_state(driver)}"
@@ -1020,7 +1017,7 @@ def _blur_active_input_and_wait(driver, *, label: str = "输入完成") -> None:
         document.body?.focus?.();
         document.dispatchEvent(new Event('change', {bubbles:true}));
         """)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     seconds = random.uniform(1.8, 3.2)
     logger.info("[Codex][Browser] %s，已移开焦点，等待页面处理 %.1f 秒", label, seconds)
@@ -1084,7 +1081,7 @@ def _refresh_add_phone_for_retry(driver, *, reason: str = "") -> None:
         try:
             _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=8)
             return
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         # 如果刷新后仍不在输入页，强制回 add-phone。
         target = _auth_origin(driver).rstrip("/") + "/add-phone"
@@ -1096,7 +1093,7 @@ def _refresh_add_phone_for_retry(driver, *, reason: str = "") -> None:
         error_text = str(exc).lower()
         try:
             current_url = str(getattr(driver, "current_url", "") or "").lower()
-        except Exception:
+        except Exception:  # noqa: BLE001
             current_url = ""
         if "net::err_" in error_text or current_url.startswith("chrome-error://"):
             raise PhoneAuthStateResetRequired(
@@ -1138,13 +1135,13 @@ def _click_add_phone_continue_button(driver, *, timeout: int = 10) -> dict:
                 time.sleep(random.uniform(0.3, 0.8))
                 try:
                     text = str(getattr(btn, 'text', '') or btn.get_attribute('value') or btn.get_attribute('data-dd-action-name') or '').strip()
-                except Exception:
+                except Exception:  # noqa: BLE001
                     text = ''
                 try:
                     btn.click()
                     _wait_page_settle_after_submit()
                     return {"ok": True, "method": "click", "text": text}
-                except Exception as click_exc:
+                except Exception as click_exc:  # noqa: BLE001
                     last = click_exc
                     submitted = driver.execute_script(r"""
                     const btn = arguments[0];
@@ -1162,7 +1159,7 @@ def _click_add_phone_continue_button(driver, *, timeout: int = 10) -> dict:
                     if submitted:
                         _wait_page_settle_after_submit()
                         return {"ok": True, "method": "requestSubmit", "text": text, "click_error": str(click_exc)[:160]}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last = exc
         time.sleep(0.25)
     raise RuntimeError(f"submit_missing: add-phone Continue/続行 submit button not found last={last} state={_phone_page_state(driver)}")
@@ -1185,8 +1182,12 @@ def _force_submit_add_phone_form(driver) -> dict:
         else form.submit();
         return {ok:true, method: btn ? 'requestSubmit(button)' : 'requestSubmit(form)', url: location.href};
         """) or {}
-    except Exception as exc:
-        return {ok:false, reason:f'{type(exc).__name__}: {exc}', url:getattr(driver, 'current_url', '')}
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+            "url": getattr(driver, "current_url", ""),
+        }
 
 
 def _wait_after_phone_send(driver, timeout: int = 12) -> str:
@@ -1333,7 +1334,7 @@ def _do_phone_verification_if_present(driver) -> None:
                 time.sleep(0.5)
             if not (_has_strict_add_phone_form(driver) or _is_phone_code_page(driver)):
                 raise RuntimeError("not_phone_flow")
-        except Exception:
+        except Exception:  # noqa: BLE001
             logger.info("[Codex][Browser] 未检测到手机号验证页，跳过手机步骤")
             return
 
@@ -1419,7 +1420,7 @@ def _do_phone_verification_if_present(driver) -> None:
                             http,
                             reason=err_text.split(":", 1)[0],
                         )
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                 # 余额不足 / 无可用号码：重试多少次都不会成功，立即失败止损，
                 # 避免白等 N 轮换号重试（每轮还要刷新页面 + 随机等待）。
@@ -1442,7 +1443,7 @@ def _do_phone_verification_if_present(driver) -> None:
                         logger.info("[Codex][Browser] 当前仍在手机验证码页，下一轮将返回 add-phone 重新设置新号码")
                     else:
                         _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=2)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     if _is_add_phone_page(driver) or _is_phone_code_page(driver):
                         logger.info("[Codex][Browser] 仍处于手机号流程，继续换号重试")
                     else:
@@ -1455,7 +1456,7 @@ def _do_phone_verification_if_present(driver) -> None:
     finally:
         try:
             http.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -1466,7 +1467,6 @@ def _finish_consent_workspace(driver) -> str:
         callback = _extract_callback_url_from_any_window(driver)
         if callback:
             return callback
-        current = str(driver.current_url or "")
         clicked = False
         for selectors in [
             ["//button[contains(., 'Allow')]", "//button[contains(., 'Authorize')]", "//button[contains(., 'Continue')]"],
@@ -1496,17 +1496,17 @@ def clear_roxy_browser_auth_state(driver) -> None:
     logger.info("[Codex][Browser] 复用注册窗口：开始清理 Cookie / localStorage / sessionStorage / cache")
     try:
         driver.execute_cdp_cmd("Network.enable", {})
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         driver.execute_cdp_cmd("Network.clearBrowserCookies", {})
         logger.info("[Codex][Browser] 已清理浏览器 Cookie")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.info("[Codex][Browser] 清理 Cookie 失败，继续尝试其它缓存：%s", str(exc)[:160])
     try:
         driver.execute_cdp_cmd("Network.clearBrowserCache", {})
         logger.info("[Codex][Browser] 已清理浏览器 Cache")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.info("[Codex][Browser] 清理 Cache 失败，继续：%s", str(exc)[:160])
     for origin in origins:
         try:
@@ -1515,11 +1515,11 @@ def clear_roxy_browser_auth_state(driver) -> None:
                 "storageTypes": "all",
             })
             logger.info("[Codex][Browser] 已清理站点数据：%s", origin)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Codex][Browser] 清理站点数据失败 %s: %s", origin, exc)
     try:
         driver.get("about:blank")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     time.sleep(1.0)
     logger.info("[Codex][Browser] 注册窗口登录态清理完成，准备开始 Codex 授权")
@@ -1685,13 +1685,13 @@ def _run_roxy_codex_oauth_once(
         if owns_driver and driver and not bool(_roxy_cfg.ROXY_KEEP_BROWSER_OPEN):
             try:
                 driver.quit()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         if owns_driver and client and not bool(_roxy_cfg.ROXY_KEEP_BROWSER_OPEN):
             client.cleanup_profile(opened)
         try:
             _CODEX_BROWSER_KIND.reset(browser_kind_token)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 

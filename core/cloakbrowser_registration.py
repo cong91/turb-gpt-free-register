@@ -1,41 +1,62 @@
-# -*- coding: utf-8 -*-
 """通过 CloakBrowser + Playwright 适配层执行 ChatGPT 注册。"""
 from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 from config import cloakbrowser as _cfg
 from config import twofa as _twofa_cfg
-from core.account_export import BrowserPageTransport, checkpoint_account_data, save_account_data, post_register_dwell
 from core import db
+from core.account_export import (
+    BrowserPageTransport,
+    checkpoint_account_data,
+    post_register_dwell,
+    save_account_data,
+)
 from core.browser_challenge import (
     browser_challenge_state as _browser_challenge_state,
+)
+from core.browser_challenge import (
     wait_for_browser_challenge as _wait_for_browser_challenge,
 )
+
+# 复用 Roxy 注册流程里已维护好的页面操作函数。
+from core.browser_registration import (
+    _check_manual_stop,
+    _clear_otp_inputs,
+    _click_continue,
+    _click_continue_with_password_link,
+    _click_if_enabled_submit,
+    _click_resend_email_otp,
+    _complete_profile_page,
+    _email_otp_page_state,
+    _fetch_chatgpt_session,
+    _fill_password_page_if_present,
+    _is_email_verification_page,
+    _is_unsupported_email_error,
+    _maybe_accept,
+    _page_snapshot,
+    _profile_submission_error,
+    _safe_get,
+    _submit_email_and_wait_next,
+    _type_otp,
+    _wait_after_email_otp_submit,
+)
+from core.browser_traffic import SeleniumTrafficTracker
 from core.cloakbrowser_driver import build_cloak_driver
 from core.codex_login_credentials import CodexLoginCredentials
 from core.email_provider import (
     acknowledge_verification_code,
+    acquire_email_after_input,
     resolve_email_source,
     snapshot_verification_code,
     wait_for_otp,
 )
 from core.humanize import delay as human_delay
 from core.openai_auth import AccountUnusableError, account_unusable_message
-
-# 复用 Roxy 注册流程里已维护好的页面操作函数。
-from core.browser_registration import (
-    _maybe_accept, _submit_email_and_wait_next, _fill_password_page_if_present,
-    _click_continue_with_password_link,
-    _is_email_verification_page, _email_otp_page_state,
-    _clear_otp_inputs, _type_otp, _click_continue, _wait_after_email_otp_submit,
-    _click_resend_email_otp, _complete_profile_page, _fetch_chatgpt_session, _check_manual_stop,
-    _safe_get, _is_unsupported_email_error, _page_snapshot, _profile_submission_error,
-    _click_if_enabled_submit,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +101,7 @@ def _extract_signup_callback_url(driver) -> str | None:
         entries = driver.execute_script(
             """return performance.getEntries().map(entry => ({name: entry.name}));"""
         ) or []
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     if not isinstance(entries, list):
         return None
@@ -183,16 +204,25 @@ def _wait_for_profile_submit_transition(
     return False
 
 
-def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = None, otp_code: str = None, batch_dir: Path | None = None) -> dict:
+def run_cloak_registration(
+    email: str,
+    name: str,
+    birthday: str,
+    proxy: str | None = None,
+    otp_code: str | None = None,
+    batch_dir: Path | None = None,
+    on_email_acquired: Callable[[str], None] | None = None,
+) -> dict:
     """CloakBrowser 自动化注册入口。"""
     driver = None
     opened = None
     create_acknowledged = False
     openai_password: str | None = None
-    traffic_tracker: PlaywrightTrafficTracker | None = None
+    traffic_tracker: SeleniumTrafficTracker | None = None
     network_traffic: dict | None = None
     try:
         driver, opened = build_cloak_driver(proxy=proxy)
+        traffic_tracker = SeleniumTrafficTracker(driver, label="Cloak")
         tunnel = getattr(proxy, "tunnel", None)
         if tunnel is not None:
             pool = getattr(tunnel, "pool", None)
@@ -290,7 +320,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
             human_delay("otp_input")
             try:
                 _click_continue(driver)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.info("[Cloak注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
 
             outcome = _wait_after_email_otp_submit(driver, timeout=10)
@@ -353,7 +383,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                 totp_secret = setup_2fa_for_registration(BrowserPageTransport(driver), email)
                 twofa_status = "active"
                 db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 twofa_status = "failed"
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
@@ -423,7 +453,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                 codex_result = auto_codex["codex"]
             else:
                 logger.info("[Cloak注册][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
         # 统计注册浏览器关闭前的完整会话；注册后停留期间的网络请求也计入。
@@ -458,7 +488,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         if traffic_tracker is not None:
             try:
                 network_traffic = traffic_tracker.stop()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         logger.error("[Cloak注册] 失败：%s: %s", type(exc).__name__, exc)
         logger.debug("[Cloak注册] 失败详情", exc_info=True)
@@ -474,7 +504,7 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
                 or _is_unsupported_email_error(error_text)
             ) else "failed" if create_acknowledged else "available"
             release_email(email, status=release_status, note=note_text[:180])
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return {
             "success": False,
@@ -486,10 +516,10 @@ def run_cloak_registration(email: str, name: str, birthday: str, proxy: str = No
         if traffic_tracker is not None:
             try:
                 traffic_tracker.stop()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         if driver and not bool(_cfg.CLOAK_KEEP_BROWSER_OPEN):
             try:
                 driver.quit()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass

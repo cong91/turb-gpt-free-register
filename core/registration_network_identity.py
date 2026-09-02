@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Public network identity probes for registration tunnels and browsers."""
 from __future__ import annotations
 
@@ -68,7 +67,7 @@ def _geo_endpoints() -> list[str]:
         from config import browser as browser_config
 
         return list(getattr(browser_config, "IP_GEO_ENDPOINTS", []) or [])
-    except Exception:
+    except Exception:  # noqa: BLE001
         return []
 
 
@@ -105,7 +104,7 @@ const timeoutMs = arguments[1];
     try:
         driver.set_script_timeout(max(1, int(timeout * len(urls) + 2)))
         result = driver.execute_async_script(script, urls, int(timeout * 1000))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
     return _normalize_geo_payload(result)
 
@@ -136,7 +135,7 @@ async ({urls, timeoutMs}) => {
 """
     try:
         return _normalize_geo_payload(page.evaluate(script, {"urls": urls, "timeoutMs": int(timeout * 1000)}))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
 
 
@@ -161,8 +160,9 @@ def probe_socks_public_ip(
     Raises:
         NetworkIdentityError: All endpoints failed after retries
     """
-    from curl_cffi import requests
     import time
+
+    from curl_cffi import requests
 
     errors: list[str] = []
     for endpoint in endpoints:
@@ -180,7 +180,7 @@ def probe_socks_public_ip(
                 except (ValueError, json.JSONDecodeError):
                     payload = response.text
                 return _extract_ip(payload)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 error_msg = f"{type(exc).__name__}: {str(exc)[:100]}"
                 if attempt < retries:
                     # Backoff before retry

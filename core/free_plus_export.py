@@ -1,11 +1,10 @@
-# -*- coding: utf-8 -*-
 """选择并生成 Free Plus 账号 TXT 导出。"""
 from __future__ import annotations
 
 from collections import Counter
-from datetime import datetime
 
 from core import db
+from core.time_utils import local_now
 
 _MAX_EXPORT_ACCOUNTS = 5000
 
@@ -96,7 +95,7 @@ def prepare_export(
     if not included:
         raise ValueError("没有符合条件且尚未导出的 Free Plus 账号")
 
-    now = datetime.now()
+    now = local_now()
     filename = f"free-plus-{normalized_format}-{now.strftime('%Y%m%d-%H%M%S')}.txt"
     content = ("\ufeff" + "\n".join(lines) + "\n").encode("utf-8")
     return {

@@ -1,9 +1,11 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Manual test for 1 API = 1 active job constraint."""
+import sys
 import tempfile
 from pathlib import Path
+
 from core.gmail_api_url_batch_store import GmailApiUrlBatchStore, GmailBatchConflict
+
 
 def main():
     print("=== Testing 1 API = 1 Active Job Constraint ===\n")
@@ -57,7 +59,7 @@ def main():
         # Test 3: After worker 1 completes, worker 3 can proceed
         print("Test 3: Worker 1 completes → Worker 3 can now claim")
         store.complete(job1.assignment_id)
-        print(f"  ✓ Worker 1 completed")
+        print("  ✓ Worker 1 completed")
         
         try:
             job3 = store.claim(batch_id, 'worker-3')
@@ -75,4 +77,4 @@ def main():
 
 if __name__ == '__main__':
     success = main()
-    exit(0 if success else 1)
+    sys.exit(0 if success else 1)

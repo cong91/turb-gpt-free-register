@@ -1,16 +1,15 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from config import email as email_config
 from config import register as register_config
-from core.email_provider import is_valid_email_source, normalize_email_source, parse_email_sources
+from core.email_provider import (
+    is_valid_email_source,
+    normalize_email_source,
+    parse_email_sources,
+)
 from core.gmail_aliases import GmailAliasError, normalize_routed_domains
 from core.paymesh_aliases import PaymeshAliasError, normalize_paymesh_routed_domains
 from core.registration_limits import MAX_REGISTRATION_TASKS
-from core.reserved_test_aliases import (
-    ReservedTestAliasError,
-    generate_reserved_test_aliases,
-)
 from webui.email_source_validation import validate_email_sources
 
 
@@ -165,27 +164,6 @@ def create_registration_jobs(
         workers = max(1, min(16, int(data.get("workers", 3))))
     except (TypeError, ValueError):
         return {"ok": False, "error": "workers 非法"}, 400
-    if requested_source == "local_test":
-        domains = data.get("local_test_domains")
-        if not isinstance(domains, list):
-            return {"ok": False, "error": "Tên miền kiểm thử phải được gửi dưới dạng danh sách"}, 400
-        try:
-            aliases = generate_reserved_test_aliases(
-                data.get("local_test_base"),
-                domains,
-                limit=count,
-            )
-        except ReservedTestAliasError as exc:
-            return {"ok": False, "error": str(exc)}, 400
-        jobs = service.submit_local_test_registration(aliases=aliases, workers=workers)
-        return {
-            "ok": True,
-            "submitted": len(jobs),
-            "jobs": jobs,
-            "warning": "Kiểm thử cục bộ dry-run: không gọi OpenAI, trình duyệt, OTP hoặc nhà cung cấp email.",
-            "workers": workers,
-        }, 200
-
     if requested_source is not None and not is_valid_email_source(requested_source):
         return {"ok": False, "error": "邮箱来源不支持"}, 400
 

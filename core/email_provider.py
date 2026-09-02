@@ -138,7 +138,7 @@ def _registered_email_source(email: str) -> str | None:
     try:
         from core import db
         account = db.get_account_by_email(email)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     return _normalize_explicit_email_source((account or {}).get("email_source"))
 

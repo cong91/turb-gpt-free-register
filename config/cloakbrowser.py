@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """CloakBrowser 自动化注册配置。"""
 from config.env_loader import apply_env_overrides
 

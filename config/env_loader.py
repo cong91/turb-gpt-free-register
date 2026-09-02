@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """从项目根目录 .env 加载密钥/敏感配置。
 
 设计目标：
@@ -196,7 +195,7 @@ def _coerce_env_value(raw: str, default, vtype: str | None = None):
             val = ast.literal_eval(text)
             if isinstance(val, (list, tuple)):
                 return [str(x).strip() for x in val if str(x).strip()]
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return [line.strip() for line in text.splitlines() if line.strip()]
     return str(raw).strip()
@@ -216,7 +215,7 @@ def env_value(key: str, default=None, vtype: str | None = None):
         return default
     try:
         return _coerce_env_value(raw, default, vtype)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return default
 
 

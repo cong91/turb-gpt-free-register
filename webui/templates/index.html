@@ -5,7 +5,6 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>GPT 注册控制台</title>
-  <link rel="stylesheet" href="{{ url_for('static', filename='reserved_test_aliases.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='roxy_profiles.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='email_change.css') }}">
   <style>
@@ -28,6 +27,10 @@
       background: var(--bg); color: var(--text);
     }
     body.modal-open { overflow: hidden; position: fixed; left: 0; right: 0; width: 100%; }
+    .modal-overlay { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 16px; background: rgba(15,23,42,.42); }
+    .modal-overlay .modal { width: min(420px, 100%); padding: 20px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: 0 18px 48px rgba(15,23,42,.22); }
+    .modal-overlay h3 { margin-bottom: 10px; font-size: 17px; }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
     h1, h2, h3, p { margin: 0; }
     .stats {
       display: grid; grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -2175,6 +2178,12 @@
       </svg>
       <span class="sidebar-item-label">账号</span>
     </button>
+    <button type="button" data-tab="extract-link" class="sidebar-item">
+      <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
+      </svg>
+      <span class="sidebar-item-label">Extract URL</span>
+    </button>
     <button type="button" data-tab="email-change" class="sidebar-item">
       <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><path d="M22 6l-10 7L2 6"/><path d="M16 16l2 2 4-4"/>
@@ -2192,12 +2201,6 @@
         <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><path d="M22 6l-10 7L2 6"/>
       </svg>
       <span class="sidebar-item-label">邮箱池</span>
-    </button>
-    <button type="button" data-tab="tools" class="sidebar-item">
-      <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-        <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.8-3.8a6 6 0 0 1-7.9 7.9l-6.9 6.9a2.1 2.1 0 0 1-3-3l6.9-6.9a6 6 0 0 1 7.9-7.9z"/>
-      </svg>
-      <span class="sidebar-item-label">工具</span>
     </button>
     <button type="button" data-tab="roxy-profiles" class="sidebar-item">
       <svg class="sidebar-item-icon" viewBox="0 0 24 24" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
@@ -2326,7 +2329,6 @@
             <option value="qan8_gmail_api">QAN8 Gmail API (lazy)</option>
             <option value="paymesh">Paymesh (MAIL card)</option>
             <option value="tinyhost">TinyHost email tạm</option>
-            <option value="local_test">Kiểm thử cục bộ (dry-run)</option>
           </select>
         </label>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnStartV2">开始注册</button>
@@ -2395,20 +2397,6 @@
           <span class="hint">
             Mỗi luồng = một lane = một email gốc QAN8 khác nhau. Bí danh do client sinh ra và cùng nhận OTP qua URL lấy mã của email gốc.
           </span>
-        </div>
-      </div>
-      <div class="gmail-cdk-batch-v2 hidden" data-provider-input="local_test">
-        <div class="provider-inline-config">
-          <label class="fld-inline">Tiền tố kiểm thử cục bộ
-            <input data-local-test-base type="text" maxlength="32" placeholder="sampleuser" autocomplete="off" spellcheck="false">
-          </label>
-          <label class="fld-inline">Tên miền kiểm thử 1
-            <input data-local-test-domain type="text" placeholder="mail.test" autocomplete="off" spellcheck="false">
-          </label>
-          <label class="fld-inline">Tên miền kiểm thử 2 (tùy chọn)
-            <input data-local-test-domain type="text" placeholder="inbox.invalid" autocomplete="off" spellcheck="false">
-          </label>
-          <span class="hint">Kiểm thử cục bộ dry-run không gọi OpenAI, trình duyệt, OTP hoặc nhà cung cấp email.</span>
         </div>
       </div>
       <div id="regWarnV2"></div>
@@ -2577,7 +2565,6 @@
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" disabled title="Kiểm tra trạng thái đăng nhập và làm mới accessToken theo phạm vi">Kiểm tra tài khoản</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedPlansV2" disabled title="Kiểm tra gói hiện tại theo phạm vi">Kiểm tra gói</button>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnReactivateSelectedTwofaV2" disabled title="Đăng nhập lại và hoàn thành 2FA theo phạm vi">Khôi phục 2FA</button>
-          <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExtractSelectedLinksV2" disabled title="Tạo link cho tài khoản Free có trial theo phạm vi">Tạo link</button>
         </div>
         <details class="accounts-command-section" open>
           <summary><span>Codex & Agent</span><small>ủy quyền, Agent Token, tải lên sub2api</small></summary>
@@ -2708,6 +2695,33 @@
   </div>
 
   {% include '_email_change_tool.html' %}
+
+  <!-- ============ Extract URL ============ -->
+  <div id="tab-extract-link" class="hidden">
+    <h1 class="register-title">Extract URL</h1>
+    <section class="card extract-workspace-card">
+      <div class="head"><h2>PAY.153 Checkout Link</h2><p>Chỉ hiển thị tài khoản Free có Plus trial. Provider cần 1 hoặc 2 proxy sẽ tự dùng đúng route.</p></div>
+      <div class="body">
+        <div class="row">
+          <label class="fld">Payment method<select id="extractWorkspaceMethod"></select></label>
+          <label class="fld">Proxy mode<select id="extractWorkspaceProxyMode"><option value="rotating">Proxy xoay tự động</option><option value="pool">Chọn proxy trong pool</option><option value="manual">Nhập proxy</option></select></label>
+        </div>
+        <div id="extractWorkspaceProxyFields"></div>
+        <div class="row extract-workspace-actions">
+          <button type="button" class="btn" id="btnExtractWorkspaceRefresh">Làm mới tài khoản</button>
+          <button type="button" class="btn" id="btnExtractWorkspaceSelectAll">Chọn tất cả Free Plus</button>
+          <button type="button" class="btn primary" id="btnExtractWorkspaceRun" disabled>Extract checkout link</button>
+        </div>
+        <div id="extractWorkspaceStatus" class="banner info" hidden></div>
+      </div>
+      <div class="table-wrap">
+        <table class="accounts-table extract-workspace-table">
+          <thead><tr><th class="col-check"><input type="checkbox" id="extractWorkspaceAll"></th><th>ID</th><th>Email</th><th>Plan</th><th>Extract status</th><th>Result</th></tr></thead>
+          <tbody id="extractWorkspaceBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
 
   <!-- ============ Codex 授权 ============ -->
   <div id="tab-codex" class="hidden">
@@ -2840,7 +2854,6 @@
     </section>
   </div>
 
-  {% include '_reserved_test_aliases_tool.html' %}
   {% include '_roxy_profiles_tool.html' %}
 
   <!-- ============ 配置 ============ -->
@@ -3161,12 +3174,13 @@ function debounce(fn, wait=250) {
 
 // ---------- Tab 切换 ----------
 function activateTab(tab, persist=true) {
-  const allowed = ['register','accounts','email-change','codex','outlook','tools','roxy-profiles','config'];
+  const allowed = ['register','accounts','extract-link','email-change','codex','outlook','roxy-profiles','config'];
   if (!allowed.includes(tab)) tab = 'register';
   $$('nav button').forEach(x => x.classList.toggle('active', x.dataset.tab === tab));
   allowed.forEach(t => $('#tab-'+t).classList.toggle('hidden', t !== tab));
   if (persist) localStorage.setItem('gpt_console_active_tab', tab);
   if (tab === 'accounts') { loadAccountDomainOptions(); loadAccounts(); }
+  if (tab === 'extract-link') loadExtractWorkspace();
   if (tab === 'codex') loadCodex();
   if (tab === 'outlook') loadOutlook();
   if (tab === 'config') loadConfig();
@@ -3248,11 +3262,6 @@ async function startRegistrationFromInputs(countEl, workersEl, providerEl, start
     }
     if (email_source === 'qan8_gmail_api') {
       payload.qan8_alias_count = qan8AliasCount;
-    }
-    if (email_source === 'local_test') {
-      payload.local_test_base = providerPanel?.querySelector('[data-local-test-base]')?.value || '';
-      payload.local_test_domains = Array.from(providerPanel?.querySelectorAll('[data-local-test-domain]') || [])
-        .map(el => el.value.trim()).filter(Boolean);
     }
     const r = await api('/api/jobs', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     const warnHtml = r.warning ? `<div class="banner warn">${esc(r.warning)}（本次并发 ${r.workers || workers}）</div>` : `<div class="banner info">已提交 ${r.submitted} 个任务，本次并发 ${r.workers || workers}</div>`;
@@ -3399,7 +3408,7 @@ function renderJobs() {
         <td class="col-check"><input type="checkbox" class="job-row-check" data-job-id="${esc(j.id)}" ${JOB_SELECTED.has(Number(j.id)) ? 'checked' : ''} ${running ? 'disabled title="运行中的任务不能选择"' : ''}></td>
         <td class="col-id">#${esc(j.id)}${j.parent_job_id ? `<div class="sub-cell" title="重试自任务 #${esc(j.parent_job_id)}">↳ #${esc(j.parent_job_id)} · ${esc(j.retry_attempt || 1)}</div>` : ''}</td>
         <td class="col-status">${pillV2(j.display_status || j.status)}</td>
-        <td class="col-email" title="${esc(j.email || '-')}">${esc(j.email || '-')}${j.job_type === 'local_test' ? '<div class="sub-cell">Kiểm thử cục bộ</div>' : ''}</td>
+        <td class="col-email" title="${esc(j.email || '-')}">${esc(j.email || '-')}</td>
         <td class="col-time" title="${esc(started)}">${esc(started)}</td>
         <td class="col-time" title="${esc(completed)}">${esc(completed)}</td>
         <td class="col-traffic">${formatTraffic(j.network_traffic)}</td>
@@ -4003,49 +4012,6 @@ function _planAction(r) {
   }
   return `<button data-plan-check="${esc(r.id)}" title="查询当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>`;
 }
-function _fmtExtractExpire(v) {
-  if (!v) return '';
-  const raw = String(v).trim();
-  let n = Number(raw);
-  if (!Number.isNaN(n) && n > 0) {
-    if (n > 1e12) n = Math.floor(n / 1000);
-    const d = new Date(n * 1000);
-    if (!Number.isNaN(d.getTime())) return _fmtPlanTime(d.toISOString(), false);
-  }
-  return _fmtPlanTime(raw, false) || raw;
-}
-function _extractLinkCell(r) {
-  const s = r.extract_link_status || '';
-  const err = r.extract_link_error || '';
-  const msg = r.extract_link_message || '';
-  const title = esc(err || msg || r.extract_link_job_id || '');
-  if (s === 'queued') return `<span class="pill status-running" title="${title}">提链排队</span>`;
-  if (s === 'running') return `<span class="pill status-running" title="${title}">${esc(msg || '提链中')}</span>`;
-  if (s === 'success') {
-    const typ = (r.extract_link_type || '').toUpperCase();
-    const link = r.extract_link_long_url || r.extract_link_copy_paste || '';
-    const qr = r.extract_link_image_url_png || r.extract_link_image_url_svg || '';
-    const expire = _fmtExtractExpire(r.extract_link_expires_at || '');
-    const copy = link ? cbtn('复制提链', link, 'extract-link-btn extract-copy') : '';
-    const qrBtn = qr ? `<button class="extract-link-btn extract-qr" data-qr-url="${esc(qr)}" title="打开支付二维码图片">查看二维码</button>` : '';
-    const expireHtml = expire ? `<div class="extract-link-expire" title="支付链接过期时间">支付到期：${esc(expire)}</div>` : '';
-    return `<div class="extract-link-cell"><span class="pill status-success" title="${title || esc(link)}">提链成功${typ ? '(' + esc(typ) + ')' : ''}</span>${copy}${qrBtn}${expireHtml}</div>`;
-  }
-  if (s === 'failed') {
-    const reason = err || msg || '未知原因';
-    return `<div class="extract-link-cell"><span class="pill status-failed" title="${esc(reason)}">提链失败</span><div class="extract-link-error" title="${esc(reason)}">${esc(reason)}</div></div>`;
-  }
-  return '';
-}
-function _extractLinkAction(r) {
-  const s = r.extract_link_status || '';
-  if (['queued','running'].includes(s)) return `<button disabled title="${esc(r.extract_link_message || '提链任务执行中')}">提链中…</button>`;
-  const plan = (r.current_plan_type || r.plan_type || '').toString().toLowerCase();
-  const eligible = plan === 'free' && !!r.plus_trial_eligible;
-  if (!eligible) return '';
-  const failedReason = s === 'failed' ? (r.extract_link_error || r.extract_link_message || '') : '';
-  return `<button class="good" data-extract-link="${esc(r.id)}" title="${esc(failedReason ? '重新提链；上次失败原因：' + failedReason : '为该 free(可Plus试用) 账号创建 PIX/UPI/KAKAO_PAY/IDEAL 提链任务')}">提链</button>`;
-}
 function _codexAction(r) {
   const s = r.codex_status || '';
   if (s === 'retrying') {
@@ -4083,7 +4049,6 @@ function _accountsV2MoreMenu(r) {
     `<button type="button" data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button>`,
     `<button type="button" data-account-totp-log="${esc(r.email)}" title="查看该账号最近一次 2FA 设置日志">2FA日志</button>`,
     _planAction(r),
-    _extractLinkAction(r),
     _codexAction(r),
     `<button type="button" data-codex-log="${esc(r.email)}" title="查看该账号最近一次 Codex 补跑日志">补跑日志</button>`,
     `<button type="button" data-account-archive="${esc(r.id)}" data-archived="${r.archived ? '0' : '1'}" title="${r.archived ? '恢复到默认账号列表' : '归档后默认账号列表不再显示'}">${r.archived ? '恢复' : '归档'}</button>`,
@@ -4132,7 +4097,7 @@ function renderAccounts() {
       </td>
       <td class="col-token">${_tokenCellV2(r)}</td>
       <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}">${esc(short(r.password, 18))}</span>` : '<span class="acc-v2-muted">-</span>'}</td>
-      <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${r.free_plus_exported_at ? `<span class="pill status-used" title="Free Plus 导出时间: ${esc(r.free_plus_exported_at)}">已导出${r.free_plus_export_count ? ` ${esc(r.free_plus_export_count)} 次` : ''}</span>` : (r.archived ? '<span class="pill status-used">仅归档</span>' : '')}</div><div class="acc-v2-sub">${_extractLinkCell(r)}</div></td>
+      <td class="col-plan">${_planCell(r)}<div class="acc-v2-sub">${r.free_plus_exported_at ? `<span class="pill status-used" title="Free Plus 导出时间: ${esc(r.free_plus_exported_at)}">已导出${r.free_plus_export_count ? ` ${esc(r.free_plus_export_count)} 次` : ''}</span>` : (r.archived ? '<span class="pill status-used">仅归档</span>' : '')}</div></td>
       <td class="col-note" title="${esc(r.note || '')}">${r.note ? esc(short(r.note, 80)) : '<span class="acc-v2-muted">-</span>'}</td>
       <td class="col-small">${_totpCellV2(r)}</td>
       <td class="col-status">${_codexCellV2(r)}</td>
@@ -4171,7 +4136,7 @@ function updateAccountSelectionUi(pageRows = null) {
   const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
   const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
   const v2Ids = [
-    'btnCheckSelectedLiveV2', 'btnCheckSelectedPlansV2', 'btnReactivateSelectedTwofaV2', 'btnExtractSelectedLinksV2',
+    'btnCheckSelectedLiveV2', 'btnCheckSelectedPlansV2', 'btnReactivateSelectedTwofaV2',
     'btnGenerateSelectedAgentV2', 'btnDownloadSelectedAgentV2', 'btnUploadSelectedAgentSub2V2',
     'btnLoginFreeNoTrialSub2V2', 'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
@@ -4635,12 +4600,6 @@ async function onAccountsBodyClick(e) {
   const noteBtn = e.target.closest('[data-account-note]');
   if (noteBtn) {
     await editAccountNote(Number(noteBtn.dataset.accountNote), noteBtn);
-    return;
-  }
-
-  const extractBtn = e.target.closest('[data-extract-link]');
-  if (extractBtn) {
-    await extractOneLink(Number(extractBtn.dataset.extractLink), extractBtn);
     return;
   }
 
@@ -5250,57 +5209,104 @@ async function checkOnePlan(id, btn) {
   }
 }
 
-async function extractOneLink(id, btn) {
-  const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
-  if (!acc) { showToast('账号不存在'); return; }
-  const plan = (acc.current_plan_type || acc.plan_type || '').toString().toLowerCase();
-  if (plan !== 'free' || !acc.plus_trial_eligible) {
-    showToast('仅支持 free(可Plus试用) 账号提链');
+let EXTRACT_WORKSPACE_ACCOUNTS = [];
+let EXTRACT_WORKSPACE_SELECTED = new Set();
+let EXTRACT_WORKSPACE_METHODS = [];
+let EXTRACT_WORKSPACE_POOL = [];
+let EXTRACT_WORKSPACE_TIMER = null;
+
+function extractWorkspaceRoles() {
+  const method = String($('#extractWorkspaceMethod')?.value || '');
+  if (['pix', 'momo', 'hosted'].includes(method)) return ['entry'];
+  if (['ph_short', 'gcash'].includes(method)) return ['entry', 'promotion'];
+  if (['paypal', 'upi', 'kakao'].includes(method)) return ['payment', 'promotion'];
+  return ['entry', 'payment'];
+}
+function extractWorkspaceProxyFields() {
+  const mode = $('#extractWorkspaceProxyMode')?.value || 'rotating';
+  const roles = extractWorkspaceRoles();
+  const labels = {entry: 'Entry / checkout proxy', payment: 'Payment proxy', promotion: 'Promotion proxy'};
+  if (mode === 'rotating') {
+    $('#extractWorkspaceProxyFields').innerHTML = '<div class="hint">按所选支付方式自动分配 1 或 2 条 PAY.153 旋转代理线路。</div>';
     return;
   }
-  if (!confirm(`确定为该账号提链吗？\n\n${acc.email || ('#' + id)}\n\n提链类型按配置使用 PIX/UPI/KAKAO_PAY/IDEAL，成功会消耗 1 次 CDK。`)) return;
-  const old = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = '提链中…';
+  const html = roles.map(role => {
+    if (mode === 'pool') {
+      return `<label class="fld">${labels[role]}<select data-extract-proxy-role="${role}"><option value="">自动从 pool 分配</option>${EXTRACT_WORKSPACE_POOL.map(item => `<option value="${esc(item.id)}">${esc(item.label)}</option>`).join('')}</select></label>`;
+    }
+    return `<label class="fld">${labels[role]}<input data-extract-proxy-role="${role}" type="text" placeholder="http://user:pass@host:port" autocomplete="off" spellcheck="false"></label>`;
+  }).join('');
+  $('#extractWorkspaceProxyFields').innerHTML = `<div class="row extract-proxy-fields">${html}</div>`;
+}
+function extractWorkspaceRender() {
+  const body = $('#extractWorkspaceBody');
+  if (!body) return;
+  body.innerHTML = EXTRACT_WORKSPACE_ACCOUNTS.map(acc => {
+    const checked = EXTRACT_WORKSPACE_SELECTED.has(Number(acc.id));
+    const status = acc.extract_link_status || '';
+    const link = acc.extract_link_long_url || acc.extract_link_copy_paste || '';
+    const planLabel = acc.plus_trial_eligible ? 'Free Plus' : (acc.current_plan_type || acc.plan_type || 'unknown');
+    return `<tr><td><input type="checkbox" data-extract-workspace-id="${esc(acc.id)}" ${checked ? 'checked' : ''}></td><td>${esc(acc.id)}</td><td title="${esc(acc.email || '')}">${esc(acc.email || '-')}</td><td>${esc(planLabel)}</td><td>${esc(status || 'ready')}${acc.extract_link_message ? `<div class="sub-cell">${esc(acc.extract_link_message)}</div>` : ''}</td><td class="wrap">${link ? `<button type="button" class="extract-link-btn extract-copy" data-copy-extract="${esc(link)}">复制链接</button>` : '-'}</td></tr>`;
+  }).join('') || '<tr><td colspan="6" class="muted">没有可用的 Free Plus 账号</td></tr>';
+  $('#btnExtractWorkspaceRun').disabled = EXTRACT_WORKSPACE_SELECTED.size === 0;
+  $('#extractWorkspaceAll').checked = EXTRACT_WORKSPACE_ACCOUNTS.length > 0 && EXTRACT_WORKSPACE_SELECTED.size === EXTRACT_WORKSPACE_ACCOUNTS.length;
+}
+async function loadExtractWorkspace() {
+  const methodEl = $('#extractWorkspaceMethod');
+  if (!methodEl) return;
   try {
-    await api('/api/accounts/extract-link', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({account_id: id}),
-    });
-    showToast('提链任务已入队');
-    await pollAccountPlanStatuses();
-  } catch(err) {
-    showToast('提链失败: ' + err.message);
-    btn.disabled = false;
-    btn.textContent = old;
+    const [options, proxies, accounts] = await Promise.all([
+      api('/api/extract-link/options'),
+      api('/api/extract-link/proxies'),
+      api('/api/accounts?paged=1&page=1&page_size=500&plan=free_plus'),
+    ]);
+    EXTRACT_WORKSPACE_METHODS = options.payment_methods || [];
+    EXTRACT_WORKSPACE_POOL = proxies.pool || [];
+    const remembered = localStorage.getItem('turb.extract_link_payment_method') || options.default_payment_method;
+    methodEl.innerHTML = EXTRACT_WORKSPACE_METHODS.map(item => `<option value="${esc(item.id)}"${item.id === remembered ? ' selected' : ''}>${esc(item.label)} (${esc(item.country || '')}/${esc(item.currency || '')})</option>`).join('');
+    EXTRACT_WORKSPACE_ACCOUNTS = (accounts.items || []).filter(acc => String(acc.current_plan_type || acc.plan_type || '').toLowerCase() === 'free' && !!acc.plus_trial_eligible);
+    EXTRACT_WORKSPACE_SELECTED = new Set([...EXTRACT_WORKSPACE_SELECTED].filter(id => EXTRACT_WORKSPACE_ACCOUNTS.some(acc => Number(acc.id) === id)));
+    extractWorkspaceProxyFields();
+    extractWorkspaceRender();
+  } catch (err) {
+    const status = $('#extractWorkspaceStatus');
+    if (status) { status.hidden = false; status.className = 'banner warn'; status.textContent = err.message; }
   }
 }
-
-async function extractSelectedLinks() {
-  const ids = await getAccountBulkIds();
-  if (ids.length === 0) { showToast('请先选择账号'); return; }
-  if (!confirm(`确定在当前批量范围内提链 ${ids.length} 个账号吗？\n\n仅 free(可Plus试用) 账号会执行，其余由服务端自动跳过。成功会按账号消耗 CDK 次数。`)) return;
-  const btn = $('#btnExtractSelectedLinksV2');
-  const old = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = '提链中…';
-  try {
-    const r = await api('/api/accounts/extract-link-bulk', {
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({account_ids: ids}),
-    });
-    const skipped = (r.skipped_count || 0) + (r.busy_count || 0) + (r.failed_count || 0);
-    showToast(skipped ? `已入队 ${r.started_count || 0} 个，跳过/失败 ${skipped} 个` : `已入队 ${r.started_count || 0} 个`);
-    await pollAccountPlanStatuses();
-  } catch(err) {
-    showToast('批量提链失败: ' + err.message);
-    updateAccountSelectionUi();
-  } finally {
-    btn.textContent = old;
+async function runExtractWorkspace() {
+  const ids = [...EXTRACT_WORKSPACE_SELECTED];
+  if (!ids.length) return;
+  const body = {account_ids: ids, link_type: $('#extractWorkspaceMethod').value};
+  const mode = $('#extractWorkspaceProxyMode').value;
+  if (mode !== 'rotating') {
+    for (const role of extractWorkspaceRoles()) {
+      const value = $('#extractWorkspaceProxyFields [data-extract-proxy-role="' + role + '"]')?.value?.trim() || '';
+      if (mode === 'pool') body[role === 'entry' ? 'proxy_pool_index' : role + '_proxy_pool_index'] = value;
+      else body[role === 'entry' ? 'proxy' : role + '_proxy'] = value;
+    }
   }
+  const button = $('#btnExtractWorkspaceRun');
+  button.disabled = true;
+  try {
+    const result = await api('/api/accounts/extract-link-bulk', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const status = $('#extractWorkspaceStatus');
+    status.hidden = false; status.className = 'banner info'; status.textContent = `已入队 ${result.started_count || 0} 个账号`;
+    clearInterval(EXTRACT_WORKSPACE_TIMER);
+    EXTRACT_WORKSPACE_TIMER = setInterval(loadExtractWorkspace, 4000);
+    await loadExtractWorkspace();
+  } catch (err) {
+    const status = $('#extractWorkspaceStatus');
+    status.hidden = false; status.className = 'banner warn'; status.textContent = err.message;
+  } finally { extractWorkspaceRender(); }
 }
+$('#extractWorkspaceMethod')?.addEventListener('change', e => { localStorage.setItem('turb.extract_link_payment_method', e.target.value); extractWorkspaceProxyFields(); });
+$('#extractWorkspaceProxyMode')?.addEventListener('change', extractWorkspaceProxyFields);
+$('#btnExtractWorkspaceRefresh')?.addEventListener('click', loadExtractWorkspace);
+$('#btnExtractWorkspaceSelectAll')?.addEventListener('click', () => { EXTRACT_WORKSPACE_SELECTED = new Set(EXTRACT_WORKSPACE_ACCOUNTS.map(acc => Number(acc.id))); extractWorkspaceRender(); });
+$('#extractWorkspaceAll')?.addEventListener('change', e => { EXTRACT_WORKSPACE_SELECTED = e.target.checked ? new Set(EXTRACT_WORKSPACE_ACCOUNTS.map(acc => Number(acc.id))) : new Set(); extractWorkspaceRender(); });
+$('#extractWorkspaceBody')?.addEventListener('change', e => { const cb = e.target.closest('[data-extract-workspace-id]'); if (!cb) return; const id = Number(cb.dataset.extractWorkspaceId); if (cb.checked) EXTRACT_WORKSPACE_SELECTED.add(id); else EXTRACT_WORKSPACE_SELECTED.delete(id); extractWorkspaceRender(); });
+$('#extractWorkspaceBody')?.addEventListener('click', e => { const btn = e.target.closest('[data-copy-extract]'); if (btn) copyText(btn.dataset.copyExtract); });
+$('#btnExtractWorkspaceRun')?.addEventListener('click', runExtractWorkspace);
 
 async function generateOneCodexAgent(id, btn) {
   const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
@@ -5825,7 +5831,6 @@ async function loginAllFreeNoTrialToSub2() {
   bind('btnCheckSelectedPlansV2', checkSelectedPlans);
   bind('btnReactivateSelectedTwofaV2', reactivateSelectedTwofa);
   bind('btnImportPlanEmailsV2', openImportPlanPanel);
-  bind('btnExtractSelectedLinksV2', extractSelectedLinks);
   bind('btnGenerateSelectedAgentV2', generateSelectedCodexAgents);
   bind('btnDownloadSelectedAgentV2', downloadSelectedCodexAgents);
   bind('btnUploadSelectedAgentSub2V2', uploadSelectedCodexAgentSub2);
@@ -7943,7 +7948,6 @@ jobsTimer = setInterval(() => { if (!$('#tab-register').classList.contains('hidd
 setInterval(loadSummary, 30000);
 setInterval(() => { if (!$('#tab-accounts').classList.contains('hidden')) pollAccountPlanStatuses(); }, 10000);
 </script>
-  <script src="{{ url_for('static', filename='reserved_test_aliases.js') }}"></script>
   <script src="{{ url_for('static', filename='roxy_profiles.js') }}"></script>
   <script src="{{ url_for('static', filename='email_change.js') }}"></script>
   <script src="{{ url_for('static', filename='vi.js') }}"></script>

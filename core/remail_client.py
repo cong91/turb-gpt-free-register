@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Remail 开放 API 邮箱客户端。
 
 Remail 的开放 API 与本项目已有的“生成随机邮箱”类服务不同：
@@ -305,7 +304,7 @@ def _saved_context_metadata(email: str) -> dict:
         from core import db
 
         row = db.get_account_by_email(email)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[Remail] 读取已注册账号订单信息失败: %s: %s", type(exc).__name__, exc)
         return {}
     if not row:
@@ -706,7 +705,7 @@ def fetch_latest_otp(
                 return best_otp
         except RemailError as exc:
             last_error = str(exc)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}: {exc}"
 
         remaining = deadline - time.monotonic()

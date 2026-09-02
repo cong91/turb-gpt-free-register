@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Base class for Gmail batch stores with shared SQLite lifecycle."""
 from __future__ import annotations
 
@@ -8,7 +7,6 @@ from abc import ABC, abstractmethod
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from core import app_state_db
 
@@ -61,17 +59,16 @@ class GmailBatchStoreBase(ABC):
     @abstractmethod
     def _get_schema_sql(self) -> str:
         """Return provider-specific schema SQL."""
-        pass
 
     @abstractmethod
     def poll_otp(
         self,
         assignment: Assignment,
         *,
-        after_ts: Optional[float] = None,
+        after_ts: float | None = None,
         timeout: float = 60.0,
         poll_interval: float = 2.0,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Poll for OTP code using provider-specific mechanism.
         
         Args:
@@ -83,7 +80,6 @@ class GmailBatchStoreBase(ABC):
         Returns:
             OTP code if found, None if timeout
         """
-        pass
 
     def claim(self, batch_id: str, job_id: str) -> Assignment:
         """Claim an available Gmail account from batch."""
@@ -145,7 +141,7 @@ class GmailBatchStoreBase(ABC):
         assignment_id: str,
         target: str,
         *,
-        item_state: Optional[str],
+        item_state: str | None,
         reason: str = "",
     ) -> bool:
         """Internal method to transition assignment state."""
@@ -194,7 +190,7 @@ class GmailBatchStoreBase(ABC):
 
     def find_active_assignment(
         self, batch_id: str, job_id: str
-    ) -> Optional[Assignment]:
+    ) -> Assignment | None:
         """Find active assignment for batch+job combination."""
         with closing(self._connect()) as connection:
             row = connection.execute(
@@ -204,7 +200,7 @@ class GmailBatchStoreBase(ABC):
             ).fetchone()
         return self._assignment(row) if row else None
 
-    def find_active_assignment_for_alias(self, alias: str) -> Optional[Assignment]:
+    def find_active_assignment_for_alias(self, alias: str) -> Assignment | None:
         """Find active assignment for a given alias email.
         
         Used during release_account() to finalize orphaned assignments
@@ -224,7 +220,6 @@ class GmailBatchStoreBase(ABC):
     @abstractmethod
     def _table_prefix(self) -> str:
         """Return table prefix for SQL queries (e.g., 'gmail_cdk' or 'gmail_api_url')."""
-        pass
 
     @staticmethod
     def _required(*values: str) -> tuple[str, ...]:
@@ -247,9 +242,9 @@ class GmailBatchStoreBase(ABC):
 
     class _Transaction:
         """Transaction context manager."""
-        def __init__(self, store: "GmailBatchStoreBase"):
+        def __init__(self, store: GmailBatchStoreBase):
             self.store = store
-            self.connection: Optional[sqlite3.Connection] = None
+            self.connection: sqlite3.Connection | None = None
 
         def __enter__(self) -> sqlite3.Connection:
             self.connection = self.store._connect()
@@ -268,6 +263,6 @@ class GmailBatchStoreBase(ABC):
             finally:
                 self.connection.close()
 
-    def _transaction(self) -> "_Transaction":
+    def _transaction(self) -> _Transaction:
         """Create transaction context manager."""
         return self._Transaction(self)

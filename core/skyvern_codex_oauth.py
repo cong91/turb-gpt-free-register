@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Skyvern 云端浏览器 Codex OAuth 入口。"""
 from __future__ import annotations
 

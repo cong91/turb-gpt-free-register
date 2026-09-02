@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Regression tests for Roxy profile lifecycle."""
 import threading
 import time
@@ -138,7 +137,7 @@ class RoxyProfileQuotaTests(unittest.TestCase):
                 raise RuntimeError("open failed")
             return {"ok": True}
 
-        with patch.object(RoxyBrowserClient, "request", new=request):
+        with patch.object(RoxyBrowserClient, "request", new=request):  # noqa: SIM117
             with self.assertRaisesRegex(RuntimeError, "open failed"):
                 RoxyBrowserClient().open_profile()
 

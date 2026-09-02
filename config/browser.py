@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 浏览器指纹与 HTTP 客户端配置。
 
@@ -12,12 +11,11 @@ navigator/screen/timezone/client hints 不能互相打架。
 """
 from __future__ import annotations
 
-from config.env_loader import apply_env_overrides
-
 import random
-import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
+
+from config.env_loader import apply_env_overrides
 
 
 def _latest_chrome_major(default: str = "149") -> str:
@@ -121,7 +119,7 @@ def _offset_minutes_for_timezone(tz_name: str, default: int) -> int:
         offset = datetime.now(ZoneInfo(tz_name)).utcoffset()
         if offset is not None:
             return int(offset.total_seconds() // 60)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return int(default)
 

@@ -26,6 +26,28 @@ class AppStateDbTests(unittest.TestCase):
             finally:
                 connection.close()
 
+    def test_connection_does_not_rewrite_existing_delete_journal_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.sqlite3"
+            sqlite3.connect(path).close()
+            statements: list[str] = []
+            original_connect = sqlite3.connect
+
+            def traced_connect(*args, **kwargs):
+                connection = original_connect(*args, **kwargs)
+                connection.set_trace_callback(statements.append)
+                return connection
+
+            with patch.object(app_state_db.sqlite3, "connect", side_effect=traced_connect):
+                connection = app_state_db.connect(path)
+            try:
+                self.assertNotIn(
+                    "PRAGMA journal_mode = DELETE",
+                    [statement.strip().upper() for statement in statements],
+                )
+            finally:
+                connection.close()
+
     def test_core_database_path_tracks_canonical_turb_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "turb.sqlite3"
@@ -133,6 +155,56 @@ class AppStateDbTests(unittest.TestCase):
 
             with patch.object(app_state_db, "APP_STATE_DB_PATH", database):
                 self.assertEqual(app_state_db.get_document(export, []), [])
+
+    def test_account_save_preserves_rows_absent_from_a_stale_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "turb.sqlite3"
+            accounts_path = root / "accounts.json"
+            with (
+                patch.object(app_state_db, "APP_STATE_DB_PATH", database),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", database),
+                patch.object(db, "_ACCOUNTS_JSON", accounts_path),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_schedule_static_viewer_refresh"),
+            ):
+                db._save_accounts([{"id": 1, "email": "first@example.com"}])
+                db._save_accounts([
+                    {"id": 1, "email": "first@example.com"},
+                    {"id": 2, "email": "newer@example.com"},
+                ])
+
+                db._save_accounts([{"id": 1, "email": "first@example.com", "note": "updated"}])
+
+                rows = db.list_accounts()
+
+        self.assertEqual(
+            [(row["id"], row["email"], row.get("note")) for row in rows],
+            [(2, "newer@example.com", ""), (1, "first@example.com", "updated")],
+        )
+
+    def test_explicit_account_delete_still_removes_only_requested_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            database = root / "turb.sqlite3"
+            with (
+                patch.object(app_state_db, "APP_STATE_DB_PATH", database),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", database),
+                patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_schedule_static_viewer_refresh"),
+            ):
+                db._save_accounts([
+                    {"id": 1, "email": "first@example.com"},
+                    {"id": 2, "email": "second@example.com"},
+                ])
+
+                self.assertTrue(db.delete_account(acc_id=1))
+                rows = db.list_accounts()
+
+        self.assertEqual([row["email"] for row in rows], ["second@example.com"])
 
     def test_rewriting_unchanged_document_preserves_update_timestamp(self):
         with tempfile.TemporaryDirectory() as tmp:

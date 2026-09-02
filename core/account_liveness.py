@@ -1,26 +1,11 @@
-# -*- coding: utf-8 -*-
 """已注册账号查活：优先复用已有 AT 预热后走 reauth OTP，成功刷新 AT 即视为正常。"""
-import logging
 import json
+import logging
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 from core import db
-from core.session import BrowserSession
-from core.codex_oauth import _account_registration_password, _account_totp_secret, _account_totp_code
-from core.humanize import delay as human_delay
-from core.chatgpt_auth import get_csrf_token, signin_openai
-from core.openai_auth import (
-    follow_authorize,
-    send_email_otp,
-    validate_email_otp,
-    EmailOtpInvalidError,
-    AccountUnusableError,
-    account_unusable_message,
-    detect_account_unusable_text,
-)
 from core.account_export import (
     _follow_reauth,
     _trigger_reauth,
@@ -28,7 +13,25 @@ from core.account_export import (
     fetch_session,
     follow_oauth_callback,
 )
+from core.chatgpt_auth import get_csrf_token, signin_openai
+from core.codex_oauth import (
+    _account_registration_password,
+    _account_totp_code,
+    _account_totp_secret,
+)
 from core.email_provider import wait_for_otp
+from core.humanize import delay as human_delay
+from core.openai_auth import (
+    AccountUnusableError,
+    EmailOtpInvalidError,
+    account_unusable_message,
+    detect_account_unusable_text,
+    follow_authorize,
+    send_email_otp,
+    validate_email_otp,
+)
+from core.session import BrowserSession
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 _LOG_DIR = Path(__file__).resolve().parent.parent / "注册日志"
@@ -81,7 +84,7 @@ def _network_preflight_with_retry(email: str, proxy: str | None, max_attempts: i
         if session is not None:
             try:
                 session.session.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         # 保留 None / "" 的语义差异：显式空字符串必须是真直连。
         session = BrowserSession(proxy=proxy, fingerprint_seed=seed)
@@ -99,7 +102,7 @@ def _network_preflight_with_retry(email: str, proxy: str | None, max_attempts: i
             if attempt >= max_attempts or not _is_retryable_network_error(exc):
                 try:
                     session.session.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
                 raise
             logger.warning(
@@ -111,7 +114,7 @@ def _network_preflight_with_retry(email: str, proxy: str | None, max_attempts: i
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return local_now().isoformat(timespec="seconds")
 
 
 def _safe_fingerprint_for_account(session: BrowserSession) -> dict:
@@ -226,7 +229,7 @@ def _stored_access_token(email: str) -> str:
     try:
         account = db.get_account_by_email(email)
         return str((account or {}).get("access_token") or "").strip()
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[查活] 读取已有 accessToken 失败，改走备用登录链：%s: %s", type(exc).__name__, exc)
         return ""
 
@@ -257,7 +260,7 @@ def _warm_authenticated_session(session: BrowserSession, access_token: str) -> N
         logger.info("[查活] 使用已有 accessToken 预热登录态...")
         authenticated_bootstrap(session, access_token, strict=False)
         logger.info("[查活] accessToken 预热完成，继续走 reauth OTP")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # strict=False 已经会吞掉大部分单接口错误；这里仅兜住初始化异常。
         logger.warning("[查活] accessToken 预热失败，继续走 reauth OTP：%s: %s", type(exc).__name__, str(exc)[:180])
     finally:
@@ -499,10 +502,7 @@ def _validate_with_retry(
                 raise
             last_exc = exc
             logger.warning("[查活] OTP 验证网络抖动，重新发送后再取（%s/%s）：%s", attempt, max_otp_attempts, str(exc)[:180])
-            try:
-                send_email_otp(session)
-            except Exception:
-                raise
+            send_email_otp(session)
             previous_submitted_otp = current_otp
             otp_after_ts = time.time()
             current_otp = None
@@ -633,7 +633,7 @@ def check_account_liveness(
         message = account_unusable_message(code)
         logger.warning("[查活] %s：%s %s", message, email, code)
         return {"ok": False, "status": "deactivated", "checked_at": checked_at, "error": message}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         code = detect_account_unusable_text(_exception_response_text(exc)) or detect_account_unusable_text(str(exc))
         if code:
             message = account_unusable_message(code)
@@ -647,7 +647,7 @@ def check_account_liveness(
             if session is not None:
                 try:
                     session.session.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             if fh is not None:
                 root_logger.removeHandler(fh)

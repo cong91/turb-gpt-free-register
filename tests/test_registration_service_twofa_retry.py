@@ -247,6 +247,120 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             discard_on_failure=True,
         )
 
+    @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
+    def test_transient_registration_failure_queues_one_new_registration_job(self):
+        source = db.create_job(email_source="qan8_gmail_api")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            return_value={"success": False, "error": "密码页提交失败：vui lòng thử lại"},
+        ), patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+        ) as release_email, patch.object(
+            registration_service,
+            "get_executor",
+            return_value=ImmediateExecutor(),
+        ), patch.object(
+            registration_service,
+            "get_executor_workers",
+            return_value=1,
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            registration_service._run_one_job(source["id"], source["log_file"])
+
+        jobs = db.list_jobs(limit=10)
+        child = next(job for job in jobs if job["id"] != source["id"])
+        self.assertEqual(db.get_job(source["id"])["status"], "failed")
+        self.assertEqual(child["parent_job_id"], source["id"])
+        self.assertEqual(child["root_job_id"], source["id"])
+        self.assertEqual(child["retry_attempt"], 1)
+        self.assertEqual(child["job_type"], "registration")
+        release_email.assert_called_once_with(
+            "alias+one@gmail.com",
+            "密码页提交失败：vui lòng thử lại",
+            discard_on_failure=True,
+        )
+        self.assertEqual(len(submitted), 1)
+        self.assertIs(submitted[0][0], registration_service._run_one_job)
+
+    @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
+    def test_terminal_registration_failure_does_not_queue_a_new_job(self):
+        source = db.create_job(email_source="qan8_gmail_api")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            return_value={"success": False, "error": "account deactivated"},
+        ), patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+        ), patch.object(
+            registration_service,
+            "get_executor",
+            return_value=ImmediateExecutor(),
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            registration_service._run_one_job(source["id"], source["log_file"])
+
+        self.assertEqual(len(db.list_jobs(limit=10)), 1)
+        self.assertEqual(submitted, [])
+
+    @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
+    def test_transient_failure_retries_when_main_already_failed_qan8_assignment(self):
+        source = db.create_job(
+            email_source="qan8_gmail_api",
+            provider_context={"qan8_gmail_api_batch_id": "batch-1", "qan8_gmail_api_lane_id": 0},
+        )
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            return_value={"success": False, "error": "密码页提交失败：vui lòng thử lại"},
+        ), patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+            return_value=False,
+        ), patch(
+            "core.qan8_gmail_api_store.Qan8GmailApiStore.get_assignment",
+            return_value={"state": "failed"},
+        ), patch.object(
+            registration_service,
+            "get_executor",
+            return_value=ImmediateExecutor(),
+        ), patch.object(
+            registration_service,
+            "get_executor_workers",
+            return_value=1,
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            registration_service._run_one_job(source["id"], source["log_file"])
+
+        self.assertEqual(len(db.list_jobs(limit=10)), 2)
+        self.assertEqual(len(submitted), 1)
+
     def test_qan8_alias_is_failed_when_registration_fails_before_create(self):
         import main
 

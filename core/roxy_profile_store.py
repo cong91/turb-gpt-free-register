@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Durable catalog and operation ledger for managed Roxy profiles."""
 from __future__ import annotations
 

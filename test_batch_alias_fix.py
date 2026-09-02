@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """
 Integration test: Gmail API URL multi-alias batch registration
 Verifies Bug B fix (source email filtered) + Bug C fix (assignment finalize)
@@ -11,8 +10,8 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.gmail_aliases import generate_gmail_dual_domain_variants
 from core.app_state_db import APP_STATE_DB_PATH
+from core.gmail_aliases import generate_gmail_dual_domain_variants
 
 
 def test_source_email_filtered():
@@ -111,8 +110,9 @@ def test_assignment_finalize_code_exists():
     """Verify that release_account() has batch assignment finalize logic"""
     print("=== Test 3: Assignment Finalize Code Check ===")
     
-    from core import gmail_api_url_client
     import inspect
+
+    from core import gmail_api_url_client
     
     source = inspect.getsource(gmail_api_url_client.release_account)
     
@@ -145,7 +145,7 @@ if __name__ == '__main__':
     
     try:
         results.append(("Source Email Filter", test_source_email_filtered()))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"❌ Test 1 failed with exception: {e}")
         import traceback
         traceback.print_exc()
@@ -153,7 +153,7 @@ if __name__ == '__main__':
     
     try:
         results.append(("Batch Items Aliases", test_batch_items_are_aliases()))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"❌ Test 2 failed with exception: {e}")
         import traceback
         traceback.print_exc()
@@ -161,7 +161,7 @@ if __name__ == '__main__':
     
     try:
         results.append(("Assignment Finalize", test_assignment_finalize_code_exists()))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"❌ Test 3 failed with exception: {e}")
         import traceback
         traceback.print_exc()

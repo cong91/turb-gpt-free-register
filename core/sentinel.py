@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Sentinel Token 生成模块
 逆向自 sentinel.openai.com 的 sdk.js
@@ -10,19 +9,27 @@ Sentinel Token 生成模块
 4. 计算 Proof of Work（FNV-1a 哈希）
 5. 组装最终的 openai-sentinel-token 请求头值
 """
-import json
-import time
-import math
-import random
 import base64
-import hashlib
-from datetime import datetime, timezone, timedelta
+import json
+import random
+import time
+from datetime import datetime, timedelta, timezone
 
 from config import (
-    USER_AGENT, SENTINEL_SV, NAVIGATOR_LANGUAGE, NAVIGATOR_LANGUAGES,
-    TIMEZONE_OFFSET_MINUTES, TIMEZONE_NAME, SCREEN_WIDTH, SCREEN_HEIGHT,
-    HARDWARE_CONCURRENCY, JS_HEAP_SIZE_LIMIT, NAVIGATOR_PROTO_SAMPLES,
-    DOCUMENT_KEY_SAMPLES, WINDOW_KEY_SAMPLES, WINDOW_FEATURE_FLAGS,
+    DOCUMENT_KEY_SAMPLES,
+    HARDWARE_CONCURRENCY,
+    JS_HEAP_SIZE_LIMIT,
+    NAVIGATOR_LANGUAGE,
+    NAVIGATOR_LANGUAGES,
+    NAVIGATOR_PROTO_SAMPLES,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
+    SENTINEL_SV,
+    TIMEZONE_NAME,
+    TIMEZONE_OFFSET_MINUTES,
+    USER_AGENT,
+    WINDOW_FEATURE_FLAGS,
+    WINDOW_KEY_SAMPLES,
 )
 
 

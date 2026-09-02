@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Launch a copied profile with the installed RoxyChrome core."""
 from __future__ import annotations
 
@@ -285,7 +284,7 @@ def capture_signature(
         if not expected:
             return actual, "unknown"
         return actual, "matched" if actual == expected else "mismatched"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "", "unknown"
 
 
@@ -312,13 +311,12 @@ def _tracked_process_matches(launch: RoxyLocalLaunch) -> bool:
     executable = str(launch.executable).replace("'", "''")
     command = [
         "powershell", "-NoProfile", "-NonInteractive", "-Command",
-        "$p=Get-CimInstance Win32_Process -Filter \"ProcessId=%d\"; "
-        "if(-not $p){exit 2}; "
-        "$e=$p.ExecutablePath; "
-        "$s=(Get-Process -Id %d -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o'); "
-        "if($e -ne '%s' -or $s -ne '%s'){exit 3}" % (
-            int(launch.pid), int(launch.pid), executable,
-            str(launch.process_started_at).replace("'", "''"),
+        (
+            f"$p=Get-CimInstance Win32_Process -Filter \"ProcessId={int(launch.pid)}\"; "
+            "if(-not $p){exit 2}; "
+            "$e=$p.ExecutablePath; "
+            f"$s=(Get-Process -Id {int(launch.pid)} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o'); "
+            f"if($e -ne '{executable}' -or $s -ne '{str(launch.process_started_at).replace(chr(39), chr(39) * 2)}'){{exit 3}}"
         ),
     ]
     try:

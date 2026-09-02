@@ -1,8 +1,11 @@
-# -*- coding: utf-8 -*-
 import base64
 import unittest
 
-from core.generic_api_mail_client import _decode_data_uri, _fetch_yangyang_otp, _parse_yangyang_code_url
+from core.generic_api_mail_client import (
+    _decode_data_uri,
+    _fetch_yangyang_otp,
+    _parse_yangyang_code_url,
+)
 
 
 class FakeResponse:
@@ -83,7 +86,7 @@ class GenericApiYangyangTests(unittest.TestCase):
 
     def test_fetch_yangyang_otp_respects_after_ts(self):
         import datetime
-        after = datetime.datetime(2026, 8, 1, 10, 2, 0).timestamp()
+        after = datetime.datetime(2026, 8, 1, 10, 2, 0, tzinfo=datetime.timezone.utc).timestamp()
         result = _fetch_yangyang_otp(
             FakeSession(),
             "http://yangyang.website/messages/tok/a@icloud.com",

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """GPTMail 临时邮箱客户端。"""
 from __future__ import annotations
 

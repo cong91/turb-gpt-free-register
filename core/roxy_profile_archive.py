@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Encrypted metadata archives for managed Roxy profiles."""
 from __future__ import annotations
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """sub2api 对接配置。"""
 import ast
 import re

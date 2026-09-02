@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 OpenAI / ChatGPT OAuth 协议固定参数
 

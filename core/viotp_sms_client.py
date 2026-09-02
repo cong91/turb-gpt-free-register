@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """ViOTP HTTP client for renting phone numbers and reading SMS sessions."""
 from urllib.parse import urljoin
 

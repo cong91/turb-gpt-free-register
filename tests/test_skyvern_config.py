@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
 import unittest
 from unittest.mock import patch
 
 from config import env_loader
-from webui import config_editor
 from core.skyvern_client import SkyvernClient
+from webui import config_editor
 
 
 class SkyvernConfigTests(unittest.TestCase):

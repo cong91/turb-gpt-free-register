@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import hashlib
@@ -8,7 +7,6 @@ import re
 import string
 from collections.abc import Sequence
 from dataclasses import dataclass
-
 
 MAX_GMAIL_VARIANTS = 6
 _RESERVED_ROUTED_SUFFIXES = (".test", ".invalid", ".example")

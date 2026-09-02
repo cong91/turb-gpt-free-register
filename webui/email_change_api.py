@@ -44,7 +44,7 @@ def _change_response(mode: str, results: list[dict], submitted: int, succeeded: 
             mode,
             public_results,
         )
-    except Exception:
+    except Exception:  # noqa: BLE001
         return jsonify({
             "ok": False,
             "error": "无法保存本次变更记录",

@@ -1,10 +1,11 @@
-# -*- coding: utf-8 -*-
 """注册资料生成工具。"""
 
 from __future__ import annotations
 
 import random
 from datetime import date, timedelta
+
+from core.time_utils import local_today
 
 
 def _shift_year_safe(day: date, years: int) -> date:
@@ -24,7 +25,7 @@ def generate_random_birthday(min_age: int = 18, max_age: int = 29) -> str:
     if min_age < 0 or max_age < min_age:
         raise ValueError(f"年龄范围无效: min_age={min_age}, max_age={max_age}")
 
-    today = date.today()
+    today = local_today()
     oldest = _shift_year_safe(today, -max_age)
     youngest = _shift_year_safe(today, -min_age)
     span_days = (youngest - oldest).days

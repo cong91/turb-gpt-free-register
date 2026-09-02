@@ -71,7 +71,7 @@ def _has_usable_navigation_document(page, target_url: str) -> bool:
         state = page.evaluate(
             "() => ({readyState: document.readyState, hasBody: !!document.body})"
         ) or {}
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return bool(state.get("hasBody")) and state.get("readyState") in {
         "loading",
@@ -145,7 +145,7 @@ class BrowserElement:
             if self.locator is not None:
                 return bool(self.locator.is_visible(timeout=800))
             return bool(self.handle.evaluate("el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'"))
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
 
     def is_enabled(self) -> bool:
@@ -153,7 +153,7 @@ class BrowserElement:
             if self.locator is not None:
                 return bool(self.locator.is_enabled(timeout=800))
             return bool(self.handle.evaluate("el => !el.disabled && el.getAttribute('aria-disabled') !== 'true'"))
-        except Exception:
+        except Exception:  # noqa: BLE001
             return False
 
     def click(self) -> None:
@@ -168,7 +168,7 @@ class BrowserElement:
                 self.locator.fill("", timeout=10000)
             else:
                 self.handle.fill("", timeout=10000)
-        except Exception:
+        except Exception:  # noqa: BLE001
             # 部分非 input 元素不支持 fill，回退键盘清空。
             self.click()
             self.page.keyboard.press("Meta+A")
@@ -178,7 +178,7 @@ class BrowserElement:
     def tag_name(self) -> str:
         try:
             return str(self._eval("el => el.tagName.toLowerCase()") or "")
-        except Exception:
+        except Exception:  # noqa: BLE001
             return ""
 
     @property
@@ -188,10 +188,10 @@ class BrowserElement:
             if self.locator is not None:
                 return str(self.locator.inner_text(timeout=1000) or "")
             return str(self.handle.inner_text(timeout=1000) or "")
-        except Exception:
+        except Exception:  # noqa: BLE001
             try:
                 return str(self._eval("el => el.innerText || el.textContent || ''") or "")
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return ""
 
     def send_keys(self, *values: str) -> None:
@@ -227,7 +227,7 @@ class BrowserElement:
             if self.locator is not None:
                 return self.locator.get_attribute(name, timeout=1000)
             return self.handle.get_attribute(name)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
 
 
@@ -268,7 +268,7 @@ class BrowserSeleniumDriver:
         try:
             if self.context is not None:
                 return list(self.context.pages)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         try:
             contexts = list(getattr(self.browser, "contexts", []) or [])
@@ -276,7 +276,7 @@ class BrowserSeleniumDriver:
             for ctx in contexts:
                 pages.extend(list(getattr(ctx, "pages", []) or []))
             return pages or [self.page]
-        except Exception:
+        except Exception:  # noqa: BLE001
             return [self.page]
 
     def _switch_window(self, handle: str) -> None:
@@ -285,7 +285,7 @@ class BrowserSeleniumDriver:
         self.page = pages[idx]
         try:
             self.page.bring_to_front()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def set_page_load_timeout(self, seconds: int) -> None:
@@ -293,7 +293,7 @@ class BrowserSeleniumDriver:
         try:
             self.page.set_default_navigation_timeout(self._page_load_timeout_ms)
             self.page.set_default_timeout(self._page_load_timeout_ms)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     @property
@@ -310,7 +310,7 @@ class BrowserSeleniumDriver:
             for cookie in cookies:
                 if cookie.get("name") == name:
                     return dict(cookie)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return None
 
@@ -346,7 +346,7 @@ class BrowserSeleniumDriver:
                 )
                 try:
                     self.page.goto("about:blank", wait_until="commit", timeout=min(self._page_load_timeout_ms, 10000))
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
                 if delay:
                     time.sleep(delay)
@@ -366,18 +366,18 @@ class BrowserSeleniumDriver:
         try:
             if self.context is not None:
                 self.context.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         try:
             self.browser.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
     def find_elements(self, by: Any, selector: str) -> list[BrowserElement]:
         loc = self._locator(by, selector)
         try:
             count = min(int(loc.count()), 200)
-        except Exception:
+        except Exception:  # noqa: BLE001
             count = 0
         return [BrowserElement(self.page, loc.nth(i)) for i in range(count)]
 
@@ -404,7 +404,7 @@ class BrowserSeleniumDriver:
         try:
             client = self.context.new_cdp_session(self.page) if self.context is not None else self.page.context.new_cdp_session(self.page)
             return client.send(cmd, params)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Cloak] CDP 命令失败 %s: %s", cmd, exc)
             return None
 
@@ -432,7 +432,7 @@ class BrowserSeleniumDriver:
     def _unwrap_js_result(page, handle: Any) -> Any:
         try:
             element = handle.as_element()
-        except Exception:
+        except Exception:  # noqa: BLE001
             element = None
         if element is not None:
             return BrowserElement(page, handle=element)
@@ -465,7 +465,7 @@ class BrowserSeleniumDriver:
         finally:
             try:
                 handle.dispose()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
 
     def _evaluate(self, script: str, args: tuple[Any, ...], async_mode: bool) -> Any:
@@ -543,10 +543,11 @@ def _detect_cloak_exit_geo(proxy_url: str | None = None) -> dict:
     """按当前/代理出口检测地理信息，供 Cloak 显式 locale/timezone 使用。"""
     try:
         import requests
+
         from config import browser as _browser_cfg
         endpoints = list(getattr(_browser_cfg, "IP_GEO_ENDPOINTS", []) or [])
         timeout = float(getattr(_browser_cfg, "IP_GEO_TIMEOUT", 6) or 6)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
     proxies = None
     if proxy_url:
@@ -575,7 +576,7 @@ def _detect_cloak_exit_geo(proxy_url: str | None = None) -> dict:
                     geo.get("ip") or "?", geo.get("country") or "?", geo.get("city") or "?", geo.get("timezone") or "?",
                 )
                 return geo
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Cloak] 出口 IP 地理检测失败 endpoint=%s: %s: %s", url, type(exc).__name__, exc)
     return {}
 
@@ -603,7 +604,7 @@ def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
         out.setdefault("timezone", str(profile.get("timezone_iana") or ""))
         out.setdefault("accept_language", str(profile.get("accept_language") or ""))
         out["geo"] = geo
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[Cloak] 构建自动语言/时区失败：%s: %s", type(exc).__name__, exc)
     return {k: v for k, v in out.items() if v}
 

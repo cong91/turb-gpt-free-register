@@ -50,7 +50,7 @@ def _mask_proxy(value: object) -> str:
 
 
 class RotatingProxyManager:
-    """Allocate one provider key per scoped lane and reuse it until TTL expiry."""
+    """Lease unique keys to active lanes and reuse cached proxies until TTL expiry."""
 
     def __init__(
         self,
@@ -107,6 +107,29 @@ class RotatingProxyManager:
                 str(exc)[:180],
             )
             return False
+
+    def _cached_proxy(
+        self,
+        key: str,
+        *,
+        key_info: dict[str, Any] | None,
+        now: float,
+    ) -> dict[str, Any] | None:
+        cached = self.store.get_cached_proxy(key)
+        if cached is None:
+            return None
+        try:
+            active = float(cached.get("proxy_expires_at") or 0) > now
+        except (TypeError, ValueError):
+            active = False
+        if not active or self._key_expired(key_info):
+            self.store.delete_cached_proxy(key, proxy_url=cached.get("proxy_url"))
+            return None
+        proxy_url = str(cached.get("proxy_url") or "").strip()
+        if proxy_url and self._proxy_healthy(proxy_url):
+            return cached
+        self.store.delete_cached_proxy(key, proxy_url=proxy_url or None)
+        return None
 
     @staticmethod
     def _cooldown_seconds(error: Exception) -> int | None:
@@ -216,16 +239,21 @@ class RotatingProxyManager:
         lane_scope = self._scope(scope)
         with self._lock:
             self.store.delete_expired_leases(self.clock())
-            refreshed = self._refresh_keys()
+            self.store.delete_expired_cached_proxies(self.clock())
+            local_inventory = self.store.list_keys()
             ordered_keys = [
-                str(item.get("key") or "").strip()
-                for item in refreshed
-                if str(item.get("key") or "").strip()
+                str(item.get("rotating_key") or "").strip()
+                for item in local_inventory
+                if str(item.get("rotating_key") or "").strip()
             ]
             active_keys = {
                 key
                 for key in ordered_keys
-                if not self._key_expired(self.store.get_key(key))
+                if (
+                    (key_info := self.store.get_key(key)) is not None
+                    and key_info.get("key_expires_at") is not None
+                    and not self._key_expired(key_info)
+                )
             }
             occupied_keys = set()
             for lease in self.store.list_leases():
@@ -239,14 +267,28 @@ class RotatingProxyManager:
                 if not same_target_lane:
                     occupied_keys.add(key)
 
+            available_count = len(active_keys - occupied_keys)
+            if available_count < target:
+                refreshed = self._refresh_keys()
+                ordered_keys = [
+                    str(item.get("key") or "").strip()
+                    for item in refreshed
+                    if str(item.get("key") or "").strip()
+                ]
+                active_keys = {
+                    key
+                    for key in ordered_keys
+                    if not self._key_expired(self.store.get_key(key))
+                }
             missing = max(0, target - len(active_keys - occupied_keys))
             logger.info(
-                "[RotatingProxy] inventory check: scope=%s target_lanes=%s active_keys=%s occupied_keys=%s missing=%s",
+                "[RotatingProxy] inventory check: scope=%s target_lanes=%s active_keys=%s occupied_keys=%s missing=%s refreshed=%s",
                 lane_scope,
                 target,
                 len(active_keys),
                 len(occupied_keys),
                 missing,
+                available_count < target,
             )
             known_keys = {str(item.get("rotating_key") or "").strip() for item in self.store.list_keys()}
             while missing:
@@ -298,6 +340,7 @@ class RotatingProxyManager:
                 fallback = previous
 
             self.store.delete_expired_leases(now)
+            self.store.delete_expired_cached_proxies(now)
             existing = self.store.get_lease(lane, scope=lane_scope)
             existing_key = str(existing.get("rotating_key") or "").strip() if existing else ""
             key_info = self.store.get_key(existing_key) if existing_key else None
@@ -322,6 +365,10 @@ class RotatingProxyManager:
                         proxy_expires_at=float(existing["proxy_expires_at"]),
                         key_expires_at=existing.get("key_expires_at"),
                     )
+                self.store.delete_cached_proxy(
+                    str(existing["rotating_key"]),
+                    proxy_url=str(existing["proxy_url"]),
+                )
                 self.store.delete_lease(
                     lane,
                     scope=lane_scope,
@@ -343,6 +390,38 @@ class RotatingProxyManager:
                 key = str(key_info.get("rotating_key") or "").strip()
                 if not key:
                     raise RotatingProxyError("Không xác định được keyxoay cho lane")
+                cached = self._cached_proxy(key, key_info=key_info, now=now)
+                if cached is not None:
+                    proxy_url = str(cached["proxy_url"])
+                    proxy_expires_at = float(cached["proxy_expires_at"])
+                    persisted = self.store.try_upsert_lease(
+                        lane,
+                        scope=lane_scope,
+                        rotating_key=key,
+                        proxy_url=proxy_url,
+                        proxy_expires_at=proxy_expires_at,
+                        key_expires_at=key_info.get("key_expires_at"),
+                        assigned_at=now,
+                    )
+                    if persisted:
+                        logger.info(
+                            "[RotatingProxy] reuse cached proxy: scope=%s lane=%s key=%s ttl=%ss",
+                            lane_scope,
+                            lane,
+                            _mask_key(key),
+                            max(0, int(proxy_expires_at - now)),
+                        )
+                        return RotatingProxyLease(
+                            scope=lane_scope,
+                            lane_id=lane,
+                            key=key,
+                            proxy_url=proxy_url,
+                            proxy_expires_at=proxy_expires_at,
+                            key_expires_at=key_info.get("key_expires_at"),
+                        )
+                    excluded_keys.add(key)
+                    existing = None
+                    continue
                 try:
                     proxy = self.client.get_proxy(key)
                 except Exception as exc:  # noqa: BLE001 - retry another rotating key.
@@ -414,6 +493,12 @@ class RotatingProxyManager:
                     ttl_seconds = 1800
                 proxy_expires_at = now + ttl_seconds
                 key_expires_at = key_info.get("key_expires_at")
+                self.store.upsert_cached_proxy(
+                    key,
+                    proxy_url=proxy_url,
+                    proxy_expires_at=proxy_expires_at,
+                    key_expires_at=key_expires_at,
+                )
                 persisted = self.store.try_upsert_lease(
                     lane,
                     scope=lane_scope,
@@ -462,10 +547,26 @@ class RotatingProxyManager:
         rotating_key: str | None = None,
         proxy_url: str | None = None,
     ) -> bool:
-        """Release a scoped worker-lane lease so another workflow can claim the key."""
+        """Release a worker lane while retaining its usable proxy cache."""
         lane = self._lane_id(lane_id)
         lane_scope = self._scope(scope)
         with self._lock:
+            existing = self.store.get_lease(lane, scope=lane_scope)
+            if existing is None:
+                return False
+            current_key = str(existing.get("rotating_key") or "").strip()
+            current_proxy = str(existing.get("proxy_url") or "").strip()
+            if rotating_key is not None and current_key != str(rotating_key):
+                return False
+            if proxy_url is not None and current_proxy != str(proxy_url):
+                return False
+            if current_key and current_proxy:
+                self.store.upsert_cached_proxy(
+                    current_key,
+                    proxy_url=current_proxy,
+                    proxy_expires_at=float(existing["proxy_expires_at"]),
+                    key_expires_at=existing.get("key_expires_at"),
+                )
             released = self.store.delete_lease(
                 lane,
                 scope=lane_scope,
@@ -480,6 +581,42 @@ class RotatingProxyManager:
             )
         return released
 
+    def retire(
+        self,
+        lane_id: int,
+        *,
+        scope: str = "registration",
+        rotating_key: str | None = None,
+        proxy_url: str | None = None,
+    ) -> bool:
+        """Release a lane and discard its cached proxy after a confirmed proxy failure."""
+        lane = self._lane_id(lane_id)
+        lane_scope = self._scope(scope)
+        with self._lock:
+            existing = self.store.get_lease(lane, scope=lane_scope)
+            if existing is None:
+                return False
+            current_key = str(existing.get("rotating_key") or "").strip()
+            current_proxy = str(existing.get("proxy_url") or "").strip()
+            if rotating_key is not None and current_key != str(rotating_key):
+                return False
+            if proxy_url is not None and current_proxy != str(proxy_url):
+                return False
+            self.store.delete_cached_proxy(current_key, proxy_url=current_proxy or None)
+            retired = self.store.delete_lease(
+                lane,
+                scope=lane_scope,
+                rotating_key=rotating_key,
+                proxy_url=proxy_url,
+            )
+        if retired:
+            logger.info(
+                "[RotatingProxy] retired proxy cache: scope=%s lane=%s",
+                lane_scope,
+                lane,
+            )
+        return retired
+
     def refresh_keys(self) -> dict[str, Any]:
         with self._lock:
             self._refresh_keys()
@@ -488,9 +625,12 @@ class RotatingProxyManager:
     def status(self) -> dict[str, Any]:
         from config import proxy as proxy_config
 
-        self.store.delete_expired_leases(self.clock())
+        now = self.clock()
+        self.store.delete_expired_leases(now)
+        self.store.delete_expired_cached_proxies(now)
         keys = self.store.list_keys()
         leases = self.store.list_leases()
+        cached_proxies = self.store.list_cached_proxies()
         return {
             "enabled": bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False)),
             "configured": bool(str(getattr(proxy_config, "ROTATING_PROXY_API_KEY", "") or "").strip()),
@@ -514,6 +654,14 @@ class RotatingProxyManager:
                 }
                 for item in leases
             ],
+            "cached_proxies": [
+                {
+                    "key": _mask_key(item.get("rotating_key")),
+                    "proxy": _mask_proxy(item.get("proxy_url")),
+                    "proxy_expires_at": item.get("proxy_expires_at"),
+                }
+                for item in cached_proxies
+            ],
         }
 
 
@@ -525,11 +673,7 @@ def get_rotating_proxy_manager() -> RotatingProxyManager:
     global _DEFAULT_MANAGER
     with _DEFAULT_MANAGER_LOCK:
         if _DEFAULT_MANAGER is None:
-            manager = RotatingProxyManager()
-            cleared = manager.store.clear_leases()
-            if cleared:
-                logger.info("[RotatingProxy] cleared %s lease(s) from previous process", cleared)
-            _DEFAULT_MANAGER = manager
+            _DEFAULT_MANAGER = RotatingProxyManager()
         return _DEFAULT_MANAGER
 
 

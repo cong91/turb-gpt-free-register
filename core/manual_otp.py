@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """非交互环境下的手动 OTP 通道（WebUI / 后台任务用）。
 
 用法：
@@ -113,7 +112,7 @@ def wait_for_manual_otp(email: str, *, timeout: int = 180, job_id: int | None = 
     try:
         import sys
         has_tty = bool(getattr(sys, "stdin", None) and sys.stdin.isatty())
-    except Exception:
+    except Exception:  # noqa: BLE001
         has_tty = False
 
     end = time.time() + max(10, int(timeout))
@@ -147,7 +146,7 @@ def wait_for_manual_otp(email: str, *, timeout: int = 180, job_id: int | None = 
             try:
                 from core.registration_service import check_stop_requested
                 check_stop_requested()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         raise TimeoutError(f"等待手动验证码超时（{timeout}s）：{email}")
     finally:

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """NordVPN WireGuard → 本地 SOCKS5 代理管理器（基于 wireproxy 用户态实现）。
 
 替代 NordVPN 桌面/CLI 全局隧道方案：把每个 NordVPN 的 WireGuard ``.conf``

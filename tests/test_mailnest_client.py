@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,7 +9,7 @@ class MailNestClientTests(unittest.TestCase):
         mailnest_client._CONTEXT_CACHE.clear()
 
     def test_pick_account_requires_api_key(self):
-        with patch.object(mailnest_client._email_cfg, "MAIL_NEST_API_KEY", "", create=True):
+        with patch.object(mailnest_client._email_cfg, "MAIL_NEST_API_KEY", "", create=True):  # noqa: SIM117
             with self.assertRaisesRegex(mailnest_client.MailNestClientError, "MailNest API Key"):
                 mailnest_client.pick_account()
 

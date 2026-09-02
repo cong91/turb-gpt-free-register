@@ -12,7 +12,7 @@ def _country_to_locale(country: object) -> str:
         from config import browser as browser_config
 
         return str(getattr(browser_config, "COUNTRY_LOCALE_PROFILE_MAP", {}).get(value) or value.lower())
-    except Exception:
+    except Exception:  # noqa: BLE001
         return value.lower()
 
 

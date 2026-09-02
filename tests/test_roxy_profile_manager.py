@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import base64
 import tempfile
 import unittest
@@ -154,7 +153,7 @@ class RoxyProfileManagerTests(unittest.TestCase):
                 raise RuntimeError("db commit failed")
             return original_transition(local_id, new_state, **kwargs)
 
-        with patch.object(self.store, "transition", side_effect=transition):
+        with patch.object(self.store, "transition", side_effect=transition):  # noqa: SIM117
             with self.assertRaisesRegex(Exception, "db commit failed"):
                 manager.open_managed_profile("local-1")
         self.assertEqual(
@@ -307,7 +306,7 @@ class RoxyProfileManagerTests(unittest.TestCase):
             manager.archive_managed_profile("local-open-fail")
         with patch("core.roxy_profile_manager._manager_cfg.ROXY_PROFILE_OFFLINE_STAGING_DIR", str(staging_root)), \
              patch("core.roxy_profile_manager._manager_cfg.ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED", True), \
-             patch.object(self.store, "save_launch", side_effect=RuntimeError("db failed")):
+             patch.object(self.store, "save_launch", side_effect=RuntimeError("db failed")):  # noqa: SIM117
             with self.assertRaisesRegex(RuntimeError, "db failed"):
                 manager.open_offline_profile("local-open-fail")
         stopper.assert_called_once_with(launch)
@@ -346,7 +345,7 @@ class RoxyProfileManagerTests(unittest.TestCase):
         stopper = Mock()
         manager = self._manager(stopper=stopper)
         with patch("core.roxy_profile_manager._manager_cfg.ROXY_PROFILE_OFFLINE_STAGING_DIR", str(staging_root)), \
-             patch.object(self.archive, "verify_folder", side_effect=RuntimeError("verify failed")):
+             patch.object(self.archive, "verify_folder", side_effect=RuntimeError("verify failed")):  # noqa: SIM117
             with self.assertRaisesRegex(Exception, "verify failed"):
                 manager.close_offline_profile("local-verify-fail")
         stopper.assert_called_once()
@@ -419,7 +418,7 @@ class RoxyProfileManagerTests(unittest.TestCase):
             display_name="Local",
             owner_marker="owner-2",
         )
-        with patch("core.roxy_profile_manager._manager_cfg.ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED", False):
+        with patch("core.roxy_profile_manager._manager_cfg.ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED", False):  # noqa: SIM117
             with self.assertRaises(RoxyProfileManagerStateError):
                 self._manager().open_offline_profile(profile.local_id)
 

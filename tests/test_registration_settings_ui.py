@@ -1,7 +1,6 @@
 import unittest
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 INDEX_TEMPLATE = PROJECT_ROOT / "webui" / "templates" / "index.html"
 VI_TRANSLATION = PROJECT_ROOT / "webui" / "static" / "vi.js"
