@@ -95,6 +95,31 @@ class _CooldownRotatingProxyClient(_FakeRotatingProxyClient):
         )
 
 
+class _CooldownAfterHealthFailureClient(_FakeRotatingProxyClient):
+    def __init__(self, keys):
+        super().__init__(keys)
+        self.health_calls = []
+
+    def list_keys(self):
+        self.list_calls += 1
+        return []
+
+    def check_proxy(self, proxy_url):
+        self.health_calls.append(proxy_url)
+        return len(self.health_calls) > 1
+
+    def get_proxy(self, key):
+        self.get_calls.append(key)
+        if len(self.get_calls) == 2:
+            raise RotatingProxyApiError(
+                "proxy.vn API status=101: Con 23s moi co the doi proxy"
+            )
+        return {
+            "proxy_url": f"http://198.51.100.{len(self.get_calls)}:8080",
+            "ttl_seconds": 60,
+        }
+
+
 class RotatingProxyManagerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -203,6 +228,35 @@ class RotatingProxyManagerTests(unittest.TestCase):
         second = manager.acquire(0)
         self.assertEqual(second.proxy_url, first.proxy_url)
         self.assertEqual(client.get_calls, ["key-1"])
+
+    def test_provider_cooldown_waits_and_reuses_key_without_purchase(self):
+        client = _CooldownAfterHealthFailureClient(
+            [{"key": "key-1", "expires_at": 1000.0}]
+        )
+        manager = self._manager(client)
+        self.store.upsert_key("key-1", 1000.0)
+
+        with patch("core.rotating_proxy_manager.time.sleep") as sleep:
+            lease = manager.acquire(0)
+
+        self.assertEqual(lease.key, "key-1")
+        self.assertEqual(client.purchase_calls, 0)
+        self.assertEqual(client.get_calls, ["key-1", "key-1", "key-1"])
+        self.assertEqual(client.list_calls, 0)
+        sleep.assert_called_once_with(23)
+
+    def test_status_key_assignments_expose_scope_for_ui(self):
+        client = _FakeRotatingProxyClient(
+            [{"key": "key-1", "expires_at": 1000.0}]
+        )
+        manager = self._manager(client)
+
+        manager.acquire(0, scope="registration")
+
+        self.assertEqual(
+            manager.status()["keys"][0]["assignments"],
+            [{"scope": "registration", "lane_id": 0}],
+        )
 
     def test_status_removes_expired_leases_from_inventory(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])

@@ -453,6 +453,41 @@ class RotatingProxyManager:
                                 proxy_expires_at=fallback_expiry,
                                 key_expires_at=fallback.get("key_expires_at"),
                             )
+                    if cooldown:
+                        used_keys = {
+                            str(item.get("rotating_key") or "")
+                            for item in self.store.list_leases()
+                            if self._lease_active(item)
+                        }
+                        alternative = self._choose_available_key(
+                            used_keys | excluded_keys | {key}
+                        )
+                        if alternative is not None:
+                            excluded_keys.add(key)
+                            existing = None
+                            logger.warning(
+                                "[RotatingProxy] provider cooldown còn %ss; chuyển sang key dự phòng: scope=%s lane=%s",
+                                cooldown,
+                                lane_scope,
+                                lane,
+                            )
+                            continue
+                        logger.warning(
+                            "[RotatingProxy] provider cooldown còn %ss; chờ rồi dùng lại key=%s scope=%s lane=%s",
+                            cooldown,
+                            _mask_key(key),
+                            lane_scope,
+                            lane,
+                        )
+                        self._lock.release()
+                        try:
+                            time.sleep(cooldown)
+                        finally:
+                            self._lock.acquire()
+                        now = self.clock()
+                        excluded_keys.clear()
+                        existing = None
+                        continue
                     failed_attempts[key] = failed_attempts.get(key, 0) + 1
                     if failed_attempts[key] >= 2:
                         excluded_keys.add(key)
