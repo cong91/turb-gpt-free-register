@@ -356,7 +356,7 @@ class RotatingProxyStore:
     def scoped_lanes_for_key(self, rotating_key: str) -> list[dict[str, Any]]:
         with closing(self._connect()) as connection:
             rows = connection.execute(
-                "SELECT lane_scope, lane_id FROM rotating_proxy_scoped_leases "
+                "SELECT lane_scope AS scope, lane_id FROM rotating_proxy_scoped_leases "
                 "WHERE rotating_key = ? ORDER BY lane_scope, lane_id",
                 (str(rotating_key),),
             ).fetchall()

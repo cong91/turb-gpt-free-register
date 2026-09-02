@@ -377,6 +377,46 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         )
         database.gmail_api_url_email_pool_summary.assert_not_called()
 
+    def test_automation_qan8_count_is_account_count_not_source_count(self):
+        service = MagicMock()
+        service.submit_registration.return_value = []
+        service.effective_registration_workers.return_value = 3
+        database = MagicMock()
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "qan8_gmail_api"
+        ), patch.object(email_config, "QAN8_API_BASE", "https://shop.qan8.com", create=True), patch.object(
+            email_config, "QAN8_API_KEY", "key", create=True
+        ), patch.object(email_config, "QAN8_GMAIL_SKU_ID", "42", create=True):
+            payload, status = create_registration_jobs(
+                {
+                    "count": 35,
+                    "workers": 3,
+                    "email_source": "qan8_gmail_api",
+                },
+                service=service,
+                database=database,
+                automation_context={
+                    "sub2api_automation_request_id": "req-35",
+                    "sub2api_automation_kind": "registration",
+                    "sub2api_callback_url": "https://sub2.example/callback",
+                },
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["submitted"], 0)
+        service.submit_registration.assert_called_once_with(
+            count=35,
+            workers=3,
+            email_source="qan8_gmail_api",
+            qan8_aliases_per_source=12,
+            automation_context={
+                "sub2api_automation_request_id": "req-35",
+                "sub2api_automation_kind": "registration",
+                "sub2api_callback_url": "https://sub2.example/callback",
+            },
+        )
+
     def test_webui_rejects_qan8_expanded_count_over_limit(self):
         service = MagicMock()
         database = MagicMock()
