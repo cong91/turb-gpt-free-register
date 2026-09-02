@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from core.gmail_aliases import generate_gmail_dual_domain_aliases
@@ -168,7 +169,28 @@ class Qan8GmailApiAllocator:
     def status(self, batch_id: str) -> dict:
         return self.store.batch_status(batch_id)
 
+    @contextmanager
+    def _request_route(self):
+        """Hold one QAN8 route for the full purchase and order-poll cycle."""
+        if str(getattr(self.client, "proxy_url", "") or "").strip():
+            yield
+            return
+
+        from core.nordvpn_wireguard import proxy_for_qan8_api
+
+        previous_proxy = getattr(self.client, "proxy_url", "")
+        with proxy_for_qan8_api(owner_id=f"qan8-api:{uuid.uuid4().hex}") as proxy_url:
+            self.client.proxy_url = str(proxy_url or "")
+            try:
+                yield
+            finally:
+                self.client.proxy_url = previous_proxy
+
     def _purchase_source(self, batch: dict, lane_id: int, deadline: float | None) -> object | None:
+        with self._request_route():
+            return self._purchase_source_on_route(batch, lane_id, deadline)
+
+    def _purchase_source_on_route(self, batch: dict, lane_id: int, deadline: float | None) -> object | None:
         batch_id = str(batch["batch_id"])
         owner = uuid.uuid4().hex
         if not self.store.acquire_lane_lease(batch_id, lane_id, owner):

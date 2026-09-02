@@ -861,6 +861,22 @@ def proxy_for_registration(
         active_pool.release(proxy)
 
 
+@contextmanager
+def proxy_for_qan8_api(
+    country_filter: str | None = None,
+    pool: WireGuardProxyPool | None = None,
+    *,
+    owner_id: str | None = None,
+) -> Iterator[str | None]:
+    """Reuse the configured NordVPN WireGuard lifecycle for QAN8 API calls."""
+    with proxy_for_registration(
+        country_filter=country_filter,
+        pool=pool,
+        owner_id=owner_id,
+    ) as proxy_url:
+        yield proxy_url
+
+
 def list_active_leases(
     lease_store: NordVPNWireGuardLeaseStore | None = None,
 ) -> list[dict]:

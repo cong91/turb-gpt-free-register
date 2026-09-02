@@ -485,6 +485,8 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         fields = {item["key"]: item for item in config_editor.EDITABLE_FIELDS}
         self.assertEqual(fields["QAN8_API_KEY"]["storage"], "sqlite")
         self.assertTrue(fields["QAN8_API_KEY"]["secret"])
+        self.assertEqual(fields["QAN8_API_PROXY"]["storage"], "sqlite")
+        self.assertTrue(fields["QAN8_API_PROXY"]["secret"])
         self.assertEqual(fields["QAN8_GMAIL_SKU_ID"]["storage"], "sqlite")
         self.assertEqual(fields["QAN8_ORDER_TIMEOUT"]["type"], "int")
 
