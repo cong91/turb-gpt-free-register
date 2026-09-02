@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import hashlib
@@ -37,7 +36,7 @@ class OtpIdentityStore:
         if not provider_name or not canonical:
             raise OtpIdentityStoreError("Provider and CDK are required")
         return "sha256:" + hashlib.sha256(
-            f"{provider_name}:{canonical}".encode("utf-8")
+            f"{provider_name}:{canonical}".encode()
         ).hexdigest()
 
     @staticmethod
@@ -47,7 +46,7 @@ class OtpIdentityStore:
         if not provider_name or not value:
             raise OtpIdentityStoreError("Provider and OTP identity are required")
         return "sha256:" + hashlib.sha256(
-            f"{provider_name}:{value}".encode("utf-8")
+            f"{provider_name}:{value}".encode()
         ).hexdigest()
 
     def _connect(self) -> sqlite3.Connection:

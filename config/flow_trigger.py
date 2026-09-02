@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 注册成功后自动触发 Flow 的配置项。
 设置 ENABLE_FLOW_TRIGGER = False 可完全跳过此步骤。

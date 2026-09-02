@@ -4,8 +4,8 @@ from urllib.parse import parse_qs, urlparse
 
 from core.account_export import (
     BrowserPageTransport,
-    _ScriptResponse,
     _follow_reauth,
+    _ScriptResponse,
     _trigger_reauth,
     setup_2fa,
     setup_2fa_for_registration,
@@ -27,7 +27,7 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
         transport = Mock()
         error = RuntimeError("HTTP 401: recent_auth_required")
 
-        with patch("core.account_export.setup_2fa", side_effect=error) as setup:
+        with patch("core.account_export.setup_2fa", side_effect=error) as setup:  # noqa: SIM117
             with self.assertRaises(RuntimeError) as raised:
                 setup_2fa_for_registration(transport, "user@example.com")
 

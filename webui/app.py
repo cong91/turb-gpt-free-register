@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Flask 本地控制台。
 
@@ -10,23 +9,32 @@ Flask 本地控制台。
 所有接口返回 JSON；前端是单文件 templates/index.html（原生 JS + fetch）。
 默认绑定 127.0.0.1，仅本地访问。
 """
-import logging
 import gzip
 import json
+import logging
 import threading
 import time
 import uuid
+from datetime import timezone
 from urllib.parse import urlparse
 
-from flask import Flask, Response, jsonify, make_response, render_template, request
 import pyotp
+from flask import Flask, Response, jsonify, render_template, request
 
-from core import codex_retry_service, db, plan_check_service, extract_link_service, codex_agent_service, live_check_service
-from core import free_plus_export
-from core.openai_auth import account_unusable_message
-from webui.auth import init_auth, register_auth_routes
+from core import (
+    codex_agent_service,
+    codex_retry_service,
+    db,
+    extract_link_service,
+    free_plus_export,
+    live_check_service,
+    plan_check_service,
+)
 from core import registration_service as svc
+from core.gmail_api_url_batch_store import GmailApiUrlBatchConflict
+from core.openai_auth import account_unusable_message
 from webui import config_editor
+from webui.auth import init_auth, register_auth_routes
 
 logger = logging.getLogger(__name__)
 
@@ -59,7 +67,7 @@ def _matches_query(row: dict, q: str | None) -> bool:
         return True
     try:
         return q in "\n".join(str(v) for v in row.values()).lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -103,7 +111,7 @@ def _compact_account_for_list(row: dict) -> dict:
     if isinstance(extra_raw, str) and extra_raw.strip():
         try:
             extra = json.loads(extra_raw)
-        except Exception:
+        except Exception:  # noqa: BLE001
             extra = {}
     elif isinstance(extra_raw, dict):
         extra = extra_raw
@@ -182,7 +190,7 @@ def _account_secret_value(row: dict, field: str, format_name: str = "modern") ->
         if isinstance(extra_raw, str) and extra_raw.strip():
             try:
                 extra = json.loads(extra_raw)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 extra = {}
         elif isinstance(extra_raw, dict):
             extra = extra_raw
@@ -238,7 +246,7 @@ def _read_log_tail(path, *, max_bytes: int, default_running: bool = False, runni
     if callable(running_fn):
         try:
             running = bool(running_fn())
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return {"ok": True, "log": content, "running": running}
 
@@ -852,7 +860,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         try:
             from core import twofa_service
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"2FA 服务加载失败：{type(exc).__name__}: {exc}"}), 503
 
         queued = twofa_service.enqueue_account_totp_setup(
@@ -987,7 +995,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         if acc_id is not None:
             try:
                 acc = db.get_account(int(acc_id))
-            except Exception:
+            except Exception:  # noqa: BLE001
                 acc = None
         if acc is None and email:
             acc = db.get_account_by_email(email)
@@ -1030,7 +1038,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         for raw in ids:
             try:
                 acc_id = int(raw)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 skipped.append({"id": raw, "reason": "ID 非法"})
                 continue
             if acc_id in seen:
@@ -1133,11 +1141,49 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.get("/api/extract-link/cdk")
     def api_extract_link_cdk():
         """查询当前配置或传入 CDK 的剩余次数。"""
-        code = (request.args.get("code") or "").strip() or None
         try:
+            backend = extract_link_service.backend_status()
+            if backend.get("mode") == "local":
+                return jsonify({"ok": True, **backend, "cdk_remaining": None})
+            code = (request.args.get("code") or "").strip() or None
             return jsonify({"ok": True, **extract_link_service.query_cdk(cdk=code)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+
+    @app.get("/api/extract-link/status")
+    def api_extract_link_status():
+        """Return active extraction backend without exposing credentials."""
+        try:
+            return jsonify({"ok": True, **extract_link_service.backend_status()})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+
+    @app.get("/api/extract-link/options")
+    def api_extract_link_options():
+        """Return the payment-method selector data for the active backend."""
+        try:
+            return jsonify({"ok": True, **extract_link_service.payment_method_options()})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+
+    @app.get("/api/extract-link/proxies")
+    def api_extract_link_proxies():
+        """Return masked configured-pool entries for the Extract URL workspace."""
+        try:
+            return jsonify({"ok": True, **extract_link_service.proxy_options()})
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+
+    def _extract_proxy_args(data: dict) -> dict:
+        """Resolve proxy input fields without returning proxy credentials to clients."""
+        return {
+            "proxy": data.get("proxy") or None,
+            "payment_proxy": data.get("payment_proxy") or None,
+            "promotion_proxy": data.get("promotion_proxy") or None,
+            "proxy_pool_index": data.get("proxy_pool_index"),
+            "payment_proxy_pool_index": data.get("payment_proxy_pool_index"),
+            "promotion_proxy_pool_index": data.get("promotion_proxy_pool_index"),
+        }
 
     def _is_extract_eligible(acc: dict) -> bool:
         plan = str(acc.get("current_plan_type") or acc.get("plan_type") or "").lower()
@@ -1150,7 +1196,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         acc_id = data.get("account_id") or data.get("id")
         try:
             acc = db.get_account(int(acc_id))
-        except Exception:
+        except Exception:  # noqa: BLE001
             acc = None
         if not acc:
             return jsonify({"ok": False, "error": "账号不存在"}), 404
@@ -1167,8 +1213,9 @@ def create_app(auth_code: str | None = None) -> Flask:
                 trigger="manual",
                 link_type=data.get("link_type"),
                 cdk=data.get("cdk"),
+                **_extract_proxy_args(data),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
         if queued.get("busy"):
             return jsonify({"ok": False, **queued}), 409
@@ -1194,7 +1241,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         for raw in ids:
             try:
                 acc_id = int(raw)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 skipped.append({"id": raw, "reason": "ID 非法"})
                 continue
             if acc_id in seen:
@@ -1220,8 +1267,9 @@ def create_app(auth_code: str | None = None) -> Flask:
                     trigger="manual_bulk",
                     link_type=data.get("link_type"),
                     cdk=data.get("cdk"),
+                    **_extract_proxy_args(data),
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 failed.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
                 continue
             item = {"id": acc_id, "email": email, **{k: v for k, v in queued.items() if k != "future"}}
@@ -1250,7 +1298,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         acc_id = data.get("account_id") or data.get("id")
         try:
             acc = db.get_account(int(acc_id))
-        except Exception:
+        except Exception:  # noqa: BLE001
             acc = None
         if not acc:
             return jsonify({"ok": False, "error": "账号不存在"}), 404
@@ -1265,7 +1313,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 trigger="manual",
                 verify_task=bool(data.get("verify_task", True)),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
         if queued.get("busy"):
             return jsonify({"ok": False, **queued}), 409
@@ -1291,7 +1339,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         for raw in ids:
             try:
                 acc_id = int(raw)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 skipped.append({"id": raw, "reason": "ID 非法"})
                 continue
             if acc_id in seen:
@@ -1314,7 +1362,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                     trigger="manual_bulk",
                     verify_task=bool(data.get("verify_task", True)),
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 failed.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
                 continue
             item = {"id": acc_id, "email": email, **{k: v for k, v in queued.items() if k != "future"}}
@@ -1348,7 +1396,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             try:
                 payload = _json.loads(token_text)
                 token_text = _json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-            except Exception:
+            except Exception:  # noqa: BLE001
                 token_text = token_text + ("\n" if not token_text.endswith("\n") else "")
             return token_text, filename
 
@@ -1379,6 +1427,7 @@ def create_app(auth_code: str | None = None) -> Flask:
     def _upload_account_codex_agent_to_sub2(acc: dict) -> dict:
         """把账号已生成的 Codex Agent auth.json 上传到 sub2api。"""
         import json as _json
+
         from config import sub2api as sub2api_cfg
         from core.codex_agent import upload_sub2api_account
 
@@ -1427,7 +1476,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "账号不存在"}), 404
         try:
             result = _upload_account_codex_agent_to_sub2(acc)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
         return jsonify({"ok": True, "account_id": acc_id, "email": acc.get("email"), "result": result})
 
@@ -1446,7 +1495,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         for raw in ids:
             try:
                 acc_id = int(raw)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 skipped.append({"id": raw, "reason": "ID 非法"})
                 continue
             if acc_id in seen:
@@ -1463,7 +1512,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             try:
                 result = _upload_account_codex_agent_to_sub2(acc)
                 uploaded.append({"id": acc_id, "email": email, "url": result.get("url"), "status_code": result.get("status_code")})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 failed.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
         return jsonify({
             "ok": True,
@@ -1483,7 +1532,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "账号不存在"}), 404
         try:
             content, filename = _codex_agent_auth_for_account(acc)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 404
         data = content.encode("utf-8")
         return Response(
@@ -1510,7 +1559,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             ids_text = (request.form.get("account_ids") or request.form.get("ids") or "").strip()
             try:
                 ids = _json.loads(ids_text) if ids_text else []
-            except Exception:
+            except Exception:  # noqa: BLE001
                 ids = [x.strip() for x in ids_text.split(",") if x.strip()]
         else:
             ids = data.get("account_ids") or data.get("ids") or []
@@ -1528,7 +1577,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             for raw in ids:
                 try:
                     acc_id = int(raw)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     errors.append({"id": raw, "error": "ID 非法"})
                     continue
                 if acc_id in seen:
@@ -1547,10 +1596,10 @@ def create_app(auth_code: str | None = None) -> Flask:
                     used_names.add(arcname)
                     zf.writestr(arcname, content)
                     added.append({"id": acc_id, "email": acc.get("email"), "filename": arcname})
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append({"id": acc_id, "email": acc.get("email"), "error": f"{type(exc).__name__}: {exc}"})
             manifest = {
-                "exported_at": _dt.now().isoformat(timespec="seconds"),
+                "exported_at": _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None).isoformat(timespec="seconds"),
                 "source": "accounts-codex-agent",
                 "count": len(added),
                 "files": added,
@@ -1560,7 +1609,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         if not added:
             return jsonify({"ok": False, "error": "没有可下载的 Codex Agent Token", "errors": errors}), 404
-        now = _dt.now()
+        now = _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
         dl_name = f"accounts-codex-agent-{now.strftime('%Y%m%d-%H%M%S')}.zip"
         buf.seek(0)
         zip_bytes = buf.getvalue()
@@ -1585,14 +1634,18 @@ def create_app(auth_code: str | None = None) -> Flask:
         import json as _json
         import zipfile
         from datetime import datetime as _dt
-        from core.codex_oauth import download_cpa_codex_auth_text, list_cpa_codex_auth_files
+
+        from core.codex_oauth import (
+            download_cpa_codex_auth_text,
+            list_cpa_codex_auth_files,
+        )
 
         data = request.get_json(silent=True) or {}
         if not data and request.form:
             ids_text = (request.form.get("account_ids") or request.form.get("ids") or "").strip()
             try:
                 ids = _json.loads(ids_text) if ids_text else []
-            except Exception:
+            except Exception:  # noqa: BLE001
                 ids = [x.strip() for x in ids_text.split(",") if x.strip()]
         else:
             ids = data.get("account_ids") or data.get("ids") or []
@@ -1603,14 +1656,14 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         try:
             cpa_files = list_cpa_codex_auth_files()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"读取 CPA auth-files 失败: {type(exc).__name__}: {exc}"}), 502
 
         def _match_cpa_file(email: str, local_filename: str = "") -> dict | None:
             """在已缓存的 CPA 文件列表中匹配，避免每个账号都重新请求 auth-files。"""
             email_l = str(email or "").strip().lower()
             local_name_l = str(local_filename or "").strip().lower()
-            local_stem_l = local_name_l[:-5] if local_name_l.endswith(".json") else local_name_l
+            local_stem_l = local_name_l.removesuffix(".json")
 
             def score(item: dict) -> int:
                 name_l = str(item.get("name") or "").lower()
@@ -1641,7 +1694,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 fname = str(item.get("filename") or "").strip()
                 if email_key and fname and email_key not in local_by_email:
                     local_by_email[email_key] = fname
-        except Exception:
+        except Exception:  # noqa: BLE001
             local_by_email = {}
 
         errors = []
@@ -1694,13 +1747,13 @@ def create_app(auth_code: str | None = None) -> Flask:
                     if local_filename:
                         try:
                             db.mark_codex_exported(local_filename)
-                        except Exception:
+                        except Exception:  # noqa: BLE001, S110
                             pass
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append({"id": acc_id, "email": email, "error": f"{type(exc).__name__}: {exc}"})
 
             manifest = {
-                "exported_at": _dt.now().isoformat(timespec="seconds"),
+                "exported_at": _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None).isoformat(timespec="seconds"),
                 "source": "accounts-cpa",
                 "count": len(added),
                 "files": added,
@@ -1710,7 +1763,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         if not added:
             return jsonify({"ok": False, "error": "没有成功从 CPA 下载任何凭证", "errors": errors}), 502
-        now = _dt.now()
+        now = _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
         dl_name = f"accounts-cpa-bulk-{now.strftime('%Y%m%d-%H%M%S')}.zip"
         buf.seek(0)
         zip_bytes = buf.getvalue()
@@ -1937,7 +1990,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 else:
                     db.release_outlook(email, status=status, note=note)
                 updated.append({"email": email, "source": item_source, "status": status})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 skipped.append({"email": email, "source": item_source, "reason": f"{type(exc).__name__}: {exc}"})
         return jsonify({
             "ok": True,
@@ -2159,14 +2212,14 @@ def create_app(auth_code: str | None = None) -> Flask:
             import json as _json
             try:
                 local = _json.loads(content)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 local = {}
             email = str(local.get("email") or "").strip()
             from core.codex_oauth import download_cpa_codex_auth_text
             cpa_text, cpa_name, _meta = download_cpa_codex_auth_text(email=email, local_filename=fname)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 404
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 502
         db.mark_codex_exported(fname)
         return Response(
@@ -2185,6 +2238,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         import json as _json
         import zipfile
         from datetime import datetime as _dt
+
         from core.codex_oauth import download_cpa_codex_auth_text
 
         data = request.get_json(silent=True) or {}
@@ -2207,7 +2261,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                     content, real_fname = db.read_codex_credential(fname)
                     try:
                         local = _json.loads(content)
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         local = {}
                     email = str(local.get("email") or "").strip()
                     cpa_text, cpa_name, _meta = download_cpa_codex_auth_text(email=email, local_filename=real_fname)
@@ -2219,10 +2273,10 @@ def create_app(auth_code: str | None = None) -> Flask:
                     zf.writestr(arcname, cpa_text)
                     added.append({"local_filename": real_fname, "cpa_filename": cpa_name})
                     db.mark_codex_exported(real_fname)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     errors.append({"filename": fname, "error": f"{type(exc).__name__}: {exc}"})
             manifest = {
-                "exported_at": _dt.now().isoformat(timespec="seconds"),
+                "exported_at": _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None).isoformat(timespec="seconds"),
                 "source": "cpa",
                 "count": len(added),
                 "files": added,
@@ -2232,7 +2286,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         if not added:
             return jsonify({"ok": False, "error": "没有成功从 CPA 下载任何凭证", "errors": errors}), 502
-        now = _dt.now()
+        now = _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
         dl_name = f"codex-cpa-bulk-{now.strftime('%Y%m%d-%H%M%S')}.zip"
         buf.seek(0)
         return Response(
@@ -2279,10 +2333,10 @@ def create_app(auth_code: str | None = None) -> Flask:
                 parsed = _json.loads(content)
                 bundle.append({"filename": real_fname, "data": parsed})
                 db.mark_codex_exported(real_fname)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 errors.append({"filename": fname, "error": f"{type(exc).__name__}: {exc}"})
 
-        now = _dt.now()
+        now = _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
         result = {
             "exported_at": now.isoformat(timespec="seconds"),
             "count": len(bundle),
@@ -2307,7 +2361,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "filename 为空"}), 400
         try:
             db.reset_codex_exported(fname)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(exc)}), 400
         return jsonify({"ok": True})
 
@@ -2320,7 +2374,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "filename 为空"}), 400
         try:
             deleted = db.delete_codex_credential(fname)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": str(exc)}), 400
         if not deleted:
             return jsonify({"ok": False, "error": "凭证文件不存在"}), 404
@@ -2349,7 +2403,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                     deleted.append(fname)
                 else:
                     skipped.append({"filename": fname, "reason": "文件不存在"})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 skipped.append({"filename": fname, "reason": f"{type(exc).__name__}: {exc}"})
         return jsonify({"ok": True, "deleted": deleted, "deleted_count": len(deleted), "skipped": skipped})
 
@@ -2403,7 +2457,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             for raw in ids:
                 try:
                     acc = db.get_account(int(raw))
-                except Exception:
+                except Exception:  # noqa: BLE001
                     acc = None
                 if acc and acc.get("email"):
                     targets.append(str(acc.get("email") or "").strip())
@@ -2464,7 +2518,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             log_path = codex_retry_service.log_path(email)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             with log_path.open("a", encoding="utf-8") as f:
-                ts = _dt.now().strftime("%H:%M:%S")
+                ts = _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%H:%M:%S")
                 shown = new_status or "空"
                 f.write(f"{ts} [WARNING] [Codex 补跑] 用户手动重置补跑中状态，当前状态={shown}\n")
         except Exception:
@@ -2560,14 +2614,14 @@ def create_app(auth_code: str | None = None) -> Flask:
                 _release_codex_retry(item["email"])
             return jsonify({"ok": False, "error": f"Proxy.vn keyxoay 准备失败: {exc}", "skipped": skipped}), 503
 
-        batch_id = _dt.now().strftime("%Y%m%d-%H%M%S")
+        batch_id = _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime("%Y%m%d-%H%M%S")
         for item in selected:
             email = item["email"]
             db.update_account_codex_status(email, "retrying", None)
             log_path = codex_retry_service.log_path(email)
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(
-                f"{_dt.now().strftime('%H:%M:%S')} [INFO] [Codex 批量补跑] 已加入批量任务 batch={batch_id} workers={workers}，等待线程执行\n",
+                f"{_dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime('%H:%M:%S')} [INFO] [Codex 批量补跑] 已加入批量任务 batch={batch_id} workers={workers}，等待线程执行\n",
                 encoding="utf-8",
             )
 
@@ -2650,7 +2704,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         try:
             acc = db.get_account_by_email(email) or {}
             data["running"] = bool(str(acc.get("totp_setup_status") or "") in {"queued", "running"}) or twofa_service.is_running(int(acc.get("id") or 0))
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return jsonify(data)
 
@@ -2674,20 +2728,14 @@ def create_app(auth_code: str | None = None) -> Flask:
             result = _paginate_items(rows, page=page, page_size=page_size)
             page_rows = result.get("items") or []
             for row in page_rows:
-                row["manual_otp_required"] = (
-                    manual_otp_required
-                    and str(row.get("job_type") or "registration") != "local_test"
-                )
+                row["manual_otp_required"] = manual_otp_required
                 row.update(svc.get_retry_info(row))
             result["items"] = [_compact_job_for_list(r) for r in page_rows]
             result["status_counts"] = status_counts
             result["compact"] = True
             return jsonify(result)
         for row in rows:
-            row["manual_otp_required"] = (
-                manual_otp_required
-                and str(row.get("job_type") or "registration") != "local_test"
-            )
+            row["manual_otp_required"] = manual_otp_required
             row.update(svc.get_retry_info(row))
         return jsonify(rows)
 
@@ -2708,7 +2756,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         """Return QAN8 lane/source counters without credentials or code URLs."""
         try:
             status = svc.qan8_batch_status(batch_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
         if not status.get("target_count"):
             return jsonify({"ok": False, "error": "QAN8 batch không tồn tại"}), 404
@@ -2736,7 +2784,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         try:
             result = submit_manual_otp(email, code)
             return jsonify(result)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
 
     @app.post("/api/jobs/cancel-pending")
@@ -2897,8 +2945,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         """手动生成 CloudMail Authorization Token，并保存本次 CloudMail 配置。"""
         data = request.get_json(silent=True) or {}
         try:
-            from core.cloudmail_client import gen_token
             from config.env_loader import write_env_values
+            from core.cloudmail_client import gen_token
 
             api_base = (data.get("api_base") or "").strip()
             admin_email = (data.get("email") or data.get("admin_email") or "").strip()
@@ -2942,8 +2990,8 @@ def create_app(auth_code: str | None = None) -> Flask:
         """从 CloudMail 平台获取域名列表，并写入 SQLite 作为本地缓存。"""
         data = request.get_json(silent=True) or {}
         try:
-            from core.cloudmail_client import fetch_domains
             from config.env_loader import write_env_values
+            from core.cloudmail_client import fetch_domains
 
             updates = {}
             api_base = (data.get("api_base") or "").strip()
@@ -3048,19 +3096,17 @@ def create_app(auth_code: str | None = None) -> Flask:
             ),
         })
 
-    from webui.nordvpn_rotation_api import register_nordvpn_rotation_routes
-    from webui.nordvpn_status_api import register_nordvpn_status_routes
-    from webui.reserved_test_aliases_api import register_reserved_test_alias_routes
-    from webui.roxy_profiles_api import register_roxy_profile_routes
     from webui.codex_sub2_api import register_codex_sub2_routes
     from webui.email_change_api import register_email_change_routes
+    from webui.nordvpn_rotation_api import register_nordvpn_rotation_routes
+    from webui.nordvpn_status_api import register_nordvpn_status_routes
     from webui.rotating_proxy_api import register_rotating_proxy_routes
+    from webui.roxy_profiles_api import register_roxy_profile_routes
 
     register_codex_sub2_routes(app)
     register_email_change_routes(app)
     register_nordvpn_rotation_routes(app)
     register_nordvpn_status_routes(app)
-    register_reserved_test_alias_routes(app)
     register_roxy_profile_routes(app)
     register_rotating_proxy_routes(app)
 

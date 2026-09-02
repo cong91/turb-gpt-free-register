@@ -9,7 +9,7 @@ class WebEntrypointTests(unittest.TestCase):
         socket_instance = mock.MagicMock()
         socket_instance.bind.side_effect = OSError(10048, "address in use")
 
-        with mock.patch("web.socket.socket", return_value=socket_instance):
+        with mock.patch("web.socket.socket", return_value=socket_instance):  # noqa: SIM117
             with self.assertRaisesRegex(RuntimeError, "5057.*已被占用"):
                 web._assert_listen_address_available("127.0.0.1", 5057)
 

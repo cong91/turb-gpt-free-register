@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import hashlib
@@ -36,7 +35,7 @@ class ProviderCardLedger:
         if not canonical:
             raise ProviderCardQuotaError("Card không được để trống")
         return "sha256:" + hashlib.sha256(
-            f"{self.provider_name}:{canonical}".encode("utf-8")
+            f"{self.provider_name}:{canonical}".encode()
         ).hexdigest()
 
     @staticmethod

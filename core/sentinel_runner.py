@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Sentinel Runner 适配层
 通过 subprocess 调用项目根目录的 sentinel-runner.js，
@@ -19,28 +18,28 @@ import tempfile
 from pathlib import Path
 
 from config import (
-    USER_AGENT,
-    CHROME_MAJOR,
     CHROME_FULL_VERSION,
+    CHROME_MAJOR,
+    DEVICE_MEMORY,
+    HARDWARE_CONCURRENCY,
+    JS_HEAP_SIZE_LIMIT,
+    NAVIGATOR_LANGUAGE,
+    NAVIGATOR_LANGUAGES,
+    OPENAI_BUILD_ID,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
     SEC_CH_UA,
-    SEC_CH_UA_PLATFORM,
-    SEC_CH_UA_FULL_VERSION_LIST,
-    SEC_CH_UA_PLATFORM_VERSION,
     SEC_CH_UA_ARCH,
     SEC_CH_UA_BITNESS,
+    SEC_CH_UA_FULL_VERSION_LIST,
     SEC_CH_UA_MODEL,
+    SEC_CH_UA_PLATFORM,
+    SEC_CH_UA_PLATFORM_VERSION,
+    SENTINEL_SV,
     TIMEZONE_IANA,
     TIMEZONE_NAME,
     TIMEZONE_OFFSET_MINUTES,
-    NAVIGATOR_LANGUAGE,
-    NAVIGATOR_LANGUAGES,
-    SCREEN_WIDTH,
-    SCREEN_HEIGHT,
-    HARDWARE_CONCURRENCY,
-    JS_HEAP_SIZE_LIMIT,
-    DEVICE_MEMORY,
-    SENTINEL_SV,
-    OPENAI_BUILD_ID,
+    USER_AGENT,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,22 +156,21 @@ def generate_sentinel_token(
     )
 
     # 把 challenge 写入临时文件，避免命令行长度 / 转义问题
-    tmp = tempfile.NamedTemporaryFile(
+    with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".json",
         prefix=f"sentinel-challenge-{flow}-",
         delete=False,
         encoding="utf-8",
-    )
-    try:
+    ) as tmp:
+        tmp_path = tmp.name
         json.dump(challenge, tmp, ensure_ascii=False)
         tmp.flush()
-        tmp.close()
-
+    try:
         cmd = [
             _resolve_node_executable(),
             str(_RUNNER_PATH),
-            "--challenge-file", tmp.name,
+            "--challenge-file", tmp_path,
             "--flow", flow,
             "--device-id", device_id,
             "--sentinel-sid", sentinel_sid or "",
@@ -231,6 +229,7 @@ def generate_sentinel_token(
                 cwd=str(_PROJECT_ROOT),
                 timeout=_RUNNER_TIMEOUT,
                 env=env,
+                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -287,6 +286,6 @@ def generate_sentinel_token(
     finally:
         # 清理临时文件
         try:
-            os.unlink(tmp.name)
+            os.unlink(tmp_path)
         except OSError:
             pass

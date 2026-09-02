@@ -1,0 +1,57 @@
+services:
+  web:
+    image: ${TURB_IMAGE:-ghcr.io/cong91/turb-gpt-free-register:main}
+    container_name: turb-gpt-free-register
+    restart: unless-stopped
+    init: true
+    user: "1000:1000"
+    read_only: true
+    shm_size: "1gb"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    environment:
+      TURB_ENV_FILE: /run/secrets/turb.env
+      WEBUI_SECURE_COOKIE: "True"
+      TZ: Asia/Ho_Chi_Minh
+      CLOAKBROWSER_CACHE_DIR: /opt/cloakbrowser
+      CLOAK_EXTRA_ARGS: '["--disable-crashpad-for-testing", "--single-process"]'
+      NORDVPN_WG_WIREPROXY_EXE: wireproxy
+      NORDVPN_WG_CONFIGS_DIR: /var/lib/turb/nordvpn-wireguard
+    networks:
+      - default
+      - sub2api-internal
+    volumes:
+      - turb_runtime:/var/lib/turb
+      - turb_cloak_cache:/opt/cloakbrowser
+      - ./secrets/.env:/run/secrets/turb.env:ro
+    ports:
+      - "127.0.0.1:5057:5057"
+    tmpfs:
+      - /tmp:rw,nosuid,size=512m
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import urllib.request;
+          response=urllib.request.urlopen('http://127.0.0.1:5057/login', timeout=5);
+          raise SystemExit(0 if response.status == 200 else 1)"
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+    stop_grace_period: 30s
+
+volumes:
+  turb_runtime:
+    name: turb_gpt_runtime
+    external: true
+  turb_cloak_cache:
+    name: turb_gpt_cloak_cache
+    external: true
+
+networks:
+  sub2api-internal:
+    name: deploy_sub2api-network
+    external: true

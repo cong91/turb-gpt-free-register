@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Safe full-folder snapshots for managed Roxy profiles."""
 from __future__ import annotations
 

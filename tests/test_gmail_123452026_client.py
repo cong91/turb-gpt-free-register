@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import tempfile
 import unittest
 from pathlib import Path
@@ -175,6 +174,7 @@ class Gmail123452026ClientTests(unittest.TestCase):
     @patch("core.gmail_123452026_client._inventory_store")
     def test_restart_lookup_recovers_batch_assignment(self, inventory_store, batch_store):
         from types import SimpleNamespace
+
         from core import gmail_123452026_client as client
 
         row = {
@@ -315,7 +315,7 @@ class Gmail123452026ClientTests(unittest.TestCase):
         config_values.return_value = ("https://mail.example.com/api", 30, 3, False)
         redeem.return_value = Gmail123452026Account("abcdef@gmail.com", cdk, 3)
         client._CONTEXT_CACHE.clear()
-        with tempfile.TemporaryDirectory() as temp_dir:
+        with tempfile.TemporaryDirectory():
             inventory = SimpleNamespace(provider="gmail", state="active", configured_limit=3)
             assignment = GmailCdkAssignment("assignment-1", "batch-1", "inventory-1", "17", "active")
             reservation = SimpleNamespace(

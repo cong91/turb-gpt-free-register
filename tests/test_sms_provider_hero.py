@@ -35,6 +35,17 @@ class _Http:
         pass
 
 
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
 class _ConcurrentHttp:
     def __init__(self, prices):
         self.prices = prices
@@ -557,6 +568,25 @@ class HeroSmsProviderTests(unittest.TestCase):
         })
         self.assertEqual(http.calls[2]["params"]["status"], "6")
         self.assertEqual(http.calls[3]["params"]["status"], "8")
+
+    def test_wait_polls_at_deadline_after_capped_final_sleep(self):
+        http = _Http([
+            _Resp("STATUS_WAIT_CODE"),
+            _Resp("STATUS_WAIT_CODE"),
+            _Resp("STATUS_OK:123456"),
+        ])
+        clock = _Clock()
+
+        with self._config(), \
+                patch.object(sms_provider.time, "time", side_effect=clock.time), \
+                patch.object(sms_provider.time, "sleep", side_effect=clock.sleep):
+            code = sms_provider.wait_for_sms_code(
+                "hero-deadline", http=http, max_wait=10, poll_interval=6
+            )
+
+        self.assertEqual(code, "123456")
+        self.assertEqual(len(http.calls), 3)
+        self.assertEqual(clock.now, 10.0)
 
     def test_wait_resend_requests_next_sms(self):
         http = _Http([

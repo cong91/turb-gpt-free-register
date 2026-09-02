@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import logging
@@ -10,14 +9,12 @@ from urllib.parse import urlparse
 
 import requests
 
-from core.app_state_db import APP_STATE_DB_PATH, PROJECT_ROOT
+from core.app_state_db import APP_STATE_DB_PATH
 from core.gmail_aliases import (
     GmailAliasError,
     build_gmail_alias_plan,
-    canonical_gmail,
     normalize_routed_domains,
 )
-
 
 DEFAULT_API_BASE = "http://gmail.123452026.xyz/api"
 _HEADERS = {"Accept": "*/*", "Content-Type": "application/json"}
@@ -110,7 +107,6 @@ def redeem_cdk(
 def _otp_store():
     global _OTP_STORE
     if _OTP_STORE is None:
-        from pathlib import Path
 
         from core.otp_identity_store import OtpIdentityStore
 
@@ -264,7 +260,6 @@ def _inventory_store(store_path=None):
 def _batch_store():
     global _BATCH_STORE
     if _BATCH_STORE is None:
-        from pathlib import Path
 
         from core.gmail_cdk_batch_store import GmailCdkBatchStore
 
@@ -516,7 +511,7 @@ def pick_account_by_inventory(
             )
             _CONTEXT_CACHE[_cache_key(account.email)] = account
             return account
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
             continue
     if last_error is not None:
@@ -565,12 +560,12 @@ def get_account_context(email: str) -> Gmail123452026Account | None:
                     inventory_id=row["inventory_id"],
                     reservation_id=row["slot_id"],
                     owner_token=row["owner_token"],
-                    alias_phase=row["alias_phase"] if "alias_phase" in row.keys() else None,
-                    alias_domain=row["alias_domain"] if "alias_domain" in row.keys() else None,
+                    alias_phase=(row["alias_phase"] if "alias_phase" in row else None),  # noqa: SIM401 - sqlite3.Row has no get().
+                    alias_domain=(row["alias_domain"] if "alias_domain" in row else None),  # noqa: SIM401 - sqlite3.Row has no get().
                 )
                 _CONTEXT_CACHE[key] = account
                 return account
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return None
 

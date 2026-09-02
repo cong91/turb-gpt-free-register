@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 from unittest.mock import Mock, patch
 
@@ -11,7 +10,7 @@ class CloudMailClientTests(unittest.TestCase):
         cloudmail_client._DOMAIN_CACHE = None
 
     def test_pick_account_requires_domains(self):
-        with patch.object(cloudmail_client._email_cfg, "CLOUDMAIL_API_BASE", "https://mail.example.com", create=True), patch.object(
+        with patch.object(cloudmail_client._email_cfg, "CLOUDMAIL_API_BASE", "https://mail.example.com", create=True), patch.object(  # noqa: SIM117
             cloudmail_client._email_cfg, "CLOUDMAIL_AUTH_TOKEN", "token", create=True
         ), patch.object(cloudmail_client._email_cfg, "CLOUDMAIL_DOMAINS", [], create=True), patch(
             "core.cloudmail_client.fetch_domains",

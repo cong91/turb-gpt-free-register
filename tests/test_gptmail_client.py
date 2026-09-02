@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 from unittest.mock import Mock, patch
 
@@ -10,7 +9,7 @@ class GPTMailClientTests(unittest.TestCase):
         gptmail_client._CONTEXT_CACHE.clear()
 
     def test_pick_account_requires_configured_api_key(self):
-        with patch.object(gptmail_client._email_cfg, "GPTMAIL_API_KEY", "", create=True):
+        with patch.object(gptmail_client._email_cfg, "GPTMAIL_API_KEY", "", create=True):  # noqa: SIM117
             with self.assertRaisesRegex(gptmail_client.GPTMailError, "请填写 GPTMail API Key"):
                 gptmail_client.pick_account()
 
@@ -135,6 +134,6 @@ class GPTMailClientTests(unittest.TestCase):
         response.json.return_value = {"success": False, "error": "Invalid API key"}
         get.return_value = response
 
-        with patch.object(gptmail_client._email_cfg, "GPTMAIL_API_KEY", "bad-key", create=True):
+        with patch.object(gptmail_client._email_cfg, "GPTMAIL_API_KEY", "bad-key", create=True):  # noqa: SIM117
             with self.assertRaisesRegex(gptmail_client.GPTMailError, "Invalid API key"):
                 gptmail_client.pick_account()

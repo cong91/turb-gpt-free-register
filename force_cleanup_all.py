@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Force cleanup ALL active assignments."""
 import sqlite3
 

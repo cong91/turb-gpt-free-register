@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 2FA（TOTP）配置
 

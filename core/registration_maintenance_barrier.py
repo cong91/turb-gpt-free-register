@@ -1,13 +1,12 @@
-# -*- coding: utf-8 -*-
 """In-process maintenance barrier for staging and mock job orchestration."""
 from __future__ import annotations
 
+import logging
 import threading
 import time
 import uuid
-import logging
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +134,7 @@ class RegistrationMaintenanceBarrier:
                 if self._barrier_id:
                     try:
                         self.cancel(self._barrier_id)
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
                 return False
         
@@ -155,7 +154,7 @@ class RegistrationMaintenanceBarrier:
                 logger.exception("[Barrier] confirm 失败，尝试 cancel")
                 try:
                     self.cancel(self._barrier_id)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
         
         return success

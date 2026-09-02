@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """NordVPN CLI wrapper for the locally installed Windows NordVPN app.
 
 Controls the NordVPN desktop application through its documented
@@ -36,6 +35,8 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
+
+from typing_extensions import Self
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +95,11 @@ def _run_nordvpn(*args: str, timeout: int | None = None) -> subprocess.Completed
     }
     # Only pass encoding on Python >= 3.11 where it's not redundant.
     try:
-        result = subprocess.run(cmd, encoding="utf-8", **kwargs)  # type: ignore[call-overload]
+        result = subprocess.run(cmd, encoding="utf-8", check=False, **kwargs)  # type: ignore[call-overload]
     except TypeError:
         # Python 3.10 compat: encoding was removed from subprocess.run.
         kwargs.pop("encoding", None)  # type: ignore[arg-type]
-        result = subprocess.run(cmd, **kwargs)  # type: ignore[call-overload]
+        result = subprocess.run(cmd, check=False, **kwargs)  # type: ignore[call-overload]
 
     def _log_stream(label: str, text: str | None) -> None:
         if text:
@@ -212,13 +213,14 @@ def is_connected() -> bool:
         result = subprocess.run(
             [
                 "powershell.exe", "-NoProfile", "-Command",
-                "(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
+                ("(Get-NetRoute -DestinationPrefix '0.0.0.0/0' "
                 "-InterfaceAlias NordLynx -ErrorAction SilentlyContinue "
-                "| Measure-Object).Count",
+                "| Measure-Object).Count"),
             ],
             capture_output=True,
             text=True,
             timeout=10,
+            check=False,
         )
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -329,7 +331,7 @@ class VPNContext:
         self._disconnect_on_exit = disconnect_on_exit
         self._was_connected_before = False
 
-    def __enter__(self) -> VPNContext:
+    def __enter__(self) -> Self:
         if _cfg_attr("NORDVPN_ENABLED", False):
             self._was_connected_before = is_connected()
             connect(country_group=self._country_group)
@@ -344,7 +346,6 @@ class VPNContext:
                     "[NordVPN] VPNContext __exit__ disconnect 失败，"
                     "VPN 可能仍在连接状态", exc_info=True,
                 )
-        return None  # don't suppress exceptions
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """ChatGPT 账号套餐/试用资格查询。"""
 from __future__ import annotations
 
@@ -9,10 +8,11 @@ import logging
 import socket
 import time
 from datetime import datetime, timezone
-from typing import Any, Optional, Protocol
+from typing import Any, Protocol
 from urllib.parse import quote, urlparse
 
 from core.session import BrowserSession
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ class PlanCheckBrowserTransport(Protocol):
 
 
 def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return local_now().isoformat(timespec="seconds")
 
 
 def normalize_token(token: str) -> str:
@@ -58,7 +58,7 @@ def _mask_proxy(proxy: str) -> str:
         scheme = f"{parsed.scheme}://" if parsed.scheme else ""
         auth = "***:***@" if parsed.username or parsed.password else ""
         return f"{scheme}{auth}{host}{port}" or "***"
-    except Exception:
+    except Exception:  # noqa: BLE001
         return "***"
 
 
@@ -85,14 +85,14 @@ def _local_proxy_status(proxy: str) -> tuple[bool, bool, str | None]:
                 return True, True, None
         except OSError as exc:
             return True, False, f"本地代理 {host}:{parsed.port} 未监听（{type(exc).__name__}）"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return False, False, f"代理地址解析失败（{type(exc).__name__}）"
 
 
 def resolve_plan_check_route(
-    explicit_proxy: Optional[str] = None,
+    explicit_proxy: str | None = None,
     *,
-    exclude_proxy: Optional[str] = None,
+    exclude_proxy: str | None = None,
 ) -> dict:
     """解析套餐查询的实际网络路径。
 
@@ -168,7 +168,7 @@ def decode_jwt_payload_unverified(token: str) -> dict:
             return {}
         payload = parts[1] + "=" * (-len(parts[1]) % 4)
         return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
 
 
@@ -218,7 +218,7 @@ def parse_accounts_check(data: dict, *, token: str = "") -> dict:
     claim_account_id = claims.get("account_id")
     accounts = data.get("accounts") if isinstance(data, dict) else None
     if not isinstance(accounts, dict):
-        raise ValueError("响应缺少 accounts 对象")
+        raise TypeError("响应缺少 accounts 对象")
 
     item = None
     account_key = None
@@ -236,7 +236,7 @@ def parse_accounts_check(data: dict, *, token: str = "") -> dict:
                 account_key = k
                 break
     if not isinstance(item, dict):
-        raise ValueError("未找到可解析的账号条目")
+        raise TypeError("未找到可解析的账号条目")
 
     account = item.get("account") or {}
     entitlement = item.get("entitlement") or {}
@@ -334,7 +334,7 @@ def _retry_wait_seconds(resp: Any, base_delay: float, attempt: int) -> float:
 def check_account_plan(
     token: str,
     *,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     browser_transport: PlanCheckBrowserTransport | None = None,
     timezone_offset_min: str = "-",
     timeout: float | None = None,
@@ -387,7 +387,7 @@ def check_account_plan(
 def _check_account_plan_impl(
     token: str,
     *,
-    proxy: Optional[str] = None,
+    proxy: str | None = None,
     browser_transport: PlanCheckBrowserTransport | None = None,
     timezone_offset_min: str = "-",
     timeout: float | None = None,
@@ -420,7 +420,7 @@ def _check_account_plan_impl(
     else:
         try:
             route = resolve_plan_check_route(proxy)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return {
                 "ok": False,
                 "checked_at": now_iso(),
@@ -431,7 +431,7 @@ def _check_account_plan_impl(
     route_meta = {k: v for k, v in route.items() if k != "proxy"}
     try:
         timeout_seconds, attempts, base_delay = _plan_check_settings(timeout, max_attempts, retry_delay)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {
             "ok": False,
             "checked_at": now_iso(),
@@ -487,7 +487,7 @@ def _check_account_plan_impl(
                     "response_preview": response_text[:500],
                     "retryable": _retryable_plan_error(http_status),
                     "token_expired": True if is_auth_expired else claims.get("token_expired"),
-                    "needs_live_check": True if is_auth_expired else False,
+                    "needs_live_check": bool(is_auth_expired),
                 }
                 if (
                     http_status == 403
@@ -507,7 +507,7 @@ def _check_account_plan_impl(
             else:
                 try:
                     data: Any = resp.json()
-                except Exception:
+                except Exception:  # noqa: BLE001
                     data = json.loads(response_text) if response_text.strip().startswith(("{", "[")) else None
                 if not isinstance(data, dict):
                     last_result = {
@@ -553,7 +553,7 @@ def _check_account_plan_impl(
             if owns_env and env is not None:
                 try:
                     env.session.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
 
         last_result = last_result or {"ok": False, "checked_at": now_iso(), "error": "未知错误", "retryable": True}

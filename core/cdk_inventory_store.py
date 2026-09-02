@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import hashlib
@@ -8,13 +7,13 @@ import secrets
 import sqlite3
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from core import app_state_db
-
 
 SCHEMA_VERSION = 2
 _MAX_CONFIGURED_LIMIT = 6
@@ -330,7 +329,7 @@ class CdkInventoryStore:
         if not provider_name or not canonical:
             raise CdkInventoryError("Provider and CDK are required")
         fingerprint = "sha256:" + hashlib.sha256(
-            f"{provider_name}:{canonical}".encode("utf-8")
+            f"{provider_name}:{canonical}".encode()
         ).hexdigest()
         return provider_name, raw_value, fingerprint
 
@@ -474,7 +473,7 @@ class CdkInventoryStore:
                     f"configured_limit {limit} below used slots {used}"
                 )
             if limit <= inventory["configured_limit"]:
-                return None
+                return
             connection.execute(
                 "UPDATE cdk_inventory SET configured_limit = ?, updated_at = CURRENT_TIMESTAMP "
                 "WHERE inventory_id = ?", (limit, inventory_id)
@@ -483,7 +482,7 @@ class CdkInventoryStore:
                 connection, inventory_id, "configured_limit_bumped", "", "",
                 {"configured_limit": limit},
             )
-            return None
+            return
 
         self._write(operation)
         record = self.get_inventory(inventory_id)

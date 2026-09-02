@@ -1,9 +1,8 @@
-# -*- coding: utf-8 -*-
 import json
+import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-import tempfile
 from unittest.mock import Mock, patch
 
 from config import email as email_config

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Codex 授权补跑服务，供账号页和注册任务队列共同使用。"""
 import ctypes
 import logging
@@ -30,7 +29,7 @@ def _thread_alive(thread_id: int | None) -> bool:
         return False
     try:
         tid = int(thread_id)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return any(getattr(t, "ident", None) == tid and t.is_alive() for t in threading.enumerate())
 
@@ -60,7 +59,7 @@ def reserve(email: str) -> bool:
             try:
                 acc = db.get_account_by_email(email)
                 status = str((acc or {}).get("codex_status") or "").lower()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 status = ""
             # 修复“实际已停止/线程已结束，但进程内占位未释放”导致无法再次补跑。
             # 用户点停止后，部分浏览器/短信等待步骤可能不会立刻退出，UI 已是 stopped 但进程占位仍在。
@@ -190,7 +189,7 @@ def request_stop(email: str) -> dict:
                     try:
                         acc = db.get_account_by_email(email)
                         status = str((acc or {}).get("codex_status") or "").lower()
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         status = ""
                     if status == "stopped":
                         logger.warning("[Codex 补跑] 停止后延迟释放占位：email=%s thread_id=%s", email, thread_id or "-")
@@ -201,8 +200,9 @@ def request_stop(email: str) -> dict:
         p = log_path(email)
         p.parent.mkdir(parents=True, exist_ok=True)
         from datetime import datetime as _dt
+        from datetime import timezone
         with p.open("a", encoding="utf-8") as f:
-            f.write(f"{_dt.now().strftime('%H:%M:%S')} [WARNING] [Codex 补跑] 用户手动停止，已发送停止信号 injected={injected}\n")
+            f.write(f"{_dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None).strftime('%H:%M:%S')} [WARNING] [Codex 补跑] 用户手动停止，已发送停止信号 injected={injected}\n")
     except Exception:
         logger.exception("写入 Codex 停止日志失败")
     return {"ok": True, "message": "已发送停止信号", "state": "stopped", "running": True, "injected": injected}
@@ -260,7 +260,7 @@ def run_worker(
                 getattr(roxy_cfg, "ROXY_OPEN_HEADLESS", ""),
                 getattr(roxy_cfg, "ROXY_KEEP_BROWSER_OPEN", ""),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[Codex 补跑] 配置热加载失败，将继续使用当前内存配置：%s: %s", type(exc).__name__, exc)
 
         if batch_label:
@@ -308,7 +308,7 @@ def run_worker(
             if isinstance(sub2_callback_context, dict)
             else nullcontext()
         )
-        with callback_scope:
+        with callback_scope:  # noqa: SIM117
             with proxy_context as (active_proxy, network_mode):
                 if active_proxy:
                     oauth_kwargs["proxy"] = active_proxy

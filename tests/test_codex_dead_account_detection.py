@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 
 from core.browser_use_codex_oauth import (
@@ -7,8 +6,8 @@ from core.browser_use_codex_oauth import (
 )
 from core.browser_use_registration import _quick_auth_state
 from core.openai_auth import (
-    account_unusable_message,
     account_unusable_error_message,
+    account_unusable_message,
     detect_account_unusable_response_body,
     detect_account_unusable_text,
 )

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace

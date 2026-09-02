@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Browser Use Cloud 配置。
 
@@ -11,7 +10,7 @@ Browser Use Cloud 配置。
   2. 在 .env 填入 BROWSER_USE_API_KEY（也可用 WebUI 密钥字段写入 .env）
   3. 推荐先关 Codex：ENABLE_CODEX_AUTO = False
 """
-from config.env_loader import env_str, apply_env_overrides
+from config.env_loader import apply_env_overrides, env_str
 
 # Browser Use API Key（Cloud Dashboard 创建；优先读 .env / 环境变量）
 BROWSER_USE_API_KEY: str = env_str("BROWSER_USE_API_KEY", "")

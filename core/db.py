@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 SQLite 持久化层。
 
@@ -7,23 +6,29 @@ SQLite 持久化层。
 """
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import uuid
 from contextlib import closing
-from datetime import datetime
+from datetime import datetime, timezone
 from html import escape
 from pathlib import Path
 from typing import Any
 
 from core import app_state_db
 from core.gmail_aliases import (
-    GmailAliasError,
     MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
+    GmailAliasError,
     generate_gmail_dual_domain_aliases,
 )
-from core.gmail_api_url_batch_store import GmailApiUrlBatchConflict, GmailApiUrlBatchStore
+from core.gmail_api_url_batch_store import (
+    GmailApiUrlBatchConflict,
+    GmailApiUrlBatchStore,
+)
 from core.openai_auth import account_unusable_message
+
+logger = logging.getLogger(__name__)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DATA_DIR = _PROJECT_ROOT
@@ -93,7 +98,17 @@ _SQLITE_READY_PATH: Path | None = None
 
 
 def _now() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None).isoformat(timespec="seconds")
+
+
+def _local_now() -> datetime:
+    """Return the local wall-clock time as a naive value for legacy fields."""
+    return datetime.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
+
+
+def _local_fromtimestamp(value: float) -> datetime:
+    """Convert a filesystem timestamp to the local naive representation."""
+    return datetime.fromtimestamp(value, tz=timezone.utc).astimezone().replace(tzinfo=None)
 
 
 def _ensure_storage() -> None:
@@ -147,7 +162,8 @@ def _read_legacy_sqlite_collection(collection: str) -> list[dict] | None:
             if not table or not _table_exists(legacy_conn, table):
                 return None
             return [dict(row) for row in legacy_conn.execute(f"SELECT * FROM {table}").fetchall()]
-    except Exception:
+    except (OSError, sqlite3.Error, TypeError, ValueError) as exc:
+        logger.debug("读取旧 SQLite 集合失败: %s", exc, exc_info=True)
         return None
 
 
@@ -200,7 +216,7 @@ def _ensure_sqlite() -> None:
                 value TEXT NOT NULL
             );
         """)
-        for table in {"accounts", "email_pool", "registration_jobs"}:
+        for table in ("accounts", "email_pool", "registration_jobs"):
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_status ON {table}(status, id DESC)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_archived ON {table}(archived, id DESC)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_email ON {table}(email COLLATE NOCASE)")
@@ -280,13 +296,14 @@ def _ensure_sqlite() -> None:
                 try:
                     content = json.loads(path.read_text(encoding="utf-8"))
                     stat = path.stat()
-                except Exception:
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    logger.debug("无法迁移 Codex 凭证 %s：%s: %s", path, type(exc).__name__, exc)
                     continue
                 filename = path.name
                 meta = dict(content)
                 meta["_filename"] = filename
                 meta["_size"] = stat.st_size
-                meta["_mtime"] = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+                meta["_mtime"] = _local_fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
                 es = state.get(filename) or {}
                 meta["_exported_at"] = es.get("exported_at")
                 meta["_exported_count"] = es.get("exported_count", 0)
@@ -301,7 +318,8 @@ def _ensure_sqlite() -> None:
                 try:
                     content = json.loads(path.read_text(encoding="utf-8"))
                     stat = path.stat()
-                except Exception:
+                except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                    logger.debug("无法迁移 Codex Agent 凭证 %s：%s: %s", path, type(exc).__name__, exc)
                     continue
                 identity = content.get("agent_identity") if isinstance(content.get("agent_identity"), dict) else {}
                 email = str(content.get("email") or identity.get("email") or "").strip()
@@ -309,7 +327,7 @@ def _ensure_sqlite() -> None:
                 if not account:
                     continue
                 account_id = int(account["id"])
-                stamp = datetime.fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
+                stamp = _local_fromtimestamp(stat.st_mtime).isoformat(timespec="seconds")
                 conn.execute(
                     "INSERT OR IGNORE INTO codex_agent_accounts(account_id,email,filename,created_at,updated_at,payload) VALUES(?,?,?,?,?,?)",
                     (account_id, email or str(json.loads(account["payload"]).get("email") or ""), path.name, stamp, stamp, json.dumps(content, ensure_ascii=False)),
@@ -334,37 +352,52 @@ def _ensure_sqlite() -> None:
 def _load_collection(collection: str) -> list[dict]:
     _ensure_sqlite()
     table = _TABLES[collection]
-    with closing(_sqlite_conn()) as conn:
-        with conn:
-            sql = f"SELECT payload FROM {table}"
-            params: tuple[str, ...] = ()
-            if table == "email_pool":
-                sql += " WHERE source=?"; params = (_EMAIL_SOURCES[collection],)
-            sql += " ORDER BY id"
-            return [json.loads(row["payload"]) for row in conn.execute(sql, params)]
+    with closing(_sqlite_conn()) as conn, conn:
+        sql = f"SELECT payload FROM {table}"
+        params: tuple[str, ...] = ()
+        if table == "email_pool":
+            sql += " WHERE source=?"; params = (_EMAIL_SOURCES[collection],)
+        sql += " ORDER BY id"
+        return [json.loads(row["payload"]) for row in conn.execute(sql, params)]
 
 
-def _save_collection(collection: str, rows: list[dict]) -> None:
+def _save_collection(collection: str, rows: list[dict], *, replace_existing: bool = True) -> None:
     _ensure_sqlite()
     table = _TABLES[collection]
-    with closing(_sqlite_conn()) as conn:
-        with conn:
+    with closing(_sqlite_conn()) as conn, conn:
+        if replace_existing:
             if table == "email_pool":
                 conn.execute("DELETE FROM email_pool WHERE source=?", (_EMAIL_SOURCES[collection],))
             else:
                 conn.execute(f"DELETE FROM {table}")
-            for pos, raw in enumerate(rows, 1):
-                row = dict(raw)
-                rid = int(row.get("id") or pos)
+        for pos, raw in enumerate(rows, 1):
+            row = dict(raw)
+            rid = int(row.get("id") or pos)
+            row["id"] = rid
+            if table == "email_pool" and conn.execute("SELECT 1 FROM email_pool WHERE id=?", (rid,)).fetchone():
+                rid = int(conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM email_pool").fetchone()[0])
                 row["id"] = rid
-                if table == "email_pool" and conn.execute("SELECT 1 FROM email_pool WHERE id=?", (rid,)).fetchone():
-                    rid = int(conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM email_pool").fetchone()[0])
-                    row["id"] = rid
+            values = (
+                rid,
+                str(row.get("email") or ""),
+                str(row.get("status") or ""),
+                int(bool(row.get("archived"))),
+                str(row.get("created_at") or row.get("imported_at") or ""),
+                str(row.get("updated_at") or ""),
+                json.dumps(row, ensure_ascii=False),
+            )
+            if replace_existing:
                 conn.execute(
                     f"INSERT INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
-                    (rid, str(row.get("email") or ""), str(row.get("status") or ""),
-                     int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
-                     str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False)),
+                    values,
+                )
+            else:
+                conn.execute(
+                    f"INSERT INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?) "
+                    "ON CONFLICT(id) DO UPDATE SET email=excluded.email, status=excluded.status, "
+                    "archived=excluded.archived, created_at=excluded.created_at, "
+                    "updated_at=excluded.updated_at, payload=excluded.payload",
+                    values,
                 )
 
 
@@ -546,7 +579,8 @@ def _read_json(path: Path, default: Any) -> Any:
         return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        logger.debug("读取 JSON 文件失败: %s", path, exc_info=True)
         return default
 
 
@@ -626,7 +660,10 @@ def _extract_registration_password(row: dict) -> str:
     if isinstance(extra_raw, str) and extra_raw.strip():
         try:
             extra = json.loads(extra_raw)
-        except Exception:
+        except (TypeError, json.JSONDecodeError):
+            logger.debug("解析注册密码扩展字段失败", exc_info=True)
+            extra = {}
+        if not isinstance(extra, dict):
             extra = {}
     elif isinstance(extra_raw, dict):
         extra = extra_raw
@@ -639,13 +676,11 @@ def _looks_like_email_material_segment(segment: str) -> bool:
     seg = str(segment or "").strip()
     if not seg:
         return False
-    if seg.startswith("M.") or seg.startswith("m."):
+    if seg.startswith(("M.", "m.")):
         return True
     if len(seg) >= 32 and "-" in seg and seg.count("-") >= 4:
         return True
-    if any(ch in seg for ch in ("@", ":", "/", "\\")):
-        return True
-    return False
+    return any(ch in seg for ch in ("@", ":", "/", "\\"))
 
 
 def _ensure_password_in_material_line(base: str, password: str) -> str:
@@ -1075,7 +1110,7 @@ render();
                 pass
             return _VIEWER_HTML
         except PermissionError:
-            fallback = _DATA_DIR / f"accounts_viewer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            fallback = _DATA_DIR / f"accounts_viewer_{_local_now().strftime('%Y%m%d_%H%M%S')}.html"
             fallback.write_text(html_text, encoding="utf-8")
             try:
                 tmp.unlink()
@@ -1100,13 +1135,9 @@ def _run_debounced_static_viewer_refresh() -> None:
             outlook_rows = _load_outlook()
             account_rows = _load_accounts()
             _render_static_viewer(outlook_rows=outlook_rows, account_rows=account_rows)
-    except Exception:
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError) as exc:
         # 静态查看页只是旁路产物，失败不应影响主流程。
-        try:
-            import logging
-            logging.getLogger(__name__).exception("后台刷新 accounts_viewer.html 失败: %s", reason or "-")
-        except Exception:
-            pass
+        logger.exception("后台刷新 accounts_viewer.html 失败: %s", reason or "-", exc_info=exc)
 
 
 def _schedule_static_viewer_refresh(reason: str = "") -> None:
@@ -1159,13 +1190,14 @@ def _load_accounts() -> list[dict]:
     return _load_collection("accounts")
 
 
-def _save_accounts(rows: list[dict]) -> None:
+def _save_accounts(rows: list[dict], *, allow_delete: bool = False) -> None:
     for row in rows:
         row["copy_line"] = _account_line(row)
-    _save_collection("accounts", rows)
-    _write_json(_ACCOUNTS_JSON, rows)
-    _sync_accounts_txt(rows)
-    _sync_tokens_txt(rows)
+    _save_collection("accounts", rows, replace_existing=allow_delete)
+    persisted_rows = rows if allow_delete else _load_accounts()
+    _write_json(_ACCOUNTS_JSON, persisted_rows)
+    _sync_accounts_txt(persisted_rows)
+    _sync_tokens_txt(persisted_rows)
     _schedule_static_viewer_refresh("save_accounts")
 
 
@@ -1202,7 +1234,7 @@ def _decorate_account(row: dict) -> dict:
             stamp_key = "plan_check_queued_at" if plan_status == "queued" else "plan_check_started_at"
             stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if plan_status == "queued" else _PLAN_CHECK_STALE_SECONDS
             started_at = datetime.fromisoformat(str(out.get(stamp_key) or ""))
-            if (datetime.now() - started_at).total_seconds() >= stale_after:
+            if (_local_now() - started_at).total_seconds() >= stale_after:
                 out["plan_check_status"] = "failed"
                 out["plan_check_error"] = "上次套餐查询状态已超时，可重新查询"
                 out["plan_check_stale"] = True
@@ -1431,6 +1463,9 @@ def _decorate_gmail_api_url_email(row: dict, account_by_email: dict[str, dict] |
 def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
     """Attach alias inventory counts without exposing the source code URL."""
     result = [dict(row) for row in rows]
+    from core.qan8_gmail_api_store import Qan8GmailApiStore
+
+    qan8_store = Qan8GmailApiStore(_SQLITE_PATH, initialize_schema=False)
     code_urls = {
         str(row.get("code_url") or "").strip()
         for row in result
@@ -1439,6 +1474,20 @@ def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
     usage_by_url = GmailApiUrlBatchStore(_SQLITE_PATH).alias_usage_for_code_urls(code_urls)
     empty_usage = {"allocated": set(), "consumed": set(), "failed": set(), "reserved": set()}
     for row in result:
+        qan8_usage = qan8_store.alias_usage_for_source(
+            str(row.get("email") or ""),
+            str(row.get("code_url") or ""),
+        )
+        if qan8_usage is not None:
+            row.update({
+                "alias_total": int(qan8_usage["total"]),
+                "alias_allocated": int(qan8_usage["total"]),
+                "alias_available": int(qan8_usage["available"]),
+                "alias_used": int(qan8_usage["used"]),
+                "alias_failed": int(qan8_usage["failed"]),
+                "alias_reserved": int(qan8_usage["reserved"]),
+            })
+            continue
         try:
             candidates = generate_gmail_dual_domain_aliases(
                 row.get("email"), limit=MAX_GMAIL_DUAL_DOMAIN_VARIANTS
@@ -1668,7 +1717,7 @@ def claim_account_codex_agent(acc_id: int, trigger: str = "manual") -> bool:
                 stamp_key = "codex_agent_queued_at" if current_status == "queued" else "codex_agent_started_at"
                 stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
                 started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (datetime.now() - started_at).total_seconds() < stale_after:
+                if (_local_now() - started_at).total_seconds() < stale_after:
                     return False
             except (TypeError, ValueError):
                 pass
@@ -1727,7 +1776,7 @@ def update_account_codex_agent(acc_id: int, result: dict | None = None) -> bool:
         if isinstance(result.get("auth_json"), dict):
             auth_json = result.get("auth_json")
             row["codex_agent_token"] = json.dumps(auth_json, ensure_ascii=False)
-            agent_filename = f"codex-agent-{str(row.get('email') or acc_id)}.json"
+            agent_filename = f"codex-agent-{row.get('email') or acc_id!s}.json"
             stamp = _now()
             _ensure_sqlite()
             with closing(_sqlite_conn()) as conn:
@@ -1812,7 +1861,7 @@ def claim_account_plan_check(
                 stamp_key = "plan_check_queued_at" if current_status == "queued" else "plan_check_started_at"
                 stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
                 started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (datetime.now() - started_at).total_seconds() < stale_after:
+                if (_local_now() - started_at).total_seconds() < stale_after:
                     return False
             except (TypeError, ValueError):
                 pass
@@ -1972,7 +2021,7 @@ def claim_account_extract(acc_id: int, trigger: str = "manual", link_type: str =
                 stamp_key = "extract_link_queued_at" if current_status == "queued" else "extract_link_started_at"
                 stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
                 started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (datetime.now() - started_at).total_seconds() < stale_after:
+                if (_local_now() - started_at).total_seconds() < stale_after:
                     return False
             except (TypeError, ValueError):
                 pass
@@ -2074,7 +2123,7 @@ def _account_matches_query(row: dict, q: str | None) -> bool:
         return True
     try:
         return q in "\n".join(str(v) for v in row.values()).lower()
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         return False
 
 
@@ -2093,7 +2142,7 @@ def _parse_iso_dt(value: str | None, end_of_day: bool = False) -> datetime | Non
                 return datetime.fromisoformat(text + "T23:59:59.999999")
             return datetime.fromisoformat(text + "T00:00:00")
         return datetime.fromisoformat(text)
-    except Exception:
+    except ValueError:
         return None
 
 
@@ -2622,7 +2671,7 @@ def claim_account_totp_setup(acc_id: int, trigger: str = "manual") -> bool:
                 stamp_key = "totp_setup_queued_at" if current_status == "queued" else "totp_setup_started_at"
                 stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
                 started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (datetime.now() - started_at).total_seconds() < stale_after:
+                if (_local_now() - started_at).total_seconds() < stale_after:
                     return False
             except (TypeError, ValueError):
                 pass
@@ -2714,7 +2763,7 @@ def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
                 stamp_key = "live_check_queued_at" if row.get("live_check_status") == "queued" else "live_check_started_at"
                 stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if row.get("live_check_status") == "queued" else _PLAN_CHECK_STALE_SECONDS
                 started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (datetime.now() - started_at).total_seconds() < stale_after:
+                if (_local_now() - started_at).total_seconds() < stale_after:
                     return False
             except (TypeError, ValueError):
                 pass
@@ -2956,7 +3005,7 @@ def delete_account(acc_id: int | None = None, email: str | None = None) -> bool:
             new_rows.append(row)
         if not deleted:
             return False
-        _save_accounts(new_rows)
+        _save_accounts(new_rows, allow_delete=True)
         if deleted_ids:
             _ensure_sqlite()
             with closing(_sqlite_conn()) as conn:
@@ -2993,7 +3042,7 @@ def delete_accounts(account_ids: list[int] | None = None, emails: list[str] | No
         for item in email_set - seen_emails:
             skipped.append({"email": item, "reason": "账号不存在"})
         if deleted:
-            _save_accounts(new_rows)
+            _save_accounts(new_rows, allow_delete=True)
             _ensure_sqlite()
             with closing(_sqlite_conn()) as conn:
                 conn.executemany("DELETE FROM codex_agent_accounts WHERE account_id=?", [(x["id"],) for x in deleted])
@@ -3638,7 +3687,7 @@ def reset_gmail_api_url_aliases(email: str) -> dict:
         if record is None:
             raise ValueError("Gmail API URL email not found")
         if _find_by_email(_load_accounts(), normalized_email) is not None:
-            raise GmailBatchConflict("该 Gmail 源邮箱已存在注册账号，不能重置")
+            raise GmailApiUrlBatchConflict("该 Gmail 源邮箱已存在注册账号，不能重置")
         code_url = str(record.get("code_url") or "").strip()
         if not code_url:
             raise ValueError("Gmail API URL code_url is missing")
@@ -4187,8 +4236,8 @@ def delete_job(job_id: int, *, delete_log: bool = True, allow_running: bool = Fa
         if log_file:
             try:
                 Path(log_file).unlink(missing_ok=True)
-            except Exception:
-                pass
+            except OSError:
+                logger.debug("删除注册任务日志失败: %s", log_file, exc_info=True)
     return True
 
 
@@ -4209,46 +4258,45 @@ def _migrate_legacy_sqlite() -> dict:
     if not _LEGACY_SQLITE.exists():
         return summary
     try:
-        conn = sqlite3.connect(str(_LEGACY_SQLITE))
-        conn.row_factory = sqlite3.Row
-        if _table_exists(conn, "outlook_pool"):
-            records = []
-            statuses = []
-            for row in conn.execute("SELECT * FROM outlook_pool").fetchall():
-                records.append({
-                    "email": row["email"],
-                    "password": row["password"],
-                    "client_id": row["client_id"],
-                    "refresh_token": row["refresh_token"],
-                })
-                statuses.append({
-                    "email": row["email"],
-                    "status": row["status"],
-                    "note": row["note"],
-                })
-            ins, skip = import_outlook_accounts(records)
-            for item in statuses:
-                if item["status"] != "available":
-                    release_outlook(item["email"], status=item["status"], note=item["note"])
-            summary["sqlite_outlook_imported"] += ins
-            summary["sqlite_outlook_skipped"] += skip
-        if _table_exists(conn, "registered_accounts"):
-            for row in conn.execute("SELECT * FROM registered_accounts").fetchall():
-                insert_account(
-                    email=row["email"],
-                    access_token=row["access_token"],
-                    totp_secret=row["totp_secret"],
-                    user_id=row["user_id"],
-                    user_name=row["user_name"],
-                    plan_type=row["plan_type"],
-                    expires_at=row["expires_at"],
-                    proxy_used=row["proxy_used"],
-                    email_source=row["email_source"],
-                    extra=json.loads(row["extra_json"]) if row["extra_json"] else None,
-                )
-                summary["sqlite_accounts_imported"] += 1
-        conn.close()
-    except Exception as exc:
+        with closing(sqlite3.connect(str(_LEGACY_SQLITE))) as conn:
+            conn.row_factory = sqlite3.Row
+            if _table_exists(conn, "outlook_pool"):
+                records = []
+                statuses = []
+                for row in conn.execute("SELECT * FROM outlook_pool").fetchall():
+                    records.append({
+                        "email": row["email"],
+                        "password": row["password"],
+                        "client_id": row["client_id"],
+                        "refresh_token": row["refresh_token"],
+                    })
+                    statuses.append({
+                        "email": row["email"],
+                        "status": row["status"],
+                        "note": row["note"],
+                    })
+                ins, skip = import_outlook_accounts(records)
+                for item in statuses:
+                    if item["status"] != "available":
+                        release_outlook(item["email"], status=item["status"], note=item["note"])
+                summary["sqlite_outlook_imported"] += ins
+                summary["sqlite_outlook_skipped"] += skip
+            if _table_exists(conn, "registered_accounts"):
+                for row in conn.execute("SELECT * FROM registered_accounts").fetchall():
+                    insert_account(
+                        email=row["email"],
+                        access_token=row["access_token"],
+                        totp_secret=row["totp_secret"],
+                        user_id=row["user_id"],
+                        user_name=row["user_name"],
+                        plan_type=row["plan_type"],
+                        expires_at=row["expires_at"],
+                        proxy_used=row["proxy_used"],
+                        email_source=row["email_source"],
+                        extra=json.loads(row["extra_json"]) if row["extra_json"] else None,
+                    )
+                    summary["sqlite_accounts_imported"] += 1
+    except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError) as exc:
         summary["sqlite_error"] = f"{type(exc).__name__}: {exc}"
     return summary
 
@@ -4286,7 +4334,8 @@ def migrate_legacy_files() -> dict:
                     extra=extra,
                 )
                 summary["accounts_imported"] += 1
-            except Exception:
+            except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                logger.debug("无法迁移账号文件 %s：%s: %s", jf, type(exc).__name__, exc)
                 continue
 
     for txt in (_PROJECT_ROOT / "outlook_accounts.txt", _OUTLOOK_TXT):
@@ -4320,8 +4369,8 @@ def migrate_legacy_files() -> dict:
             emails = json.loads(used.read_text(encoding="utf-8"))
             for email in emails:
                 release_outlook(email, status="used")
-        except Exception:
-            pass
+        except (OSError, UnicodeError, TypeError, ValueError, sqlite3.Error):
+            logger.debug("迁移已使用 Outlook 邮箱状态失败", exc_info=True)
 
     return summary
 

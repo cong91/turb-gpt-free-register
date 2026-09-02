@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """通过 Browser Use Cloud + Playwright 执行 Codex OAuth 授权。"""
 from __future__ import annotations
 
@@ -10,13 +9,14 @@ from urllib.parse import urlparse
 
 from config import browser_use as _cfg
 from config import roxybrowser as _roxy_cfg
-from core import sms_provider
 from core import codex_oauth as _codex_proto
+from core import sms_provider
 from core.browser_use_client import BrowserUseClient
 from core.browser_use_registration import (
     _clear_otp_inputs,
     _click_first,
     _click_passwordless_signup_if_present,
+    _fill_first,
     _maybe_accept_cookies,
     _page_url,
     _quick_auth_state,
@@ -99,7 +99,7 @@ class _StepTimer:
 def _is_callback_url(url: str) -> bool:
     try:
         parsed = urlparse(url)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     return (
         parsed.scheme in ("http", "https")
@@ -114,7 +114,7 @@ def _extract_callback_url_from_page(page) -> str:
         current = str(page.url or "")
         if _is_callback_url(current):
             return current
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         urls = page.evaluate(
@@ -133,7 +133,7 @@ def _extract_callback_url_from_page(page) -> str:
             if _is_callback_url(str(url)):
                 logger.info("[Codex][BrowserUse] 已从页面性能记录提取 callback URL：%s", str(url)[:160])
                 return str(url)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[Codex][BrowserUse] 提取 callback URL 失败：%s", exc)
     return ""
 
@@ -144,14 +144,15 @@ def _extract_callback_url_from_context(context, page=None) -> str:
         pages.append(page)
     try:
         pages.extend([p for p in context.pages if p not in pages])
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     for p in pages:
         try:
             found = _extract_callback_url_from_page(p)
             if found:
                 return found
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse callback page probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return ""
 
@@ -168,7 +169,7 @@ def _wait_for_callback(context, page, timeout: int | None = None) -> str:
             callback = _extract_callback_url_from_context(context, page)
             if callback:
                 return callback
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         time.sleep(0.25 if _fast_mode() else 0.5)
     raise RuntimeError(f"等待 Codex callback 超时，最后 URL={last_url}")
@@ -197,7 +198,7 @@ def _all_frames(page):
     frames = [page]
     try:
         frames.extend([f for f in page.frames if f not in frames])
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return frames
 
@@ -214,15 +215,15 @@ def _wait_auth_page_ready(page, timeout: int = 8) -> None:
                 try:
                     if frame.locator("input, button, textarea, [role='button']").count() > 0:
                         return
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
                 try:
                     text = (frame.locator("body").inner_text(timeout=500) or "").strip()
                     if text:
                         return
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         time.sleep(0.25 if _fast_mode() else 0.6)
     logger.warning("[Codex][BrowserUse] 登录页等待渲染超时，最后 URL=%s", last_url or "-")
@@ -237,7 +238,8 @@ def _visible_locator_any_frame(page, selectors: list[str], timeout_ms: int = 100
                     continue
                 if loc.is_visible(timeout=timeout_ms):
                     return loc
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("BrowserUse locator visibility probe failed: %s: %s", type(exc).__name__, exc)
                 continue
     return None
 
@@ -251,11 +253,11 @@ def _click_first_any_frame(page, selectors: list[str], timeout_ms: int = 5000) -
                 loc.scroll_into_view_if_needed(timeout=2000)
                 loc.click(timeout=3000)
                 return True
-            except Exception:
+            except Exception:  # noqa: BLE001
                 try:
                     loc.evaluate("el => el.click()")
                     return True
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
         time.sleep(0.25)
     return False
@@ -272,7 +274,7 @@ def _fill_first_any_frame(page, selectors: list[str], value: str, timeout_ms: in
                 loc.click(timeout=2000)
                 loc.fill(value, timeout=5000)
                 return True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 last_err = exc
                 try:
                     loc.evaluate(
@@ -288,7 +290,7 @@ def _fill_first_any_frame(page, selectors: list[str], value: str, timeout_ms: in
                         value,
                     )
                     return True
-                except Exception as exc2:
+                except Exception as exc2:  # noqa: BLE001
                     last_err = exc2
         time.sleep(0.25)
     if last_err:
@@ -327,7 +329,8 @@ def _js_fill_email_fallback(page, email: str) -> bool:
         try:
             if frame.evaluate(script, email):
                 return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse email fallback frame probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return False
 
@@ -339,7 +342,7 @@ def _body_snippet(page, limit: int = 600) -> str:
             text = " ".join(text.split())
             if text:
                 chunks.append(text)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return " | ".join(chunks)[:limit]
 
@@ -356,7 +359,7 @@ def _looks_next_step_after_login(page) -> bool:
         return True
     try:
         body = (page.locator("body").inner_text(timeout=1000) or "").lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         body = ""
     return any(
         x in body
@@ -434,7 +437,8 @@ def _classify_credential_login_state(page) -> str:
                 timeout_ms=500,
             ) is not None:
                 return "totp"
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse credential state frame probe failed: %s: %s", type(exc).__name__, exc)
             continue
     if any(marker in body for marker in ("allow access", "authorize codex", "continue to codex", "consent")):
         return "accepted"
@@ -486,7 +490,7 @@ def _login_with_credentials(page, credentials: CodexLoginCredentials, auth_url: 
     )
     try:
         page.wait_for_load_state("load", timeout=5000)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     _wait_auth_page_ready(page, timeout=2)
     _bu_delay("navigate")
@@ -525,7 +529,7 @@ def _login_with_credentials(page, credentials: CodexLoginCredentials, auth_url: 
     ):
         try:
             page.keyboard.press("Enter")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     _bu_delay("form")
     state = _wait_for_credential_login_state(page, ignored_states={"password"})
@@ -567,7 +571,7 @@ def _login_with_credentials(page, credentials: CodexLoginCredentials, auth_url: 
         ):
             try:
                 page.keyboard.press("Enter")
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         _bu_delay("otp_input")
         state = _wait_for_credential_login_state(page, ignored_states={"totp"})
@@ -603,7 +607,8 @@ def _click_email_entry_fast(page) -> bool:
         try:
             if frame.evaluate(script):
                 return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse email entry frame probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return False
 
@@ -638,7 +643,8 @@ def _fill_email_fast(page, email: str) -> bool:
         try:
             if frame.evaluate(script, email):
                 return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse email fill frame probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return False
 
@@ -699,12 +705,13 @@ def _submit_visible_form_or_enter(page) -> bool:
         try:
             if frame.evaluate(script):
                 return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse form submit frame probe failed: %s: %s", type(exc).__name__, exc)
             continue
     try:
         page.keyboard.press("Enter")
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 def _fill_email_for_codex(page, email: str) -> None:
@@ -782,7 +789,7 @@ def _looks_email_otp_page(page) -> bool:
         if page.locator("form[action*='/mfa-challenge' i]").count() > 0:
             return False
         return page.locator("input[autocomplete='one-time-code'], input[name='code'], input[inputmode='numeric']").count() > 0
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -798,17 +805,17 @@ def _install_account_dead_response_tracker(page) -> dict:
                 if int(getattr(resp, "status", 0) or 0) != 200:
                     try:
                         text = resp.text() or ""
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         text = ""
                 code = detect_account_unusable_response_body(text)
                 if code:
                     tracker["code"] = code
                     tracker["text"] = text[:500]
                     logger.warning("[Codex][BrowserUse] email-otp/validate phản hồi: OpenAI đã khóa tài khoản (%s)", code)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         page.on("response", _on_response)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return tracker
 
@@ -856,13 +863,12 @@ def _maybe_click_passwordless_after_email(page, email: str, timeout: int = 18) -
                 logger.info("[Codex][BrowserUse] 提交邮箱后检测密码/OTP 跳转：url=%s", url or "-")
                 last_url = url
             lower = str(url or "").lower()
-            if "/password" in lower or "auth.openai.com" in lower:
-                if _click_passwordless_signup_if_present(page):
-                    clicked = True
-                    logger.info("[Codex][BrowserUse] 已点击一次性验证码入口：email=%s", email)
-                    _bu_delay("form")
-                    continue
-        except Exception as exc:
+            if ("/password" in lower or "auth.openai.com" in lower) and _click_passwordless_signup_if_present(page):
+                clicked = True
+                logger.info("[Codex][BrowserUse] 已点击一次性验证码入口：email=%s", email)
+                _bu_delay("form")
+                continue
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Codex][BrowserUse] 密码页一次性验证码入口探测失败：%s", str(exc)[:140])
         time.sleep(0.4)
     if clicked:
@@ -872,14 +878,14 @@ def _maybe_click_passwordless_after_email(page, email: str, timeout: int = 18) -
 def _account_password_for_email(email: str) -> str:
     try:
         return _codex_proto._account_registration_password(email)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
 def _account_totp_code_for_email(email: str) -> str:
     try:
         return _codex_proto._account_totp_code(email)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -889,7 +895,7 @@ def _looks_mfa_challenge_page(page) -> bool:
         return True
     try:
         return bool(page.locator('form[action*="/mfa-challenge" i] input[name="code"]').count())
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -930,7 +936,7 @@ def _fill_mfa_challenge_if_present(page, email: str, timeout: int = 15) -> bool:
             ):
                 try:
                     page.keyboard.press("Enter")
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             logger.info("[Codex][BrowserUse] 已填写并提交 MFA 验证码：%s", email)
             wait_end = time.time() + 12
@@ -939,7 +945,7 @@ def _fill_mfa_challenge_if_present(page, email: str, timeout: int = 15) -> bool:
                     return True
                 time.sleep(0.4)
             return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("[Codex][BrowserUse] MFA challenge 处理失败：%s", str(exc)[:160])
             time.sleep(0.5)
     return False
@@ -962,7 +968,7 @@ def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str 
                 if "/log-in/password" not in _page_url(page).lower():
                     time.sleep(0.4)
                     continue
-            except Exception:
+            except Exception:  # noqa: BLE001
                 time.sleep(0.4)
                 continue
         ok = _fill_first(
@@ -995,7 +1001,7 @@ def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str 
         ):
             try:
                 page.keyboard.press("Enter")
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         logger.info("[Codex][BrowserUse] 已填写并提交登录密码：%s", email)
         wait_end = time.time() + 12
@@ -1009,7 +1015,7 @@ def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str 
                 try:
                     if "/log-in/password" not in _page_url(page).lower():
                         return "next_step"
-                except Exception:
+                except Exception:  # noqa: BLE001
                     return "next_step"
             time.sleep(0.5)
         return "next_step"
@@ -1024,7 +1030,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
     page.goto(auth_url, wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
     try:
         page.wait_for_load_state("load", timeout=5000)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     _wait_auth_page_ready(page, timeout=2)
     _t_goto.done(f"url={_page_url(page) or '-'}")
@@ -1083,7 +1089,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
                     logger.info("[Codex][BrowserUse] 重新提交邮箱后进入 MFA 验证，已完成 2FA")
                     return
                 _maybe_click_passwordless_after_email(page, email, timeout=12)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("[Codex][BrowserUse] 重新提交邮箱失败，继续按当前页面轮询：%s", str(exc)[:180])
         _bu_delay("api")
 
@@ -1156,7 +1162,7 @@ def _select_sms_channel(page) -> None:
               if (sms) { sms.click(); sms.dispatchEvent(new Event('input', {bubbles:true})); sms.dispatchEvent(new Event('change', {bubbles:true})); }
             }"""
         )
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -1166,7 +1172,7 @@ def _has_phone_prompt(page) -> bool:
         return True
     try:
         body = (page.locator("body").inner_text(timeout=1000) or "").lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         body = ""
     return any(x in body for x in ("phone number", "verify your phone", "手机号", "电话号码"))
 
@@ -1197,10 +1203,10 @@ def _read_phone_input_value(page) -> str:
         return ""
     try:
         return str(loc.input_value(timeout=1000) or "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             return str(loc.evaluate("el => el.value || ''") or "")
-        except Exception:
+        except Exception:  # noqa: BLE001
             return ""
 
 
@@ -1235,7 +1241,8 @@ def _force_set_phone_value(page, phone_e164: str) -> bool:
         try:
             if frame.evaluate(script, phone_e164):
                 return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse phone value frame probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return False
 
@@ -1330,7 +1337,7 @@ def _dismiss_phone_country_dropdown(page) -> None:
         time.sleep(0.15)
         page.keyboard.press("Tab")
         time.sleep(0.15)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         page.evaluate("""() => {
@@ -1338,7 +1345,7 @@ def _dismiss_phone_country_dropdown(page) -> None:
           if (active && active.blur) active.blur();
           document.body.click();
         }""")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -1371,7 +1378,8 @@ def _click_phone_continue(page) -> bool:
         try:
             if frame.evaluate(script):
                 return True
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse phone continue frame probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return _click_first_any_frame(
         page,
@@ -1413,7 +1421,7 @@ def _clear_phone_inputs(page) -> None:
     for frame in _all_frames(page):
         try:
             frame.evaluate(script)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 def _fill_phone(page, phone: str) -> str:
@@ -1457,7 +1465,7 @@ def _fill_phone(page, phone: str) -> str:
     if not _click_phone_continue(page):
         try:
             page.keyboard.press("Enter")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return phone_e164
 
@@ -1483,7 +1491,7 @@ def _wait_after_phone_otp(page, timeout: int = 25) -> str:
             return "accepted"
         try:
             body = (page.locator("body").inner_text(timeout=1000) or "").lower()
-        except Exception:
+        except Exception:  # noqa: BLE001
             body = ""
         if any(x in body for x in ("incorrect", "invalid", "expired", "错误", "过期", "无效")):
             return "invalid"
@@ -1530,17 +1538,16 @@ def _ensure_add_phone_form(page, *, reason: str = "") -> bool:
 
     # 如果在短信验证码页，优先点击 change/back 或浏览器后退，保留 auth transaction state。
     try:
-        if _try_click_change_phone(page):
-            if _wait_phone_form_ready(page, timeout=8):
-                return True
-    except Exception:
+        if _try_click_change_phone(page) and _wait_phone_form_ready(page, timeout=8):
+            return True
+    except Exception:  # noqa: BLE001, S110
         pass
 
     try:
         page.go_back(wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
         if _wait_phone_form_ready(page, timeout=8):
             return True
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     # 直接打开 add-phone。有时 body 会短暂为空，所以 reload + wait。
@@ -1549,17 +1556,17 @@ def _ensure_add_phone_form(page, *, reason: str = "") -> bool:
             page.goto("https://auth.openai.com/add-phone", wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
             try:
                 page.wait_for_load_state("load", timeout=5000)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             if _wait_phone_form_ready(page, timeout=10):
                 return True
             try:
                 page.reload(wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             if _wait_phone_form_ready(page, timeout=8):
                 return True
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.info("[Codex][BrowserUse] 打开 add-phone 尝试 %s 失败：%s", i + 1, str(exc)[:160])
 
     logger.warning("[Codex][BrowserUse] 无法回到手机号输入页：%s", _current_state_for_log(page))
@@ -1625,7 +1632,7 @@ def _do_phone_verification_if_present(page) -> None:
                 sms_provider.complete(activation_id, http)
                 return
             raise RuntimeError(f"手机验证码未通过：{outcome}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}: {str(exc)[:220]}"
             logger.warning("[Codex][BrowserUse] 手机验证失败（%s/%s）：%s", attempt, max_retries, last_error)
             if activation_id:
@@ -1635,7 +1642,7 @@ def _do_phone_verification_if_present(page) -> None:
                         http,
                         reason=_codex_proto._phone_failure_reason(str(exc)) or str(exc)[:120],
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             if attempt >= max_retries:
                 break
@@ -1643,7 +1650,7 @@ def _do_phone_verification_if_present(page) -> None:
                 _dismiss_phone_country_dropdown(page)
                 _clear_phone_inputs(page)
                 _ensure_add_phone_form(page, reason=f"after-fail-{attempt}")
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             time.sleep(min(1 + attempt, 4))
     raise RuntimeError(f"手机验证失败，已重试 {max_retries} 次：{last_error}")
@@ -1862,18 +1869,18 @@ def _run_browser_use_codex_oauth_once(
             try:
                 from config import skyvern as _skyvern_cfg
                 keep_open = bool(getattr(_skyvern_cfg, "SKYVERN_KEEP_BROWSER_OPEN", False))
-            except Exception:
+            except Exception:  # noqa: BLE001
                 keep_open = False
         if not keep_open and not reusing_existing_session:
             try:
                 if browser is not None:
                     browser.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             if provider in ("skyvern", "sv") and hasattr(client, "close_browser_session") and getattr(session_info, "session_id", ""):
                 try:
                     client.close_browser_session(session_info.session_id)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
         _set_log_provider_label("BrowserUse")
 
@@ -1884,7 +1891,7 @@ def _has_running_asyncio_loop() -> bool:
         import asyncio
         loop = asyncio.get_event_loop()
         return bool(loop and loop.is_running())
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 

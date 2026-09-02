@@ -16,6 +16,8 @@ TWOFA_SETUP_PROXY_SCOPE = "twofa_setup"
 TWOFA_CHANGE_PROXY_SCOPE = "twofa_change"
 EMAIL_CHANGE_PROXY_SCOPE = "email_change"
 EXTRACT_LINK_PROXY_SCOPE = "extract_link"
+EXTRACT_LINK_PAYMENT_PROXY_SCOPE = "extract_link_payment"
+EXTRACT_LINK_PROMOTION_PROXY_SCOPE = "extract_link_promotion"
 
 logger = logging.getLogger(__name__)
 
@@ -80,19 +82,19 @@ def release_rotating_proxy(
     proxy_url: str | None = None,
     retire: bool = False,
 ) -> bool:
-    """Keep a lane lease until proxy expiry; retire it only when explicitly requested."""
-    if not retire:
-        logger.debug(
-            "[RotatingProxy] retaining lease until expiry: scope=%s lane=%s",
-            scope,
-            lane_id if lane_id is not None else "thread",
-        )
-        return False
+    """Release an active lane immediately while preserving a reusable proxy cache."""
     from core.rotating_proxy_manager import get_rotating_proxy_manager
 
     try:
         effective_lane = default_proxy_lane_id() if lane_id is None else lane_id
-        return get_rotating_proxy_manager().release(
+        manager = get_rotating_proxy_manager()
+        if retire:
+            return manager.retire(
+                effective_lane,
+                scope=scope,
+                proxy_url=proxy_url,
+            )
+        return manager.release(
             effective_lane,
             scope=scope,
             proxy_url=proxy_url,

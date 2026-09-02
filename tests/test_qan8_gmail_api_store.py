@@ -1,5 +1,7 @@
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from core.qan8_gmail_api_store import Qan8GmailApiStore
@@ -87,6 +89,53 @@ class Qan8GmailApiStoreTests(unittest.TestCase):
             self.store.get_account_context(failed["alias"])["alias_state"],
             "failed",
         )
+
+    def test_source_alias_usage_reports_consumed_failed_and_active_slots(self):
+        batch = self.store.create_batch(3, requested_workers=1, aliases_per_source=3)
+        batch_id = batch["batch_id"]
+        source_email = "source@gmail.com"
+        code_url = "https://mail.example/source"
+        self.store.create_source_group(
+            batch_id,
+            0,
+            source_email,
+            code_url,
+            [
+                "source+one@gmail.com",
+                "source+two@gmail.com",
+                "source+three@gmail.com",
+            ],
+        )
+
+        completed = self.store.claim_alias(batch_id, 0, "job-completed")
+        self.assertIsNotNone(completed)
+        self.assertTrue(self.store.complete_assignment("job-completed"))
+        failed = self.store.claim_alias(batch_id, 0, "job-failed")
+        self.assertIsNotNone(failed)
+        self.assertTrue(self.store.fail_assignment("job-failed", reason="registration failed"))
+        active = self.store.claim_alias(batch_id, 0, "job-active")
+        self.assertIsNotNone(active)
+
+        usage = self.store.alias_usage_for_source(source_email, code_url)
+
+        self.assertEqual(
+            usage,
+            {"total": 3, "available": 0, "used": 1, "failed": 1, "reserved": 1},
+        )
+
+    def test_read_only_alias_usage_does_not_create_qan8_schema(self):
+        empty_path = Path(self.temp_dir.name) / "empty.sqlite3"
+
+        store = Qan8GmailApiStore(empty_path, initialize_schema=False)
+
+        self.assertIsNone(
+            store.alias_usage_for_source("source@gmail.com", "https://mail.example/source")
+        )
+        with closing(sqlite3.connect(empty_path)) as connection:
+            tables = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'qan8_%'"
+            ).fetchall()
+        self.assertEqual(tables, [])
 
     def test_exhausted_failed_source_is_removed_from_lane(self):
         batch = self.store.create_batch(3, requested_workers=1, aliases_per_source=2)

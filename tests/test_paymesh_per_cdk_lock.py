@@ -1,12 +1,11 @@
-# -*- coding: utf-8 -*-
 """Regression: mỗi CDK trong 1 thời điểm chỉ 1 worker tạo account."""
 import threading
 import time
 import unittest
-from unittest.mock import patch, Mock
+from unittest.mock import patch
 
 from core import paymesh_mail_client as client
-from core.paymesh_mail_client import PaymeshMailAccount, PaymeshMailError
+from core.paymesh_mail_client import PaymeshMailAccount
 from core.provider_card_ledger import ProviderCardLedger
 
 
@@ -28,14 +27,14 @@ class PerCdkLockTests(unittest.TestCase):
                 time.sleep(0.4)
                 if name == "first":
                     client.mark_account_consumed(acct.email)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 with lock:
                     results.append((name, "error", time.time(), str(exc)[:80]))
 
         client._CONTEXT_CACHE.clear()
         client._SEEN_CODES_BY_CDK.clear()
         client._CDK_LOCKS.clear()
-        with patch("core.paymesh_mail_client.redeem_cdk", side_effect=slow_redeem):
+        with patch("core.paymesh_mail_client.redeem_cdk", side_effect=slow_redeem):  # noqa: SIM117
             with patch("core.paymesh_mail_client._config_values", return_value=("http://x", 30, 6)):
                 import tempfile
                 from pathlib import Path
@@ -50,8 +49,8 @@ class PerCdkLockTests(unittest.TestCase):
 
         names = [r[0] for r in results if r[1] == "picked"]
         self.assertEqual(names, ["first", "second"])
-        first_time = [r[2] for r in results if r[0] == "first" and r[1] == "picked"][0]
-        second_time = [r[2] for r in results if r[0] == "second" and r[1] == "picked"][0]
+        first_time = next(r[2] for r in results if r[0] == "first" and r[1] == "picked")
+        second_time = next(r[2] for r in results if r[0] == "second" and r[1] == "picked")
         # Thread 2 must pick AFTER thread 1 releases (not concurrent)
         self.assertGreater(second_time - first_time, 0.3,
                            f"second pick must wait for first to finish; gap={second_time - first_time}")
@@ -65,7 +64,7 @@ class PerCdkLockTests(unittest.TestCase):
         client._CONTEXT_CACHE.clear()
         client._SEEN_CODES_BY_CDK.clear()
         client._CDK_LOCKS.clear()
-        with patch("core.paymesh_mail_client._config_values", return_value=("http://x", 30, 6)):
+        with patch("core.paymesh_mail_client._config_values", return_value=("http://x", 30, 6)):  # noqa: SIM117
             with patch("core.paymesh_mail_client.redeem_cdk", side_effect=RuntimeError("network down")):
                 with self.assertRaises(RuntimeError):
                     client.pick_account("failed", ["CARD-ERROR"])

@@ -40,11 +40,19 @@ CREATE TABLE IF NOT EXISTS rotating_proxy_scoped_leases (
 );
 CREATE INDEX IF NOT EXISTS rotating_proxy_scoped_leases_key_idx
     ON rotating_proxy_scoped_leases(rotating_key);
+CREATE TABLE IF NOT EXISTS rotating_proxy_cache (
+    rotating_key TEXT PRIMARY KEY,
+    proxy_url TEXT NOT NULL,
+    proxy_expires_at REAL NOT NULL,
+    key_expires_at REAL,
+    cached_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
 class RotatingProxyStore:
-    """Persist rotating-proxy inventory and one lease per scoped worker lane."""
+    """Persist rotating-proxy inventory, active leases, and reusable proxy cache."""
 
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else app_state_db.APP_STATE_DB_PATH
@@ -116,6 +124,80 @@ class RotatingProxyStore:
             rows = connection.execute(
                 "SELECT rotating_key, key_expires_at, first_seen_at, last_seen_at "
                 "FROM rotating_proxy_keys ORDER BY first_seen_at, rotating_key"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def upsert_cached_proxy(
+        self,
+        rotating_key: str,
+        *,
+        proxy_url: str,
+        proxy_expires_at: float,
+        key_expires_at: float | None,
+    ) -> None:
+        """Retain one verified provider response while its proxy TTL remains valid."""
+        now = time.time()
+        with closing(self._connect()) as connection:
+            connection.execute(
+                "INSERT INTO rotating_proxy_cache "
+                "(rotating_key, proxy_url, proxy_expires_at, key_expires_at, cached_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(rotating_key) DO UPDATE SET "
+                "proxy_url = excluded.proxy_url, proxy_expires_at = excluded.proxy_expires_at, "
+                "key_expires_at = excluded.key_expires_at, updated_at = excluded.updated_at",
+                (
+                    str(rotating_key),
+                    str(proxy_url),
+                    float(proxy_expires_at),
+                    key_expires_at,
+                    now,
+                    now,
+                ),
+            )
+
+    def get_cached_proxy(self, rotating_key: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT rotating_key, proxy_url, proxy_expires_at, key_expires_at, cached_at, updated_at "
+                "FROM rotating_proxy_cache WHERE rotating_key = ?",
+                (str(rotating_key),),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def delete_cached_proxy(
+        self,
+        rotating_key: str,
+        *,
+        proxy_url: str | None = None,
+    ) -> bool:
+        conditions = ["rotating_key = ?"]
+        params: list[object] = [str(rotating_key)]
+        if proxy_url is not None:
+            conditions.append("proxy_url = ?")
+            params.append(str(proxy_url))
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "DELETE FROM rotating_proxy_cache WHERE " + " AND ".join(conditions),
+                params,
+            )
+        return bool(cursor.rowcount)
+
+    def delete_expired_cached_proxies(self, now: float | None = None) -> int:
+        current = time.time() if now is None else float(now)
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                "DELETE FROM rotating_proxy_cache "
+                "WHERE proxy_expires_at <= ? "
+                "OR (key_expires_at IS NOT NULL AND key_expires_at <= ?)",
+                (current, current),
+            )
+        return cursor.rowcount
+
+    def list_cached_proxies(self) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT rotating_key, proxy_url, proxy_expires_at, key_expires_at, cached_at, updated_at "
+                "FROM rotating_proxy_cache ORDER BY cached_at, rotating_key"
             ).fetchall()
         return [dict(row) for row in rows]
 
@@ -247,7 +329,7 @@ class RotatingProxyStore:
         return cursor.rowcount
 
     def clear_leases(self) -> int:
-        """Clear leases left by a previous application process."""
+        """Clear active leases left by a previous application process."""
         with closing(self._connect()) as connection:
             cursor = connection.execute("DELETE FROM rotating_proxy_scoped_leases")
             legacy_cursor = connection.execute("DELETE FROM rotating_proxy_leases")

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 OTP 检测与抽取通用工具，被 outlook_client（Outlook 邮箱）使用。
 

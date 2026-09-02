@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import multiprocessing
@@ -31,7 +30,7 @@ def _reserve_final_slot(path: str, inventory_id: str, owner: str, start, results
         )
     except CdkInventoryConflict:
         results.put(("conflict", owner))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         results.put(("error", type(exc).__name__))
     else:
         results.put(("success", reservation.email))
@@ -44,7 +43,7 @@ def _take_over_expired_lease(path: str, inventory_id: str, owner: str, start, re
         lease = store.acquire_lease(inventory_id, owner_token=owner, ttl_seconds=30)
     except CdkInventoryConflict:
         results.put(("conflict", owner))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         results.put(("error", type(exc).__name__))
     else:
         results.put(("success", lease.fencing_token))

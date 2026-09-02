@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Browser Use Cloud + Playwright 注册驱动。
 
@@ -12,21 +11,34 @@ from __future__ import annotations
 
 import logging
 import random
-import threading
 import string
+import threading
 import time
-from datetime import date
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from config import browser_use as _cfg
 from config import twofa as _twofa_cfg
-from core.account_export import BrowserContextTransport, checkpoint_account_data, save_account_data, _post_register_dwell_seconds
 from core import db
+from core.account_export import (
+    BrowserContextTransport,
+    _post_register_dwell_seconds,
+    checkpoint_account_data,
+    save_account_data,
+)
+from core.browser_registration import (
+    _is_unsupported_email_error,
+    _profile_submission_error,
+)
+from core.browser_traffic import PlaywrightTrafficTracker
 from core.browser_use_client import BrowserUseClient
-from core.browser_registration import _is_unsupported_email_error, _profile_submission_error
 from core.codex_login_credentials import CodexLoginCredentials
-from core.email_provider import resolve_email_source, wait_for_otp
+from core.email_provider import (
+    acquire_email_after_input,
+    resolve_email_source,
+    wait_for_otp,
+)
 from core.humanize import delay as human_delay
 from core.openai_auth import (
     AccountUnusableError,
@@ -34,6 +46,7 @@ from core.openai_auth import (
     account_unusable_message,
     detect_account_unusable_text,
 )
+from core.time_utils import local_today
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +76,7 @@ def _skyvern_human_mode() -> bool:
         from config import skyvern as _skyvern_cfg
 
         return bool(getattr(_skyvern_cfg, "SKYVERN_HUMAN_MODE", True))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return True
 
 
@@ -119,7 +132,7 @@ def _human_pause(min_s: float = 0.08, max_s: float = 0.28) -> None:
     """Browser Use / Skyvern 始终保留随机停顿，避免毫秒级连贯操作。"""
     try:
         time.sleep(random.uniform(float(min_s), float(max_s)))
-    except Exception:
+    except Exception:  # noqa: BLE001
         time.sleep(0.12)
 
 
@@ -128,11 +141,11 @@ def _safe_scroll_locator(loc, *, timeout: int = 1800) -> None:
     try:
         loc.scroll_into_view_if_needed(timeout=timeout)
         return
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[BrowserUse] scroll_into_view_if_needed 不稳定，使用轻量滚动兜底：%s", str(exc)[:160])
     try:
         loc.evaluate("el => { try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e) {} }")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -143,11 +156,11 @@ def _human_click_locator(loc, *, timeout: int = 3000) -> None:
     try:
         loc.hover(timeout=min(1600, max(700, timeout)))
         _human_pause(0.18, 0.55)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         loc.click(timeout=timeout, delay=random.randint(80, 260))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         # Skyvern 远端页面偶发一直等待 stable；这里退一步用 force click，但仍保留前置滚动/hover/停顿。
         logger.debug("[BrowserUse] 常规点击失败，使用 force click 兜底：%s", str(exc)[:160])
         loc.click(timeout=timeout, delay=random.randint(80, 220), force=True)
@@ -159,7 +172,7 @@ def _human_focus_for_typing(loc, *, timeout: int = 2500) -> None:
     try:
         _human_click_locator(loc, timeout=timeout)
         return
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[BrowserUse] 输入框点击聚焦失败，改用 focus 聚焦继续键盘输入：%s", str(exc)[:180])
     _safe_scroll_locator(loc, timeout=1200)
     _human_pause(0.15, 0.45)
@@ -167,7 +180,7 @@ def _human_focus_for_typing(loc, *, timeout: int = 2500) -> None:
         loc.focus(timeout=1200)
         _human_pause(0.12, 0.35)
         return
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[BrowserUse] locator.focus 失败，改用 DOM focus：%s", str(exc)[:160])
     try:
         loc.evaluate("el => { try { el.scrollIntoView({block:'center', inline:'center', behavior:'instant'}); } catch(e) {} try { el.focus({preventScroll:true}); } catch(e) { el.focus && el.focus(); } }")
@@ -196,7 +209,7 @@ def _human_fill_locator(
             _human_pause(0.04, 0.14)
             page.keyboard.press("Backspace")
             return
-        except Exception:
+        except Exception:  # noqa: BLE001
             page.keyboard.press("Control+A")
             _human_pause(0.04, 0.14)
             page.keyboard.press("Backspace")
@@ -218,7 +231,7 @@ def _human_fill_locator(
         _human_pause(0.08, 0.22)
         _type_slowly()
         return
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             _safe_scroll_locator(loc, timeout=1200)
             _human_focus_for_typing(loc, timeout=2500)
@@ -279,7 +292,7 @@ def _registration_password() -> str:
         configured = str(getattr(_register_cfg, "REGISTER_PASSWORD", "") or "").strip()
         if configured:
             return configured
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return _generate_password()
 
@@ -339,13 +352,13 @@ def _apply_cloud_browser_automation_mask(context, page, *, label: str, provider_
         stealth.apply_stealth_sync(context)
         result["playwright_stealth"] = True
         logger.info("[%s] 已对 BrowserContext 应用 playwright-stealth", label)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[%s] 对 BrowserContext 应用 playwright-stealth 失败：%s", label, str(exc)[:180])
     try:
         stealth.apply_stealth_sync(page)
         result["playwright_stealth"] = True
         logger.info("[%s] 已对当前 Page 应用 playwright-stealth", label)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[%s] 对 Page 应用 playwright-stealth 失败：%s", label, str(exc)[:180])
     return result
 
@@ -366,14 +379,14 @@ def _post_register_dwell(page, context, *, provider_prefix: str, email: str) -> 
     while time.time() < end:
         try:
             _check_manual_stop()
-        except Exception:
+        except Exception:  # noqa: BLE001
             break
         if time.time() - last_touch >= random.uniform(4.0, 8.0):
             try:
                 page = _pick_live_page(context, page) or page
                 if page is not None:
                     page.evaluate("() => { try { window.scrollBy(0, Math.floor(Math.random()*80)-40); } catch(e) {} return location.href; }")
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             last_touch = time.time()
         time.sleep(random.uniform(0.8, 1.8))
@@ -382,7 +395,7 @@ def _post_register_dwell(page, context, *, provider_prefix: str, email: str) -> 
 def _page_url(page) -> str:
     try:
         return str(page.url or "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
 
 
@@ -392,7 +405,8 @@ def _visible_locator(page, selectors: list[str], timeout_ms: int = 1500):
         try:
             if loc.is_visible(timeout=timeout_ms):
                 return loc
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse locator visibility probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return None
 
@@ -412,7 +426,8 @@ def _visible_textbox_locator(page, timeout_ms: int = 1500):
         try:
             if loc.is_visible(timeout=timeout_ms):
                 return loc
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("BrowserUse textbox visibility probe failed: %s: %s", type(exc).__name__, exc)
             continue
     return None
 
@@ -440,7 +455,7 @@ def _fill_first(
                     per_char=per_char,
                 )
                 return True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 last_err = exc
         time.sleep(0.15 if _fast_mode() else 0.3)
     if last_err:
@@ -456,7 +471,7 @@ def _click_first(page, selectors: list[str], timeout_ms: int | None = None) -> b
             try:
                 _human_click_locator(loc, timeout=3000)
                 return True
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         time.sleep(0.15 if _fast_mode() else 0.3)
     return False
@@ -523,7 +538,7 @@ def _account_unusable_page_code(page) -> str:
     """读取 Playwright 页面正文并识别账号停用/删除状态。"""
     try:
         body = page.locator("body").inner_text(timeout=1000) or ""
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
     return detect_account_unusable_text(str(body))
 
@@ -632,7 +647,7 @@ def _email_entry_state_pw(page) -> dict:
           return {url: location.href, title: document.title, inputs, actions};
         }
         """) or {}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"url": _page_url(page), "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -653,7 +668,7 @@ def _is_oauth_consent_like_pw(page) -> bool:
           return /oauth|authorize|consent|grant|allow/.test(actions) && !/email|username/.test(actions);
         }
         """))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -699,7 +714,7 @@ def _click_email_entry_option_pw(page) -> bool:
         _human_click_locator(loc, timeout=3000)
         logger.info("[BrowserUse] 已按 DOM 属性点击邮箱入口：%s", result)
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.info("[BrowserUse] 邮箱入口 DOM 兜底点击失败：%s: %s", type(exc).__name__, str(exc)[:180])
         return False
 
@@ -823,7 +838,7 @@ def _submit_email_step_pw(page, email: str) -> bool:
             _assert_not_external_idp(page, "提交邮箱后")
             return True
         logger.warning("[BrowserUse] 邮箱安全提交未命中，回退 Enter：%s", result)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("[BrowserUse] 邮箱安全提交异常，回退 Enter：%s: %s", type(exc).__name__, str(exc)[:180])
     try:
         _human_pause(0.25, 0.65)
@@ -831,7 +846,7 @@ def _submit_email_step_pw(page, email: str) -> bool:
         _human_pause(0.8, 1.4)
         _assert_not_external_idp(page, "Enter 提交邮箱后")
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -989,10 +1004,7 @@ def _submit_email_until_transition(
 
 
 def _is_password_page(page) -> bool:
-    try:
-        return _quick_auth_state(page).get("state") == "password"
-    except Exception:
-        raise
+    return _quick_auth_state(page).get("state") == "password"
     url = _page_url(page).lower()
     if any(x in url for x in ("/create-account/password", "/u/signup/password", "/signup/password")):
         return True
@@ -1014,7 +1026,7 @@ def _is_signup_password_page(page) -> bool:
     """更稳妥地识别注册密码页：优先看 URL，其次看密码输入框。"""
     try:
         url = str(_page_url(page) or "").lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         url = ""
     if any(x in url for x in ("/create-account/password", "/u/signup/password", "/signup/password")):
         return True
@@ -1024,7 +1036,7 @@ def _is_signup_password_page(page) -> bool:
         state = _quick_auth_state(page)
         if str(state.get("state") or "") == "password":
             return True
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         loc = _visible_locator(
@@ -1037,17 +1049,14 @@ def _is_signup_password_page(page) -> bool:
             timeout_ms=500,
         )
         return loc is not None and "email-verification" not in url
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
 def _is_email_verification_page(page) -> bool:
-    try:
-        if "/log-in/password" in (_page_url(page) or "").lower():
-            return False
-        return _quick_auth_state(page).get("state") == "email_verification"
-    except Exception:
-        raise
+    if "/log-in/password" in (_page_url(page) or "").lower():
+        return False
+    return _quick_auth_state(page).get("state") == "email_verification"
     url = _page_url(page).lower()
     if "email-verification" in url or "email_otp" in url or "verify" in url and "email" in url:
         return True
@@ -1157,7 +1166,7 @@ def _click_passwordless_signup_if_present(page) -> bool:
               return true;
             }"""
         ))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -1210,7 +1219,7 @@ def _click_continue_with_password_if_present(page) -> bool:
             }"""
         )
         return result is True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -1239,7 +1248,7 @@ def _click_continue_with_password_link(page) -> bool:
         )
         _bu_delay("navigate")
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("[BrowserUse] 无法切换到注册密码页：%s: %s", type(exc).__name__, str(exc)[:180])
         return False
 
@@ -1259,7 +1268,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
                 if not _click_continue_with_password_link(page):
                     raise RuntimeError("邮箱验证码页无法切换到注册密码页")
                 continue
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         if time.time() - last_heartbeat > 3:
             try:
@@ -1291,7 +1300,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
                 page.goto("https://auth.openai.com/create-account/password", wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
                 time.sleep(0.6 if _fast_mode() else 1.2)
                 continue
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.info("[BrowserUse] 邮箱验证码页兜底跳转密码页失败：%s", str(exc)[:180])
                 # 不要直接退出，继续等页面自己切到密码页
                 time.sleep(0.8 if _fast_mode() else 1.5)
@@ -1433,7 +1442,7 @@ def _fill_password_if_present(page, email: str, timeout: int = 25, context=None)
                 ):
                     try:
                         page.keyboard.press("Enter")
-                    except Exception:
+                    except Exception:  # noqa: BLE001, S110
                         pass
             if state_name not in ("password", "login_password"):
                 return password
@@ -1469,17 +1478,14 @@ def _type_otp(page, code: str) -> None:
     boxes = page.locator("input[maxlength='1'], input[data-index], input[aria-label*='digit' i]")
     try:
         count = boxes.count()
-    except Exception:
+    except Exception:  # noqa: BLE001
         count = 0
     if count >= len(code):
         for i, ch in enumerate(code):
             box = boxes.nth(i)
-            try:
-                _human_click_locator(box, timeout=1200)
-                _human_pause(0.05, 0.14)
-                page.keyboard.type(ch, delay=random.randint(25, 70))
-            except Exception:
-                raise
+            _human_click_locator(box, timeout=1200)
+            _human_pause(0.05, 0.14)
+            page.keyboard.type(ch, delay=random.randint(25, 70))
             _human_pause(0.04, 0.16)
         return
     raise RuntimeError("找不到 OTP 输入框")
@@ -1503,7 +1509,7 @@ def _clear_otp_inputs(page) -> None:
               }
             }"""
         )
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -1639,7 +1645,7 @@ def _click_resend_otp(page) -> bool:
         )
         logger.info("[BrowserUse][OTP] 非文本重发按钮探测结果：%s", result)
         return bool(isinstance(result, dict) and result.get("ok"))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.info("[BrowserUse][OTP] 非文本重发按钮探测失败：%s: %s", type(exc).__name__, str(exc)[:160])
         return False
 
@@ -1653,7 +1659,7 @@ def _wait_after_otp(page, timeout: int = 12) -> str:
         body = ""
         try:
             body = (page.locator("body").inner_text(timeout=1000) or "").lower()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         if any(x in url for x in ("about-you", "profile", "chatgpt.com", "create-account/about")):
             return "accepted"
@@ -1673,7 +1679,7 @@ def _fill_birthday_fields(page, birthday: str) -> None:
         raise RuntimeError(f"生日格式应为 YYYY-MM-DD: {birthday}") from exc
 
     # 年龄数字页
-    today = date.today()
+    today = local_today()
     age = max(18, min(60, today.year - year - ((today.month, today.day) < (month, day))))
     if _fill_first(
         page,
@@ -1721,13 +1727,13 @@ def _fill_birthday_fields(page, birthday: str) -> None:
                 _human_pause(0.12, 0.35)
                 try:
                     loc.select_option(value=value)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     _human_pause(0.08, 0.2)
                     loc.select_option(label=value)
             else:
                 _human_pause(0.08, 0.22)
                 _human_fill_locator(page, loc, value, timeout=5000)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -1752,7 +1758,7 @@ def _profile_diagnostics(page) -> dict:
             }
             """
         ) or {"url": _page_url(page)}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"url": _page_url(page), "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -1779,7 +1785,7 @@ def _has_chatgpt_access_token(page) -> bool:
             {"timeoutMs": 2500 if _fast_mode() else 4000},
         )
         return bool(isinstance(data, dict) and data.get("accessToken"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -1787,7 +1793,7 @@ def _fill_spinbutton_birthday(page, birthday: str) -> bool:
     """Playwright 兜底填写 React Aria spinbutton 年/月/日。"""
     try:
         y, m, d = birthday.split("-")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     ok = False
     for selector, value in [
@@ -1807,14 +1813,14 @@ def _fill_spinbutton_birthday(page, birthday: str) -> bool:
             page.keyboard.type(str(value), delay=random.randint(60, 150) if _fast_mode() else random.randint(90, 220))
             loc.evaluate("el => { el.dispatchEvent(new Event('input', {bubbles:true})); el.dispatchEvent(new Event('change', {bubbles:true})); el.blur?.(); }")
             ok = True
-        except Exception:
+        except Exception:  # noqa: BLE001
             try:
                 _human_pause(0.08, 0.22)
                 page.keyboard.press("Control+A")
                 _human_pause(0.05, 0.15)
                 page.keyboard.type(str(value), delay=random.randint(60, 150) if _fast_mode() else random.randint(90, 220))
                 ok = True
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
     if ok:
         try:
@@ -1830,7 +1836,7 @@ def _fill_spinbutton_birthday(page, birthday: str) -> bool:
                 }""",
                 birthday,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return ok
 
@@ -1864,14 +1870,14 @@ def _human_complete_profile(page, name: str, birthday: str) -> dict:
     try:
         _fill_birthday_fields(page, birthday)
         info["filled"]["birthday"] = True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         info["birthday_error"] = f"{type(exc).__name__}: {exc}"
         info["filled"]["birthday"] = False
 
     spin_ok = False
     try:
         spin_ok = _fill_spinbutton_birthday(page, birthday)
-    except Exception:
+    except Exception:  # noqa: BLE001
         spin_ok = False
     if spin_ok:
         info["filled"]["spinbutton"] = True
@@ -1889,15 +1895,16 @@ def _human_complete_profile(page, name: str, birthday: str) -> dict:
                 checked = False
                 try:
                     checked = bool(box.is_checked(timeout=300))
-                except Exception:
+                except Exception:  # noqa: BLE001
                     checked = str(box.get_attribute("aria-checked") or "").lower() == "true"
                 if not checked:
                     _human_click_locator(box, timeout=1500)
                     checkbox_count += 1
                     _human_pause(0.25, 0.7)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("BrowserUse profile checkbox interaction failed: %s: %s", type(exc).__name__, exc)
                 continue
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     info["checkboxCount"] = checkbox_count
 
@@ -1930,7 +1937,7 @@ def _human_complete_profile(page, name: str, birthday: str) -> dict:
             page.keyboard.press("Enter")
             submitted = True
             info["method"] = "human_enter"
-        except Exception:
+        except Exception:  # noqa: BLE001
             submitted = False
     info["submitted"] = bool(submitted)
     info["ok"] = bool(name_ok and submitted)
@@ -1942,9 +1949,9 @@ def _js_complete_profile(page, name: str, birthday: str) -> dict:
     """JS 兜底处理 about-you/profile：填 name/age/生日/checkbox 并提交。"""
     try:
         year, month, day = [int(x) for x in birthday.split("-")]
-    except Exception:
+    except Exception:  # noqa: BLE001
         year, month, day = 1995, 1, 1
-    today = date.today()
+    today = local_today()
     age = max(18, min(60, today.year - year - ((today.month, today.day) < (month, day))))
     script = r"""
     ({name, birthday, year, month, day, age}) => {
@@ -2098,7 +2105,7 @@ def _js_complete_profile(page, name: str, birthday: str) -> dict:
     """
     try:
         return page.evaluate(script, {"name": name, "birthday": birthday, "year": year, "month": month, "day": day, "age": age}) or {}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "url": _page_url(page)}
 
 
@@ -2114,7 +2121,7 @@ def _force_exit_profile_page(page, deadline: float) -> bool:
         attempt += 1
         try:
             url = _page_url(page).lower()
-        except Exception:
+        except Exception:  # noqa: BLE001
             url = ""
         if "chatgpt.com" in url and "about-you" not in url and "signup/profile" not in url and "auth.openai.com" not in url:
             return True
@@ -2133,7 +2140,7 @@ def _force_exit_profile_page(page, deadline: float) -> bool:
                 url = _page_url(page).lower()
                 if "chatgpt.com" in url and "about-you" not in url and "signup/profile" not in url and "auth.openai.com" not in url:
                     return True
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("[BrowserUse] 强制跳出资料页失败：%s: %s", type(exc).__name__, str(exc)[:180])
         time.sleep(0.8 if _fast_mode() else 1.2)
     return False
@@ -2145,7 +2152,6 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
     timeout = min(timeout, 45) if _fast_mode() else timeout
     end = time.time() + timeout
     submitted = False
-    last_submit = 0.0
     last_log = 0.0
     last_info: dict[str, Any] = {}
     last_diag: dict[str, Any] = {}
@@ -2164,7 +2170,7 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
         body = ""
         try:
             body = (page.locator("body").inner_text(timeout=800) or "").lower()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         profile_error = _profile_submission_error({"url": url, "text": body, "errors": []})
         if profile_error:
@@ -2187,7 +2193,6 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
                 if submitted and post_submit_hard_exit_at is None:
                     # 已提交后不再重复填写/点击；最多给它 10~16 秒同步登录态，然后强制跳出。
                     post_submit_hard_exit_at = time.time() + (10 if _fast_mode() else 16)
-                last_submit = time.time()
                 _bu_delay("form")
             elif time.time() - last_log > 2:
                 logger.info("[BrowserUse] 资料页已提交，等待短暂跳转/准备取 AT：url=%s", _page_url(page) or "-")
@@ -2255,15 +2260,16 @@ def _pick_live_page(context, preferred=None):
             try:
                 if not p.is_closed():
                     pages.append(p)
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("BrowserUse context page inspection failed: %s: %s", type(exc).__name__, exc)
                 continue
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     if preferred is not None:
         try:
             if not preferred.is_closed() and preferred not in pages:
                 pages.insert(0, preferred)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     if not pages:
         return None
@@ -2285,7 +2291,7 @@ def _pick_live_page(context, preferred=None):
     for idx, p in enumerate(pages):
         try:
             info = _quick_auth_state(p)
-        except Exception:
+        except Exception:  # noqa: BLE001
             info = {"state": "other", "url": _page_url(p), "error": "state_failed"}
         state = str(info.get("state") or "other")
         score = rank.get(state, 0)
@@ -2322,10 +2328,10 @@ def _browser_use_heartbeat(page, context=None, label: str = ""):
             for idx, p in enumerate(list(context.pages)):
                 try:
                     closed = p.is_closed()
-                except Exception:
+                except Exception:  # noqa: BLE001
                     closed = True
                 items.append(f"#{idx}:{'closed' if closed else 'open'}:{_page_url(p)[:100]}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return f"inventory-failed:{type(exc).__name__}"
         return items and "; ".join(items) or "no-pages"
 
@@ -2342,7 +2348,8 @@ def _browser_use_heartbeat(page, context=None, label: str = ""):
             try:
                 if live.is_closed():
                     continue
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("BrowserUse live page inspection failed: %s: %s", type(exc).__name__, exc)
                 continue
             return live
         return None
@@ -2415,7 +2422,7 @@ def _wait_for_otp_with_browser_heartbeat(
         total_wait = int(getattr(_email_cfg, "OTP_MAX_WAIT", 60) or 60)
         poll_interval = int(getattr(_email_cfg, "OTP_POLL_INTERVAL", 2) or 2)
         settle = int(getattr(_email_cfg, "OTP_SETTLE_SECONDS", 5) or 0)
-    except Exception:
+    except Exception:  # noqa: BLE001
         total_wait, poll_interval, settle = 90, 3, 5
 
     # 单次邮箱轮询不要阻塞太久，否则云端浏览器这段时间没有任何 page activity。
@@ -2482,12 +2489,12 @@ def _read_chatgpt_session_via_context(context, timeout_ms: int = 5000) -> dict |
         )
         try:
             data = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {"status": resp.status, "text": (resp.text() or "")[:500]}
         if isinstance(data, dict):
             data.setdefault("_http_status", resp.status)
         return data
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"_error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -2495,7 +2502,7 @@ def _read_chatgpt_session_via_page(page, timeout_ms: int = 5000) -> dict | None:
     """页面内读取 session，加 JS AbortController，避免 page.evaluate 无限挂住。"""
     try:
         page.set_default_timeout(max(2000, timeout_ms + 1000))
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     try:
         return page.evaluate(
@@ -2518,7 +2525,7 @@ def _read_chatgpt_session_via_page(page, timeout_ms: int = 5000) -> dict | None:
             }""",
             {"timeoutMs": timeout_ms},
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"_error": f"{type(exc).__name__}: {exc}"}
 
 def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
@@ -2535,7 +2542,7 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
     if context is None:
         try:
             context = page.context
-        except Exception:
+        except Exception:  # noqa: BLE001
             context = None
 
     while time.time() < end:
@@ -2591,10 +2598,12 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
             if any(x in url for x in ("about-you", "profile", "create-account/about", "signup/profile")):
                 if first_profile_still_at is None:
                     first_profile_still_at = time.time()
-                if time.time() - first_profile_still_at >= (3.0 if _fast_mode() else 6.0):
-                    if _force_exit_profile_page(page, min(end, time.time() + (8 if _fast_mode() else 12))):
-                        proactive_opened = True
-                        continue
+                if (
+                    time.time() - first_profile_still_at >= (3.0 if _fast_mode() else 6.0)
+                    and _force_exit_profile_page(page, min(end, time.time() + (8 if _fast_mode() else 12)))
+                ):
+                    proactive_opened = True
+                    continue
                 if time.time() - last_log > 2:
                     logger.info("[BrowserUse] session 阶段仍在资料页，短暂等待后将强制跳出：url=%s", _page_url(page) or "-")
                     last_log = time.time()
@@ -2611,7 +2620,7 @@ def _fetch_chatgpt_session(page, context=None, timeout: int = 120) -> dict:
                     _bu_delay("navigate")
                     _maybe_dismiss_chatgpt_onboarding(page)
                     continue
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     last = f"goto_chatgpt_failed {type(exc).__name__}: {exc}"
                     if _is_target_closed_error(exc):
                         target_closed_count += 1
@@ -2703,7 +2712,7 @@ def run_browser_use_registration(
             try:
                 # 从拿到远端 BrowserContext 后立即监听，覆盖后续所有 page/popup 的注册请求。
                 traffic_tracker = PlaywrightTrafficTracker(context, label=cloud_label)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 # 统计失败不应影响注册主流程。
                 logger.warning(
                     "[%s] 初始化浏览器流量统计失败，继续注册：%s: %s",
@@ -2726,7 +2735,7 @@ def run_browser_use_registration(
                 try:
                     from config import skyvern as _skyvern_cfg
                     start_url = str(getattr(_skyvern_cfg, "SKYVERN_START_URL", "https://chatgpt.com/auth/login") or "https://chatgpt.com/auth/login")
-                except Exception:
+                except Exception:  # noqa: BLE001
                     start_url = "https://chatgpt.com/auth/login"
             else:
                 start_url = str(getattr(_cfg, "BROWSER_USE_START_URL", "https://chatgpt.com/auth/login") or "https://chatgpt.com/auth/login")
@@ -2871,7 +2880,7 @@ def run_browser_use_registration(
                 _bu_delay("otp_input")
                 try:
                     _click_continue(page)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     logger.info("[BrowserUse][OTP] 提交按钮未找到，继续观察页面：%s", str(exc)[:120])
                 _check_manual_stop()
 
@@ -2952,7 +2961,7 @@ def run_browser_use_registration(
                     totp_secret = setup_2fa_for_registration(BrowserContextTransport(context, page), email)
                     twofa_status = "active"
                     db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     twofa_status = "failed"
                     twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                     db.update_account_2fa(account_id, status="failed", error=twofa_error)
@@ -3026,7 +3035,7 @@ def run_browser_use_registration(
                     codex_result = auto_codex["codex"]
                 else:
                     logger.info("[BrowserUse][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning("[BrowserUse][Codex] 自动授权失败：%s: %s", type(exc).__name__, str(exc)[:220])
                 codex_result = {
                     "status": "failed",
@@ -3085,7 +3094,7 @@ def run_browser_use_registration(
         if traffic_tracker is not None:
             try:
                 network_traffic = traffic_tracker.stop()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         logger.error("[BrowserUse] 注册失败：%s: %s", type(exc).__name__, exc)
         logger.debug("[BrowserUse] 失败详情", exc_info=True)
@@ -3105,7 +3114,7 @@ def run_browser_use_registration(
                 status=release_status,
                 note=note_text[:180],
             )
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return {
             "success": False,
@@ -3118,17 +3127,17 @@ def run_browser_use_registration(
         if traffic_tracker is not None:
             try:
                 traffic_tracker.stop()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         try:
             if browser is not None:
                 browser.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         if provider_prefix == "skyvern" and 'client' in locals() and hasattr(client, "close_browser_session") and getattr(session_info_open, "session_id", ""):
             try:
                 client.close_browser_session(session_info_open.session_id)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         _set_log_provider_label("BrowserUse")
         _set_cloud_provider("browser_use")

@@ -1,0 +1,6 @@
+test_extract_link_job_reuses_one_proxy_for_create_and_event_stream (tests.test_rotating_proxy.RotatingProxyWorkflowRoutingTests.test_extract_link_job_reuses_one_proxy_for_create_and_event_stream) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.070s
+
+OK

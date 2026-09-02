@@ -34,11 +34,13 @@ class _FakeResponse:
 class _FakeRotatingProxyClient:
     def __init__(self, keys):
         self.keys = list(keys)
+        self.list_calls = 0
         self.get_calls = []
         self.purchase_calls = 0
         self.renew_calls = []
 
     def list_keys(self):
+        self.list_calls += 1
         return list(self.keys)
 
     def purchase_key(self):
@@ -119,7 +121,7 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertEqual(first.proxy_url, second.proxy_url)
         self.assertEqual(client.get_calls, ["key-1"])
 
-    def test_workflow_cleanup_retains_rotating_lease_until_proxy_expiry(self):
+    def test_workflow_cleanup_releases_active_rotating_lease(self):
         from core.rotating_proxy_runtime import release_rotating_proxy
 
         with patch("core.rotating_proxy_manager.get_rotating_proxy_manager") as get_manager:
@@ -129,8 +131,13 @@ class RotatingProxyManagerTests(unittest.TestCase):
                 proxy_url="http://198.51.100.1:8080",
             )
 
-        self.assertFalse(result)
-        get_manager.return_value.release.assert_not_called()
+        self.assertTrue(result)
+        get_manager.return_value.release.assert_called_once_with(
+            0,
+            scope="registration",
+            proxy_url="http://198.51.100.1:8080",
+        )
+        get_manager.return_value.retire.assert_not_called()
 
     def test_health_checks_cached_proxy_before_reusing_it(self):
         client = _HealthAwareRotatingProxyClient(
@@ -210,9 +217,15 @@ class RotatingProxyManagerTests(unittest.TestCase):
 
         self.assertEqual(manager.status()["leases"], [])
 
-    def test_new_default_manager_clears_leases_from_previous_process(self):
+    def test_new_default_manager_preserves_active_leases_from_other_processes(self):
         import core.rotating_proxy_manager as manager_module
 
+        self.store.upsert_cached_proxy(
+            "key-1",
+            proxy_url="http://198.51.100.77:8080",
+            proxy_expires_at=1000.0,
+            key_expires_at=2000.0,
+        )
         self.store.upsert_lease(
             0,
             rotating_key="key-1",
@@ -225,7 +238,11 @@ class RotatingProxyManagerTests(unittest.TestCase):
         ):
             manager = manager_module.get_rotating_proxy_manager()
 
-            self.assertEqual(manager.store.list_leases(), [])
+            self.assertEqual(len(manager.store.list_leases()), 1)
+            self.assertEqual(
+                manager.store.get_cached_proxy("key-1")["proxy_url"],
+                "http://198.51.100.77:8080",
+            )
             self.store.upsert_lease(
                 1,
                 rotating_key="key-2",
@@ -234,7 +251,7 @@ class RotatingProxyManagerTests(unittest.TestCase):
                 key_expires_at=2000.0,
             )
             self.assertIs(manager_module.get_rotating_proxy_manager(), manager)
-            self.assertEqual(len(manager.store.list_leases()), 1)
+            self.assertEqual(len(manager.store.list_leases()), 2)
 
     def test_assigns_a_new_key_when_another_lane_owns_the_only_key(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
@@ -272,14 +289,28 @@ class RotatingProxyManagerTests(unittest.TestCase):
 
         self.assertEqual(registration.key, "key-1")
         self.assertEqual(codex_retry.key, "key-1")
+        self.assertEqual(codex_retry.proxy_url, registration.proxy_url)
         self.assertEqual(client.purchase_calls, 0)
+        self.assertEqual(client.get_calls, ["key-1"])
         self.assertEqual(manager.status()["leases"], [{
             "scope": "codex_retry",
             "lane_id": 0,
             "key": "ke...-1",
-            "proxy": "http://198.51.100.2:8080",
+            "proxy": "http://198.51.100.1:8080",
             "proxy_expires_at": 160.0,
         }])
+
+    def test_retiring_a_lease_discards_its_cached_proxy(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        first = manager.acquire(0, scope="registration")
+        self.assertTrue(manager.retire(0, scope="registration", proxy_url=first.proxy_url))
+        second = manager.acquire(0, scope="codex_retry")
+
+        self.assertEqual(second.key, "key-1")
+        self.assertNotEqual(second.proxy_url, first.proxy_url)
+        self.assertEqual(client.get_calls, ["key-1", "key-1"])
 
     def test_expired_proxy_lease_does_not_block_key_reuse(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
@@ -370,6 +401,18 @@ class RotatingProxyManagerTests(unittest.TestCase):
         manager.ensure_key_inventory(1, scope="plan_check")
 
         self.assertEqual(client.purchase_calls, 1)
+        self.assertEqual(client.list_calls, 1)
+
+    def test_inventory_prepare_uses_persisted_keys_without_refreshing_provider(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        manager.ensure_key_inventory(1, scope="registration")
+        client.list_calls = 0
+        manager.ensure_key_inventory(1, scope="registration")
+
+        self.assertEqual(client.list_calls, 0)
+        self.assertEqual(client.purchase_calls, 0)
 
     def test_ensure_key_inventory_excludes_keys_claimed_by_another_scope(self):
         client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
@@ -462,6 +505,7 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertEqual(status["keys"][0]["key"], "key-1...3456")
         self.assertEqual(status["keys"][0]["lanes"], [0])
         self.assertEqual(status["leases"][0]["proxy"], "http://198.51.100.1:8080")
+        self.assertEqual(status["cached_proxies"][0]["proxy"], "http://198.51.100.1:8080")
 
 
 class RotatingProxyClientTests(unittest.TestCase):
@@ -880,6 +924,7 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
         active_proxy = "http://203.0.113.71:8080"
         with (
             patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
+            patch.object(extract_link_service, "_mode", return_value="remote"),
             patch.object(extract_link_service, "resolve_rotating_proxy", return_value=active_proxy) as resolve,
             patch.object(extract_link_service, "_create_extract_job", return_value={"job_id": "job-2"}) as create,
             patch.object(

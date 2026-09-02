@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 注册成功后的"自动触发 flow"模块。
 
@@ -6,7 +5,6 @@
     trigger_flow(access_token)
 不论触发成功失败，注册主流程都视为成功。
 """
-import json
 import logging
 
 # 这是个内部 HTTP 接口（156.225.31.95），无 Cloudflare 拦截，
@@ -15,7 +13,7 @@ import requests
 
 # 用模块属性方式读 config，支持 WebUI 热加载（config.reload_all()）。
 from config import flow_trigger as _cfg
-from config.browser import USER_AGENT, ACCEPT_LANGUAGE  # 浏览器指纹固定，不需要热加载
+from config.browser import ACCEPT_LANGUAGE, USER_AGENT  # 浏览器指纹固定，不需要热加载
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +66,7 @@ def _send_sync(access_token: str) -> dict:
             timeout=_cfg.FLOW_TRIGGER_TIMEOUT,
             verify=False,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return _flow_result(status="failed", message=f"{type(exc).__name__}: {exc}")
 
     # 简单解析 flow_id 打个日志，触发结果不影响主流程
@@ -77,7 +75,7 @@ def _send_sync(access_token: str) -> dict:
     try:
         data = resp.json()
         flow_id = (data.get("flow") or {}).get("flow_id", "")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     if resp.status_code == 200:

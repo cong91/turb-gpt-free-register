@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Skyvern Browser Sessions 客户端。"""
 from __future__ import annotations
 
@@ -128,12 +127,12 @@ class SkyvernClient:
         )
         try:
             data = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {"text": resp.text[:1000]}
         if resp.status_code >= 400:
             raise RuntimeError(f"Skyvern create browser session HTTP {resp.status_code}: {data}")
         if not isinstance(data, dict):
-            raise RuntimeError(f"Skyvern create browser session 响应不是对象: {data!r}")
+            raise TypeError(f"Skyvern create browser session 响应不是对象: {data!r}")
         return data
 
     def get_browser_session(self, session_id: str) -> dict[str, Any]:
@@ -144,12 +143,12 @@ class SkyvernClient:
         )
         try:
             data = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {"text": resp.text[:1000]}
         if resp.status_code >= 400:
             raise RuntimeError(f"Skyvern get browser session HTTP {resp.status_code}: {data}")
         if not isinstance(data, dict):
-            raise RuntimeError(f"Skyvern get browser session 响应不是对象: {data!r}")
+            raise TypeError(f"Skyvern get browser session 响应不是对象: {data!r}")
         return data
 
     def close_browser_session(self, session_id: str) -> dict[str, Any]:
@@ -161,7 +160,7 @@ class SkyvernClient:
         )
         try:
             data = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {"text": resp.text[:1000]}
         if resp.status_code >= 400:
             raise RuntimeError(f"Skyvern close browser session HTTP {resp.status_code}: {data}")

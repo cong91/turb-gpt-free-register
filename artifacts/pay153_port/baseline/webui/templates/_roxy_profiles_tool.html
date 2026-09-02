@@ -1,0 +1,77 @@
+<div id="tab-roxy-profiles" class="hidden">
+  <div class="roxy-profile-manager-head">
+    <div>
+      <h1 class="register-title">Profile trình duyệt Roxy</h1>
+      <p class="roxy-profile-manager-note">Quản lý profile độc lập với luồng đăng ký. Bản lưu trữ v1 chỉ lưu siêu dữ liệu đã mã hóa; bản full-folder v2 mới có thể mở thử nghiệm cục bộ. Chế độ cục bộ chỉ khôi phục trạng thái trình duyệt, không đảm bảo tương đương fingerprint/proxy/đồng bộ của Roxy.</p>
+    </div>
+    <div class="roxy-profile-capabilities" id="roxyProfileCapabilities" aria-live="polite"></div>
+  </div>
+
+  <section class="card roxy-profile-toolbar" aria-label="Thao tác quản lý profile">
+    <div class="roxy-profile-toolbar-main">
+      <button type="button" class="btn primary" id="btnCreateRoxyProfile" title="Tạo profile Roxy mới">＋ Tạo profile</button>
+      <label class="roxy-profile-search"><span class="sr-only">Tìm profile</span><input id="roxyProfileSearch" type="search" placeholder="Tìm profile..."></label>
+      <select id="roxyProfileStateFilter" aria-label="Lọc trạng thái"><option value="">Tất cả trạng thái</option><option value="ACTIVE_STOPPED">Đã dừng</option><option value="RUNNING">Đang chạy</option><option value="ARCHIVE_COMMITTED">Đã lưu trữ</option><option value="TRASHED">Trong thùng rác</option><option value="OFFLINE_STOPPED">Cục bộ đã dừng</option></select>
+      <button type="button" class="btn" id="btnBulkOpenRoxyProfiles" disabled>▶ Mở đã chọn</button>
+      <button type="button" class="btn" id="btnBulkMetadataRoxyProfiles" disabled>⇩ Siêu dữ liệu đã chọn</button>
+      <button type="button" class="btn" id="btnBulkExportRoxyProfiles" disabled>⇩ Xuất đã chọn</button>
+      <button type="button" class="btn" id="btnBulkArchiveRoxyProfiles" disabled>⌫ Lưu trữ đã chọn</button>
+      <button type="button" class="btn" id="btnBulkCloseRoxyProfiles" disabled>■ Đóng đã chọn</button>
+      <button type="button" class="btn" id="btnImportRoxyProfile" title="Nhập artifact full-folder">↑ Nhập bản đầy đủ</button>
+      <button type="button" class="btn" id="btnRefreshRoxyProfiles" title="Đồng bộ trạng thái với RoxyBrowser">↻ Đồng bộ</button>
+      <input id="roxyProfileImportFile" type="file" accept=".rpa2,application/octet-stream" class="hidden">
+      <span class="roxy-profile-status" id="roxyProfileStatus" role="status" aria-live="polite"></span>
+    </div>
+    <div class="roxy-profile-summary" id="roxyProfileSummary"></div>
+  </section>
+
+  <section class="card roxy-profile-table-card" aria-label="Profile Roxy được quản lý">
+    <div class="head">
+      <h2>Profile được quản lý</h2>
+      <p>Chỉ profile do module này tạo mới có thể sửa, mở, đóng hoặc lưu trữ.</p>
+    </div>
+    <div class="table-wrap roxy-profile-table-wrap">
+      <table class="roxy-profile-table">
+        <thead><tr><th><input id="roxyProfilesSelectAll" type="checkbox" aria-label="Chọn tất cả profile trên trang"></th><th>Tên</th><th>Trạng thái</th><th>Roxy</th><th>Lưu trữ</th><th>Thời gian chạy</th><th>Cập nhật</th><th>Thao tác</th></tr></thead>
+        <tbody id="roxyProfilesBody"></tbody>
+      </table>
+    </div>
+    <div class="roxy-profile-empty hidden" id="roxyProfilesEmpty">Chưa có profile được quản lý.</div>
+    <div class="roxy-profile-pagination"><button type="button" class="btn" id="btnRoxyProfilesPrev" title="Trang trước">←</button><span id="roxyProfilesPage" aria-live="polite">1</span><button type="button" class="btn" id="btnRoxyProfilesNext" title="Trang sau">→</button></div>
+  </section>
+
+  <div class="roxy-profile-modal hidden" id="roxyProfileCreateModal" role="dialog" aria-modal="true" aria-labelledby="roxyProfileCreateTitle">
+    <div class="roxy-profile-modal-panel">
+      <div class="roxy-profile-modal-head"><h2 id="roxyProfileCreateTitle">Tạo Roxy profile</h2><button type="button" class="roxy-profile-icon-btn" id="btnCloseRoxyProfileModal" title="Đóng" aria-label="Đóng">×</button></div>
+      <form id="roxyProfileCreateForm">
+        <label class="fld">Tên profile<input id="roxyProfileName" type="text" maxlength="100" required autocomplete="off" placeholder="profile-01"></label>
+        <label class="fld">Hệ điều hành<select id="roxyProfileOs"><option value="Windows">Windows</option><option value="macOS">macOS</option><option value="Linux">Linux</option></select></label>
+        <label class="fld">Phiên bản Core<input id="roxyProfileCoreVersion" type="text" maxlength="32" autocomplete="off"></label>
+        <div class="roxy-profile-modal-actions"><button type="button" class="btn" id="btnCancelRoxyProfileModal">Hủy</button><button type="submit" class="btn primary" id="btnSubmitRoxyProfile">Tạo</button></div>
+      </form>
+    </div>
+  </div>
+
+  <div class="roxy-profile-modal hidden" id="roxyProfileEditModal" role="dialog" aria-modal="true" aria-labelledby="roxyProfileEditTitle">
+    <div class="roxy-profile-modal-panel">
+      <div class="roxy-profile-modal-head"><h2 id="roxyProfileEditTitle">Sửa Roxy profile</h2><button type="button" class="roxy-profile-icon-btn" id="btnCloseRoxyProfileEditModal" title="Đóng" aria-label="Đóng">×</button></div>
+      <form id="roxyProfileEditForm">
+        <input id="roxyProfileEditId" type="hidden">
+        <label class="fld">Tên profile<input id="roxyProfileEditName" type="text" maxlength="100" required autocomplete="off"></label>
+        <label class="fld">Hệ điều hành<select id="roxyProfileEditOs"><option value="Windows">Windows</option><option value="macOS">macOS</option><option value="Linux">Linux</option></select></label>
+        <label class="fld">Phiên bản Core<input id="roxyProfileEditCoreVersion" type="text" maxlength="32" autocomplete="off"></label>
+        <div class="roxy-profile-modal-actions"><button type="button" class="btn" id="btnCancelRoxyProfileEditModal">Hủy</button><button type="submit" class="btn primary">Lưu</button></div>
+      </form>
+    </div>
+  </div>
+  <div class="roxy-profile-modal hidden" id="roxyProfileImportModal" role="dialog" aria-modal="true" aria-labelledby="roxyProfileImportTitle">
+    <div class="roxy-profile-modal-panel">
+      <div class="roxy-profile-modal-head"><h2 id="roxyProfileImportTitle">Nhập artifact full-folder</h2><button type="button" class="roxy-profile-icon-btn" id="btnCloseRoxyProfileImportModal" title="Đóng" aria-label="Đóng">×</button></div>
+      <form id="roxyProfileImportForm">
+        <label class="fld">Tên profile<input id="roxyProfileImportName" type="text" maxlength="100" required autocomplete="off" placeholder="profile-imported"></label>
+        <p class="roxy-profile-manager-note">Chỉ upload file .rpa2 đã mã hóa. Artifact sẽ được verify trước khi ghi vào catalog.</p>
+        <div class="roxy-profile-modal-actions"><button type="button" class="btn" id="btnCancelRoxyProfileImportModal">Hủy</button><button type="submit" class="btn primary">Nhập</button></div>
+      </form>
+    </div>
+  </div>
+</div>

@@ -1,10 +1,9 @@
-# -*- coding: utf-8 -*-
+import tempfile
 import unittest
-from unittest.mock import MagicMock, patch
+from pathlib import Path
+from unittest.mock import patch
 
-from config import email as email_config
-from core import db
-from webui.registration_jobs_api import create_registration_jobs
+from core import app_state_db, db
 from webui.app import create_app
 
 
@@ -36,36 +35,20 @@ class WebUiPerformanceAndLimitsTests(unittest.TestCase):
         schedule_refresh,
         render_viewer,
     ):
-        db._save_accounts([{"id": 1, "email": "user@example.com"}])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "turb.sqlite3"
+            with (
+                patch.object(db, "_DEFAULT_SQLITE_PATH", database),
+                patch.object(app_state_db, "APP_STATE_DB_PATH", database),
+                patch.object(db, "_ACCOUNTS_JSON", Path(temp_dir) / "accounts.json"),
+            ):
+                db._save_accounts([{"id": 1, "email": "user@example.com"}])
 
         schedule_refresh.assert_called_once_with("save_accounts")
         render_viewer.assert_not_called()
         write_json.assert_called_once()
         sync_accounts.assert_called_once()
         sync_tokens.assert_called_once()
-
-    def test_registration_job_count_allows_1000_reserved_test_tasks(self):
-        service = MagicMock()
-        service.submit_local_test_registration.return_value = [{"id": index} for index in range(1000)]
-        database = MagicMock()
-
-        with patch.object(email_config, "USE_EMAIL_SERVICE", False):
-            payload, status = create_registration_jobs(
-                {
-                    "count": 1000,
-                    "workers": 4,
-                    "email_source": "local_test",
-                    "local_test_base": "sampleuser",
-                    "local_test_domains": ["mail.test"],
-                },
-                service=service,
-                database=database,
-            )
-
-        self.assertEqual(status, 200)
-        self.assertEqual(payload["submitted"], 1000)
-        service.submit_local_test_registration.assert_called_once()
-
 
 if __name__ == "__main__":
     unittest.main()

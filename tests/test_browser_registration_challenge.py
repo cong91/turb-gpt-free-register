@@ -5,6 +5,8 @@ from unittest.mock import Mock, patch
 
 from core.browser_challenge import (
     browser_challenge_state as _browser_challenge_state,
+)
+from core.browser_challenge import (
     complete_owned_lab_challenge,
     describe_browser_challenge,
     inspect_turnstile_response,

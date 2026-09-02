@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
 ChatGPT backend-api 指纹环境请求测试脚本。
 
@@ -32,14 +31,14 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 from urllib.parse import quote
 
 # 让 tools/ 脚本能 import 到项目根的 core / config
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT))
 
-from core.session import BrowserSession  # noqa: E402
+from core.session import BrowserSession
 
 logger = logging.getLogger("chatgpt_curl_cffi_test")
 
@@ -83,7 +82,7 @@ def _read_token_file(path: str, index: int = 0) -> str:
             try:
                 obj = json.loads(line)
                 token = obj.get("token") or obj.get("access_token") or obj.get("bearer") or ""
-            except Exception:
+            except Exception:  # noqa: BLE001
                 token = ""
         if not token:
             if "----" in line:
@@ -113,17 +112,17 @@ def _decode_jwt_payload_unverified(token: str) -> dict:
         payload = parts[1]
         payload += "=" * (-len(payload) % 4)
         return json.loads(base64.urlsafe_b64decode(payload.encode("ascii")))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return {}
 
 
-def _extract_account_id(token: str) -> Optional[str]:
+def _extract_account_id(token: str) -> str | None:
     payload = _decode_jwt_payload_unverified(token)
     auth = payload.get("https://api.openai.com/auth") or {}
     return auth.get("chatgpt_account_id")
 
 
-def _build_url(endpoint: str, token: str, account_id: Optional[str], timezone_offset_min: str) -> tuple[str, str, str]:
+def _build_url(endpoint: str, token: str, account_id: str | None, timezone_offset_min: str) -> tuple[str, str, str]:
     if endpoint == "accounts-check":
         path = "/backend-api/accounts/check/v4-2023-04-27"
         url = f"https://chatgpt.com{path}?timezone_offset_min={quote(str(timezone_offset_min))}"
@@ -138,7 +137,7 @@ def _build_url(endpoint: str, token: str, account_id: Optional[str], timezone_of
     raise RuntimeError(f"未知 endpoint: {endpoint}")
 
 
-def _build_headers(env: BrowserSession, token: str, target_path: str, target_route: str) -> Dict[str, str]:
+def _build_headers(env: BrowserSession, token: str, target_path: str, target_route: str) -> dict[str, str]:
     headers = env._get_common_headers()  # 复用项目统一指纹画像头
     headers.update(
         {
@@ -160,7 +159,7 @@ def _build_headers(env: BrowserSession, token: str, target_path: str, target_rou
 def _try_json(text: str) -> Any:
     try:
         return json.loads(text)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
 
@@ -229,7 +228,7 @@ def main() -> int:
             args.account_id,
             args.timezone_offset_min,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.error("构建 URL 失败：%s", exc)
         return 2
 
@@ -246,7 +245,7 @@ def main() -> int:
     try:
         resp = env.session.get(url, headers=headers, allow_redirects=False)
     except Exception as exc:
-        logger.exception("[请求] 异常：%s: %s", type(exc).__name__, exc)
+        logger.exception("[请求] 异常：%s", type(exc).__name__)
         return 1
     elapsed = time.time() - started
 

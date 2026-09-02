@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """用户资料显示名样本。
 
 只生成英文字母和空格，避免触发 OpenAI name_invalid_chars。
@@ -6,7 +5,6 @@
 from __future__ import annotations
 
 import random
-
 
 FIRST_NAMES = [
     "James", "Robert", "John", "Michael", "David", "William", "Richard", "Joseph",

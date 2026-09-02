@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 from unittest.mock import Mock, patch
 
@@ -188,7 +187,7 @@ class RemailClientTests(unittest.TestCase):
         self.assertEqual(request.call_args.kwargs["params"]["search"], "fresh@outlook.test")
 
     def test_pick_account_requires_project_id(self):
-        with patch.object(email_config, "REMAIL_API_KEY", "rk-test-key", create=True), patch.object(
+        with patch.object(email_config, "REMAIL_API_KEY", "rk-test-key", create=True), patch.object(  # noqa: SIM117
             email_config, "REMAIL_PROJECT_ID", 0, create=True
         ):
             with self.assertRaisesRegex(remail_client.RemailError, "项目 ID"):

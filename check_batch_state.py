@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Check current batch database state."""
 import sqlite3
 import sys
@@ -90,7 +89,7 @@ exhausted = conn.execute('''
     WHERE i.completed_count >= b.capacity
 ''').fetchone()
 
-print(f"\n📊 Statistics:")
+print("\n📊 Statistics:")
 print(f"  Exhausted items (reached capacity): {exhausted['cnt']}")
 
 conn.close()

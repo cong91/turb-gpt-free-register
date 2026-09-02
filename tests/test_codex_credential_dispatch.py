@@ -1,6 +1,6 @@
-from contextlib import contextmanager
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 

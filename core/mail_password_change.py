@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 mail.com 邮箱密码修改模块。
 
@@ -32,9 +31,9 @@ from urllib.parse import quote, urljoin
 from bs4 import BeautifulSoup
 
 from core.mailcom_client import (
+    _CONTEXT_CACHE,
     MailComError,
     MailComLightClient,
-    _CONTEXT_CACHE,
     _http_session,
     _mailcom_proxy,
 )
@@ -67,8 +66,7 @@ def generate_mailcom_password(length: int = 12) -> str:
 
     与 register_mailcom.generate_chatgpt_password 行为一致。
     """
-    if length < 12:
-        length = 12
+    length = max(length, 12)
     required = [
         secrets.choice(string.ascii_lowercase),
         secrets.choice(string.ascii_uppercase),
@@ -224,7 +222,7 @@ def change_mailcom_password(
     form_action = ""
     try:
         form_action, _ = _extract_form(getattr(page, "text", "") or "", "idb")
-    except Exception:
+    except Exception:  # noqa: BLE001
         form_action = ""
     page_url = getattr(page, "url", "") or ""
     referer = (
@@ -265,7 +263,7 @@ def change_mailcom_password(
     if re.search(
         r"(current password is incorrect|passwords do not match|invalid password|errorMessage)",
         text,
-        re.I,
+        re.IGNORECASE,
     ):
         raise MailComError("mail.com 修改密码失败，页面返回错误提示")
 
@@ -422,7 +420,7 @@ def change_mailcom_password_for_email(
             email,
             new_password,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "[MailCom][自动化改密] %s 新密码回写 DB 失败（不影响本次注册取件，缓存已更新）: %s",
             email,
@@ -451,7 +449,7 @@ def maybe_change_mailcom_password_before_register(
     """
     try:
         from config import email as _email_cfg
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
 
     if not bool(getattr(_email_cfg, "MAILCOM_CHANGE_PASSWORD_BEFORE_REGISTER", False)):
@@ -462,7 +460,7 @@ def maybe_change_mailcom_password_before_register(
         from core.email_provider import resolve_email_source
 
         source = resolve_email_source(email)
-    except Exception:
+    except Exception:  # noqa: BLE001
         source = ""
     if source != "mailcom":
         return None
@@ -496,6 +494,6 @@ if __name__ == "__main__":
     try:
         result = change_mailcom_password_for_email(_email, new_password=_new_pwd)
         print(f"新密码: {result}")
-    except Exception as ex:
+    except Exception as ex:  # noqa: BLE001
         print(f"ERR: {ex}")
         _sys.exit(1)

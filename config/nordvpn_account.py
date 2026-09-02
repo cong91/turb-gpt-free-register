@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """NordVPN account API configuration for dynamic NordLynx proxies."""
 from config.env_loader import apply_env_overrides
 

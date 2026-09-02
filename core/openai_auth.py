@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 OpenAI Auth 模块
 处理 auth.openai.com 域名下的注册请求（步骤4-5、7-8、10、12）
@@ -8,12 +7,12 @@ import json
 import logging
 import time
 
-from core.session import BrowserSession
 from core.sentinel import (
-    generate_requirements_token,
     build_sentinel_request_body,
+    generate_requirements_token,
 )
 from core.sentinel_runner import generate_sentinel_token
+from core.session import BrowserSession
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +127,7 @@ def detect_account_unusable_response_body(body: str) -> str:
     """
     try:
         payload = json.loads(body or "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
     err = payload.get("error") if isinstance(payload, dict) else None
     code = ""
@@ -143,7 +142,7 @@ def _extract_error_code(resp) -> str:
     """从响应体 JSON 里抽 error.code（拿不到返回空串）。"""
     try:
         payload = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return ""
     err = payload.get("error") if isinstance(payload, dict) else None
     if isinstance(err, dict):
@@ -362,7 +361,7 @@ def build_sentinel_header(session: BrowserSession, sentinel_resp: dict, flow: st
                 },
                 separators=(',', ':'),
             )
-            logger.info(f"[Sentinel] 检测到 SO 字段，已构建 so-token 头")
+            logger.info("[Sentinel] 检测到 SO 字段，已构建 so-token 头")
     except (ValueError, TypeError) as exc:
         logger.warning(f"[Sentinel] runner 输出解析失败: {exc}")
 
@@ -531,7 +530,7 @@ def validate_email_otp(session: BrowserSession, code: str, sentinel_header: str 
     return data
 
 
-def create_account(session: BrowserSession, name: str, birthday: str, sentinel_header: str, so_header: str = None) -> dict:
+def create_account(session: BrowserSession, name: str, birthday: str, sentinel_header: str, so_header: str | None = None) -> dict:
     """
     步骤12: 提交用户信息，完成注册。
     POST https://auth.openai.com/api/accounts/create_account
@@ -552,7 +551,7 @@ def create_account(session: BrowserSession, name: str, birthday: str, sentinel_h
     headers["openai-sentinel-token"] = sentinel_header
     if so_header:
         headers["openai-sentinel-so-token"] = so_header
-        logger.info(f"[步骤12] 已添加 openai-sentinel-so-token 头")
+        logger.info("[步骤12] 已添加 openai-sentinel-so-token 头")
 
     body = json.dumps({
         "name": name,

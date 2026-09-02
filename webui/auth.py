@@ -1,16 +1,23 @@
-# -*- coding: utf-8 -*-
 """WebUI 授权码登录与接口鉴权。"""
 from __future__ import annotations
 
-import hmac
 import hashlib
+import hmac
 import logging
 import os
 import secrets
 from datetime import timedelta
 from typing import Any
 
-from flask import Response, jsonify, redirect, render_template, request, session, url_for
+from flask import (
+    Response,
+    jsonify,
+    redirect,
+    render_template,
+    request,
+    session,
+    url_for,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,13 +33,13 @@ def init_auth(app: Any, *, auth_code: str | None = None) -> str:
     code = (auth_code or "").strip()
     if not code:
         try:
-            from config.env_loader import load_env, env_str
+            from config.env_loader import env_str, load_env
             load_env(override=False)
             for key in AUTH_ENV_KEYS:
                 code = env_str(key, "")
                 if code:
                     break
-        except Exception:
+        except Exception:  # noqa: BLE001
             for key in AUTH_ENV_KEYS:
                 code = (os.getenv(key) or "").strip()
                 if code:
@@ -48,7 +55,7 @@ def init_auth(app: Any, *, auth_code: str | None = None) -> str:
     session_secret = os.getenv("WEBUI_SESSION_SECRET") or os.getenv("FLASK_SECRET_KEY")
     if not session_secret:
         # 授权码来自 .env 时，用带命名空间的摘要生成稳定签名密钥；修改授权码会自然注销旧会话。
-        session_secret = hashlib.sha256(f"turb-gpt-webui-session:{code}".encode("utf-8")).hexdigest()
+        session_secret = hashlib.sha256(f"turb-gpt-webui-session:{code}".encode()).hexdigest()
     app.secret_key = session_secret
     secure_cookie = (os.getenv("WEBUI_SECURE_COOKIE") or "").strip().lower() in (
         "1", "true", "yes", "on", "y"

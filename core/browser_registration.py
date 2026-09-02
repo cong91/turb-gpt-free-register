@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Selenium-compatible browser registration helpers and registration flow."""
 from __future__ import annotations
 
@@ -11,14 +10,23 @@ from pathlib import Path
 from config import roxybrowser as _cfg
 from config import twofa as _twofa_cfg
 from core import db
-from core.account_export import BrowserPageTransport, checkpoint_account_data, post_register_dwell, save_account_data
+from core.account_export import (
+    BrowserPageTransport,
+    checkpoint_account_data,
+    post_register_dwell,
+    save_account_data,
+)
 from core.browser_challenge import (
     browser_challenge_state as _browser_challenge_state,
+)
+from core.browser_challenge import (
     wait_for_browser_challenge as _wait_for_browser_challenge,
 )
 from core.codex_login_credentials import CodexLoginCredentials
 from core.email_provider import (
     _BEFORE_CODE_UNSET as _OTP_BEFORE_CODE_UNSET,
+)
+from core.email_provider import (
     acknowledge_verification_code,
     resolve_email_source,
     snapshot_verification_code,
@@ -32,6 +40,7 @@ from core.openai_auth import (
     detect_account_unusable_text,
 )
 from core.roxybrowser_client import RoxyBrowserClient, RoxyOpenResult
+from core.time_utils import local_today
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +85,7 @@ def _log_prefix(driver=None) -> str:
             return explicit
         if driver is not None and driver.__class__.__name__ == "BrowserSeleniumDriver":
             return "[Browser注册]"
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("Unable to resolve browser log prefix: %s", exc)
     return "[Roxy注册]"
 
@@ -108,7 +117,7 @@ def _coerce_browser_mapping(driver, result, *, label: str) -> dict:
         return result
     try:
         current_url = str(getattr(driver, "current_url", "") or "")
-    except Exception:
+    except Exception:  # noqa: BLE001
         current_url = ""
     return {
         "url": current_url,
@@ -152,7 +161,7 @@ def _build_driver(opened: RoxyOpenResult):
             raw_data = opened.raw.get("data") if isinstance(opened.raw, dict) else {}
             if isinstance(raw_data, dict):
                 driver_path = str(raw_data.get("driver") or raw_data.get("driverPath") or raw_data.get("driver_path") or "").strip()
-        except Exception:
+        except Exception:  # noqa: BLE001
             driver_path = ""
         if driver_path:
             logger.info("[Roxy] 使用 Roxy chromedriver=%s", driver_path)
@@ -201,7 +210,7 @@ def _center_browser_window(driver) -> None:
         y = int(work_area.top + max(0, (work_area.bottom - work_area.top - height) // 2))
         driver.set_window_position(x, y)
         logger.info("[Roxy] 浏览器窗口已居中：x=%s y=%s width=%s height=%s", x, y, width, height)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("[Roxy] 浏览器窗口居中失败，继续执行：%s", exc)
 
 
@@ -227,7 +236,7 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
             try:
                 driver.set_page_load_timeout(max(10, int(timeout)))
                 driver.set_script_timeout(8)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             driver.get(url)
             return
@@ -239,17 +248,17 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
             )
             try:
                 driver.execute_script("window.stop();")
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             time.sleep(1.0)
             try:
                 current = str(driver.current_url or "").lower()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 current = ""
             try:
                 ready = str(driver.execute_script("return document.readyState || ''") or "")
                 has_body = bool(driver.execute_script("return !!document.body"))
-            except Exception:
+            except Exception:  # noqa: BLE001
                 ready = ""
                 has_body = False
             target_ok = any(h in current for h in hosts) if hosts else (url.split("/", 3)[2].lower() in current)
@@ -262,7 +271,7 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
             if attempt < attempts:
                 try:
                     driver.get("about:blank")
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
                 time.sleep(1.5 * attempt)
                 continue
@@ -276,12 +285,12 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
         finally:
             try:
                 driver.set_page_load_timeout(old_timeout)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             if old_script_timeout is not None:
                 try:
                     driver.set_script_timeout(old_script_timeout)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
     raise last_exc or RuntimeError(f"页面跳转失败: {url}")
 
@@ -289,7 +298,7 @@ def _safe_get(driver, url: str, *, timeout: int = 45, attempts: int = 2, accept_
 def _visible(el) -> bool:
     try:
         return el.is_displayed() and el.is_enabled()
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -297,7 +306,7 @@ def _browser_actions_enabled() -> bool:
     try:
         from config import humanize as _hcfg
         return bool(getattr(_hcfg, "ENABLE_HUMANIZE_BROWSER_ACTIONS", True))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return True
 
 
@@ -323,10 +332,10 @@ def _apply_browser_automation_mask(driver) -> None:
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": script})
         try:
             driver.execute_script(script)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         logger.info("%s 已注入浏览器自动化特征弱化脚本", _log_prefix(driver))
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("%s 注入自动化特征弱化脚本失败：%s", _log_prefix(driver), exc)
 
 
@@ -335,7 +344,7 @@ def _human_scroll_to(driver, el) -> None:
     if native is not None:
         try:
             native.scroll_into_view_if_needed(timeout=5000)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return
     try:
@@ -347,10 +356,10 @@ def _human_scroll_to(driver, el) -> None:
             driver.execute_script("window.scrollBy(0, arguments[0]);", random.randint(-90, 90))
             time.sleep(random.uniform(0.05, 0.22))
             driver.execute_script("typeof arguments[0]?.scrollIntoView === 'function' && arguments[0].scrollIntoView({block:'center', inline:'nearest'});", el)
-    except Exception:
+    except Exception:  # noqa: BLE001
         try:
             driver.execute_script("typeof arguments[0]?.scrollIntoView === 'function' && arguments[0].scrollIntoView({block:'center'});", el)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -366,7 +375,7 @@ def _human_click(driver, el, *, label: str = "") -> None:
             human_delay("click")
             el.click()
             return
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug("%s Cloak locator click failed label=%s err=%s", _log_prefix(driver), label, exc)
     if not _browser_actions_enabled():
         time.sleep(0.2)
@@ -397,12 +406,12 @@ def _human_click(driver, el, *, label: str = "") -> None:
             el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true, view:window}));
             el.click();
             """, el)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("%s 人工化点击失败，回退 el.click label=%s err=%s", _log_prefix(driver), label, exc)
         time.sleep(random.uniform(0.12, 0.45))
         try:
             driver.execute_script("arguments[0].click();", el)
-        except Exception:
+        except Exception:  # noqa: BLE001
             el.click()
 
 
@@ -412,7 +421,7 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
         if clear:
             try:
                 el.clear()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         el.send_keys(value)
         return
@@ -420,7 +429,7 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
         _human_scroll_to(driver, el)
         try:
             _human_click(driver, el, label="input_focus")
-        except Exception:
+        except Exception:  # noqa: BLE001
             driver.execute_script("arguments[0].focus();", el)
         if clear:
             from selenium.webdriver.common.keys import Keys
@@ -429,16 +438,16 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
                 import platform
                 if platform.system().lower() != "darwin":
                     mod = Keys.CONTROL
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             try:
                 el.send_keys(mod, "a")
                 time.sleep(random.uniform(0.04, 0.16))
                 el.send_keys(Keys.BACKSPACE)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 try:
                     el.clear()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
         text = str(value)
         i = 0
@@ -457,7 +466,7 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
             "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
             el,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), exc)
         _set_element_value(driver, el, value)
 
@@ -473,7 +482,7 @@ def _page_warmup(driver, *, reason: str = "") -> None:
                 "x": random.randint(80, 360),
                 "y": random.randint(80, 260),
             })
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -490,7 +499,7 @@ def _find_any(driver, selectors: list[str], timeout: int | None = None):
                 for item in items:
                     if _visible(item):
                         return item
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 last = exc
         time.sleep(0.4)
     raise RuntimeError(f"找不到页面元素: {selectors}; last={last}")
@@ -536,7 +545,7 @@ def _email_entry_state(driver) -> dict:
         return {url: location.href, title: document.title, inputs, actions};
         """) or {}
         return _coerce_browser_mapping(driver, result, label="email_entry")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"url": getattr(driver, "current_url", ""), "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -584,7 +593,7 @@ def _is_oauth_consent_like(driver) -> bool:
         if not isinstance(state, dict):
             return bool(state)
         return bool(state.get("has_consent_action") and not state.get("has_email_entry"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -599,7 +608,7 @@ def _is_external_idp_url(url: str) -> bool:
 def _assert_not_external_idp(driver, label: str = '') -> None:
     try:
         current = str(driver.current_url or '')
-    except Exception:
+    except Exception:  # noqa: BLE001
         current = ''
     if _is_external_idp_url(current):
         raise RuntimeError(f"误入第三方账号授权页（{label}）：{current}")
@@ -653,7 +662,7 @@ def _wait_for_email_input(driver, timeout: int | None = None):
             try:
                 el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)
                 return el
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 last_state = {"native_locator_error": f"{type(exc).__name__}: {exc}"}
         else:
             el = _find_visible_email_input_js(driver)
@@ -764,7 +773,7 @@ def _current_email_input_value(driver) -> str:
             value = str(item.get("value") or "").strip()
             if "@" in value:
                 return value
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return ""
 
@@ -808,7 +817,7 @@ def _stabilize_email_input_before_submit(driver, email: str) -> dict:
           url: location.href
         };
         """, email) or {}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
@@ -896,7 +905,7 @@ def _submit_email_form_stable(driver, email: str) -> dict:
           url: location.href
         };
         """, email) or {}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
@@ -949,7 +958,7 @@ def _recover_email_submit_if_stuck(driver, email: str) -> dict:
         }, 80);
         return {ok:true, reason:'resubmitted_email_form', value: input.value, hasForm: !!form, hasSubmit: !!submit};
         """, email) or {}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
@@ -964,7 +973,7 @@ def _submit_email_via_browser_nextauth(driver, email: str) -> dict:
         current = str(getattr(driver, "current_url", "") or "")
         if "chatgpt.com" not in current:
             return {"ok": False, "reason": "not_on_chatgpt", "url": current[:180]}
-    except Exception:
+    except Exception:  # noqa: BLE001
         current = ""
 
     did = str(uuid.uuid4())
@@ -973,7 +982,7 @@ def _submit_email_via_browser_nextauth(driver, email: str) -> dict:
     try:
         try:
             driver.set_script_timeout(25)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         result = driver.execute_async_script(r"""
         const email = String(arguments[0] || '').trim();
@@ -1049,12 +1058,12 @@ def _submit_email_via_browser_nextauth(driver, email: str) -> dict:
         })();
         """, email, did, auth_log_id) or {}
         return result if isinstance(result, dict) else {"ok": False, "reason": "invalid_result", "result": str(result)[:300]}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
     finally:
         try:
             driver.set_script_timeout(old_script_timeout)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -1071,7 +1080,7 @@ def _email_input_value_state(driver) -> dict:
         return {url: location.href, inputs};
         """) or {}
         return _coerce_browser_mapping(driver, result, label="email_input_state")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"url": getattr(driver, "current_url", ""), "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -1338,14 +1347,14 @@ def _email_otp_page_state(driver) -> dict:
         return {url: location.href, title: document.title, inputs, buttons, errors, text: (document.body?.innerText || '').slice(0, 1200)};
         """) or {}
         return _coerce_browser_mapping(driver, result, label="email_otp_state")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"url": getattr(driver, 'current_url', ''), "error": f"{type(exc).__name__}: {exc}"}
 
 
 def _is_email_verification_page(driver) -> bool:
     try:
         url = str(driver.current_url or '').lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         url = ''
     if '/log-in/password' in url:
         return False
@@ -1371,7 +1380,7 @@ def _clear_otp_inputs(driver) -> None:
           el.dispatchEvent(new Event('change', {bubbles:true}));
         }
         """)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
 
@@ -1404,7 +1413,7 @@ def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
                 logger.info("%s[OTP] 已点击重新发送验证码按钮：%s", _log_prefix(driver), text or '-')
                 time.sleep(random.uniform(1.1, 2.4) if _browser_actions_enabled() else 1.5)
                 return {"ok": True, "text": text}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last = exc
         time.sleep(0.5)
     raise RuntimeError(f"找不到可点击的重新发送验证码按钮: last={last}, state={_email_otp_page_state(driver)}")
@@ -1518,14 +1527,14 @@ def _complete_email_otp(
             try:
                 _click_continue(driver)
                 logger.info("%s[OTP] 已提交邮箱验证码，等待资料页或登录态", _log_prefix(driver))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.info(
                     "%s[OTP] 未找到显式提交按钮，继续等待页面状态：%s",
                     _log_prefix(driver),
                     str(exc)[:120],
                 )
             outcome = _wait_after_email_otp_submit(driver, timeout=30)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = exc
             outcome = "error"
 
@@ -1575,7 +1584,7 @@ def _maybe_accept(driver) -> None:
         try:
             _click_any(driver, selectors, timeout=3)
             time.sleep(0.5)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -1604,7 +1613,7 @@ def _page_snapshot(driver) -> dict:
           .filter(Boolean).slice(0, 10);
         return {url: location.href, title: document.title, text: (document.body?.innerText || '').slice(0, 2000), inputs, buttons, widgets, errors};
         """) or {}
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}", "url": getattr(driver, 'current_url', '')}
 
 
@@ -1619,7 +1628,7 @@ def _has_access_token(driver) -> bool:
         if isinstance(result, dict):
             return bool(result.get("accessToken"))
         return bool(result)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -1681,7 +1690,7 @@ def _set_element_value(driver, el, value: str) -> None:
 def _select_or_type(driver, selectors: list[str], value: str, timeout: int = 3) -> bool:
     try:
         el = _find_any(driver, selectors, timeout=timeout)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
     try:
         tag = (el.tag_name or '').lower()
@@ -1703,17 +1712,17 @@ def _select_or_type(driver, selectors: list[str], value: str, timeout: int = 3) 
                 sel = Select(el)
                 try:
                     sel.select_by_value(str(int(value)))
-                except Exception:
+                except Exception:  # noqa: BLE001
                     try:
                         sel.select_by_visible_text(str(int(value)))
-                    except Exception:
+                    except Exception:  # noqa: BLE001
                         # 月份 select 可能是 0-based，也可能是 1-based；先 value/text，不行再 index。
                         sel.select_by_index(max(0, int(value)-1))
                 driver.execute_script("arguments[0].dispatchEvent(new Event('change', {bubbles:true}));", el)
         else:
             _human_type_text(driver, el, str(value), clear=True)
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug('%s 填写字段失败 selectors=%s value=%s err=%s', _log_prefix(driver), selectors, value, exc)
         return False
 
@@ -1829,7 +1838,7 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
             import platform
             if platform.system().lower() != 'darwin':
                 mod = Keys.CONTROL
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         for selector, value in [
             ('[role="spinbutton"][data-type="year"]', y),
@@ -1855,7 +1864,7 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
         }
         """, birthday)
         return 'spinbutton'
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug('%s spinbutton 生日填写失败：%s', _log_prefix(driver), exc)
         return None
 
@@ -1881,7 +1890,7 @@ def _registration_password() -> str:
         configured = str(getattr(_register_cfg, 'REGISTER_PASSWORD', '') or '').strip()
         if configured:
             return configured
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return _generate_roxy_password()
 
@@ -1904,7 +1913,7 @@ def _password_page_state(driver) -> dict:
         return {url: location.href, inputs, forms, buttons};
         """) or {}
         return _coerce_browser_mapping(driver, result, label="password_state")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"url": getattr(driver, "current_url", ""), "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -1966,7 +1975,7 @@ def _is_signup_password_page(driver) -> bool:
 def _is_login_password_page(driver) -> bool:
     try:
         url = str(driver.current_url or '').lower()
-    except Exception:
+    except Exception:  # noqa: BLE001
         url = ''
     if '/log-in/password' in url:
         return True
@@ -2040,7 +2049,7 @@ def _click_passwordless_signup_if_present(driver) -> dict:
             result["reason"] = "clicked_passwordless_send_otp"
             result.pop("button", None)
         return result
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
 
 
@@ -2074,7 +2083,7 @@ def _click_continue_with_password_link(driver) -> bool:
         candidates[0].click();
         return true;
         """) or False)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     if clicked:
         logger.info("%s 已点击 'Continue with password' 链接，等待密码表单", _log_prefix(driver))
@@ -2085,7 +2094,7 @@ def _click_continue_with_password_link(driver) -> bool:
         driver.get("https://auth.openai.com/create-account/password")
         time.sleep(2.0)
         return True
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("%s 导航到 /create-account/password 失败: %s", _log_prefix(driver), exc)
         return False
 
@@ -2233,7 +2242,7 @@ def _accept_profile_consents(driver) -> int:
         if count:
             logger.info("%s 已勾选 about-you/profile 同意协议复选框：%s", _log_prefix(driver), result.get('names'))
         return count
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug('%s 勾选 profile consent 失败：%s', _log_prefix(driver), exc)
         return 0
 
@@ -2298,8 +2307,7 @@ def _complete_profile_page(driver, name: str, birthday: str, timeout: int = 45) 
     """等待并完成姓名/生日页；若已经登录成功则返回 False，不把它当失败。"""
     end = time.time() + timeout
     y, m, d = birthday.split('-')
-    from datetime import date
-    today = date.today()
+    today = local_today()
     age = today.year - int(y) - ((today.month, today.day) < (int(m), int(d)))
     last_snapshot = {}
     while time.time() < end:
@@ -2402,7 +2410,7 @@ def _click_if_enabled_submit(driver) -> bool:
             return True
         _human_click(driver, target, label="profile_submit")
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -2432,21 +2440,22 @@ def _switch_to_chatgpt_window_if_any(driver) -> bool:
         current_handle = None
         try:
             current_handle = getattr(driver, "current_window_handle", None)
-        except Exception:
+        except Exception:  # noqa: BLE001
             current_handle = None
         for handle in handles:
             try:
                 driver.switch_to.window(handle)
                 if "chatgpt.com" in str(getattr(driver, "current_url", "") or ""):
                     return True
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("切换浏览器窗口探测失败：%s: %s", type(exc).__name__, exc)
                 continue
         if current_handle is not None:
             try:
                 driver.switch_to.window(current_handle)
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return False
 
@@ -2467,7 +2476,7 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
         _check_manual_stop()
         try:
             current = str(driver.current_url or '')
-        except Exception:
+        except Exception:  # noqa: BLE001
             current = ''
 
         if 'chatgpt.com' not in current:
@@ -2480,7 +2489,7 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
                     forced_chatgpt_open = True
                     time.sleep(3)
                     current = str(getattr(driver, "current_url", "") or "")
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     last_data = f"{type(exc).__name__}: {exc}"
             else:
                 time.sleep(1)
@@ -2492,7 +2501,7 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
                 if data:
                     return data
                 last_data = "session 暂无 accessToken"
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 last_data = f"{type(exc).__name__}: {exc}"
         time.sleep(2)
 
@@ -2507,7 +2516,7 @@ def _check_manual_stop() -> None:
         return
 
 
-def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = None, otp_code: str = None, batch_dir: Path | None = None) -> dict:
+def run_roxy_registration(email: str, name: str, birthday: str, proxy: str | None = None, otp_code: str | None = None, batch_dir: Path | None = None) -> dict:
     """Roxy 指纹浏览器自动化注册入口。"""
     client = RoxyBrowserClient()
     opened = None
@@ -2536,7 +2545,10 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
 
         browser_geo = probe_browser_geo(driver)
         if network_identity is not None:
-            from core.registration_network_identity import verify_profile_network_identity, NetworkIdentityError
+            from core.registration_network_identity import (
+                NetworkIdentityError,
+                verify_profile_network_identity,
+            )
 
             try:
                 network_identity = verify_profile_network_identity(driver, network_identity)
@@ -2569,7 +2581,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
             set_script_timeout = getattr(driver, "set_script_timeout", None)
             if callable(set_script_timeout):
                 set_script_timeout(max(1, int(getattr(_cfg, "ROXY_SCRIPT_TIMEOUT", _cfg.ROXY_SELENIUM_TIMEOUT))))
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         logger.info("[Roxy注册] 开始：%s，profile=%s", email, opened.profile_id)
 
@@ -2664,7 +2676,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 totp_secret = setup_2fa_for_registration(driver, email)
                 twofa_status = "active"
                 db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 twofa_status = "failed"
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
@@ -2743,7 +2755,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 codex_result = auto_codex["codex"]
             else:
                 logger.info("[Roxy注册][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:180]}"}
 
         account_id = save_account_data(
@@ -2813,7 +2825,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
                 or "/log-in/password" in error_text
             ) else "available"
             release_email(email, status=release_status, note=note_text[:180])
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return {
             "success": False,
@@ -2825,7 +2837,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str = Non
         if driver and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN):
             try:
                 driver.quit()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         if opened is not None and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN):
             client.cleanup_profile(opened)

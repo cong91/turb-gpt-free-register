@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from typing import Any
@@ -15,9 +14,9 @@ def nordvpn_status_payload(
     from config import nordvpn_wireguard as wireguard_config
 
     if nordvpn_cli is None:
-        from core import nordvpn_cli as nordvpn_cli
+        from core import nordvpn_cli
     if registration_service is None:
-        from core import registration_service as registration_service
+        from core import registration_service
 
     configured = bool(getattr(nordvpn_config, "NORDVPN_ENABLED", False))
     service_running = bool(nordvpn_cli.is_service_running()) if configured else False

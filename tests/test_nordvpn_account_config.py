@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Configuration exposure tests for NordVPN access-token proxies."""
 import unittest
 

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Cloudflare Worker 临时邮箱客户端（cloudflare_temp_email 兼容）。
 
 对齐 grokRegister-cpa/email_providers/cloudflare.py：
@@ -76,7 +75,7 @@ def _base_url() -> str:
         raise CFTempMailError(
             "Cloudflare API 地址未配置，请填写 CLOUDFLARE_API_BASE（WebUI「配置 → 邮箱 / OTP」）。"
         )
-    if not re.match(r"^https?://", base, re.I):
+    if not re.match(r"^https?://", base, re.IGNORECASE):
         base = "https://" + base
     return base.rstrip("/")
 
@@ -118,9 +117,7 @@ def _build_headers(*, content_type: bool = False, bearer_jwt: str | None = None)
                 headers["X-API-Key"] = key
             elif mode == "x-admin-auth":
                 headers["x-admin-auth"] = key
-            elif mode == "bearer":
-                headers["Authorization"] = f"Bearer {key}"
-            elif mode not in ("none", "query-key"):
+            elif mode == "bearer" or mode not in ("none", "query-key"):
                 headers["Authorization"] = f"Bearer {key}"
     return _apply_custom_auth(headers)
 
@@ -257,11 +254,12 @@ def create_address(domain: str | None = None) -> CFTempMailAccount:
     key = _api_key()
     admin_create = _is_admin_create_path(accounts_path)
 
-    if admin_create or mode in ("x-admin-auth", "bearer", "x-api-key", "query-key"):
-        if not key:
-            raise CFTempMailError(
-                "Cloudflare admin/鉴权模式需要 CLOUDFLARE_API_KEY（ADMIN_PASSWORD）。"
-            )
+    if (
+        admin_create or mode in ("x-admin-auth", "bearer", "x-api-key", "query-key")
+    ) and not key:
+        raise CFTempMailError(
+            "Cloudflare admin/鉴权模式需要 CLOUDFLARE_API_KEY（ADMIN_PASSWORD）。"
+        )
 
     if admin_create:
         payload: dict[str, Any] = {
@@ -357,7 +355,8 @@ def _message_timestamp(item: dict) -> float | None:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             return dt.timestamp()
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Cloudflare message date parse failed: %s: %s", type(exc).__name__, exc)
             continue
     return None
 
@@ -419,7 +418,7 @@ def _parse_raw_email(raw: str) -> dict[str, str]:
         return result
     try:
         msg = BytesParser(policy=policy.default).parsebytes(raw.encode("utf-8", errors="replace"))
-    except Exception:
+    except Exception:  # noqa: BLE001
         # 回退：至少从头部抠 Subject/From
         for line in raw.splitlines():
             low = line.lower()
@@ -440,7 +439,7 @@ def _parse_raw_email(raw: str) -> dict[str, str]:
             continue
         try:
             body = part.get_content()
-        except Exception:
+        except Exception:  # noqa: BLE001
             payload = part.get_payload(decode=True) or b""
             charset = part.get_content_charset() or "utf-8"
             body = payload.decode(charset, errors="replace")
@@ -462,7 +461,7 @@ def _standalone_otp_from_html(html: str) -> str | None:
     if not html:
         return None
     # 去 style，减少 #353740 这类颜色误伤
-    cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.I | re.S)
+    cleaned = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.IGNORECASE | re.DOTALL)
     for pattern in (
         r">\s*(\d{6})\s*<",
         r"(?m)^\s*(\d{6})\s*$",
@@ -614,14 +613,13 @@ def fetch_latest_otp(
             msg_id = _message_id(item)
             otp_probe = _otp_item(detail)
             # 列表字段不足时尝试详情
-            if (not otp_probe.get("text") and not otp_probe.get("html")) or not looks_like_openai_email(otp_probe):
-                if msg_id:
-                    fetched = get_message_detail(account.jwt, msg_id)
-                    if fetched:
-                        merged = dict(item)
-                        merged.update(fetched)
-                        detail = merged
-                        otp_probe = _otp_item(detail)
+            if ((not otp_probe.get("text") and not otp_probe.get("html")) or not looks_like_openai_email(otp_probe)) and msg_id:
+                fetched = get_message_detail(account.jwt, msg_id)
+                if fetched:
+                    merged = dict(item)
+                    merged.update(fetched)
+                    detail = merged
+                    otp_probe = _otp_item(detail)
 
             otp_item = otp_probe
             if not looks_like_openai_email(otp_item):

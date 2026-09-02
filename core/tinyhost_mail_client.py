@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """TinyHost temporary mailbox client."""
 from __future__ import annotations
 

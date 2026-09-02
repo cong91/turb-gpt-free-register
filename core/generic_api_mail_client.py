@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 通用 API 取码邮箱客户端。
 
@@ -8,16 +7,16 @@
 注册时领取 email；取码时直接 GET code_url，并从响应中提取 6 位验证码。
 响应可以是纯文本、HTML 或 JSON，只要其中包含 6 位验证码即可。
 """
+import base64
+import html as html_lib
 import json
 import logging
 import re
 import time
-import base64
-import html as html_lib
-from datetime import datetime
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote, unquote, urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
 import requests
 
@@ -55,7 +54,7 @@ def _cache_busted_url(url: str, attempt: int) -> str:
         query = parse_qsl(parsed.query, keep_blank_values=True)
         query.append(("_otp_poll", f"{int(time.time() * 1000)}-{attempt}"))
         return urlunparse(parsed._replace(query=urlencode(query)))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return url
 
 
@@ -93,12 +92,12 @@ def _decode_data_uri(text: str) -> str:
     if ";base64" in _meta.lower():
         try:
             return base64.b64decode(payload).decode("utf-8", errors="replace")
-        except Exception:
+        except Exception:  # noqa: BLE001
             return text
     try:
         from urllib.parse import unquote_to_bytes
         return unquote_to_bytes(payload).decode("utf-8", errors="replace")
-    except Exception:
+    except Exception:  # noqa: BLE001
         return text
 
 
@@ -112,7 +111,7 @@ def _extract_code(text: str) -> str | None:
     try:
         parsed = json.loads(text)
         candidates_text.insert(0, _decode_data_uri(_flatten_json(parsed)))
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     for body in candidates_text:
@@ -190,7 +189,7 @@ def _parse_yangyang_code_url(code_url: str) -> tuple[str, str, str] | None:
     """
     try:
         parsed = urlparse(code_url)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     m = _YANGYANG_MESSAGES_RE.search(parsed.path or "")
     if not m:
@@ -209,8 +208,8 @@ def _parse_yangyang_ts(value: str | None) -> float | None:
     raw = str(value).strip()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(raw[:19], fmt).timestamp()
-        except Exception:
+            return datetime.strptime(raw[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
+        except Exception:  # noqa: BLE001, S110
             pass
     return None
 
@@ -227,7 +226,7 @@ def _parse_generic_api_ts(value) -> float | None:
         try:
             ts = float(raw)
             return ts / 1000.0 if ts > 10_000_000_000 else ts
-        except Exception:
+        except Exception:  # noqa: BLE001
             return None
     # ISO8601: 2026-08-05T01:10:17.000Z
     try:
@@ -238,13 +237,13 @@ def _parse_generic_api_ts(value) -> float | None:
         if dt.tzinfo is None:
             return dt.timestamp()
         return dt.timestamp()
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     # 常见字符串格式
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.strptime(raw[:19], fmt).timestamp()
-        except Exception:
+            return datetime.strptime(raw[:19], fmt).replace(tzinfo=timezone.utc).timestamp()
+        except Exception:  # noqa: BLE001, S110
             pass
     return None
 
@@ -260,7 +259,7 @@ def _extract_structured_api_code(text: str, after_ts: float | None = None) -> tu
         return None
     try:
         data = json.loads(text)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return None
     if not isinstance(data, dict):
         return None
@@ -375,19 +374,13 @@ def _fetch_yangyang_otp(
             if detail_resp.status_code != 200:
                 continue
             detail = detail_resp.json()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.debug(f"[GenericAPI] yangyang 邮件详情读取失败: {type(exc).__name__}: {exc}")
             continue
 
         raw_body = str(detail.get("body") or "")
         body = _decode_data_uri(raw_body)
         subject = str(detail.get("subject") or item.get("subject") or "")
-        text = "\n".join([
-            subject,
-            str(detail.get("fromAddress") or item.get("from_address") or ""),
-            str(detail.get("receivedAt") or item.get("received_at") or ""),
-            body,
-        ])
         code = _extract_yangyang_openai_code(subject, body)
         if code:
             logger.info(
@@ -432,7 +425,7 @@ def _fetch_inline_messages_page_otp(
             logger.debug("[GenericAPI] inline messages 页面 HTTP %s: %s", resp.status_code, (resp.text or "")[:160])
             return None
         html = resp.text or ""
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.debug("[GenericAPI] inline messages 页面读取失败: %s: %s", type(exc).__name__, exc)
         return None
 
@@ -665,7 +658,7 @@ def fetch_latest_otp(
                     last_error = f"HTTP 200 但未提取到 6 位验证码，响应预览: {text[:160]}"
             else:
                 last_error = f"HTTP {resp.status_code}: {text[:160]}"
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}: {exc}"
 
         now = time.time()

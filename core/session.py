@@ -1,26 +1,39 @@
-# -*- coding: utf-8 -*-
 """
 curl_cffi Session 封装
 统一管理 Cookie、请求头和 TLS 指纹
 """
-import logging
 import hashlib
+import logging
 import random
 import threading
 import time
 import uuid
 from urllib.parse import urlparse
+
 from curl_cffi.requests import Session
 
 from config import (
-    USER_AGENT, SEC_CH_UA, SEC_CH_UA_PLATFORM, SEC_CH_UA_MOBILE,
-    SEC_CH_UA_FULL_VERSION_LIST, SEC_CH_UA_PLATFORM_VERSION, SEC_CH_UA_ARCH,
-    SEC_CH_UA_BITNESS, SEC_CH_UA_MODEL, SEND_HIGH_ENTROPY_CLIENT_HINTS,
-    ACCEPT_LANGUAGE, IMPERSONATE, OAI_CLIENT_BUILD_NUMBER, OAI_CLIENT_VERSION,
-    REQUEST_TIMEOUT, pick_proxy, pick_browser_profile, validate_browser_profile,
-    BROWSER_PROFILE_POOL, build_browser_environment,
+    ACCEPT_LANGUAGE,
+    BROWSER_PROFILE_POOL,
+    IMPERSONATE,
+    OAI_CLIENT_BUILD_NUMBER,
+    OAI_CLIENT_VERSION,
+    REQUEST_TIMEOUT,
+    SEC_CH_UA,
+    SEC_CH_UA_ARCH,
+    SEC_CH_UA_BITNESS,
+    SEC_CH_UA_FULL_VERSION_LIST,
+    SEC_CH_UA_MOBILE,
+    SEC_CH_UA_MODEL,
+    SEC_CH_UA_PLATFORM,
+    SEC_CH_UA_PLATFORM_VERSION,
+    SEND_HIGH_ENTROPY_CLIENT_HINTS,
+    USER_AGENT,
+    build_browser_environment,
+    pick_browser_profile,
+    pick_proxy,
+    validate_browser_profile,
 )
-
 
 logger = logging.getLogger(__name__)
 _GEO_CACHE: dict[str, dict] = {}
@@ -34,7 +47,7 @@ def _seed_uuid(seed: str, salt: str) -> str:
 
 
 def _seed_int(seed: str, salt: str, *, bits: int = 63) -> int:
-    digest = hashlib.sha256(f"{salt}:{seed}".encode("utf-8")).digest()
+    digest = hashlib.sha256(f"{salt}:{seed}".encode()).digest()
     nbytes = max(1, (bits + 7) // 8)
     value = int.from_bytes(digest[:nbytes], "big")
     mask = (1 << bits) - 1
@@ -59,7 +72,7 @@ class BrowserSession:
 
     def __init__(
         self,
-        proxy: str = None,
+        proxy: str | None = None,
         *,
         detect_exit_geo: bool = True,
         device_id: str | None = None,
@@ -188,7 +201,7 @@ class BrowserSession:
                 name = getattr(cookie, "name", "")
                 if name in _CF_COOKIE_NAMES:
                     out[f"{getattr(cookie, 'domain', '')}:{name}"] = len(str(getattr(cookie, "value", "") or ""))
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return out
 
@@ -273,7 +286,7 @@ class BrowserSession:
             from config import browser as _browser_cfg
             reject = bool(getattr(_browser_cfg, "REJECT_CLOUD_PROXY", True))
             keywords = list(getattr(_browser_cfg, "CLOUD_PROXY_ORG_KEYWORDS", []) or [])
-        except Exception:
+        except Exception:  # noqa: BLE001
             return
         if not reject or not self.exit_geo:
             return
@@ -303,7 +316,7 @@ class BrowserSession:
                 if cdom and not (wanted == cdom or wanted.endswith("." + cdom) or cdom.endswith("." + wanted)):
                     continue
                 pairs.append(f"{name}={value}")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return "; ".join(pairs)
 
@@ -321,7 +334,7 @@ class BrowserSession:
                 return {}
             endpoints = list(getattr(_browser_cfg, "IP_GEO_ENDPOINTS", []) or [])
             timeout = float(getattr(_browser_cfg, "IP_GEO_TIMEOUT", 6) or 6)
-        except Exception:
+        except Exception:  # noqa: BLE001
             return {}
 
         cache_key = self.proxy or "__direct__"
@@ -347,7 +360,7 @@ class BrowserSession:
                         geo.get("city") or "?", geo.get("timezone") or "?",
                     )
                     return geo
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug(f"[指纹] 出口 IP 地理检测失败 endpoint={url}: {type(exc).__name__}: {exc}")
                 continue
         with _GEO_CACHE_LOCK:
@@ -409,7 +422,7 @@ class BrowserSession:
         target = target_origin.lower().rstrip("/")
         if ref.startswith(target):
             return "same-origin"
-        if ref.startswith("https://chatgpt.com") or ref.startswith("https://auth.openai.com") or ref.startswith("https://sentinel.openai.com"):
+        if ref.startswith(("https://chatgpt.com", "https://auth.openai.com", "https://sentinel.openai.com")):
             return "cross-site"
         return "none"
 
@@ -591,13 +604,13 @@ class BrowserSession:
             return headers
         try:
             parsed = urlparse(str(url))
-        except Exception:
+        except Exception:  # noqa: BLE001
             return headers
         host = (parsed.hostname or "").lower()
         path = parsed.path or "/"
         if host != "chatgpt.com":
             return headers
-        if not (path.startswith("/backend-api/") or path.startswith("/backend-anon/") or path.startswith("/ces/")):
+        if not (path.startswith(("/backend-api/", "/backend-anon/", "/ces/"))):
             return headers
         # 不覆盖调用方显式指定的值，便于后续特殊接口单独调整。
         headers.setdefault("x-openai-target-path", path)
@@ -639,14 +652,14 @@ class BrowserSession:
         logger.warning("[熔断] 当前会话收到 HTTP %s，进入冷却 %ss，停止后续请求：%s", status, min(cool_down, 3600), url)
         return resp
 
-    def get(self, url: str, headers: dict = None, **kwargs):
+    def get(self, url: str, headers: dict | None = None, **kwargs):
         """发送 GET 请求"""
         self._raise_if_circuit_open()
         headers = self._attach_openai_target_headers_for_url(url, headers)
         resp = self.session.get(url, headers=headers, **kwargs)
         return self._observe_response_for_circuit_breaker(resp, url)
 
-    def post(self, url: str, headers: dict = None, **kwargs):
+    def post(self, url: str, headers: dict | None = None, **kwargs):
         """发送 POST 请求"""
         self._raise_if_circuit_open()
         headers = self._attach_openai_target_headers_for_url(url, headers)
