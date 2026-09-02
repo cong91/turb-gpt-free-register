@@ -396,6 +396,10 @@ EDITABLE_FIELDS = [
         "label": "QAN8 API Key", "help": "QAN8 Open API Key；保存在 .env，不会写入 config 源码", "storage": "env", "secret": True,
     },
     {
+        "key": "QAN8_API_PROXY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "QAN8 API 代理", "help": "可选 HTTP(S)/SOCKS5(H) 代理；留空时优先使用已启用的 NordVPN WireGuard，否则直连", "storage": "env", "secret": True,
+    },
+    {
         "key": "QAN8_GMAIL_SKU_ID", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
         "label": "QAN8 Gmail SKU", "help": "从 QAN8 products API 选择 Gmail API URL 商品的 sku_id", "storage": "env",
     },

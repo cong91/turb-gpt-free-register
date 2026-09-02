@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch
 
+from config import email as email_config
 from core.qan8_gmail_api_client import (
     Qan8DeliveryError,
     Qan8GmailApiClient,
@@ -30,6 +31,7 @@ class Qan8GmailApiClientTests(unittest.TestCase):
             api_key="secret-api-key",
             sku_id=156,
             request_timeout=3,
+            proxy_url="",
         )
 
     @patch("core.qan8_gmail_api_client.requests.get")
@@ -56,6 +58,58 @@ class Qan8GmailApiClientTests(unittest.TestCase):
             params={"api_key": "secret-api-key"},
             timeout=3,
         )
+
+    @patch("core.qan8_gmail_api_client.requests.get")
+    def test_configured_proxy_is_passed_to_get_requests(self, mock_get):
+        mock_get.return_value = _Response({"success": True, "data": []})
+        client = Qan8GmailApiClient(
+            api_base="https://shop.example",
+            api_key="secret-api-key",
+            proxy_url="http://proxy.example:8080",
+        )
+
+        self.assertEqual(client.list_products(), [])
+        mock_get.assert_called_once_with(
+            "https://shop.example/api/v1/open/products",
+            timeout=15,
+            proxies={
+                "http": "http://proxy.example:8080",
+                "https": "http://proxy.example:8080",
+            },
+        )
+
+    @patch("core.qan8_gmail_api_client.requests.post")
+    def test_configured_proxy_is_passed_to_post_requests(self, mock_post):
+        mock_post.return_value = _Response({
+            "success": True,
+            "data": {"order_no": "out-proxy", "status": "processing"},
+        })
+        client = Qan8GmailApiClient(
+            api_base="https://shop.example",
+            api_key="secret-api-key",
+            sku_id=156,
+            proxy_url="socks5h://proxy.example:1080",
+        )
+
+        client.create_order("out-proxy")
+
+        self.assertEqual(
+            mock_post.call_args.kwargs["proxies"],
+            {
+                "http": "socks5h://proxy.example:1080",
+                "https": "socks5h://proxy.example:1080",
+            },
+        )
+
+    @patch.object(email_config, "QAN8_API_PROXY", "http://proxy.example:8080", create=True)
+    def test_client_reads_proxy_from_dynamic_email_config(self):
+        client = Qan8GmailApiClient(api_base="https://shop.example")
+
+        self.assertEqual(client.proxy_url, "http://proxy.example:8080")
+
+    def test_client_rejects_unsupported_proxy_scheme(self):
+        with self.assertRaisesRegex(Qan8GmailApiError, "proxy"):
+            Qan8GmailApiClient(api_base="https://shop.example", proxy_url="ftp://proxy.example:21")
 
     @patch("core.qan8_gmail_api_client.requests.post")
     def test_create_order_forces_quantity_one_and_returns_snapshot(self, mock_post):
