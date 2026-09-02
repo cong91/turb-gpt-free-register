@@ -198,6 +198,13 @@ def create_registration_jobs(
         return {"ok": False, "error": provider_error}, 400
 
     submit_kwargs = {"count": count, "workers": workers}
+    # Automation callers already provide the number of account jobs required
+    # by Sub2API. The manual WebUI form may instead enter source Gmail count
+    # and expand it into aliases, so keep that legacy UI behavior scoped there.
+    automation_registration = (
+        isinstance(automation_context, dict)
+        and automation_context.get("sub2api_automation_kind") == "registration"
+    )
     if requested_source is not None:
         submit_kwargs["email_source"] = requested_source
     if "gmail_123452026" in sources:
@@ -222,7 +229,7 @@ def create_registration_jobs(
         if count > available:
             count = available
             submit_kwargs["count"] = count
-        if aliases_per_email > 1:
+        if aliases_per_email > 1 and not automation_registration:
             # count = số email gốc; mỗi email gốc sinh aliases_per_email tài khoản.
             job_count = count * aliases_per_email
             if job_count > MAX_REGISTRATION_TASKS:
@@ -248,18 +255,19 @@ def create_registration_jobs(
             return {"ok": False, "error": "qan8_alias_count 非法"}, 400
         if not 1 <= aliases_per_source <= 12:
             return {"ok": False, "error": "qan8_alias_count 需在 1~12 之间"}, 400
-        job_count = count * aliases_per_source
-        if job_count > MAX_REGISTRATION_TASKS:
-            return {
-                "ok": False,
-                "error": (
-                    f"QAN8 Gmail API: {count} source × {aliases_per_source} alias = "
-                    f"{job_count} task, vượt {MAX_REGISTRATION_TASKS}"
-                ),
-            }, 400
-        count = job_count
-        submit_kwargs["count"] = count
         submit_kwargs["qan8_aliases_per_source"] = aliases_per_source
+        if not automation_registration:
+            job_count = count * aliases_per_source
+            if job_count > MAX_REGISTRATION_TASKS:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"QAN8 Gmail API: {count} source × {aliases_per_source} alias = "
+                        f"{job_count} task, vượt {MAX_REGISTRATION_TASKS}"
+                    ),
+                }, 400
+            count = job_count
+            submit_kwargs["count"] = count
     if automation_context:
         submit_kwargs["automation_context"] = automation_context
     jobs = service.submit_registration(**submit_kwargs)
