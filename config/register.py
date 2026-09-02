@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 注册基础信息（默认值）
 
@@ -29,6 +28,10 @@ AUTO_CODEX_FOR_FREE_AFTER_REGISTER = False
 # 格式：最小秒,最大秒。设为 "0,0" 表示不额外停留。
 POST_REGISTER_DWELL_SECONDS_RANGE = "18,45"
 
+# 账号尚未创建时，浏览器页面/OTP 的已知临时错误自动创建的新注册任务数。
+# 每次会使用一个新邮箱 alias；0 表示关闭，默认只补跑一次。
+REGISTRATION_AUTO_RETRY_ATTEMPTS = 1
+
 # ---- .env overrides for WebUI editable fields ----
 apply_env_overrides(globals(), {
     'REGISTER_EMAIL': 'str',
@@ -36,4 +39,5 @@ apply_env_overrides(globals(), {
     'AUTO_PLAN_CHECK_AFTER_REGISTER': 'bool',
     'AUTO_CODEX_FOR_FREE_AFTER_REGISTER': 'bool',
     'POST_REGISTER_DWELL_SECONDS_RANGE': 'str',
+    'REGISTRATION_AUTO_RETRY_ATTEMPTS': 'int',
 })

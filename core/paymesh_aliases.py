@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Domain routing cho Paymesh MAIL card alias.
 
 Paymesh provider mặc định sinh N alias `local+<5hex>@<domain-gốc>` từ mailbox
@@ -16,7 +15,6 @@ import ipaddress
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
-
 
 MAX_PAYMESH_ROUTED_DOMAINS = 2
 _DOMAIN_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -63,7 +61,7 @@ def _split_email(email: str) -> tuple[str, str]:
 def alias_suffix(email: str, index: int) -> str:
     """Hash 5 hex ký tự, dùng chung với `paymesh_mail_client._alias_variants`."""
     value = str(email or "").strip().lower()
-    return hashlib.sha256(f"paymesh:{value}:{index}".encode("utf-8")).hexdigest()[:5]
+    return hashlib.sha256(f"paymesh:{value}:{index}".encode()).hexdigest()[:5]
 
 
 def _normalize_domain(domain: str) -> str:
@@ -82,9 +80,8 @@ def _normalize_domain(domain: str) -> str:
         raise PaymeshAliasError("Domain routing Paymesh không hợp lệ")
     if len(value) > 253:
         raise PaymeshAliasError("Domain routing Paymesh quá dài")
-    if value != "localhost":
-        if any(not _DOMAIN_LABEL.fullmatch(label) for label in labels):
-            raise PaymeshAliasError("Domain routing Paymesh không hợp lệ")
+    if value != "localhost" and any(not _DOMAIN_LABEL.fullmatch(label) for label in labels):
+        raise PaymeshAliasError("Domain routing Paymesh không hợp lệ")
     return value
 
 

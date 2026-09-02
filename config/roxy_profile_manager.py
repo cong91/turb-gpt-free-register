@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Independent RoxyBrowser profile-manager configuration."""
 from pathlib import Path
 

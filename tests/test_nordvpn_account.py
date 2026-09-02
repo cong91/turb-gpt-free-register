@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Unit tests for NordVPN access-token to NordLynx configuration flow."""
 import base64
 import unittest

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 WebUI 启动入口。
 
@@ -53,7 +52,7 @@ def _acquire_single_instance(port: int):
         else:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except (OSError, IOError) as exc:
+    except OSError as exc:
         handle.close()
         raise RuntimeError(f"端口 {port} 的 WebUI 已在运行") from exc
     handle.seek(0)
@@ -74,7 +73,7 @@ def _release_single_instance(handle) -> None:
         else:
             import fcntl
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-    except (OSError, IOError):
+    except OSError:
         pass
     handle.close()
 

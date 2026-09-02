@@ -1,11 +1,10 @@
-# -*- coding: utf-8 -*-
 import os
 import unittest
 from unittest.mock import patch
 
 from config import env_loader, roxy_profile_manager
-from core.app_state_db import APP_STATE_DB_PATH
 from core import roxy_profile_manager as roxy_profile_manager_service
+from core.app_state_db import APP_STATE_DB_PATH
 from webui import config_editor
 
 

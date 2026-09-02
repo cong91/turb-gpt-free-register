@@ -1,7 +1,5 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import hashlib
 import threading
 import time
 from collections.abc import Sequence
@@ -10,7 +8,6 @@ from datetime import datetime, timezone
 from urllib.parse import quote, urlparse
 
 import requests
-
 
 DEFAULT_API_BASE = "https://sms.paymesh.cn"
 _HEADERS_JSON = {"Accept": "application/json", "Content-Type": "application/json"}
@@ -341,11 +338,9 @@ _CDK_LOCK_WAIT = 600
 def _otp_store():
     global _OTP_STORE
     if _OTP_STORE is None:
-        from pathlib import Path
-
-        from core.otp_identity_store import OtpIdentityStore
 
         from core.app_state_db import APP_STATE_DB_PATH
+        from core.otp_identity_store import OtpIdentityStore
 
         _OTP_STORE = OtpIdentityStore(APP_STATE_DB_PATH)
     return _OTP_STORE
@@ -410,7 +405,7 @@ def _historical_emails() -> set[str]:
         from core import db
 
         rows = list(db.list_accounts(limit=100_000, archived="all")) + list(db.list_jobs(limit=100_000))
-    except Exception:
+    except Exception:  # noqa: BLE001
         return set()
     return {
         _cache_key(str(row.get("email") or ""))
@@ -447,10 +442,9 @@ def _config_values() -> tuple[str, int, int]:
 def _ledger():
     global _LEDGER
     if _LEDGER is None:
-        from pathlib import Path
 
-        from core.provider_card_ledger import ProviderCardLedger
         from core.app_state_db import APP_STATE_DB_PATH
+        from core.provider_card_ledger import ProviderCardLedger
 
         _LEDGER = ProviderCardLedger(APP_STATE_DB_PATH, provider_name="paymesh")
         from core import db
@@ -542,9 +536,8 @@ def _inventory_store(store_path=None):
     if _INVENTORY_STORE is None:
         from pathlib import Path
 
-        from core.cdk_inventory_store import CdkInventoryStore
-
         from core.app_state_db import APP_STATE_DB_PATH
+        from core.cdk_inventory_store import CdkInventoryStore
 
         path = Path(store_path) if store_path else APP_STATE_DB_PATH
         _INVENTORY_STORE = CdkInventoryStore(path)
@@ -618,7 +611,7 @@ def pick_account_by_inventory(
             if inventory.configured_limit < cap:
                 try:
                     store.update_configured_limit(inventory_id, cap)
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
             reservation = store.reserve_first_available_slot(
                 inventory_id, variants, owner,
@@ -642,11 +635,11 @@ def pick_account_by_inventory(
             )
             _CONTEXT_CACHE[_cache_key(account.email)] = account
             return account
-        except (PaymeshMailError, Exception) as exc:
+        except (PaymeshMailError, Exception) as exc:  # noqa: BLE001
             last_error = exc
             try:
                 store.release_lease(inventory_id, owner_token=owner, fencing_token="")
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             continue
     if last_error is not None:
@@ -671,7 +664,7 @@ def release_lease(inventory_id: str) -> bool:
                     owner_token=row["owner_token"],
                     fencing_token=row["fencing_token"],
                 )
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return False
 
@@ -704,7 +697,7 @@ def get_account_context(email: str) -> PaymeshMailAccount | None:
                 )
                 _CONTEXT_CACHE[_cache_key(email)] = account
                 return account
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return None
 

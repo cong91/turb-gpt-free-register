@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for core.nordvpn_cli — NordVPN CLI wrapper."""
 from __future__ import annotations
 
@@ -62,7 +61,7 @@ class NordVPNCliTests(unittest.TestCase):
     @patch.object(Path, "is_file", return_value=True)
     def test_run_nordvpn_returns_on_success(self, _is_file, _is_dir):
         cfg = self._mock_cfg()
-        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):
+        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):  # noqa: SIM117
             with patch.object(subprocess, "run") as mock_run:
                 mock_run.return_value = MagicMock(
                     returncode=0, stdout="connected", stderr=""
@@ -74,7 +73,7 @@ class NordVPNCliTests(unittest.TestCase):
     @patch.object(Path, "is_file", return_value=True)
     def test_run_nordvpn_raises_on_nonzero_exit(self, _is_file, _is_dir):
         cfg = self._mock_cfg()
-        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):
+        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):  # noqa: SIM117
             with patch.object(subprocess, "run") as mock_run:
                 mock_run.return_value = MagicMock(
                     returncode=1, stdout="", stderr="already connected"
@@ -87,7 +86,7 @@ class NordVPNCliTests(unittest.TestCase):
     @patch.object(Path, "is_file", return_value=True)
     def test_run_nordvpn_includes_timeout(self, _is_file, _is_dir):
         cfg = self._mock_cfg(NORDVPN_CLI_TIMEOUT=15)
-        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):
+        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):  # noqa: SIM117
             with patch.object(subprocess, "run") as mock_run:
                 mock_run.return_value = MagicMock(returncode=0, stdout="ok", stderr="")
                 _mod._run_nordvpn("-c")
@@ -127,14 +126,14 @@ class NordVPNCliTests(unittest.TestCase):
 
     def test_is_connected_returns_true_when_route_exists(self):
         cfg = self._mock_cfg()
-        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):
+        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):  # noqa: SIM117
             with patch.object(subprocess, "run") as mock_run:
                 mock_run.return_value = MagicMock(stdout="1\n", returncode=0)
                 self.assertTrue(_mod.is_connected())
 
     def test_is_connected_returns_false_when_no_route(self):
         cfg = self._mock_cfg()
-        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):
+        with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):  # noqa: SIM117
             with patch.object(subprocess, "run") as mock_run:
                 mock_run.return_value = MagicMock(stdout="0\n", returncode=0)
                 self.assertFalse(_mod.is_connected())
@@ -234,7 +233,7 @@ class NordVPNCliTests(unittest.TestCase):
     def test_vpn_context_disconnects_on_exception(self, _ic, _dc, _c):
         cfg = self._mock_cfg()
         with patch.object(_mod, "_cfg_attr", side_effect=lambda k, d=None: getattr(cfg, k, d)):
-            with self.assertRaises(ValueError):
+            with self.assertRaises(ValueError):  # noqa: SIM117
                 with _mod.VPNContext(country_group="Japan"):
                     raise ValueError("boom")
             _c.assert_called_once()

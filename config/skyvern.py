@@ -1,6 +1,5 @@
-# -*- coding: utf-8 -*-
 """Skyvern 云端浏览器配置。"""
-from config.env_loader import env_str, apply_env_overrides
+from config.env_loader import apply_env_overrides, env_str
 
 # Skyvern API Key（Skyvern Cloud Dashboard 创建；优先读 .env / 环境变量）
 SKYVERN_API_KEY: str = env_str("SKYVERN_API_KEY", "")

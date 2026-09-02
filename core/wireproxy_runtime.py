@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Resolve or install the pinned wireproxy runtime on Windows/Linux.
 
 The downloaded archive is pinned to a release and SHA-256 checksum. Runtime

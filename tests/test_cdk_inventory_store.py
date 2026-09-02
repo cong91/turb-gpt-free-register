@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import sqlite3
@@ -352,7 +351,7 @@ class CdkInventoryStoreTests(unittest.TestCase):
         events, total = self.store.list_events(record.inventory_id)
 
         self.assertEqual(total, 1)
-        with closing(sqlite3.connect(self.path)) as connection:
+        with closing(sqlite3.connect(self.path)) as connection:  # noqa: SIM117
             with self.assertRaises(sqlite3.IntegrityError):
                 connection.execute(
                     "INSERT INTO cdk_events "
@@ -380,7 +379,7 @@ class CdkInventoryStoreTests(unittest.TestCase):
 
     def test_domain_mutation_and_event_roll_back_together(self):
         record, _ = self.store.import_cdk("gmail", "rollback-cdk")
-        with patch.object(self.store, "_append_event", side_effect=RuntimeError("event write failed")):
+        with patch.object(self.store, "_append_event", side_effect=RuntimeError("event write failed")):  # noqa: SIM117
             with self.assertRaisesRegex(RuntimeError, "event write failed"):
                 self.store.reserve_slot(
                     record.inventory_id,

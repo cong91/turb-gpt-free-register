@@ -1,9 +1,8 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 """Test that IP probe failures don't cause registration failure."""
 import sys
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -21,7 +20,6 @@ def test_roxy_ip_probe_graceful_degradation():
         'selenium': MagicMock(),
         'selenium.webdriver': MagicMock(),
     }):
-        from core import roxy_registration
         
         # Mock driver and network_identity
         mock_driver = MagicMock()
@@ -38,10 +36,15 @@ def test_roxy_ip_probe_graceful_degradation():
             
             # Simulate the code path in roxy_registration.py:1532-1545
             try:
-                from core.registration_network_identity import verify_profile_network_identity, NetworkIdentityError as NIE
+                from core.registration_network_identity import (
+                    NetworkIdentityError as NIE,
+                )
+                from core.registration_network_identity import (
+                    verify_profile_network_identity,
+                )
                 
                 try:
-                    result = verify_profile_network_identity(mock_driver, network_identity)
+                    verify_profile_network_identity(mock_driver, network_identity)
                     print("✓ IP verification succeeded (unexpected in this test)")
                     verified = True
                 except NIE as exc:
@@ -65,7 +68,7 @@ def test_roxy_ip_probe_graceful_degradation():
                     print("❌ TEST FAILED - Error was not handled correctly")
                     return False
                     
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001
                 print(f"\n❌ TEST FAILED - Unexpected exception: {e}")
                 import traceback
                 traceback.print_exc()

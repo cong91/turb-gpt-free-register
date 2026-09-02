@@ -1,6 +1,6 @@
-# -*- coding: utf-8 -*-
 import json
 import unittest
+from typing import ClassVar
 
 from core.browser_traffic import PlaywrightTrafficTracker, SeleniumTrafficTracker
 
@@ -23,7 +23,7 @@ class _Emitter:
 class _Request:
     method = "POST"
     url = "https://example.test/register"
-    headers = {"content-type": "application/json"}
+    headers: ClassVar[dict[str, str]] = {"content-type": "application/json"}
     post_data = "{}"
 
     def sizes(self):

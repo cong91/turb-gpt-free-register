@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 注册成功后自动跑 Codex OAuth 授权的配置项。
 设置 ENABLE_CODEX = False 可完全跳过此步骤。
@@ -6,8 +5,7 @@
 参数来源：CLIProxyAPI 源码 internal/auth/codex/openai_auth.go + pkce.go，
 对照 https://github.com/router-for-me/CLIProxyAPI 逐行确认。
 """
-from config.env_loader import env_str, apply_env_overrides
-
+from config.env_loader import apply_env_overrides, env_str
 
 # 是否启用 Codex OAuth 授权（False = 跳过，不影响注册结果）
 ENABLE_CODEX: bool = False

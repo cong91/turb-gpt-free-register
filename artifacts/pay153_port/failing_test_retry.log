@@ -1,0 +1,18 @@
+test_protocol_registration_forces_codex_after_serialized_plan_flow (tests.test_registration_auto_codex.RegistrationAutoCodexTests.test_protocol_registration_forces_codex_after_serialized_plan_flow) ... 14:29:53 [INFO] [RotatingProxy] cleared 8 lease(s) from previous process
+14:29:59 [INFO] [RotatingProxy] assigned new proxy: scope=registration lane=117016 key=bjAMi...izRT ttl=1703s
+14:29:59 [INFO] [\u6ce8\u518c] \u5f00\u59cb\uff1auser@example.com\uff0c\u4ee3\u7406=http://...sid-***...@http://proxy.example
+14:29:59 [INFO] [\u6ce8\u518c] \u672c\u6b21\u968f\u673a\u751f\u65e5: 1990-01-01
+14:29:59 [INFO] [\u6b65\u9aa410] \u540e\u7eed\u5206\u652f\u5224\u65ad: page_type=external_url, has_continue_url=True
+14:29:59 [INFO] [\u6ce8\u518c] OTP \u540e\u8fdb\u5165 OAuth \u56de\u8c03\u5206\u652f\uff0c\u8df3\u8fc7 create_account\uff1auser@example.com
+14:29:59 [INFO] [\u767b\u5f55\u6001] \u5b8c\u6210 OAuth \u56de\u8c03\u5e76\u62c9\u53d6 Token\uff1auser@example.com (\u5c1d\u8bd5 1/5)
+14:29:59 [INFO] [\u767b\u5f55\u6001] \u5df2\u62ff\u5230 accessToken\uff1auser@example.com
+14:29:59 [INFO] [\u68c0\u67e5\u70b9] token \u5df2\u4fdd\u5b58\uff1a\u8d26\u53f7ID=7\uff0c2FA=pending
+14:29:59 [INFO] [Codex] \u6210\u529f\uff1auser@example.com\uff0cfile=None\uff0ccallback=None
+14:29:59 [INFO] [\u5b8c\u6210] user@example.com\uff0c\u8d26\u53f7ID=8\uff0cToken=access-token...
+14:29:59 [INFO] [Flow] \u8df3\u8fc7\uff1auser@example.com\uff0c\u539f\u56e0=None
+ok
+
+----------------------------------------------------------------------
+Ran 1 test in 5.521s
+
+OK

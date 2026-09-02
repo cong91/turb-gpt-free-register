@@ -158,6 +158,22 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
 
         _outlook.assert_not_called()
 
+    @patch(
+        "core.qan8_gmail_api_store.Qan8GmailApiStore.alias_usage_for_source",
+        create=True,
+        return_value={"total": 12, "available": 7, "used": 3, "failed": 1, "reserved": 1},
+    )
+    def test_qan8_source_uses_qan8_alias_usage_in_email_pool(self, _usage):
+        rows = db._attach_gmail_api_url_alias_stats([
+            {"email": "source@gmail.com", "code_url": "https://qan8.test/source-code"},
+        ])
+
+        self.assertEqual(rows[0]["alias_total"], 12)
+        self.assertEqual(rows[0]["alias_available"], 7)
+        self.assertEqual(rows[0]["alias_used"], 3)
+        self.assertEqual(rows[0]["alias_failed"], 1)
+        self.assertEqual(rows[0]["alias_reserved"], 1)
+
 
 class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
     def setUp(self):

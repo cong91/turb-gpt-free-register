@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 接码平台客户端。
 
@@ -147,7 +146,7 @@ def _post_l_json(http: CurlSession, path: str, payload: dict) -> dict:
     text = (resp.text or "").strip()
     try:
         data = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         data = {}
 
     if resp.status_code != 200:
@@ -189,7 +188,7 @@ def _post_h_json(http: CurlSession, path: str, payload: dict) -> dict:
     text = (resp.text or "").strip()
     try:
         data = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         data = {}
 
     if resp.status_code != 200:
@@ -479,6 +478,15 @@ def acquire_number(
 # 取短信验证码
 # ============================================================
 
+def _sleep_until_deadline(deadline: float, interval: float) -> bool:
+    """Sleep for one poll interval without skipping the final deadline check."""
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        return False
+    time.sleep(min(max(0.1, float(interval)), remaining))
+    return True
+
+
 def wait_for_sms_code(
     activation_id: str,
     http: CurlSession | None = None,
@@ -497,15 +505,15 @@ def wait_for_sms_code(
     """
     own_http = http is None
     http = http or _http()
-    deadline = time.time() + (max_wait or _cfg.SMS_CODE_WAIT)
-    interval = poll_interval or _cfg.SMS_POLL_INTERVAL
+    total_wait = max_wait if max_wait is not None else _cfg.SMS_CODE_WAIT
+    interval = poll_interval if poll_interval is not None else _cfg.SMS_POLL_INTERVAL
+    deadline = time.time() + total_wait
     try:
         provider = _provider()
-        total_wait = max_wait or _cfg.SMS_CODE_WAIT
         logger.info(f"[SMS] 等待短信验证码 activation_id={activation_id}，最长 {total_wait}s...")
         round_no = 0
         hero_resend_requested = False
-        while time.time() < deadline:
+        while time.time() <= deadline:
             try:
                 from core.registration_service import check_stop_requested
                 check_stop_requested()
@@ -554,7 +562,8 @@ def wait_for_sms_code(
                     f"[SMS:HeroSMS] 第 {round_no} 轮未收到验证码，状态={text}，"
                     f"{interval}s 后重试（剩余 {remaining}s）"
                 )
-                time.sleep(interval)
+                if not _sleep_until_deadline(deadline, interval):
+                    break
                 continue
 
             if provider == "viotp":
@@ -579,7 +588,8 @@ def wait_for_sms_code(
                     f"[SMS:ViOTP] 第 {round_no} 轮未收到验证码，状态={status}，"
                     f"{interval}s 后重试（剩余 {remaining}s）"
                 )
-                time.sleep(interval)
+                if not _sleep_until_deadline(deadline, interval):
+                    break
                 continue
 
             if provider == "l":
@@ -595,7 +605,8 @@ def wait_for_sms_code(
                     f"[SMS:L] 第 {round_no} 轮未收到验证码，状态={status or raw or 'WAIT'}，"
                     f"{interval}s 后重试（剩余 {remaining}s）"
                 )
-                time.sleep(interval)
+                if not _sleep_until_deadline(deadline, interval):
+                    break
                 continue
 
             if provider == "h":
@@ -611,7 +622,8 @@ def wait_for_sms_code(
                     f"[SMS:H] 第 {round_no} 轮未收到验证码，状态={status or raw or 'WAIT'}，"
                     f"{interval}s 后重试（剩余 {remaining}s）"
                 )
-                time.sleep(interval)
+                if not _sleep_until_deadline(deadline, interval):
+                    break
                 continue
 
             text = _request_grizzly(http, {"action": "getStatus", "id": activation_id})
@@ -625,7 +637,8 @@ def wait_for_sms_code(
             # STATUS_WAIT_CODE / STATUS_WAIT_RETRY:* / STATUS_WAIT_RESEND → 继续等
             remaining = max(0, int(deadline - time.time()))
             logger.info(f"[SMS] 第 {round_no} 轮未收到验证码，状态={text}，{interval}s 后重试（剩余 {remaining}s）")
-            time.sleep(interval)
+            if not _sleep_until_deadline(deadline, interval):
+                break
 
         raise SmsCodeTimeout(f"等待短信超时（>{total_wait}s），activation_id={activation_id}")
     finally:
@@ -681,7 +694,7 @@ def complete(activation_id: str, http: CurlSession | None = None) -> None:
         try:
             set_status(activation_id, 6, http=http)
             logger.info(f"[SMS:HeroSMS] 已标记完成 activation_id={activation_id}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(f"[SMS:HeroSMS] 标记完成失败（不影响结果）：{exc}")
         finally:
             _ACQUIRED_AT.pop(activation_id, None)
@@ -703,7 +716,7 @@ def complete(activation_id: str, http: CurlSession | None = None) -> None:
         set_status(activation_id, 6, http=http)
         logger.info(f"[SMS] 已标记完成 activation_id={activation_id}")
         _ACQUIRED_AT.pop(activation_id, None)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"[SMS] 标记完成失败（不影响结果）：{exc}")
 
 
@@ -729,7 +742,7 @@ def _do_cancel_sync(activation_id: str, http_factory) -> None:
                 logger.info(f"[SMS] 已取消 activation_id={activation_id}")
                 _ACQUIRED_AT.pop(activation_id, None)
                 return
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 if attempt == 1:
                     logger.warning(f"[SMS] 取消失败（{exc}），5s 后重试...")
                     time.sleep(5)
@@ -740,7 +753,7 @@ def _do_cancel_sync(activation_id: str, http_factory) -> None:
     finally:
         try:
             http.close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
 
 
@@ -786,7 +799,7 @@ def cancel(
         try:
             set_status(activation_id, 8, http=http)
             logger.info(f"[SMS:HeroSMS] 已取消 activation_id={activation_id}")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(f"[SMS:HeroSMS] 取消失败（不影响主流程）：{exc}")
         finally:
             _ACQUIRED_AT.pop(activation_id, None)
@@ -798,14 +811,14 @@ def cancel(
     if _provider() == "l":
         try:
             _release_l_number(activation_id, http=http)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(f"[SMS:L] 释放号码失败（不影响主流程）：id={activation_id}, {type(exc).__name__}: {exc}")
             _ACQUIRED_AT.pop(activation_id, None)
         return
     if _provider() == "h":
         try:
             _release_h_number(activation_id, http=http)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(f"[SMS:H] 释放号码失败（不影响主流程）：id={activation_id}, {type(exc).__name__}: {exc}")
             _ACQUIRED_AT.pop(activation_id, None)
         return

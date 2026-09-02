@@ -1,0 +1,103 @@
+PAY.153 checkout-link port verification
+
+Changed branch/field:
+- core/extract_link_service.py now accepts the selected payment-method ID and dispatches local PAY.153 providers instead of treating local mode as ph_short-only. `auto` always resolves to local PAY.153; legacy remote mode is explicit only.
+- core/pay153_provider_workflow.py ports the PAY.153 provider policy, Sentinel checkout headers, campaign lookup, Checkout creation/update/approval, Stripe provider extraction, OAICS GCash/PayPal handling, and UPI Go integration.
+- WebUI /api/extract-link/options and both templates provide a remembered select menu; no payment type text field is used. The separate Extract URL workspace filters Free Plus accounts, supports multi-select, manual/pool/rotating proxies, and renders only the PAY.153 route lanes required by the selected provider. Kakao carries its campaign at Checkout creation, QR-only provider results remain usable, and inventory is prepared per rotating-proxy scope.
+- Accounts tabs no longer render extraction controls or extraction result cells; selection, routing, progress, and copied links live only in the dedicated Extract URL workspace.
+
+Four required artifacts:
+- MODIFIED_FILE: C:\Users\mrc\Documents\projects\turb-gpt-free-register\artifacts\pay153_port\MODIFIED_FILE
+- DIFF_FILE: C:\Users\mrc\Documents\projects\turb-gpt-free-register\artifacts\pay153_port\DIFF_FILE
+- VERIFICATION.txt: C:\Users\mrc\Documents\projects\turb-gpt-free-register\artifacts\pay153_port\VERIFICATION.txt
+- ROLLBACK.sh: C:\Users\mrc\Documents\projects\turb-gpt-free-register\artifacts\pay153_port\ROLLBACK.sh
+
+Source preservation:
+- ORIGINAL_FILE: C:\Users\mrc\Documents\projects\turb-gpt-free-register\artifacts\pay153_port\ORIGINAL_FILE
+- Original SHA256: 841E26F9122E86EE2483C5F79FD2BD89F1741A092B5D535A574C077F0A64BF3A
+- MODIFIED_FILE remains changed from ORIGINAL_FILE after rollback testing.
+
+BASELINE
+Command:
+  Set-Location artifacts/pay153_port/baseline; python -m unittest tests.test_rotating_proxy.RotatingProxyWorkflowRoutingTests.test_extract_link_job_reuses_one_proxy_for_create_and_event_stream -v
+Literal result:
+  test_extract_link_job_reuses_one_proxy_for_create_and_event_stream ... ok
+  Ran 1 test in 0.070s; OK
+Exit status: 0
+
+MODIFIED
+Command:
+  python -m unittest tests.test_extract_link_local tests.test_rotating_proxy.RotatingProxyWorkflowRoutingTests.test_extract_link_job_reuses_one_proxy_for_create_and_event_stream -v
+Input:
+  mocked provider results, selected local provider IDs, exact 1/2-lane PAY.153 routes, proxy-pool masking, API auth, Kakao create-promo and QR-only cases
+Literal result:
+  Ran 18 tests in 0.3s; OK
+Exit status: 0
+
+MODIFIED STATIC/IMPORT CHECK
+Command:
+  python -m compileall -q core webui config tests; node --check sentinel/sentinel-runner.js; node --check sentinel/sdk.js
+Literal result:
+  Python compileall completed; both node --check commands completed without output.
+Exit status: 0
+
+TEMPLATE JAVASCRIPT PARSE CHECK
+Command:
+  node -e "read each template script block and construct a Function"
+Literal result:
+  webui/templates/index.html: 5 scripts parsed; webui/templates/index_legacy.html: 1 scripts parsed.
+Exit status: 0
+
+DEPENDENCY CHECK
+Command:
+  python -m pip check
+Literal result:
+  No broken requirements found.
+Exit status: 0
+
+FULL SUITE
+Command:
+  python -m unittest discover -s tests -p 'test_*.py' -v
+Literal result:
+  Ran 1221 tests in 359.550s
+  OK (skipped=3)
+Exit status: 0
+
+ROLLBACK
+Command:
+  bash artifacts/pay153_port/ROLLBACK.sh artifacts/pay153_port/rollback_test.py
+Literal result:
+  841e26f9122e86ee2483c5f79fd2bd89f1741a092b5d535a574c077f0a64bf3a  artifacts/pay153_port/rollback_test.py
+  MODIFIED_HASH=1843F47C327CFC368B1587ADDAF309E0CE98D59851ED810E07A0E67BDE9ACBD1
+  ORIGINAL_HASH=841E26F9122E86EE2483C5F79FD2BD89F1741A092B5D535A574C077F0A64BF3A
+  MODIFIED_FILE_REMAINS_CHANGED=True
+Exit status: 0
+
+Restored behavior/status:
+- rollback_test.py was restored to the preserved ORIGINAL_FILE hash.
+- MODIFIED_FILE was not overwritten and still differs from ORIGINAL_FILE.
+- No live payment or external checkout request was executed by verification; provider behavior was tested with mocks and local fixtures.
+
+FOLLOW-UP UI FIX
+Changed branch/field:
+- Extract URL account rows now render the semantic label `Free Plus` when `plus_trial_eligible` is true instead of exposing the stored `current_plan_type=free` value.
+- Both templates now bind `btnExtractWorkspaceRefresh`, `btnExtractWorkspaceSelectAll`, and `btnExtractWorkspaceRun`, matching the rendered HTML and preventing the null `disabled` error.
+
+Command:
+  python -m unittest tests.test_extract_link_local tests.test_webui_localization -v
+Literal result:
+  Ran 22 tests in 0.565s
+  OK
+Exit status: 0
+
+Command:
+  python -c "from core import db; result=db.list_accounts_page(limit=500,offset=0,plan_filter='free_plus'); items=result['items']; assert items and all(str(r.get('current_plan_type') or r.get('plan_type')).lower()=='free' and bool(r.get('plus_trial_eligible')) for r in items); print('FREE_PLUS_QUERY total=%s eligible=%s' % (result['total'], len(items)))"
+Literal result:
+  FREE_PLUS_QUERY total=37 eligible=37
+Exit status: 0
+
+Command:
+  node -e "parse both template script blocks and assert Extract URL element IDs"
+Literal result:
+  webui/templates/index.html: scripts=5, ids=ok; webui/templates/index_legacy.html: scripts=1, ids=ok
+Exit status: 0

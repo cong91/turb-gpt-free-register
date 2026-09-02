@@ -1,6 +1,4 @@
-# -*- coding: utf-8 -*-
 import unittest
-from unittest.mock import patch
 
 from config import env_loader
 from webui import config_editor

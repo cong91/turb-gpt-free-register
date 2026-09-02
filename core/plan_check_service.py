@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """套餐/Plus 资格查询后台队列。"""
 from __future__ import annotations
 
@@ -7,7 +6,6 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 
 from config import proxy as proxy_cfg
 from core import db
@@ -17,6 +15,7 @@ from core.rotating_proxy_runtime import (
     PLAN_CHECK_PROXY_SCOPE,
     prepare_rotating_proxy_lanes,
 )
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +276,7 @@ def _run_plan_check(
     except Exception as exc:
         result = {
             "ok": False,
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "checked_at": local_now().isoformat(timespec="seconds"),
             "error": f"{type(exc).__name__}: {str(exc)[:180]}",
         }
         try:
@@ -334,7 +333,7 @@ def enqueue_account_plan_check(
                 lease_owner_id=f"plan-check:{account_id}",
                 timezone_offset_min=str(timezone_offset_min or "-"),
             )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         with _EXECUTOR_LOCK:
             if task_counted:
                 _ACTIVE_TASKS -= 1
@@ -344,7 +343,7 @@ def enqueue_account_plan_check(
         _QUEUE_SLOTS.release()
         result = {
             "ok": False,
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "checked_at": local_now().isoformat(timespec="seconds"),
             "error": f"套餐查询入队失败: {type(exc).__name__}: {str(exc)[:160]}",
         }
         db.update_account_plan_check(acc_id=account_id, result=result)

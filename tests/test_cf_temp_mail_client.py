@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 from unittest.mock import Mock, patch
 
@@ -11,7 +10,7 @@ class CFTempMailClientTests(unittest.TestCase):
         client._DOMAIN_COUNTER = 0
 
     def test_pick_account_requires_api_base(self):
-        with patch.object(client._email_cfg, "CLOUDFLARE_API_BASE", "", create=True):
+        with patch.object(client._email_cfg, "CLOUDFLARE_API_BASE", "", create=True):  # noqa: SIM117
             with self.assertRaisesRegex(client.CFTempMailError, "请填写 CLOUDFLARE_API_BASE"):
                 client.pick_account()
 
@@ -121,7 +120,7 @@ class CFTempMailClientTests(unittest.TestCase):
         self.assertIsNone(client.get_account_context("a@b.com"))
 
     def test_admin_mode_without_key_fails(self):
-        with patch.object(client._email_cfg, "CLOUDFLARE_API_BASE", "https://mail.example.com", create=True), patch.object(
+        with patch.object(client._email_cfg, "CLOUDFLARE_API_BASE", "https://mail.example.com", create=True), patch.object(  # noqa: SIM117
             client._email_cfg, "CLOUDFLARE_AUTH_MODE", "x-admin-auth", create=True
         ), patch.object(client._email_cfg, "CLOUDFLARE_API_KEY", "", create=True), patch.object(
             client._email_cfg, "CLOUDFLARE_PATH_ACCOUNTS", "/admin/new_address", create=True
@@ -173,7 +172,7 @@ class CFTempMailClientTests(unittest.TestCase):
             "created_at": "2026-07-19 12:57:38",
         }
         otp_item = client._otp_item(item)
-        from core.otp_utils import looks_like_openai_email, extract_otp
+        from core.otp_utils import extract_otp, looks_like_openai_email
         self.assertTrue(looks_like_openai_email(otp_item))
         self.assertEqual(extract_otp(otp_item), "449759")
 

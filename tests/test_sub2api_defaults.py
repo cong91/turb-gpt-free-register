@@ -5,7 +5,6 @@ from config import sub2api as sub2api_config
 from core import codex_agent, codex_oauth
 from webui import config_editor
 
-
 AUTH_JSON = {
     "agent_identity": {
         "agent_runtime_id": "runtime-123",

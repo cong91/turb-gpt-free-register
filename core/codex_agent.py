@@ -22,19 +22,17 @@ import random
 import string
 import sys
 import time
-import uuid
 from typing import Any
 
-from curl_cffi import requests
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import (
     Encoding,
+    NoEncryption,
     PrivateFormat,
     PublicFormat,
-    NoEncryption,
     load_pem_private_key,
 )
-
+from curl_cffi import requests
 
 # ============================================================
 #  常量
@@ -235,7 +233,7 @@ def _agent_headers(access_token: str, env: Any | None = None) -> dict[str, str]:
             headers["oai-language"] = env.navigator_language()
             if hasattr(env, "_attach_auth_rum_headers"):
                 env._attach_auth_rum_headers(headers)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
     return headers
 
@@ -429,7 +427,7 @@ def build_sub2api_account_entry(
     """把 Codex Agent Identity auth.json 转成 sub2api accounts[] 条目。"""
     identity = auth_json.get("agent_identity") if isinstance(auth_json, dict) else None
     if not isinstance(identity, dict):
-        raise ValueError("auth_json 缺少 agent_identity")
+        raise TypeError("auth_json 缺少 agent_identity")
 
     agent_runtime_id = str(identity.get("agent_runtime_id") or "").strip()
     agent_private_key = str(identity.get("agent_private_key") or "").strip()
@@ -517,10 +515,10 @@ def upsert_sub2api_account(
 
     accounts = data.setdefault("accounts", [])
     if not isinstance(accounts, list):
-        raise ValueError("sub2api 配置中的 accounts 必须是数组")
+        raise TypeError("sub2api 配置中的 accounts 必须是数组")
     proxies = data.setdefault("proxies", [])
     if not isinstance(proxies, list):
-        raise ValueError("sub2api 配置中的 proxies 必须是数组")
+        raise TypeError("sub2api 配置中的 proxies 必须是数组")
     if proxy_key and not proxies:
         data["proxies"] = [{"proxy_key": str(proxy_key)}]
 
@@ -629,7 +627,7 @@ def upload_sub2api_account(
     text = getattr(resp, "text", "") or ""
     try:
         body = resp.json()
-    except Exception:
+    except Exception:  # noqa: BLE001
         body = {"text": text[:1000]}
     if status < 200 or status >= 300:
         raise RuntimeError(f"sub2api 上传失败 HTTP {status}: {text[:800]}")
@@ -704,7 +702,7 @@ def create_codex_agent_identity(
         try:
             task_id = register_task(access_token, agent_runtime_id, private_key_b64, env=env, timeout=timeout)
             _log("Step 4", f"task_id_fingerprint={_fingerprint(task_id)}", "OK")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             _log("Step 4", f"验证失败（不影响 auth.json）: {e}", "WARN")
 
     # Step 5: 生成 auth.json

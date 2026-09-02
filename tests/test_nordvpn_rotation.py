@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Tests for NordVPN auto-rotation timing and gate behaviour."""
 from __future__ import annotations
 

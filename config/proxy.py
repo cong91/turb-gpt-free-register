@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 代理池配置
 
@@ -16,7 +15,6 @@ from urllib.parse import quote, urlparse
 import requests
 
 from config.env_loader import apply_env_overrides
-
 
 # 本地代理入口；实际出口地区以代理/分流规则为准。
 # 推荐使用 socks5h://（DNS 在代理端解析），避免本地 DNS 与出口 IP 地区错配。
@@ -51,8 +49,9 @@ PLAN_CHECK_QUEUE_LIMIT = 500
 PLAN_CHECK_MIN_INTERVAL = 0.4
 PLAN_CHECK_JITTER = 0.3
 
-# Proxy xoay proxy.vn: mỗi workflow lane giữ một keyxoay và proxy hiện tại
-# đến khi TTL của proxy hết; key mới chỉ được mua khi không còn key rảnh.
+# Proxy xoay proxy.vn: lease chỉ tồn tại khi worker đang chạy. Khi hoàn tất,
+# key được trả ngay; proxy còn TTL được cache để workflow kế tiếp tái dùng.
+# Key mới chỉ được mua khi số worker đồng thời vượt số key nhàn rỗi.
 ROTATING_PROXY_ENABLED = False
 ROTATING_PROXY_API_BASE = "https://proxy.vn/proxyxoay"
 ROTATING_PROXY_PROXY_API_BASE = "https://proxyxoay.shop/api"

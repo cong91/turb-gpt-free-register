@@ -1,0 +1,19 @@
+test_auto_mode_uses_local_without_remote_configuration (tests.test_extract_link_local.LocalExtractLinkTests.test_auto_mode_uses_local_without_remote_configuration) ... ok
+test_auto_mode_uses_remote_with_api_and_cdk (tests.test_extract_link_local.LocalExtractLinkTests.test_auto_mode_uses_remote_with_api_and_cdk) ... ok
+test_enqueue_local_mode_does_not_require_cdk (tests.test_extract_link_local.LocalExtractLinkTests.test_enqueue_local_mode_does_not_require_cdk) ... ok
+test_enqueue_local_rejects_explicit_payment_rail_before_claim (tests.test_extract_link_local.LocalExtractLinkTests.test_enqueue_local_rejects_explicit_payment_rail_before_claim) ... ok
+test_local_checkout_maps_short_link_to_existing_result_contract (tests.test_extract_link_local.LocalExtractLinkTests.test_local_checkout_maps_short_link_to_existing_result_contract) ... ok
+test_local_mode_rejects_payment_rail_without_remote_extractor (tests.test_extract_link_local.LocalExtractLinkTests.test_local_mode_rejects_payment_rail_without_remote_extractor) ... [\u63d0\u94fe] \u5931\u8d25: user@example.test
+Traceback (most recent call last):
+  File "C:\Users\mrc\Documents\projects\turb-gpt-free-register\core\extract_link_service.py", line 471, in _run_extract
+    raise RuntimeError(
+    ...<2 lines>...
+    )
+RuntimeError: \u672c\u5730 PAY.153 \u63d0\u94fe\u5668\u53ea\u751f\u6210 ph_short Checkout \u94fe\u63a5\uff1b\u8bf7\u628a EXTRACT_LINK_TYPE \u8bbe\u4e3a ph_short\uff0c\u6216\u914d\u7f6e\u8fdc\u7a0b\u63d0\u94fe\u670d\u52a1\u83b7\u53d6 PIX/UPI/Kakao/iDEAL
+ok
+test_extract_link_job_reuses_one_proxy_for_create_and_event_stream (tests.test_rotating_proxy.RotatingProxyWorkflowRoutingTests.test_extract_link_job_reuses_one_proxy_for_create_and_event_stream) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 0.008s
+
+OK

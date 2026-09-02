@@ -1,23 +1,19 @@
-# -*- coding: utf-8 -*-
 """
 Tests for Gmail batch store polymorphism and base class abstraction.
 """
-import sqlite3
 import tempfile
-import time
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
+from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 from core.gmail_batch_store_base import (
-    GmailBatchStoreBase,
     Assignment,
-    GmailBatchError,
     GmailBatchConflict,
+    GmailBatchError,
+    GmailBatchStoreBase,
 )
 from core.gmail_cdk_batch_store import GmailCdkBatchStore
-from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 
 
 # Mock concrete implementation for base class testing
@@ -63,10 +59,10 @@ class MockBatchStore(GmailBatchStoreBase):
         self,
         assignment: Assignment,
         *,
-        after_ts: Optional[float] = None,
+        after_ts: float | None = None,
         timeout: float = 60.0,
         poll_interval: float = 2.0,
-    ) -> Optional[str]:
+    ) -> str | None:
         self.polled_assignments.append(assignment.assignment_id)
         return f"OTP-{assignment.inventory_id}"
     

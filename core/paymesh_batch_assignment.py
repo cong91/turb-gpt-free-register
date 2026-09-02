@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 from core.app_state_db import APP_STATE_DB_PATH

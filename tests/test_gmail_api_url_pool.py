@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Gmail API URL 邮箱池 DB 层单元测试。"""
 import unittest
 from unittest.mock import patch

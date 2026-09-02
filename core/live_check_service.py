@@ -1,12 +1,9 @@
-# -*- coding: utf-8 -*-
 """账号查活后台队列：协议 BrowserSession 指纹环境 + 独立日志。"""
 from __future__ import annotations
 
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
-from pathlib import Path
 
 from core import db
 from core.account_liveness import check_account_liveness, log_path
@@ -17,6 +14,7 @@ from core.rotating_proxy_runtime import (
     release_rotating_proxy,
     resolve_rotating_proxy,
 )
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +49,7 @@ def is_checking(email: str) -> bool:
 def _append_log(email: str, line: str, *, clear: bool = False) -> None:
     p = log_path(email)
     p.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%H:%M:%S")
+    stamp = local_now().strftime("%H:%M:%S")
     mode = "w" if clear else "a"
     with p.open(mode, encoding="utf-8") as f:
         f.write(f"{stamp} [INFO] {line}\n")
@@ -86,7 +84,7 @@ def _run_live_check(
         # 内存中存在，服务重启后按当前 EMAIL_SOURCE 推断会把来源判错。
         try:
             account = db.get_account(account_id) or {}
-        except Exception:
+        except Exception:  # noqa: BLE001
             account = {}
         email_source = str(account.get("email_source") or "").strip() or None
         if email_source:
@@ -139,7 +137,7 @@ def _run_live_check(
         result = {
             "ok": False,
             "status": "failed",
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "checked_at": local_now().isoformat(timespec="seconds"),
             "error": f"{type(exc).__name__}: {str(exc)[:500]}",
         }
         try:
@@ -149,7 +147,7 @@ def _run_live_check(
         logger.exception("[查活] 后台异常: %s", email)
         try:
             _append_log(email, f"[查活] 后台异常：{result['error']}")
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return result
     finally:
@@ -193,12 +191,12 @@ def enqueue_account_live_check(
             trigger=str(trigger or "manual"),
             proxy_lane_id=proxy_lane_id,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         _QUEUE_SLOTS.release()
         result = {
             "ok": False,
             "status": "failed",
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "checked_at": local_now().isoformat(timespec="seconds"),
             "error": f"查活入队失败: {type(exc).__name__}: {str(exc)[:160]}",
         }
         db.update_account_liveness(account_id, result)

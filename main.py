@@ -6,8 +6,8 @@ import argparse
 import logging
 import sys
 import time
+from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Callable
 
 from config import REGISTER_EMAIL, REGISTER_NAME  # 这两个一般不在 WebUI 改
 from config import email as _email_cfg
@@ -26,7 +26,7 @@ from core.account_export import (
     setup_2fa_for_registration,
 )
 from core.chatgpt_auth import get_csrf_token, get_providers, signin_openai
-from core.email_provider import acquire_email, wait_for_otp
+from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
 from core.name_samples import random_display_name
 from core.openai_auth import (
@@ -136,18 +136,19 @@ def prepare_registration_inputs() -> tuple[str | None, str, str]:
 
     # 邮箱：自动模式下先留空；浏览器驱动会在页面找到邮箱输入框后领取，
     # protocol 驱动会在 run_registration 开始认证前领取。
-    if not email:
-        if not _email_cfg.USE_EMAIL_SERVICE:
-            email = input("请输入注册邮箱: ").strip()
+    if not email and not _email_cfg.USE_EMAIL_SERVICE:
+        email = input("请输入注册邮箱: ").strip()
 
     # 显示名称：未填则随机生成
     # OpenAI 限制：name_invalid_chars —— 只允许字母和空格，不能含数字/标点
     if not name:
+        name = (
+            generate_display_name()
+            if _email_cfg.USE_EMAIL_SERVICE
+            else input("请输入显示名称: ").strip()
+        )
         if _email_cfg.USE_EMAIL_SERVICE:
-            name = generate_display_name()
             logger.debug(f"自动生成显示名称: {name}")
-        else:
-            name = input("请输入显示名称: ").strip()
 
     if not name:
         raise RuntimeError("显示名称不能为空")
@@ -166,6 +167,7 @@ def run_registration(
     batch_dir=None,
     proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
+    on_email_acquired: Callable[[str], None] | None = None,
 ):
     """Run registration while retaining its rotating-proxy lane until TTL expiry."""
     from core.rotating_proxy_runtime import (
@@ -189,6 +191,7 @@ def run_registration(
             batch_dir=batch_dir,
             proxy_lane_id=proxy_lane_id,
             lease_owner_id=lease_owner_id,
+            on_email_acquired=on_email_acquired,
         )
     finally:
         if proxy is None and active_proxy is not None:
@@ -208,6 +211,7 @@ def _run_registration_impl(
     batch_dir=None,
     proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
+    on_email_acquired: Callable[[str], None] | None = None,
 ):
     """
     执行完整的 ChatGPT 注册流程。
@@ -276,6 +280,7 @@ def _run_registration_impl(
                 proxy=proxy,
                 otp_code=otp_code,
                 batch_dir=batch_dir,
+                on_email_acquired=on_email_acquired,
             )
 
         from core.nordvpn_wireguard import proxy_for_registration
@@ -293,6 +298,7 @@ def _run_registration_impl(
                 proxy=nordvpn_proxy,
                 otp_code=otp_code,
                 batch_dir=batch_dir,
+                on_email_acquired=on_email_acquired,
             )
     if driver_mode in ("browser_use", "browseruse", "browser-use", "bu"):
         from core.browser_use_registration import run_browser_use_registration
@@ -344,6 +350,7 @@ def _run_registration_impl(
                     otp_code=otp_code,
                     batch_dir=batch_dir,
                     lease_owner_id=lease_owner_id,
+                    on_email_acquired=on_email_acquired,
                 )
 
     # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）

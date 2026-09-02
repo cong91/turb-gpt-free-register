@@ -1,9 +1,8 @@
-# -*- coding: utf-8 -*-
 """Skyvern 云端浏览器注册入口。"""
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from core.browser_use_registration import run_browser_use_registration
 

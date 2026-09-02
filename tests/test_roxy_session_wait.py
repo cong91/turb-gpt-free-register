@@ -17,9 +17,8 @@ class RoxySessionWaitTests(unittest.TestCase):
             roxy_registration,
             "_check_manual_stop",
             side_effect=registration_service.StopRequested("stop requested"),
-        ):
-            with self.assertRaises(registration_service.StopRequested):
-                roxy_registration._fetch_chatgpt_session(driver, timeout=120)
+        ), self.assertRaises(registration_service.StopRequested):
+            roxy_registration._fetch_chatgpt_session(driver, timeout=120)
 
 
 if __name__ == "__main__":

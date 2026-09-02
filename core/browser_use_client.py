@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Browser Use Cloud 客户端：构建 CDP 连接并管理 Playwright 生命周期。"""
 from __future__ import annotations
 
@@ -128,12 +127,12 @@ class BrowserUseClient:
         )
         try:
             data = response.json()
-        except Exception:
+        except Exception:  # noqa: BLE001
             data = {"text": str(getattr(response, "text", ""))[:1000]}
         if response.status_code >= 400:
             raise RuntimeError(f"Browser Use create browser HTTP {response.status_code}: {data}")
         if not isinstance(data, dict):
-            raise RuntimeError(f"Browser Use create browser 响应不是对象: {data!r}")
+            raise TypeError(f"Browser Use create browser 响应不是对象: {data!r}")
         connect_url = str(data.get("cdpUrl") or data.get("cdp_url") or data.get("connect_url") or "").strip()
         if not connect_url:
             raise RuntimeError(f"Browser Use create browser 响应缺少 cdpUrl: {data}")

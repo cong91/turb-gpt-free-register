@@ -347,20 +347,21 @@ def _release_unconsumed_job_email(
     reason: str,
     *,
     discard_on_failure: bool = False,
-) -> None:
+) -> bool:
     """任务结束时回收邮箱；真正注册失败时废弃 Gmail API/QAN8 alias。"""
     if not email:
-        return
+        return False
     try:
         from core.email_provider import release_email_if_unconsumed
 
-        release_email_if_unconsumed(
+        return bool(release_email_if_unconsumed(
             email,
             note=f"任务未消耗，已自动回收: {reason[:180]}",
             discard_on_failure=discard_on_failure,
-        )
+        ))
     except Exception:
         logger.exception("[Service] 回收未消耗邮箱失败: %s", email)
+        return False
 
 
 def quarantine_provider_lane(
@@ -817,43 +818,67 @@ class _JobLogContext:
             logging.getLogger().removeHandler(self.handler)
 
 
-def _run_local_test_job(job_id: int, log_file: str, email: str) -> None:
-    """Complete a persisted local dry-run without touching live registration paths."""
-    log_logger = logging.getLogger(__name__)
+def _registration_auto_retry_limit() -> int:
+    """Read the live retry limit while keeping a hard operational bound."""
+    from config import register as _register_cfg
+
     try:
-        if not email:
-            raise ValueError("Local test job thiếu alias đã persist")
-        with _JobLogContext(log_file):
-            check_stop_requested()
-            log_logger.info(
-                "[Job %s] Local test dry-run: alias=%s; external providers disabled",
-                job_id,
-                email,
-            )
-            check_stop_requested()
-            db.update_job(
-                job_id,
-                status="success",
-                email=email,
-                completed_at=_local_now().isoformat(timespec="seconds"),
-            )
-            log_logger.info("[Job %s] Local test dry-run completed", job_id)
-    except StopRequested as exc:
-        log_logger.warning("[Job %s] Local test stopped: %s", job_id, exc)
-        db.update_job(
+        configured = int(getattr(_register_cfg, "REGISTRATION_AUTO_RETRY_ATTEMPTS", 1) or 0)
+    except (TypeError, ValueError):
+        configured = 1
+    return min(3, max(0, configured))
+
+
+def _queue_transient_registration_retry(job_id: int, error: object) -> dict | None:
+    """Queue a fresh registration job only after a terminal failed job is durable."""
+    if is_stop_requested(job_id):
+        return None
+    source = db.get_job(job_id)
+    if source is None or source.get("status") != "failed" or _account_for_job(source):
+        return None
+
+    from core.registration_retry_policy import should_auto_retry_registration_failure
+
+    if not should_auto_retry_registration_failure(
+        error,
+        retry_attempt=int(source.get("retry_attempt") or 0),
+        max_attempts=_registration_auto_retry_limit(),
+    ):
+        return None
+
+    result = retry_job(job_id)
+    if result.get("ok"):
+        next_job = (result.get("job") or {}).get("id")
+        logger.warning(
+            "[Job %s] 临时注册失败，已创建新任务 #%s: %s",
             job_id,
-            status="stopped",
-            error="用户手动停止",
-            completed_at=_local_now().isoformat(timespec="seconds"),
+            next_job,
+            str(error)[:180],
         )
-    except Exception as exc:
-        log_logger.exception("[Job %s] Local test failed", job_id)
-        db.update_job(
+    else:
+        logger.warning(
+            "[Job %s] 临时注册失败，但自动重试未创建: %s",
             job_id,
-            status="failed",
-            error=f"{type(exc).__name__}: {exc}"[:500],
-            completed_at=_local_now().isoformat(timespec="seconds"),
+            str(result.get("error") or "unknown")[:180],
         )
+    return result
+
+
+def _registration_cleanup_allows_retry(job_id: int, cleanup_succeeded: bool) -> bool:
+    """Confirm the old QAN8 assignment is terminal before creating a new job."""
+    if cleanup_succeeded:
+        return True
+    source = db.get_job(job_id) or {}
+    if str(source.get("email_source") or "").strip().lower() != "qan8_gmail_api":
+        return False
+    try:
+        from core.qan8_gmail_api_store import Qan8GmailApiStore
+
+        assignment = Qan8GmailApiStore().get_assignment(job_id)
+    except Exception:
+        logger.exception("[Job %s] 无法确认 QAN8 assignment 是否已终态", job_id)
+        return False
+    return assignment is None or str(assignment.get("state") or "").lower() != "active"
 
 
 def _run_one_job(job_id: int, log_file: str) -> None:
@@ -878,20 +903,19 @@ def _run_one_job(job_id: int, log_file: str) -> None:
         _deactivate_job(job_id)
         _notify_sub2api_automation_job(job_id)
         return
+    if current.get("job_type") == "local_test":
+        db.update_job(
+            job_id,
+            status="cancelled",
+            error="本地测试功能已移除",
+            completed_at=_local_now().isoformat(timespec="seconds"),
+        )
+        log_logger.info(f"[Job {job_id}] 已取消已移除的本地测试任务")
+        _deactivate_job(job_id)
+        _notify_sub2api_automation_job(job_id)
+        return
 
     db.update_job(job_id, status="running", started_at=_local_now().isoformat(timespec="seconds"))
-
-    if str(current.get("job_type") or "registration") == "local_test":
-        try:
-            _run_local_test_job(
-                job_id,
-                log_file,
-                str(current.get("email") or "").strip(),
-            )
-        finally:
-            _deactivate_job(job_id)
-            _notify_sub2api_automation_job(job_id)
-        return
 
     email: str | None = None
     try:
@@ -986,10 +1010,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     (result or {}).get("account_id")
                     and str((result or {}).get("twofa_status") or "").lower() in {"pending", "failed"}
                 ) if isinstance(result, dict) else False
+                alias_discarded = False
                 if not recoverable_twofa and _should_disable_failed_registration_email(err):
                     _disable_job_email(email_to_handle, str(err))
                 elif not recoverable_twofa:
-                    _release_unconsumed_job_email(
+                    alias_discarded = _release_unconsumed_job_email(
                         email_to_handle,
                         str(err),
                         discard_on_failure=True,
@@ -1001,6 +1026,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                         job_id,
                         (result or {}).get("account_id"),
                     )
+                if (
+                    not recoverable_twofa
+                    and _registration_cleanup_allows_retry(job_id, alias_discarded)
+                ):
+                    _queue_transient_registration_retry(job_id, err)
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
     except StopRequested as exc:
         linked_account = _account_for_job(db.get_job(job_id) or {})
@@ -1028,10 +1058,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             linked_account
             and str(linked_account.get("twofa_status") or "").lower() in {"pending", "failed"}
         )
+        alias_discarded = False
         if not recoverable_twofa and _should_disable_failed_registration_email(err_text):
             _disable_job_email(email, err_text)
         elif not recoverable_twofa:
-            _release_unconsumed_job_email(
+            alias_discarded = _release_unconsumed_job_email(
                 email,
                 err_text,
                 discard_on_failure=not is_stop_requested(job_id),
@@ -1058,6 +1089,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             error=f"{type(exc).__name__}: {exc}"[:500],
             completed_at=_local_now().isoformat(timespec="seconds"),
         )
+        if (
+            not recoverable_twofa
+            and _registration_cleanup_allows_retry(job_id, alias_discarded)
+        ):
+            _queue_transient_registration_retry(job_id, err_text)
     finally:
         _deactivate_job(job_id)
         _notify_sub2api_automation_job(job_id)
@@ -1515,44 +1551,6 @@ def submit_registration(
     return jobs
 
 
-def submit_local_test_registration(
-    aliases: list[str],
-    workers: int | None = None,
-) -> list[dict]:
-    """Create persisted local dry-run jobs without provider or registration context."""
-    values = [str(alias or "").strip().lower() for alias in aliases if str(alias or "").strip()]
-    if not values:
-        raise ValueError("Local test aliases không được để trống")
-
-    with _executor_lock:
-        executor = get_executor(max_workers=workers)
-        effective_workers = get_executor_workers()
-        jobs = []
-        for alias in values:
-            job = db.create_job(
-                email_source="reserved_test",
-                job_type="local_test",
-                email=alias,
-            )
-            try:
-                executor.submit(_run_one_job, job["id"], job["log_file"])
-            except Exception as exc:
-                db.update_job(
-                    int(job["id"]),
-                    status="failed",
-                    error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
-                    completed_at=_local_now().isoformat(timespec="seconds"),
-                )
-                logger.exception("[Service] Local test job #%s 提交线程池失败", job["id"])
-            jobs.append(db.get_job(int(job["id"])) or job)
-    logger.info(
-        "[Service] 已提交 %s 个 local test dry-run 任务，workers=%s",
-        len(jobs),
-        effective_workers,
-    )
-    return jobs
-
-
 def _account_for_job(job: dict) -> dict | None:
     account_id = job.get("account_id")
     if account_id is not None:
@@ -1632,10 +1630,6 @@ def get_retry_info(job: dict) -> dict:
     }
     if status not in ("failed", "stopped", "cancelled"):
         return info
-    if str(job.get("job_type") or "registration") == "local_test":
-        info["retry_reason"] = "Local test dry-run không hỗ trợ retry"
-        return info
-
     successful_retry = db.get_successful_retry_for_job(int(job.get("id") or 0))
     if successful_retry is not None:
         info["retry_reason"] = f"后续重试任务 #{successful_retry.get('id')} 已成功"
@@ -1949,11 +1943,10 @@ def request_stop_job(job_id: int) -> dict:
                 completed_at=now_iso,
                 error="用户手动停止（任务实例不存在）",
             )
-            if str(job.get("job_type") or "registration") != "local_test":
-                _release_unconsumed_job_email(
-                    str(job.get("email") or "").strip() or None,
-                    "任务实例不存在，确认未继续执行",
-                )
+            _release_unconsumed_job_email(
+                str(job.get("email") or "").strip() or None,
+                "任务实例不存在，确认未继续执行",
+            )
             _append_job_log(
                 job_id,
                 "用户手动停止：未找到运行中的任务实例，已直接标记为已停止。",

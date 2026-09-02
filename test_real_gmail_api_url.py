@@ -1,9 +1,7 @@
-# -*- coding: utf-8 -*-
 """
 Test THẬT với email/URL do user cung cấp.
 KHÔNG chạy full registration - chỉ test phần Gmail API URL polling.
 """
-import json
 import sys
 import warnings
 from pathlib import Path
@@ -12,15 +10,14 @@ warnings.filterwarnings("ignore")  # bỏ SSL warning
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests
-from core import db
-from core import email_provider
+
+from core import db, email_provider
 from core.gmail_api_url_client import (
     GmailApiUrlAccount,
-    poll_verification_code,
-    pick_account,
-    get_account_context,
-    release_account,
     GmailApiUrlError,
+    pick_account,
+    poll_verification_code,
+    release_account,
 )
 
 EMAIL    = "willjacob6442@gmail.com"
@@ -84,7 +81,7 @@ def step_2_import():
     print(f"Skipped  : {skipped}")
 
     row = db.get_gmail_api_url_email_by_email(EMAIL)
-    print(f"\nDB row:")
+    print("\nDB row:")
     print(f"  email   = {row['email']}")
     print(f"  code_url = {row['code_url'][:60]}...")
     print(f"  status  = {row['status']}")
@@ -235,7 +232,7 @@ def main():
     except AssertionError as e:
         print(f"\n❌ ASSERTION FAILED: {e}")
         results.append(("Assertion error", False))
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         print(f"\n❌ UNEXPECTED ERROR: {type(e).__name__}: {e}")
         import traceback
         traceback.print_exc()
@@ -245,12 +242,12 @@ def main():
         try:
             step_6_release(api_code if 'api_code' in dir() else 0)
             results.append(("Release", True))
-        except Exception as e:
+        except Exception:  # noqa: BLE001
             results.append(("Release", False))
         try:
             step_7_cleanup()
             results.append(("Cleanup", True))
-        except Exception as e:
+        except Exception:  # noqa: BLE001
             results.append(("Cleanup", False))
 
     # Final report

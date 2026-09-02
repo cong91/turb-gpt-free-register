@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """MailNest/迈巢临时邮箱客户端。"""
 from __future__ import annotations
 
@@ -194,7 +193,7 @@ def fetch_latest_otp(
                 return best_otp
         except MailNestClientError as exc:
             last_error = str(exc)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             last_error = f"{type(exc).__name__}: {exc}"
 
         remaining = deadline - time.monotonic()

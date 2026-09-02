@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import hashlib
 import json
 import tempfile
@@ -142,13 +141,12 @@ class RoxyProfileSnapshotTests(unittest.TestCase):
         with patch(
             "core.roxy_profile_snapshot._source_fingerprint",
             side_effect=[before, after],
-        ):
-            with self.assertRaisesRegex(RoxyProfileSnapshotError, "source changed"):
-                create_snapshot(
-                    self.root / "source",
-                    self.root / "changed.zip",
-                    max_bytes=1024 * 1024,
-                )
+        ), self.assertRaisesRegex(RoxyProfileSnapshotError, "source changed"):
+            create_snapshot(
+                self.root / "source",
+                self.root / "changed.zip",
+                max_bytes=1024 * 1024,
+            )
         self.assertFalse((self.root / "changed.zip").exists())
 
     def test_symlink_is_rejected(self):

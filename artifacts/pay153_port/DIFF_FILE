@@ -1,0 +1,595 @@
+PAY.153 selector/provider port diff snapshot. The working-tree diff below is the original port snapshot; current provider modules are listed in VERIFICATION.txt and remain present under core/pay153_*.py.
+
+diff --git a/.env.example b/.env.example
+index c8e368a..e6bebaf 100644
+--- a/.env.example
++++ b/.env.example
+@@ -187,6 +187,18 @@ GMAIL_123452026_ACCOUNTS_PER_CDK=6
+ # Gmail CDK provider dùng HTTP theo contract hiện tại; field này giữ để tương thích config cũ, không cần bật thủ công
+ GMAIL_123452026_ALLOW_INSECURE_HTTP=True
+ PAYMESH_API_BASE=https://sms.paymesh.cn
++# 提链后端：auto=有 API/CDK 时走远程，否则使用本地 PAY.153 access-token checkout；也可填 local/remote
++EXTRACT_LINK_MODE=auto
++EXTRACT_LINK_API_BASE=
++EXTRACT_LINK_CDK=
++EXTRACT_LINK_TYPE=pix
++EXTRACT_LINK_LOCAL_BILLING_COUNTRY=PH
++EXTRACT_LINK_LOCAL_CURRENCY=PHP
++EXTRACT_LINK_LOCAL_PLAN_NAME=chatgptplusplan
++EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID=plus-1-month-free
++EXTRACT_LINK_LOCAL_APPLY_PROMO=True
++EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS=3
++EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS=3
+ # 单次 Paymesh HTTP 请求超时，不是 OTP 总等待时长
+ PAYMESH_REQUEST_TIMEOUT=30
+ # 每轮等待 Paymesh OTP 的最长秒数；Roxy 最多尝试 3 轮
+diff --git a/config/extract_link.py b/config/extract_link.py
+index 18a5683..a52272c 100644
+--- a/config/extract_link.py
++++ b/config/extract_link.py
+@@ -5,10 +5,15 @@ from config.env_loader import apply_env_overrides
+ # 提链服务地址
+ EXTRACT_LINK_API_BASE: str = ""
+ 
++# 提链后端：auto 在未配置 API/CDK 时使用本地 PAY.153 checkout 提链器。
++# 可选 auto / remote / local。
++EXTRACT_LINK_MODE: str = "auto"
++
+ # 提链 CDK；创建任务和监听事件都需要。
+ EXTRACT_LINK_CDK: str = ""
+ 
+-# 提链类型：pix / upi / kakao_pay / ideal
++# 提链类型：pix / upi / kakao_pay / ideal / ph_short。
++# ph_short 是本地 PAY.153 access-token Checkout short link。
+ EXTRACT_LINK_TYPE: str = "pix"
+ 
+ # 后台提链并发与超时
+@@ -17,12 +22,29 @@ EXTRACT_LINK_QUEUE_LIMIT: int = 500
+ EXTRACT_LINK_REQUEST_TIMEOUT: int = 30
+ EXTRACT_LINK_EVENT_TIMEOUT: int = 180
+ 
++# 本地 checkout 提链默认沿用 PAY.153 的首月免费参数。
++EXTRACT_LINK_LOCAL_BILLING_COUNTRY: str = "PH"
++EXTRACT_LINK_LOCAL_CURRENCY: str = "PHP"
++EXTRACT_LINK_LOCAL_PLAN_NAME: str = "chatgptplusplan"
++EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID: str = "plus-1-month-free"
++EXTRACT_LINK_LOCAL_APPLY_PROMO: bool = True
++EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS: int = 3
++EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS: int = 3
++
+ apply_env_overrides(globals(), {
+     'EXTRACT_LINK_API_BASE': 'str',
++    'EXTRACT_LINK_MODE': 'str',
+     'EXTRACT_LINK_CDK': 'str',
+     'EXTRACT_LINK_TYPE': 'str',
+     'EXTRACT_LINK_WORKERS': 'int',
+     'EXTRACT_LINK_QUEUE_LIMIT': 'int',
+     'EXTRACT_LINK_REQUEST_TIMEOUT': 'int',
+     'EXTRACT_LINK_EVENT_TIMEOUT': 'int',
++    'EXTRACT_LINK_LOCAL_BILLING_COUNTRY': 'str',
++    'EXTRACT_LINK_LOCAL_CURRENCY': 'str',
++    'EXTRACT_LINK_LOCAL_PLAN_NAME': 'str',
++    'EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID': 'str',
++    'EXTRACT_LINK_LOCAL_APPLY_PROMO': 'bool',
++    'EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS': 'int',
++    'EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS': 'int',
+ })
+diff --git a/core/extract_link_service.py b/core/extract_link_service.py
+index 5cdfd87..7126b96 100644
+--- a/core/extract_link_service.py
++++ b/core/extract_link_service.py
+@@ -52,13 +52,23 @@ def _int_setting(name: str, default: int, lower: int, upper: int) -> int:
+     return max(lower, min(upper, value))
+ 
+ 
+-SUPPORTED_LINK_TYPES = {"pix", "upi", "kakao_pay", "ideal"}
++SUPPORTED_LINK_TYPES = {"pix", "upi", "kakao_pay", "ideal", "ph_short"}
++
++
++def _mode() -> str:
++    """Select the local PAY.153 extractor or the legacy remote service."""
++    value = str(_runtime_setting("EXTRACT_LINK_MODE", "auto") or "auto").strip().lower()
++    if value not in {"auto", "remote", "local"}:
++        raise ValueError("EXTRACT_LINK_MODE 无效，仅支持 auto / remote / local")
++    if value == "auto":
++        return "remote" if str(_runtime_setting("EXTRACT_LINK_API_BASE", "") or "").strip() and str(_runtime_setting("EXTRACT_LINK_CDK", "") or "").strip() else "local"
++    return value
+ 
+ 
+ def _link_type(value: str | None = None) -> str:
+     t = str(value or _runtime_setting("EXTRACT_LINK_TYPE", "pix") or "pix").strip().lower()
+     if t not in SUPPORTED_LINK_TYPES:
+-        raise ValueError("提链类型无效，仅支持 pix / upi / kakao_pay / ideal")
++        raise ValueError("提链类型无效，仅支持 pix / upi / kakao_pay / ideal / ph_short")
+     return t
+ 
+ 
+@@ -76,6 +86,75 @@ def _cdk(value: str | None = None) -> str:
+     return cdk
+ 
+ 
++def _run_local_checkout(
++    *, token: str, link_type: str, proxy: str | None, log,
++) -> dict:
++    """Run PAY.153's direct access-token checkout flow and normalize its result."""
++    from uuid import uuid4
++    from core.pay153_checkout_extractor import CheckoutExtractor, ExtractorConfig, parse_credentials
++
++    country = str(_runtime_setting("EXTRACT_LINK_LOCAL_BILLING_COUNTRY", "PH") or "PH").strip().upper()
++    currency = str(_runtime_setting("EXTRACT_LINK_LOCAL_CURRENCY", "PHP") or "PHP").strip().upper()
++    config = ExtractorConfig(
++        billing_country=country,
++        currency=currency,
++        checkout_proxy=str(proxy or ""),
++        update_proxy=str(proxy or ""),
++        plan_name=str(_runtime_setting("EXTRACT_LINK_LOCAL_PLAN_NAME", "chatgptplusplan") or "chatgptplusplan"),
++        promo_campaign_id=str(_runtime_setting("EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID", "plus-1-month-free") or "plus-1-month-free"),
++        apply_promo=str(_runtime_setting("EXTRACT_LINK_LOCAL_APPLY_PROMO", "true")).strip().lower() in {"1", "true", "yes", "on"},
++        verify_proxy_country=False,
++        checkout_attempts=_int_setting("EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS", 3, 1, 10),
++        update_attempts=_int_setting("EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS", 3, 1, 10),
++        full_attempts=1,
++        timeout=float(_int_setting("EXTRACT_LINK_REQUEST_TIMEOUT", 30, 5, 300)),
++    )
++    messages: list[str] = []
++    extractor = CheckoutExtractor(
++        parse_credentials(token),
++        config=config,
++        logger=lambda message: (messages.append(str(message)[:300]), log(str(message)[:300]))[-1],
++    )
++    result = extractor.extract()
++    payload = {
++        "long_url": result.long_url,
++        "copy_paste": result.long_url,
++        "payment_method": "ph_short",
++        "payment_link_type": "ph_short",
++        "expires_at": None,
++        "checkout_session_id": result.cs_id,
++        "processor_entity": result.processor_entity,
++        "billing_country": result.billing_country,
++        "currency": result.currency,
++        "amount_verification": result.amount_verification,
++        "amount_minor": result.amount_minor,
++        "amount_currency": result.amount_currency,
++        "extractor": "pay153_direct",
++    }
++    return {
++        "ok": True,
++        "status": "success",
++        "job_id": f"local-{uuid4()}",
++        "link_type": "ph_short",
++        "requested_link_type": link_type,
++        "result": payload,
++        "logs": messages,
++    }
++
++
++def backend_status() -> dict:
++    """Return non-secret status for the active extraction backend."""
++    mode = _mode()
++    return {
++        "mode": mode,
++        "local": mode == "local",
++        "remote_configured": bool(
++            str(_runtime_setting("EXTRACT_LINK_API_BASE", "") or "").strip()
++            and str(_runtime_setting("EXTRACT_LINK_CDK", "") or "").strip()
++        ),
++    }
++
++
+ _WORKERS = _int_setting("EXTRACT_LINK_WORKERS", 3, 1, 16)
+ _QUEUE_LIMIT = _int_setting("EXTRACT_LINK_QUEUE_LIMIT", 500, _WORKERS, 5000)
+ _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="extract-link")
+@@ -387,6 +466,27 @@ def _run_extract(
+         )
+         if proxy is None:
+             rotating_proxy = active_proxy
++        if _mode() == "local":
++            if link_type != "ph_short":
++                raise RuntimeError(
++                    "本地 PAY.153 提链器只生成 ph_short Checkout 链接；"
++                    "请把 EXTRACT_LINK_TYPE 设为 ph_short，或配置远程提链服务获取 PIX/UPI/Kakao/iDEAL"
++                )
++            final = _run_local_checkout(
++                token=access_token,
++                link_type=link_type,
++                proxy=active_proxy,
++                log=lambda message: db.update_account_extract(account_id, {
++                    "ok": False,
++                    "status": "running",
++                    "link_type": link_type,
++                    "message": str(message)[:300],
++                }),
++            )
++            db.update_account_extract(account_id, final)
++            logger.info("[提链] 本地 PAY.153 成功: %s type=%s", email, link_type)
++            return final
++
+         job = _create_extract_job(
+             token=access_token,
+             link_type=link_type,
+@@ -468,8 +568,22 @@ def enqueue_account_extract(
+     if not _QUEUE_SLOTS.acquire(blocking=False):
+         return {"accepted": False, "busy": False, "error": "提链队列已满"}
+     try:
+-        lt = _link_type(link_type)
+-        code = _cdk(cdk)
++        mode = _mode()
++        # Preserve the historic PIX default for remote mode while making a
++        # fresh local install usable without requiring an extra UI selection.
++        requested_link_type = link_type
++        if mode == "local" and not str(requested_link_type or "").strip():
++            configured = str(_runtime_setting("EXTRACT_LINK_TYPE", "pix") or "pix").strip().lower()
++            requested_link_type = "ph_short" if configured == "pix" else configured
++        lt = _link_type(requested_link_type)
++        if mode == "local" and lt != "ph_short":
++            raise ValueError(
++                "本地 PAY.153 提链器只生成 ph_short Checkout 链接；"
++                "请把 EXTRACT_LINK_TYPE 设为 ph_short，或配置远程提链服务获取 PIX/UPI/Kakao/iDEAL"
++            )
++        if mode == "remote" and lt == "ph_short":
++            raise ValueError("ph_short 仅支持本地 PAY.153 提链模式")
++        code = _cdk(cdk) if mode == "remote" else ""
+         if not db.claim_account_extract(account_id, trigger=trigger, link_type=lt):
+             _QUEUE_SLOTS.release()
+             return {"accepted": False, "busy": True, "error": "该账号正在提链中"}
+@@ -485,7 +599,7 @@ def enqueue_account_extract(
+             proxy=proxy,
+             proxy_lane_id=proxy_lane_id,
+         )
+-        return {"accepted": True, "busy": False, "future": fut, "link_type": lt}
++        return {"accepted": True, "busy": False, "future": fut, "link_type": lt, "mode": mode}
+     except Exception:
+         _QUEUE_SLOTS.release()
+         raise
+diff --git a/tests/test_rotating_proxy.py b/tests/test_rotating_proxy.py
+index 9eda0bb..3f8ac50 100644
+--- a/tests/test_rotating_proxy.py
++++ b/tests/test_rotating_proxy.py
+@@ -880,6 +880,7 @@ class RotatingProxyWorkflowRoutingTests(unittest.TestCase):
+         active_proxy = "http://203.0.113.71:8080"
+         with (
+             patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
++            patch.object(extract_link_service, "_mode", return_value="remote"),
+             patch.object(extract_link_service, "resolve_rotating_proxy", return_value=active_proxy) as resolve,
+             patch.object(extract_link_service, "_create_extract_job", return_value={"job_id": "job-2"}) as create,
+             patch.object(
+diff --git a/webui/app.py b/webui/app.py
+index 9b0734e..6f66f84 100644
+--- a/webui/app.py
++++ b/webui/app.py
+@@ -1133,12 +1133,23 @@ def create_app(auth_code: str | None = None) -> Flask:
+     @app.get("/api/extract-link/cdk")
+     def api_extract_link_cdk():
+         """查询当前配置或传入 CDK 的剩余次数。"""
+-        code = (request.args.get("code") or "").strip() or None
+         try:
++            backend = extract_link_service.backend_status()
++            if backend.get("mode") == "local":
++                return jsonify({"ok": True, **backend, "cdk_remaining": None})
++            code = (request.args.get("code") or "").strip() or None
+             return jsonify({"ok": True, **extract_link_service.query_cdk(cdk=code)})
+         except Exception as exc:
+             return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
+ 
++    @app.get("/api/extract-link/status")
++    def api_extract_link_status():
++        """Return active extraction backend without exposing credentials."""
++        try:
++            return jsonify({"ok": True, **extract_link_service.backend_status()})
++        except Exception as exc:
++            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
++
+     def _is_extract_eligible(acc: dict) -> bool:
+         plan = str(acc.get("current_plan_type") or acc.get("plan_type") or "").lower()
+         return plan == "free" and bool(acc.get("plus_trial_eligible"))
+diff --git a/webui/config_editor.py b/webui/config_editor.py
+index 95c00a0..7672195 100644
+--- a/webui/config_editor.py
++++ b/webui/config_editor.py
+@@ -696,6 +696,38 @@ EDITABLE_FIELDS = [
+         "label": "Độ trễ ngẫu nhiên của yêu cầu gói/Agent (giây)", "help": "Thêm độ trễ ngẫu nhiên vào khoảng tối thiểu giữa các yêu cầu kiểm tra gói và tạo Agent Token để tránh lịch gọi quá đều",
+     },
+     # ---- 提链 ----
++    {
++        "key": "EXTRACT_LINK_MODE", "file": "extract_link.py", "type": "str", "group": "提链",
++        "label": "提链后端模式", "help": "auto=有 API/CDK 用远程服务，否则使用本地 PAY.153 checkout；也可固定 local / remote",
++    },
++    {
++        "key": "EXTRACT_LINK_LOCAL_BILLING_COUNTRY", "file": "extract_link.py", "type": "str", "group": "提链",
++        "label": "本地 Checkout 账单国家", "help": "PAY.153 本地模式默认 PH",
++    },
++    {
++        "key": "EXTRACT_LINK_LOCAL_CURRENCY", "file": "extract_link.py", "type": "str", "group": "提链",
++        "label": "本地 Checkout 币种", "help": "PAY.153 本地模式默认 PHP",
++    },
++    {
++        "key": "EXTRACT_LINK_LOCAL_PLAN_NAME", "file": "extract_link.py", "type": "str", "group": "提链",
++        "label": "本地 Checkout 计划", "help": "默认 chatgptplusplan",
++    },
++    {
++        "key": "EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID", "file": "extract_link.py", "type": "str", "group": "提链",
++        "label": "本地 Checkout 优惠活动", "help": "默认 plus-1-month-free",
++    },
++    {
++        "key": "EXTRACT_LINK_LOCAL_APPLY_PROMO", "file": "extract_link.py", "type": "bool", "group": "提链",
++        "label": "本地 Checkout 应用优惠", "help": "验证首月免费金额为 0",
++    },
++    {
++        "key": "EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS", "file": "extract_link.py", "type": "int", "group": "提链",
++        "label": "本地 Checkout 重试次数", "help": "PAY.153 本地创建 Checkout 的最大尝试数，建议 1-3",
++    },
++    {
++        "key": "EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS", "file": "extract_link.py", "type": "int", "group": "提链",
++        "label": "本地优惠更新重试次数", "help": "PAY.153 本地更新优惠的最大尝试数，建议 1-3",
++    },
+     {
+         "key": "EXTRACT_LINK_API_BASE", "file": "extract_link.py", "type": "str", "group": "提链",
+         "label": "提链服务地址", "help": "填写提链服务 API 地址",
+@@ -707,7 +739,7 @@ EDITABLE_FIELDS = [
+     },
+     {
+         "key": "EXTRACT_LINK_TYPE", "file": "extract_link.py", "type": "str", "group": "提链",
+-        "label": "提链类型", "help": "支持 pix / upi / kakao_pay / ideal",
++        "label": "提链类型", "help": "支持 pix / upi / kakao_pay / ideal；本地 PAY.153 模式使用 ph_short",
+     },
+     {
+         "key": "EXTRACT_LINK_WORKERS", "file": "extract_link.py", "type": "int", "group": "提链",
+diff --git a/webui/templates/index.html b/webui/templates/index.html
+index ddf07f2..e656d5a 100644
+--- a/webui/templates/index.html
++++ b/webui/templates/index.html
+@@ -4044,7 +4044,7 @@ function _extractLinkAction(r) {
+   const eligible = plan === 'free' && !!r.plus_trial_eligible;
+   if (!eligible) return '';
+   const failedReason = s === 'failed' ? (r.extract_link_error || r.extract_link_message || '') : '';
+-  return `<button class="good" data-extract-link="${esc(r.id)}" title="${esc(failedReason ? '重新提链；上次失败原因：' + failedReason : '为该 free(可Plus试用) 账号创建 PIX/UPI/KAKAO_PAY/IDEAL 提链任务')}">提链</button>`;
++  return `<button class="good" data-extract-link="${esc(r.id)}" title="${esc(failedReason ? '重新提链；上次失败原因：' + failedReason : '按提链后端配置创建支付链接；本地 PAY.153 模式使用 ph_short')}">提链</button>`;
+ }
+ function _codexAction(r) {
+   const s = r.codex_status || '';
+@@ -5258,7 +5258,7 @@ async function extractOneLink(id, btn) {
+     showToast('仅支持 free(可Plus试用) 账号提链');
+     return;
+   }
+-  if (!confirm(`确定为该账号提链吗？\n\n${acc.email || ('#' + id)}\n\n提链类型按配置使用 PIX/UPI/KAKAO_PAY/IDEAL，成功会消耗 1 次 CDK。`)) return;
++  if (!confirm(`确定为该账号提链吗？\n\n${acc.email || ('#' + id)}\n\n按当前配置生成支付/Checkout 链接；远程模式消耗 1 次 CDK，本地 PAY.153 模式直接使用 access token。`)) return;
+   const old = btn.textContent;
+   btn.disabled = true;
+   btn.textContent = '提链中…';
+@@ -5280,7 +5280,7 @@ async function extractOneLink(id, btn) {
+ async function extractSelectedLinks() {
+   const ids = await getAccountBulkIds();
+   if (ids.length === 0) { showToast('请先选择账号'); return; }
+-  if (!confirm(`确定在当前批量范围内提链 ${ids.length} 个账号吗？\n\n仅 free(可Plus试用) 账号会执行，其余由服务端自动跳过。成功会按账号消耗 CDK 次数。`)) return;
++  if (!confirm(`确定在当前批量范围内提链 ${ids.length} 个账号吗？\n\n仅 free(可Plus试用) 账号会执行，其余由服务端自动跳过。远程模式消耗 CDK，本地 PAY.153 模式直接使用 access token。`)) return;
+   const btn = $('#btnExtractSelectedLinksV2');
+   const old = btn.textContent;
+   btn.disabled = true;
+diff --git a/webui/templates/index_legacy.html b/webui/templates/index_legacy.html
+index 76384bf..e477c89 100644
+--- a/webui/templates/index_legacy.html
++++ b/webui/templates/index_legacy.html
+@@ -1466,7 +1466,7 @@ function _extractLinkAction(r) {
+   const eligible = plan === 'free' && !!r.plus_trial_eligible;
+   if (!eligible) return '';
+   const failedReason = s === 'failed' ? (r.extract_link_error || r.extract_link_message || '') : '';
+-  return `<button class="good" data-extract-link="${esc(r.id)}" title="${esc(failedReason ? '重新提链；上次失败原因：' + failedReason : '为该 free(可Plus试用) 账号创建 PIX/UPI/KAKAO_PAY/IDEAL 提链任务')}">提链</button>`;
++  return `<button class="good" data-extract-link="${esc(r.id)}" title="${esc(failedReason ? '重新提链；上次失败原因：' + failedReason : '按提链后端配置创建支付链接；本地 PAY.153 模式使用 ph_short')}">提链</button>`;
+ }
+ function _codexAction(r) {
+   const s = r.codex_status || '';
+@@ -2102,7 +2102,7 @@ async function extractOneLink(id, btn) {
+     showToast('仅支持 free(可Plus试用) 账号提链');
+     return;
+   }
+-  if (!confirm(`确定为该账号提链吗？\n\n${acc.email || ('#' + id)}\n\n提链类型按配置使用 PIX/UPI/KAKAO_PAY/IDEAL，成功会消耗 1 次 CDK。`)) return;
++  if (!confirm(`确定为该账号提链吗？\n\n${acc.email || ('#' + id)}\n\n按当前配置生成支付/Checkout 链接；远程模式消耗 1 次 CDK，本地 PAY.153 模式直接使用 access token。`)) return;
+   const old = btn.textContent;
+   btn.disabled = true;
+   btn.textContent = '提链中…';
+@@ -2127,7 +2127,7 @@ async function extractSelectedLinks() {
+   const selected = ids.map(id => ACCOUNTS.find(a => Number(a.id) === Number(id))).filter(Boolean);
+   const eligible = selected.filter(a => (a.current_plan_type || a.plan_type || '').toString().toLowerCase() === 'free' && !!a.plus_trial_eligible);
+   if (!eligible.length) { showToast('选中账号里没有 free(可Plus试用)'); return; }
+-  if (!confirm(`确定批量提链 ${eligible.length} 个 free(可Plus试用) 账号吗？\n\n非可试用账号会自动跳过。成功会按账号消耗 CDK 次数。`)) return;
++  if (!confirm(`确定批量提链 ${eligible.length} 个 free(可Plus试用) 账号吗？\n\n非可试用账号会自动跳过。远程模式消耗 CDK，本地 PAY.153 模式直接使用 access token。`)) return;
+   const btn = $('#btnExtractSelectedLinks');
+   const old = btn.textContent;
+   btn.disabled = true;
+
+===== core/pay153_checkout_extractor.py (source copy diff) =====
+warning: in the working copy of 'core\pay153_checkout_extractor.py', LF will be replaced by CRLF the next time Git touches it
+diff --git "a/C:\\Users\\mrc\\Documents\\projects\\pay153-checkout-link\\ph_short_extractor.py" "b/core\\pay153_checkout_extractor.py"
+index 340d809..267ad2a 100644
+--- "a/C:\\Users\\mrc\\Documents\\projects\\pay153-checkout-link\\ph_short_extractor.py"
++++ "b/core\\pay153_checkout_extractor.py"
+@@ -35,7 +35,10 @@ Use ``--credential-file -`` to read a token or session JSON from stdin.
+ from __future__ import annotations
+ 
+ import argparse
+-import fcntl
++try:
++    import fcntl
++except ImportError:  # Windows does not expose POSIX file locking.
++    fcntl = None  # type: ignore[assignment]
+ import getpass
+ import json
+ import os
+@@ -252,17 +255,19 @@ def persist_private_checkout_context(
+         "created_at": time.time(),
+         "source": "pay153_ph_short_extractor",
+     }
+-    target = Path(os.getenv("PH_SHORT_CONTEXT_PATH", "/opt/pay153/data/ph_short_contexts.jsonl"))
++    target = Path(os.getenv("TURB_PAY153_CONTEXT_PATH", str(Path(__file__).resolve().parent.parent / "data" / "pay153_checkout_contexts.jsonl")))
+     target.parent.mkdir(parents=True, exist_ok=True)
+     with target.open("a", encoding="utf-8", newline="\n") as handle:
+         try:
+-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
++            if fcntl is not None:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+         except Exception:
+             pass
+         handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+         handle.flush()
+         try:
+-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++            if fcntl is not None:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+         except Exception:
+             pass
+ 
+@@ -883,6 +888,12 @@ class CheckoutExtractor:
+     def _stage_proxies(self) -> tuple[str, str]:
+         checkout_proxy = normalize_proxy_url(self.config.checkout_proxy)
+         update_proxy = normalize_proxy_url(self.config.update_proxy)
++        if not checkout_proxy and not update_proxy and not (
++            str(self.config.cliproxy_host or "").strip()
++            and str(self.config.cliproxy_username or "").strip()
++            and str(self.config.cliproxy_password or "").strip()
++        ):
++            return "", ""
+         if not checkout_proxy:
+             checkout_proxy = cliproxy_proxy_url(
+                 self.config.cliproxy_host,
+@@ -1226,10 +1237,13 @@ class CheckoutExtractor:
+                     checkout_session, checkout, update_payload
+                 )
+                 self._require_customer_session(checkout_session, checkout)
+-                persist_private_checkout_context(
+-                    checkout_session, checkout, checkout_proxy,
+-                    self.device_id, self.chatgpt_session_id, self.config.user_agent,
+-                )
++                if str(os.getenv("TURB_PAY153_PERSIST_CONTEXT", "")).strip().lower() in {
++                    "1", "true", "yes", "on",
++                }:
++                    persist_private_checkout_context(
++                        checkout_session, checkout, checkout_proxy,
++                        self.device_id, self.chatgpt_session_id, self.config.user_agent,
++                    )
+                 return CheckoutResult(
+                     ok=True,
+                     long_url=checkout_short_url(
+
+===== tests/test_extract_link_local.py (new regression tests) =====
+diff --git a/tests/test_extract_link_local.py b/tests/test_extract_link_local.py
+new file mode 100644
+index 0000000..be5ce5a
+--- /dev/null
++++ b/tests/test_extract_link_local.py
+@@ -0,0 +1,114 @@
++# -*- coding: utf-8 -*-
++import unittest
++from types import SimpleNamespace
++from unittest.mock import patch
++
++from core import extract_link_service
++
++
++class LocalExtractLinkTests(unittest.TestCase):
++    def test_auto_mode_uses_local_without_remote_configuration(self):
++        with patch.object(extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: {
++            "EXTRACT_LINK_MODE": "auto",
++            "EXTRACT_LINK_API_BASE": "",
++            "EXTRACT_LINK_CDK": "",
++        }.get(name, default)):
++            self.assertEqual(extract_link_service._mode(), "local")
++
++    def test_auto_mode_uses_remote_with_api_and_cdk(self):
++        with patch.object(extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: {
++            "EXTRACT_LINK_MODE": "auto",
+warning: in the working copy of 'tests/test_extract_link_local.py', LF will be replaced by CRLF the next time Git touches it
++            "EXTRACT_LINK_API_BASE": "https://extract.example.test",
++            "EXTRACT_LINK_CDK": "test-cdk",
++        }.get(name, default)):
++            self.assertEqual(extract_link_service._mode(), "remote")
++
++    def test_local_checkout_maps_short_link_to_existing_result_contract(self):
++        fake_result = SimpleNamespace(
++            long_url="https://chatgpt.com/checkout/openai_ie/oaics_test",
++            cs_id="oaics_test",
++            processor_entity="openai_ie",
++            billing_country="PH",
++            currency="PHP",
++            amount_verification="verified_zero",
++            amount_minor=0,
++            amount_currency="PHP",
++        )
++        fake_extractor = SimpleNamespace(extract=lambda: fake_result)
++        settings = {
++            "EXTRACT_LINK_LOCAL_BILLING_COUNTRY": "PH",
++            "EXTRACT_LINK_LOCAL_CURRENCY": "PHP",
++            "EXTRACT_LINK_LOCAL_PLAN_NAME": "chatgptplusplan",
++            "EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID": "plus-1-month-free",
++            "EXTRACT_LINK_LOCAL_APPLY_PROMO": "true",
++            "EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS": "3",
++            "EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS": "3",
++            "EXTRACT_LINK_REQUEST_TIMEOUT": "30",
++        }
++        with patch.object(extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: settings.get(name, default)), patch(
++            "core.pay153_checkout_extractor.parse_credentials", return_value=SimpleNamespace()
++        ), patch("core.pay153_checkout_extractor.CheckoutExtractor", return_value=fake_extractor):
++            result = extract_link_service._run_local_checkout(
++                token="token", link_type="ph_short", proxy="http://127.0.0.1:8000", log=lambda _message: None,
++            )
++
++        self.assertTrue(result["ok"])
++        self.assertEqual(result["link_type"], "ph_short")
++        self.assertEqual(result["result"]["long_url"], fake_result.long_url)
++        self.assertEqual(result["result"]["copy_paste"], fake_result.long_url)
++        self.assertEqual(result["result"]["payment_method"], "ph_short")
++
++    def test_local_mode_rejects_payment_rail_without_remote_extractor(self):
++        with patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True), patch.object(
++            extract_link_service, "resolve_rotating_proxy", return_value=None
++        ), patch.object(extract_link_service, "_mode", return_value="local"), patch.object(
++            extract_link_service.db, "update_account_extract"
++        ) as update, patch.object(extract_link_service._QUEUE_SLOTS, "release"):
++            result = extract_link_service._run_extract(
++                account_id=1,
++                email="user@example.test",
++                access_token="token",
++                link_type="pix",
++                cdk="",
++                trigger="manual",
++            )
++
++        self.assertFalse(result["ok"])
++        self.assertIn("ph_short", result["error"])
++        self.assertTrue(update.called)
++
++    def test_enqueue_local_mode_does_not_require_cdk(self):
++        with patch.object(extract_link_service, "_mode", return_value="local"), patch.object(
++            extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: default
++        ), patch.object(extract_link_service.db, "claim_account_extract", return_value=True), patch.object(
++            extract_link_service, "_prepare_proxy_inventory"
++        ), patch.object(extract_link_service._EXECUTOR, "submit", return_value=SimpleNamespace()) as submit:
++            result = extract_link_service.enqueue_account_extract(
++                account_id=1,
++                email="user@example.test",
++                access_token="token",
++                link_type=None,
++            )
++
++        self.assertTrue(result["accepted"])
++        self.assertEqual(result["mode"], "local")
++        self.assertEqual(result["link_type"], "ph_short")
++        self.assertEqual(submit.call_args.kwargs["cdk"], "")
++
++    def test_enqueue_local_rejects_explicit_payment_rail_before_claim(self):
++        with patch.object(extract_link_service, "_mode", return_value="local"), patch.object(
++            extract_link_service.db, "claim_account_extract", return_value=True
++        ) as claim:
++            with self.assertRaisesRegex(ValueError, "ph_short"):
++                extract_link_service.enqueue_account_extract(
++                    account_id=1,
++                    email="user@example.test",
++                    access_token="token",
++                    link_type="pix",
++                )
++
++        claim.assert_not_called()
++
++
++if __name__ == "__main__":
++    unittest.main()

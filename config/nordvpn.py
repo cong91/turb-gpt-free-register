@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """NordVPN CLI configuration for local Windows NordVPN app control.
 
 Uses the NordVPN Windows desktop app's Command Prompt interface

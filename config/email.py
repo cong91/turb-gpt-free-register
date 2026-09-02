@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 邮箱服务配置。
 
@@ -7,8 +6,7 @@ Outlook 注册邮箱与 OTP 的默认池行为：
     2. 运行期间通过 WebUI「邮箱库」导入和管理邮箱
     3. 注册时直接从 SQLite 邮箱库领取可用邮箱
 """
-from config.env_loader import env_str, apply_env_overrides
-
+from config.env_loader import apply_env_overrides, env_str
 
 # True: REGISTER_EMAIL 留空时从 Outlook 账号池自动获取邮箱，OTP 自动收取
 # False: 走人工输入邮箱 + 人工填 OTP 的流程

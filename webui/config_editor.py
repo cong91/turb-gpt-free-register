@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 配置读写层（供 WebUI /api/config 使用）。
 
@@ -697,6 +696,38 @@ EDITABLE_FIELDS = [
     },
     # ---- 提链 ----
     {
+        "key": "EXTRACT_LINK_MODE", "file": "extract_link.py", "type": "str", "group": "提链",
+        "label": "提链后端模式", "help": "auto=本地 PAY.153 checkout（旋转代理）；仅显式 remote 才使用 API/CDK",
+    },
+    {
+        "key": "EXTRACT_LINK_LOCAL_BILLING_COUNTRY", "file": "extract_link.py", "type": "str", "group": "提链",
+        "label": "本地 Checkout 账单国家", "help": "PAY.153 本地模式默认 PH",
+    },
+    {
+        "key": "EXTRACT_LINK_LOCAL_CURRENCY", "file": "extract_link.py", "type": "str", "group": "提链",
+        "label": "本地 Checkout 币种", "help": "PAY.153 本地模式默认 PHP",
+    },
+    {
+        "key": "EXTRACT_LINK_LOCAL_PLAN_NAME", "file": "extract_link.py", "type": "str", "group": "提链",
+        "label": "本地 Checkout 计划", "help": "默认 chatgptplusplan",
+    },
+    {
+        "key": "EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID", "file": "extract_link.py", "type": "str", "group": "提链",
+        "label": "本地 Checkout 优惠活动", "help": "默认 plus-1-month-free",
+    },
+    {
+        "key": "EXTRACT_LINK_LOCAL_APPLY_PROMO", "file": "extract_link.py", "type": "bool", "group": "提链",
+        "label": "本地 Checkout 应用优惠", "help": "验证首月免费金额为 0",
+    },
+    {
+        "key": "EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS", "file": "extract_link.py", "type": "int", "group": "提链",
+        "label": "本地 Checkout 重试次数", "help": "PAY.153 本地创建 Checkout 的最大尝试数，建议 1-3",
+    },
+    {
+        "key": "EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS", "file": "extract_link.py", "type": "int", "group": "提链",
+        "label": "本地优惠更新重试次数", "help": "PAY.153 本地更新优惠的最大尝试数，建议 1-3",
+    },
+    {
         "key": "EXTRACT_LINK_API_BASE", "file": "extract_link.py", "type": "str", "group": "提链",
         "label": "提链服务地址", "help": "填写提链服务 API 地址",
     },
@@ -704,10 +735,6 @@ EDITABLE_FIELDS = [
         "key": "EXTRACT_LINK_CDK", "file": "extract_link.py", "type": "str", "group": "提链",
         "label": "提链 CDK", "help": "创建提链任务和监听任务事件使用；成功提链扣 1 次",
         "storage": "env", "secret": True,
-    },
-    {
-        "key": "EXTRACT_LINK_TYPE", "file": "extract_link.py", "type": "str", "group": "提链",
-        "label": "提链类型", "help": "支持 pix / upi / kakao_pay / ideal",
     },
     {
         "key": "EXTRACT_LINK_WORKERS", "file": "extract_link.py", "type": "int", "group": "提链",
@@ -997,7 +1024,7 @@ def _literal_default_from_expr(node):
     """
     try:
         return ast.literal_eval(node)
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
 
     if isinstance(node, ast.Call):
@@ -1012,7 +1039,7 @@ def _literal_default_from_expr(node):
             if len(node.args) >= 2:
                 try:
                     return ast.literal_eval(node.args[1])
-                except Exception:
+                except Exception:  # noqa: BLE001
                     return None
             return None
 
@@ -1020,7 +1047,7 @@ def _literal_default_from_expr(node):
         if func_name == "env_value" and len(node.args) >= 2:
             try:
                 return ast.literal_eval(node.args[1])
-            except Exception:
+            except Exception:  # noqa: BLE001
                 return None
 
     return None
@@ -1102,11 +1129,11 @@ def _coerce_raw_value(raw: str, fallback, vtype: str):
                 val = ast.literal_eval(text)
                 if isinstance(val, (list, tuple)):
                     return [str(x).strip() for x in val if str(x).strip()]
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             return [line.strip() for line in text.splitlines() if line.strip()]
         return str(raw)
-    except Exception:
+    except Exception:  # noqa: BLE001
         return fallback
 
 
@@ -1211,7 +1238,7 @@ def _format_env_value(value, vtype: str) -> str:
 
 def update_config(updates: dict) -> dict:
     """批量更新配置。所有 WebUI 可编辑项只写 canonical SQLite settings。"""
-    from config.env_loader import write_env_values, load_env
+    from config.env_loader import load_env, write_env_values
 
     updated, ignored = [], []
     env_updates: dict[str, str] = {}

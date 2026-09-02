@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Resolve a NordVPN access token into a per-profile NordLynx configuration.
 
 The endpoint and response fields mirror NordVPN's open-source Linux client:

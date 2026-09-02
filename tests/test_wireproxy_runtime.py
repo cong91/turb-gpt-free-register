@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Offline tests for pinned wireproxy runtime installation."""
 import hashlib
 import io

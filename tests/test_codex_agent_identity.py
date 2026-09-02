@@ -62,7 +62,7 @@ class CodexAgentIdentityTests(unittest.TestCase):
             },
         )
 
-        with patch("core.codex_agent._agent_post", return_value=response):
+        with patch("core.codex_agent._agent_post", return_value=response):  # noqa: SIM117
             with self.assertRaises(AgentIdentityRegistrationError) as raised:
                 register_agent("access-token", "ssh-ed25519 public-key")
 

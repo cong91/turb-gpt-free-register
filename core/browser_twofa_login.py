@@ -7,10 +7,10 @@ import time
 from core.browser_registration import (
     _clear_otp_inputs,
     _click_continue,
+    _click_resend_email_otp,
     _fetch_chatgpt_session,
     _has_access_token,
     _maybe_accept,
-    _click_resend_email_otp,
     _submit_email_and_wait_next,
     _type_otp,
     _wait_after_email_otp_submit,

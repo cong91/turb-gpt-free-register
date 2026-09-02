@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Use-case orchestration for the independent Roxy profile manager."""
 from __future__ import annotations
 
@@ -107,7 +106,7 @@ class RoxyProfileManager:
         if include_remote:
             try:
                 remote_profiles = self.client.list_profiles()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 remote_error = self._safe_error(exc)
         return {
             "enabled": self.enabled,
@@ -203,7 +202,7 @@ class RoxyProfileManager:
         for local_id in identifiers:
             try:
                 results.append({"local_id": local_id, "ok": True, "result": handler(local_id)})
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 results.append({"local_id": local_id, "ok": False, "error": self._safe_error(exc)})
         return {
             "action": str(action),
@@ -355,7 +354,7 @@ class RoxyProfileManager:
             if signature_sha256:
                 self.store.save_official_signature(local_id, signature_sha256)
                 updated = self._require_profile(local_id)
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         return {
             "profile": self._public_profile(updated),
@@ -703,7 +702,7 @@ class RoxyProfileManager:
             if launch is not None:
                 try:
                     self.offline_stopper(launch)
-                except Exception as stop_exc:
+                except Exception as stop_exc:  # noqa: BLE001
                     failure = RoxyProfileManagerError(
                         f"{self._safe_error(exc)}; launched process cleanup failed: "
                         f"{self._safe_error(stop_exc)}"
@@ -722,7 +721,7 @@ class RoxyProfileManager:
                                 fingerprint_status=launch.fingerprint_status,
                                 signature_sha256=launch.signature_sha256,
                             )
-                        except Exception:
+                        except Exception:  # noqa: BLE001, S110
                             pass
                 else:
                     self.store.clear_launch(local_id)

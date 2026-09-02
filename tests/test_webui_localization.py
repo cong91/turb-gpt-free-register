@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import unittest
 
 from webui.app import create_app
@@ -33,10 +32,6 @@ class WebUiLocalizationTests(unittest.TestCase):
         html = response.get_data(as_text=True)
         for leaked in (
             "Reactive 2FA",
-            "Local test (dry-run)",
-            "Local test base",
-            "Test domain 1",
-            "Test domain 2 (optional)",
             "ACCOUNT OPERATIONS",
             "EMAIL LOGIN",
             "AUTHENTICATOR KEY",
@@ -52,7 +47,6 @@ class WebUiLocalizationTests(unittest.TestCase):
         ):
             self.assertNotIn(leaked, html)
         self.assertIn("Khôi phục 2FA", html)
-        self.assertIn("Kiểm thử cục bộ", html)
         self.assertIn("THAO TÁC TÀI KHOẢN", html)
         self.assertIn("Profile Roxy", html)
         self.assertIn("Khu vực / quốc gia", html)
@@ -76,7 +70,6 @@ class WebUiLocalizationTests(unittest.TestCase):
             self.assertEqual(response.status_code, 200)
             script = response.get_data(as_text=True)
             self.assertIn("Bảng điều khiển đăng ký GPT", script)
-            self.assertIn("Kiểm thử cục bộ", script)
             self.assertIn("Trong thùng rác", script)
             self.assertIn("__translateVi", script)
             self.assertIn("MutationObserver", script)

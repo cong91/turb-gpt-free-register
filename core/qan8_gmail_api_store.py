@@ -106,10 +106,16 @@ CREATE TABLE IF NOT EXISTS qan8_leases (
 class Qan8GmailApiStore:
     """Own QAN8 state transitions while leaving HTTP to the client module."""
 
-    def __init__(self, path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        path: str | Path | None = None,
+        *,
+        initialize_schema: bool = True,
+    ) -> None:
         self.path = Path(path) if path is not None else APP_STATE_DB_PATH
-        with closing(self._connection()) as connection:
-            connection.executescript(_SCHEMA)
+        if initialize_schema:
+            with closing(self._connection()) as connection:
+                connection.executescript(_SCHEMA)
 
     def create_batch(
         self,
@@ -378,6 +384,39 @@ class Qan8GmailApiStore:
             if item is not None:
                 items.append(item)
         return items
+
+    def alias_usage_for_source(self, source_email: str, code_url: str) -> dict | None:
+        """Return alias state counts for one QAN8 source without exposing its code URL."""
+        email = str(source_email or "").strip().lower()
+        url = str(code_url or "").strip()
+        if not email or not url or not self.path.is_file():
+            return None
+        try:
+            uri = f"file:{self.path.resolve().as_posix()}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True)) as connection:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "SELECT x.state, COUNT(*) AS count FROM qan8_aliases x "
+                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
+                    "WHERE s.source_email = ? AND s.code_url = ? "
+                    "GROUP BY x.state",
+                    (email, url),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return None
+            raise
+        if not rows:
+            return None
+        counts = {str(row["state"]): int(row["count"] or 0) for row in rows}
+        total = sum(counts.values())
+        return {
+            "total": total,
+            "available": counts.get("available", 0),
+            "used": counts.get("consumed", 0),
+            "failed": counts.get("failed", 0),
+            "reserved": counts.get("active", 0),
+        }
 
     def claim_alias(self, batch_id: str, lane_id: int, job_id: int | str) -> dict | None:
         job = str(job_id)

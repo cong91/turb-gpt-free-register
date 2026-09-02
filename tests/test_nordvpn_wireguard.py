@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """NordVPN WireGuard → SOCKS5 代理管理器单元测试。
 
 覆盖配置扫描、临时 conf 生成、端口分配/探测、wireproxy 生命周期以及
@@ -132,7 +131,7 @@ class PortHelperTests(unittest.TestCase):
 
     def test_wait_for_port_timeout_raises(self) -> None:
         with mock.patch.object(wg.socket, "create_connection", side_effect=OSError), \
-             mock.patch.object(wg.time, "sleep"):
+             mock.patch.object(wg.time, "sleep"):  # noqa: SIM117
             with self.assertRaises(wg.WireGuardProxyError):
                 wg._wait_for_port("127.0.0.1", 25000, timeout=0.2)
 
@@ -192,7 +191,7 @@ class ProxyPoolTests(unittest.TestCase):
         _write_conf(self.dir, "us1.conf")
         pool = self._pool()
         with mock.patch.object(pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
-             mock.patch.object(
+             mock.patch.object(  # noqa: SIM117
                  wg, "_spawn_wireproxy", side_effect=wg.WireGuardProxyError("boom")
              ):
             with self.assertRaises(wg.WireGuardProxyError):
@@ -213,7 +212,7 @@ class ProxyPoolTests(unittest.TestCase):
         )
         with mock.patch.object(pool, "_wireproxy_executable", return_value="wireproxy.exe"), \
              mock.patch.object(wg, "_spawn_wireproxy", return_value=fake_proxy), \
-             mock.patch(
+             mock.patch(  # noqa: SIM117
                  "core.registration_network_identity.probe_socks_public_ip",
                  side_effect=NetworkIdentityError("egress unavailable"),
              ), \
@@ -499,7 +498,7 @@ class SpawnWireproxyTests(unittest.TestCase):
         conf = _write_conf(self.dir, "us1.conf")
         with mock.patch.object(wg, "_build_wireproxy_config", return_value="/tmp/t.conf"), \
              mock.patch.object(wg.subprocess, "Popen", side_effect=OSError("not found")), \
-             mock.patch.object(wg.os, "unlink") as unlink:
+             mock.patch.object(wg.os, "unlink") as unlink:  # noqa: SIM117
             with self.assertRaises(wg.WireGuardProxyError):
                 wg._spawn_wireproxy(
                     conf_path=str(conf),
@@ -514,7 +513,7 @@ class SpawnWireproxyTests(unittest.TestCase):
         proc = mock.MagicMock()
         with mock.patch.object(wg, "_build_wireproxy_config", return_value="/tmp/t.conf"), \
              mock.patch.object(wg.subprocess, "Popen", return_value=proc), \
-             mock.patch.object(
+             mock.patch.object(  # noqa: SIM117
                  wg, "_wait_for_port", side_effect=wg.WireGuardProxyError("timeout")
              ), \
              mock.patch.object(wg.os, "unlink") as unlink:
@@ -535,7 +534,7 @@ class SpawnWireproxyTests(unittest.TestCase):
         with mock.patch.object(wg.subprocess, "Popen", return_value=proc), \
              mock.patch.object(wg, "_wait_for_port"), \
              mock.patch.object(wg, "_build_wireproxy_config", return_value="/tmp/t.conf"), \
-             mock.patch.object(wg.os, "unlink"):
+             mock.patch.object(wg.os, "unlink"):  # noqa: SIM117
             with self.assertRaisesRegex(wg.WireGuardProxyError, "已退出"):
                 wg._spawn_wireproxy(
                     conf_path=str(conf),
@@ -573,7 +572,7 @@ class ProxyForRegistrationTests(unittest.TestCase):
         return mock.patch.object(wg, "is_per_profile_proxy_enabled", return_value=enabled)
 
     def test_disabled_yields_none(self) -> None:
-        with self._enabled_patch(False):
+        with self._enabled_patch(False):  # noqa: SIM117
             with wg.proxy_for_registration() as proxy_url:
                 self.assertIsNone(proxy_url)
 
@@ -598,7 +597,7 @@ class ProxyForRegistrationTests(unittest.TestCase):
             return {"NORDVPN_WG_ENABLED": True, "NORDVPN_WG_COUNTRY_FILTER": ""}.get(name, default)
 
         with self._enabled_patch(True), \
-             mock.patch.object(wg, "_cfg_attr", side_effect=_cfg):
+             mock.patch.object(wg, "_cfg_attr", side_effect=_cfg):  # noqa: SIM117
             with wg.proxy_for_registration(pool=pool) as proxy_url:
                 self.assertEqual(proxy_url, "socks5://127.0.0.1:25000")
         pool.acquire.assert_called_once()
@@ -619,7 +618,7 @@ class ProxyForRegistrationTests(unittest.TestCase):
             return {"NORDVPN_WG_ENABLED": True, "NORDVPN_WG_COUNTRY_FILTER": ""}.get(name, default)
 
         with self._enabled_patch(True), \
-             mock.patch.object(wg, "_cfg_attr", side_effect=_cfg):
+             mock.patch.object(wg, "_cfg_attr", side_effect=_cfg):  # noqa: SIM117
             with self.assertRaises(RuntimeError):
                 with wg.proxy_for_registration(pool=pool):
                     raise RuntimeError("registration blew up")
@@ -640,7 +639,7 @@ class ProxyForRegistrationTests(unittest.TestCase):
             return {"NORDVPN_WG_ENABLED": True, "NORDVPN_WG_COUNTRY_FILTER": "us"}.get(name, default)
 
         with self._enabled_patch(True), \
-             mock.patch.object(wg, "_cfg_attr", side_effect=_cfg):
+             mock.patch.object(wg, "_cfg_attr", side_effect=_cfg):  # noqa: SIM117
             with wg.proxy_for_registration(country_filter="jp", pool=pool):
                 pass
         pool.acquire.assert_called_once_with("jp")
@@ -666,7 +665,7 @@ class ProxyForRegistrationTests(unittest.TestCase):
 
         with self._enabled_patch(True), \
              mock.patch.object(wg, "_cfg_attr", side_effect=_cfg), \
-             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):
+             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):  # noqa: SIM117
             with wg.proxy_for_registration(pool=pool) as proxy_url:
                 self.assertEqual(proxy_url, "socks5://127.0.0.1:25000")
 
@@ -697,7 +696,7 @@ class ProxyForRegistrationTests(unittest.TestCase):
         )
 
         with self._enabled_patch(True), \
-             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):
+             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):  # noqa: SIM117
             with wg.proxy_for_registration(pool=pool, owner_id="registration-job:42"):
                 pass
 
@@ -726,7 +725,7 @@ class ProxyForRegistrationTests(unittest.TestCase):
         ]
 
         with self._enabled_patch(True), \
-             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):
+             mock.patch("core.nordvpn_account.get_account_client", return_value=account_client):  # noqa: SIM117
             with wg.proxy_for_registration(pool=pool) as proxy_url:
                 self.assertEqual(proxy_url, proxy.proxy_url)
 

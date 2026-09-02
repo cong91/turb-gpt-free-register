@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Sentinel Runner 适配层
 通过 subprocess 调用项目根目录的 sentinel-runner.js，
@@ -19,28 +18,28 @@ import tempfile
 from pathlib import Path
 
 from config import (
-    USER_AGENT,
-    CHROME_MAJOR,
     CHROME_FULL_VERSION,
+    CHROME_MAJOR,
+    DEVICE_MEMORY,
+    HARDWARE_CONCURRENCY,
+    JS_HEAP_SIZE_LIMIT,
+    NAVIGATOR_LANGUAGE,
+    NAVIGATOR_LANGUAGES,
+    OPENAI_BUILD_ID,
+    SCREEN_HEIGHT,
+    SCREEN_WIDTH,
     SEC_CH_UA,
-    SEC_CH_UA_PLATFORM,
-    SEC_CH_UA_FULL_VERSION_LIST,
-    SEC_CH_UA_PLATFORM_VERSION,
     SEC_CH_UA_ARCH,
     SEC_CH_UA_BITNESS,
+    SEC_CH_UA_FULL_VERSION_LIST,
     SEC_CH_UA_MODEL,
+    SEC_CH_UA_PLATFORM,
+    SEC_CH_UA_PLATFORM_VERSION,
+    SENTINEL_SV,
     TIMEZONE_IANA,
     TIMEZONE_NAME,
     TIMEZONE_OFFSET_MINUTES,
-    NAVIGATOR_LANGUAGE,
-    NAVIGATOR_LANGUAGES,
-    SCREEN_WIDTH,
-    SCREEN_HEIGHT,
-    HARDWARE_CONCURRENCY,
-    JS_HEAP_SIZE_LIMIT,
-    DEVICE_MEMORY,
-    SENTINEL_SV,
-    OPENAI_BUILD_ID,
+    USER_AGENT,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,7 +54,6 @@ _SDK_PATH = _SENTINEL_DIR / "sdk.js"
 # 各 flow 对应的 page-url（与浏览器实际页面一致，影响 sdk.js 指纹生成）
 _FLOW_PAGE_URL = {
     "username_password_create": "https://auth.openai.com/create-account/password",
-    "email_otp_validate": "https://auth.openai.com/email-verification",
     "authorize_continue": "https://auth.openai.com/email-verification",
     "oauth_create_account": "https://auth.openai.com/about-you",
 }
@@ -130,15 +128,6 @@ def generate_sentinel_token(
     js_heap_size_limit = int(profile.get("js_heap_size_limit", JS_HEAP_SIZE_LIMIT))
     device_memory = int(profile.get("device_memory", DEVICE_MEMORY))
     device_pixel_ratio = float(profile.get("device_pixel_ratio", 2))
-    screen_avail_width = int(profile.get("screen_avail_width", screen_width))
-    screen_avail_height = int(profile.get("screen_avail_height", max(0, screen_height - 25)))
-    outer_width = int(profile.get("outer_width", screen_avail_width))
-    outer_height = int(profile.get("outer_height", screen_avail_height))
-    inner_width = int(profile.get("inner_width", profile.get("viewport_width", outer_width)))
-    inner_height = int(profile.get(
-        "inner_height", profile.get("viewport_height", max(0, outer_height - 87))
-    ))
-    color_depth = int(profile.get("color_depth", 24))
     navigator_language = str(profile.get("navigator_language", NAVIGATOR_LANGUAGE))
     navigator_languages = list(profile.get("navigator_languages", NAVIGATOR_LANGUAGES))
     chrome_major = str(profile.get("chrome_major", CHROME_MAJOR))
@@ -156,9 +145,7 @@ def generate_sentinel_token(
     build_id = str(profile.get("build_id", OPENAI_BUILD_ID))
     # Auth 页面 Sentinel token 的 documentElement 通常没有 data-build；
     # ChatGPT 页面 prepare/finalize 的 p 才带前端 build。
-    runner_build_id = "" if page_url is None and flow in {
-        "email_otp_validate", "authorize_continue", "oauth_create_account", "username_password_create"
-    } else build_id
+    runner_build_id = "" if page_url is None and flow in {"authorize_continue", "oauth_create_account", "username_password_create"} else build_id
     timezone_iana = str(profile.get("timezone_iana", TIMEZONE_IANA))
     timezone_name = str(profile.get("timezone_name", TIMEZONE_NAME))
     timezone_offset_minutes = int(profile.get("timezone_offset_minutes", TIMEZONE_OFFSET_MINUTES))
@@ -168,35 +155,25 @@ def generate_sentinel_token(
         flow, "https://auth.openai.com/create-account/password"
     )
 
-    # dx 是用发起 sentinel/req 时的 p 混淆的。该 proof 只在本地传给 runner，
-    # 不应作为 challenge 的额外字段暴露给 SDK。
-    challenge_proof = str(challenge.get("_request_p") or "") if isinstance(challenge, dict) else ""
-    challenge_payload = (
-        {k: v for k, v in challenge.items() if k != "_request_p"}
-        if isinstance(challenge, dict) else challenge
-    )
-
     # 把 challenge 写入临时文件，避免命令行长度 / 转义问题
-    tmp = tempfile.NamedTemporaryFile(
+    with tempfile.NamedTemporaryFile(
         mode="w",
         suffix=".json",
         prefix=f"sentinel-challenge-{flow}-",
         delete=False,
         encoding="utf-8",
-    )
-    try:
-        json.dump(challenge_payload, tmp, ensure_ascii=False)
+    ) as tmp:
+        tmp_path = tmp.name
+        json.dump(challenge, tmp, ensure_ascii=False)
         tmp.flush()
-        tmp.close()
-
+    try:
         cmd = [
             _resolve_node_executable(),
             str(_RUNNER_PATH),
-            "--challenge-file", tmp.name,
+            "--challenge-file", tmp_path,
             "--flow", flow,
             "--device-id", device_id,
             "--sentinel-sid", sentinel_sid or "",
-            "--challenge-proof", challenge_proof,
             "--react-listening-key", react_listening_key or "",
             "--react-container-key", react_container_key or str(profile.get("react_container_key") or ""),
             "--react-resources-key", react_resources_key or str(profile.get("react_resources_key") or ""),
@@ -208,24 +185,11 @@ def generate_sentinel_token(
             "--user-agent-data-platform", user_agent_data_platform,
             "--request-idle-callback", "1" if request_idle_callback else "0",
             "--sdk", str(_SDK_PATH),
-            # challenge 请求的初始 p[5] 都来自版本化 SDK；最终提交头则由
-            # Auth 页包装 SDK 生成：密码/资料页为 backend-api，OTP 页为版本化地址。
-            "--script-src", (
-                f"https://sentinel.openai.com/sentinel/{SENTINEL_SV}/sdk.js"
-                if flow == "email_otp_validate"
-                else "https://sentinel.openai.com/backend-api/sentinel/sdk.js"
-            ),
+            "--script-src", f"https://sentinel.openai.com/sentinel/{SENTINEL_SV}/sdk.js",
             "--build-id", runner_build_id,
             # 与 config.browser / core.sentinel.py 中的指纹默认值保持一致
             "--width", str(screen_width),
             "--height", str(screen_height),
-            "--avail-width", str(screen_avail_width),
-            "--avail-height", str(screen_avail_height),
-            "--outer-width", str(outer_width),
-            "--outer-height", str(outer_height),
-            "--inner-width", str(inner_width),
-            "--inner-height", str(inner_height),
-            "--color-depth", str(color_depth),
             "--cores", str(hardware_concurrency),
             "--language", navigator_language,
             "--languages", ",".join(navigator_languages),
@@ -244,8 +208,6 @@ def generate_sentinel_token(
             "--sec-ch-ua-arch", sec_ch_ua_arch,
             "--sec-ch-ua-bitness", sec_ch_ua_bitness,
             "--sec-ch-ua-model", sec_ch_ua_model,
-            "--webgl-vendor", str(profile.get("webgl_vendor") or ""),
-            "--webgl-renderer", str(profile.get("webgl_renderer") or ""),
             "--cookie", runner_cookie,
         ]
 
@@ -267,6 +229,7 @@ def generate_sentinel_token(
                 cwd=str(_PROJECT_ROOT),
                 timeout=_RUNNER_TIMEOUT,
                 env=env,
+                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError(
@@ -315,7 +278,7 @@ def generate_sentinel_token(
         logger.info(
             f"[SentinelRunner] token 生成成功, flow={flow}, "
             f"包含 turnstile={'t' in parsed and bool(parsed.get('t'))}, "
-            f"包含 so={bool(parsed.get('_so') or parsed.get('so'))}, "
+            f"包含 so={bool(parsed.get('so'))}, "
             f"字段: {field_summary}"
         )
         return token_text
@@ -323,6 +286,6 @@ def generate_sentinel_token(
     finally:
         # 清理临时文件
         try:
-            os.unlink(tmp.name)
+            os.unlink(tmp_path)
         except OSError:
             pass

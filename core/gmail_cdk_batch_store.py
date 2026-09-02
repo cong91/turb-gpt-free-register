@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import json
@@ -6,16 +5,13 @@ import sqlite3
 import uuid
 from contextlib import closing
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Optional
 
 from .gmail_batch_store_base import (
-    GmailBatchStoreBase,
-    GmailBatchError,
-    GmailBatchConflict,
     Assignment,
+    GmailBatchConflict,
+    GmailBatchError,
+    GmailBatchStoreBase,
 )
-
 
 # Backward compatibility aliases
 GmailCdkBatchError = GmailBatchError
@@ -92,10 +88,10 @@ class GmailCdkBatchStore(GmailBatchStoreBase):
         self,
         assignment: Assignment,
         *,
-        after_ts: Optional[float] = None,
+        after_ts: float | None = None,
         timeout: float = 60.0,
         poll_interval: float = 2.0,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Poll OTP via Gmail CDK client."""
         from . import gmail_cdk_client
         return gmail_cdk_client.poll_otp(
@@ -139,7 +135,7 @@ class GmailCdkBatchStore(GmailBatchStoreBase):
         """Mark assignment and item as exhausted (CDK-specific)."""
         return self._finish(assignment_id, "exhausted", item_state="exhausted", reason=reason)
 
-    def get_assignment(self, assignment_id: str) -> Optional[GmailCdkAssignment]:
+    def get_assignment(self, assignment_id: str) -> GmailCdkAssignment | None:
         """Get assignment by ID (CDK-specific return type)."""
         with closing(self._connect()) as connection:
             row = connection.execute(
@@ -148,7 +144,7 @@ class GmailCdkBatchStore(GmailBatchStoreBase):
             ).fetchone()
         return self._assignment(row) if row else None
 
-    def get_item(self, batch_id: str, inventory_id: str) -> Optional[GmailCdkBatchItem]:
+    def get_item(self, batch_id: str, inventory_id: str) -> GmailCdkBatchItem | None:
         """Get batch item details."""
         with closing(self._connect()) as connection:
             row = connection.execute(

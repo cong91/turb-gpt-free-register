@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Codex Agent Identity 生成后台队列。"""
 from __future__ import annotations
 
@@ -7,7 +6,6 @@ import random
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,6 +17,7 @@ from core.rotating_proxy_runtime import (
     release_rotating_proxy,
     resolve_rotating_proxy,
 )
+from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +145,8 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
     try:
         if not db.mark_account_codex_agent_running(account_id):
             return {"ok": False, "error": "账号已删除或 Codex Agent 状态已被重置"}
-        from core.codex_agent import create_codex_agent_identity
         from core.chatgpt_plan import resolve_plan_check_route
+        from core.codex_agent import create_codex_agent_identity
         from core.session import BrowserSession
 
         # 和查套餐一致解析网络路径；每个账号独立创建 BrowserSession，
@@ -190,7 +189,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
                 last_exc = exc
                 try:
                     env.session.close()
-                except Exception:
+                except Exception:  # noqa: BLE001, S110
                     pass
                 env = None
                 if attempt >= attempts or not _retryable_agent_error(exc):
@@ -207,13 +206,16 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
                 if wait_seconds > 0:
                     time.sleep(wait_seconds)
         if not isinstance(auth_json, dict):
-            raise RuntimeError(f"Codex Agent 生成未返回 auth_json: {last_exc}")
+            raise TypeError(f"Codex Agent 生成未返回 auth_json: {last_exc}")
         identity = auth_json.get("agent_identity") if isinstance(auth_json, dict) else {}
         sub2api_result = None
         try:
             from config import sub2api as sub2api_cfg
             if bool(getattr(sub2api_cfg, "SUB2API_AUTO_EXPORT", True)):
-                from core.codex_agent import upsert_sub2api_account, upload_sub2api_account
+                from core.codex_agent import (
+                    upload_sub2api_account,
+                    upsert_sub2api_account,
+                )
                 mode = str(getattr(sub2api_cfg, "SUB2API_SYNC_MODE", "api") or "api").strip().lower()
                 if mode not in {"api", "file", "both"}:
                     logger.warning("[CodexAgent] SUB2API_SYNC_MODE=%s 不合法，已按 api 处理", mode)
@@ -270,12 +272,12 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
                     "url": next((r.get("url") for r in results if r.get("url")), None),
                     "total": next((r.get("total") for r in results if r.get("total") is not None), None),
                 }
-        except Exception as sub_exc:
+        except Exception as sub_exc:  # noqa: BLE001
             logger.warning("[CodexAgent] 同步 sub2api 失败（不影响 Agent Token）: %s: %s", type(sub_exc).__name__, str(sub_exc)[:180])
         result = {
             "ok": True,
             "status": "success",
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "checked_at": local_now().isoformat(timespec="seconds"),
             "message": "Codex Agent Token 已生成" + ("，已同步 sub2api" if sub2api_result else ""),
             "agent_runtime_id": (identity or {}).get("agent_runtime_id"),
             "auth_path": None,
@@ -300,7 +302,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
         result = {
             "ok": False,
             "status": "failed",
-            "checked_at": datetime.now().isoformat(timespec="seconds"),
+            "checked_at": local_now().isoformat(timespec="seconds"),
             "error": f"{type(exc).__name__}: {str(exc)[:300]}",
             "network_route": route_meta.get("network_route"),
             "proxy_mode": route_meta.get("proxy_mode"),
@@ -327,7 +329,7 @@ def _run_generate(*, account_id: int, email: str, access_token: str, trigger: st
         if env is not None:
             try:
                 env.session.close()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
         _QUEUE_SLOTS.release()
 

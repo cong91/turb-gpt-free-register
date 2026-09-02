@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """Authenticated WebUI routes for the independent Roxy profile manager."""
 from __future__ import annotations
 
@@ -113,7 +112,7 @@ def register_roxy_profile_routes(app) -> None:
                 "total": total,
                 "has_next": page * page_size < total,
             })
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles")
@@ -129,14 +128,14 @@ def register_roxy_profile_routes(app) -> None:
                 idempotency_key=request.headers.get("Idempotency-Key"),
             )
             return jsonify({"ok": True, "profile": result}), 201
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.get("/api/roxy/profiles/<local_id>")
     def api_roxy_profile_get(local_id: str):
         try:
             return jsonify({"ok": True, "profile": manager().get_profile(local_id)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.patch("/api/roxy/profiles/<local_id>")
@@ -150,7 +149,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "包含不支持的更新字段"}), 400
         try:
             return jsonify({"ok": True, "profile": manager().update_managed_profile(local_id, data)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/<local_id>/open")
@@ -159,7 +158,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
         try:
             return jsonify({"ok": True, **manager().open_managed_profile(local_id)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/<local_id>/close")
@@ -168,7 +167,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
         try:
             return jsonify({"ok": True, "profile": manager().close_managed_profile(local_id)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/<local_id>/export")
@@ -177,7 +176,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
         try:
             return jsonify({"ok": True, **manager().export_managed_profile(local_id)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/<local_id>/export-full")
@@ -186,7 +185,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
         try:
             return jsonify({"ok": True, **manager().export_full_profile(local_id)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/<local_id>/open-local")
@@ -195,7 +194,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
         try:
             return jsonify({"ok": True, **manager().open_offline_profile(local_id)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/<local_id>/close-local")
@@ -204,7 +203,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
         try:
             return jsonify({"ok": True, **manager().close_offline_profile(local_id)})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/import")
@@ -231,7 +230,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": True, **result}), 201
         except RequestEntityTooLarge:
             return jsonify({"ok": False, "error": "Archive quá lớn"}), 413
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
         finally:
             if temporary is not None:
@@ -249,7 +248,7 @@ def register_roxy_profile_routes(app) -> None:
                     idempotency_key=request.headers.get("Idempotency-Key"),
                 ),
             })
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/bulk")
@@ -264,7 +263,7 @@ def register_roxy_profile_routes(app) -> None:
         try:
             result = manager().bulk_action(data["local_ids"], str(data.get("action") or ""))
             return jsonify({"ok": True, "result": result})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.post("/api/roxy/profiles/reconcile")
@@ -273,7 +272,7 @@ def register_roxy_profile_routes(app) -> None:
             return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
         try:
             return jsonify({"ok": True, "result": manager().reconcile_profiles()})
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.get("/api/roxy/profiles/<local_id>/local-status")
@@ -287,7 +286,7 @@ def register_roxy_profile_routes(app) -> None:
                 "capability": "browser_state_only",
                 "fingerprint_status": (profile.get("launch") or {}).get("fingerprint_status", "unknown"),
             })
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)
 
     @app.get("/api/roxy/profiles/<local_id>/archive/download")
@@ -301,5 +300,5 @@ def register_roxy_profile_routes(app) -> None:
                 mimetype="application/octet-stream",
                 max_age=0,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             return _error_response(exc)

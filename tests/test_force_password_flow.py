@@ -1,11 +1,15 @@
-# -*- coding: utf-8 -*-
 """Regression: registration must always force password creation, never OTP-only."""
 import unittest
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from core import browser_registration, browser_use_registration, cloakbrowser_registration, roxy_registration
+from core import (
+    browser_registration,
+    browser_use_registration,
+    cloakbrowser_registration,
+    roxy_registration,
+)
 from core.account_export import BrowserPageTransport
 from core.openai_auth import AccountUnusableError
 
@@ -33,7 +37,7 @@ class ForcePasswordFlowTests(unittest.TestCase):
 
         with patch("core.browser_registration._raise_if_account_unusable"), \
             patch("core.browser_registration._is_email_verification_page", return_value=False), \
-            patch("core.browser_registration._password_page_state", return_value={
+            patch("core.browser_registration._password_page_state", return_value={  # noqa: SIM117
                 "url": "https://auth.openai.com/create-account/password",
             }), \
             patch("core.browser_registration._is_signup_password_page", return_value=True), \

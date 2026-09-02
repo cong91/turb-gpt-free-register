@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Outlook 邮箱客户端（mail.chatai.codes 双协议）
 
@@ -32,21 +31,22 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.header import decode_header
-from urllib.parse import urlencode
 from pathlib import Path
+from urllib.parse import urlencode
 
 from curl_cffi.requests import Session as CurlSession
 
 from config import (
+    IMPERSONATE,
+    OTP_SETTLE_SECONDS,
     OUTLOOK_ACCOUNTS_FILE,
     OUTLOOK_API_BASE,
-    OTP_SETTLE_SECONDS,
     USER_AGENT,
-    IMPERSONATE,
 )
+
 # OTP_POLL_INTERVAL / OTP_MAX_WAIT 是 WebUI 可热改的，从模块读
 from config import email as _email_cfg
-from core.otp_utils import looks_like_openai_email, extract_otp
+from core.otp_utils import extract_otp, looks_like_openai_email
 
 logger = logging.getLogger(__name__)
 
@@ -452,7 +452,7 @@ def _decode_email_header(header_value: str | None) -> str:
         if isinstance(part, bytes):
             try:
                 out.append(part.decode(charset or "utf-8", errors="replace"))
-            except Exception:
+            except Exception:  # noqa: BLE001
                 out.append(part.decode("utf-8", errors="replace"))
         else:
             out.append(str(part))
@@ -474,7 +474,8 @@ def _get_msg_text(msg) -> str:
                     continue
                 charset = part.get_content_charset() or "utf-8"
                 text = payload.decode(charset, errors="replace")
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("Outlook MIME part decode failed: %s: %s", type(exc).__name__, exc)
                 continue
             if ctype == "text/plain":
                 text_parts.append(text)
@@ -487,7 +488,7 @@ def _get_msg_text(msg) -> str:
         if payload:
             charset = msg.get_content_charset() or "utf-8"
             return payload.decode(charset, errors="replace")
-    except Exception:
+    except Exception:  # noqa: BLE001, S110
         pass
     return str(msg.get_payload() or "")
 
@@ -506,7 +507,7 @@ def _imap_msg_to_dict(msg) -> dict:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
             ts_str = dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        except Exception:
+        except Exception:  # noqa: BLE001
             ts_str = str(date_raw)
     return {
         "id": msg.get("Message-ID") or msg.get("Message-Id") or "",
@@ -610,7 +611,7 @@ def _ms_access_token(
             data = {}
             try:
                 data = resp.json()
-            except Exception:
+            except Exception:  # noqa: BLE001, S110
                 pass
             if resp.status_code == 200 and isinstance(data, dict) and data.get("access_token"):
                 expires_in = int(data.get("expires_in") or 3600)
@@ -661,7 +662,7 @@ def _live_imap_access_token(account: OutlookAccount, http: CurlSession | None = 
         data = {}
         try:
             data = resp.json()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         token = str((data or {}).get("access_token") or "")
         if resp.status_code == 200 and token:
@@ -799,7 +800,7 @@ def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
         try:
             token = _live_imap_access_token(account, http=http)
             token_source = "live_imap_new"
-        except Exception as live_exc:
+        except Exception as live_exc:  # noqa: BLE001
             logger.debug("[Outlook] Live IMAP(New) token 获取失败，尝试 Entra IMAP token: %s", str(live_exc)[:220])
             token, _kind = _ms_access_token(account, http=http, preferred_kind="outlook")
             token_source = "entra_outlook"
@@ -831,21 +832,21 @@ def _fetch_imap_direct_messages(account: OutlookAccount) -> list[dict]:
                 item = _imap_msg_to_dict(msg)
                 item["_fetch_source"] = "imap_new" if token_source == "live_imap_new" else "imap_entra_outlook"
                 out.append(item)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.debug("[Outlook] 本地 IMAP 解析邮件失败 mid=%s: %s", mid, exc)
         if token_source == "live_imap_new":
             logger.info("[Outlook] 本地 IMAP(New) 直连拿到 %s 封邮件", len(out))
         else:
             logger.info("[Outlook] 本地 IMAP 直连拿到 %s 封邮件 token_source=%s", len(out), token_source)
         return out
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning("[Outlook] 本地 IMAP 直连失败: %s: %s", type(exc).__name__, exc)
         return []
     finally:
         try:
             if mail is not None:
                 mail.logout()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         http.close()
 
@@ -864,7 +865,7 @@ def _fetch_via_graph_direct(account: OutlookAccount) -> list[dict]:
                 out = _fetch_graph_messages(http, token)
                 logger.debug(f"[Outlook] Microsoft Graph 直连拿到 {len(out)} 封邮件")
                 return out
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[Outlook] Microsoft Graph 读取失败，尝试 Outlook REST: {type(exc).__name__}: {exc}")
                 # 重新取 Outlook REST token。注意不能继续复用 Graph token；
                 # Graph token 的 audience 是 graph.microsoft.com，拿去请求
@@ -874,7 +875,7 @@ def _fetch_via_graph_direct(account: OutlookAccount) -> list[dict]:
         out = _fetch_outlook_rest_messages(http, token)
         logger.debug(f"[Outlook] Outlook REST 直连拿到 {len(out)} 封邮件")
         return out
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"[Outlook] Microsoft/Outlook 直连失败: {type(exc).__name__}: {exc}")
         return []
     finally:
@@ -925,7 +926,7 @@ def _fetch_via(session: CurlSession, protocol: str, account: OutlookAccount) -> 
             if protocol == "graph":
                 return _fetch_via_graph_direct(account)
         return []
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.warning(f"[Outlook] {protocol} 请求异常: {type(exc).__name__}: {exc}")
         return []
 
@@ -1150,11 +1151,11 @@ def _parse_email_ts(item: dict) -> float | None:
     for fmt in formats:
         try:
             if fmt.endswith("%z"):
-                from datetime import datetime
-                return datetime.strptime(raw, fmt).timestamp()
+                return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc).timestamp()
             base_fmt = fmt[: fmt.index("%f") - 1] if "%f" in fmt else fmt
             return float(calendar.timegm(time.strptime(raw[:19] if len(raw) >= 19 else raw, base_fmt)))
-        except Exception:
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Outlook timestamp parse failed: %s: %s", type(exc).__name__, exc)
             continue
     return None
 

@@ -8,7 +8,6 @@ from flask import jsonify, request
 
 from config import codex as codex_config
 from core import db, registration_service
-from core.email_provider import normalize_email_source
 from core.registration_limits import MAX_REGISTRATION_TASKS
 from core.registration_service import submit_codex_retry_for_account
 from webui import registration_jobs_api
@@ -130,11 +129,6 @@ def register_sub2api_automation_routes(app) -> None:
         callback_url, error = _validate_callback_url(callback_url)
         if error:
             return _error_response(error)
-        if email_source and normalize_email_source(email_source) == "local_test":
-            return jsonify(
-                {"ok": False, "error": "automation registration cannot use local_test"}
-            ), 400
-
         existing = db.list_jobs_for_automation_request(request_id)
         if existing:
             return jsonify(
