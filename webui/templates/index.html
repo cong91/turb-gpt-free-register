@@ -219,6 +219,10 @@
     #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #totpLogPanel .log, #importPlanPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
     #logPanel .log, #retryLogPanel .log, #liveLogPanel .log, #importPlanPanel .log { max-height: calc(min(760px, calc(100vh - 48px)) - 74px); margin-top:0; }
     #importPlanPanel textarea { min-height: 180px; margin-top: 0; }
+    .import-plan-network { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px; padding:10px 12px; border:1px solid var(--line); border-radius:8px; background:var(--soft); }
+    .import-plan-network label { color:var(--muted); font-size:12px; font-weight:800; white-space:nowrap; }
+    .import-plan-network select { width:auto; min-width:220px; min-height:34px; margin-top:0; padding:5px 9px; font-size:12px; }
+    .import-plan-network span { color:var(--muted); font-size:12px; line-height:1.4; }
     .import-plan-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:12px; }
     .import-plan-summary { margin-top:12px; color:var(--muted); font-size:13px; line-height:1.5; }
     .import-plan-results { margin-top:14px; border:1px solid var(--line); border-radius:8px; overflow:hidden; background:#fff; }
@@ -2654,7 +2658,17 @@
       <h3>Lọc tài khoản Free theo email
         <button class="btn" id="btnCloseImportPlan" style="float:right;min-height:28px;">Đóng</button>
       </h3>
-      <textarea id="importPlanEmails" spellcheck="false" placeholder="email1@example.com&#10;email2@example.com"></textarea>
+      <textarea id="importPlanEmails" spellcheck="false" placeholder="email1@example.com&#10;email2@example.com&#10;email3@example.com | password | 2FA"></textarea>
+      <div class="import-plan-network">
+        <label for="importPlanLoginNetwork">Proxy đăng nhập</label>
+        <select id="importPlanLoginNetwork" title="Chọn route cho các email cần đăng nhập">
+          <option value="auto">Tự động theo cấu hình</option>
+          <option value="nord_wire">NordVPN WireGuard</option>
+          <option value="rotating_proxy">Proxy xoay Proxy.vn</option>
+          <option value="proxy_pool">Proxy pool</option>
+        </select>
+        <span>Áp dụng cho email chưa có accessToken; hệ thống kiểm tra route trước khi đăng nhập, còn kiểm tra gói dùng route riêng.</span>
+      </div>
       <div class="import-plan-actions">
         <button type="button" class="btn primary" id="btnStartImportPlan">Bắt đầu kiểm tra</button>
         <button type="button" class="btn" id="btnCopyFreePlanEmails" disabled>Sao chép email Free</button>
@@ -4290,7 +4304,11 @@ function importedPlanDetail(item) {
   if (classification === 'not_free_plan') return 'Gói hiện tại không phải Free';
   if (classification === 'needs_live_check') return 'Token cần được kiểm tra lại hoặc làm mới';
   if (classification === 'not_found') return 'Không có tài khoản tương ứng trong database';
-  if (classification === 'pending') return 'Worker đang xử lý tài khoản này';
+  if (classification === 'pending') {
+    return String(item?.status || '').toLowerCase() === 'login_pending'
+      ? 'Đang đăng nhập và lưu accessToken trước khi kiểm tra gói'
+      : 'Worker đang xử lý tài khoản này';
+  }
   return 'Không đưa được email vào lượt kiểm tra';
 }
 function importedPlanPrecheckItem(item, classification, error) {
@@ -4451,7 +4469,10 @@ async function startImportedPlanCheck() {
     const result = await api('/api/accounts/check-plan-import', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({emails: text}),
+      body: JSON.stringify({
+        emails: text,
+        login_network_mode: $('#importPlanLoginNetwork')?.value || 'auto',
+      }),
     });
     importedPlanPrecheckItems = importedPlanPrecheckItemsFromResult(result);
     importedPlanIds = (result.started || []).map(item => Number(item.id)).filter(Number.isFinite);
