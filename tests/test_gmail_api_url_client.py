@@ -79,6 +79,32 @@ class GmailApiUrlClientTests(unittest.TestCase):
 
     @patch("core.gmail_api_url_client._batch_store")
     @patch("core.db.claim_next_gmail_api_url_email")
+    def test_create_registration_batch_reuses_used_sources_with_alias_capacity(
+        self, mock_claim, mock_store_factory
+    ):
+        source = {
+            "email": "used@gmail.com",
+            "code_url": "https://api.example/source",
+            "status": "used",
+            "_claimed_from_available": False,
+        }
+
+        def claim_source(*, include_used=False, exclude_emails=None):
+            if not include_used or source["email"] in (exclude_emails or set()):
+                return None
+            return dict(source)
+
+        mock_claim.side_effect = claim_source
+        mock_store_factory.return_value.list_aliases_for_code_url.return_value = set()
+        mock_store_factory.return_value.create_batch_multi.return_value = "batch-used-source"
+
+        batch_id = create_registration_batch(1, aliases_per_email=1)
+
+        self.assertEqual(batch_id, "batch-used-source")
+        mock_store_factory.return_value.create_batch_multi.assert_called_once()
+
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.claim_next_gmail_api_url_email")
     def test_create_registration_batch_skips_alias_used_by_same_source_record(
         self, mock_claim, mock_store_factory
     ):

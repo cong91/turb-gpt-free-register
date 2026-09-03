@@ -2385,10 +2385,10 @@
               inputmode="numeric" autocomplete="off"
               title="1 email gốc → sinh tối đa 12 bí danh: tối đa 1 bí danh có dấu chấm, các bí danh còn lại dùng +; tổng 6 gmail.com + 6 googlemail.com. Tất cả dùng chung URL lấy OTP.">
           </label>
-          <button type="button" class="jobs-tb-btn" id="btnUseAllGmailApiUrlV2" title="Đặt số bản ghi bằng toàn bộ bản ghi chưa dùng trong kho">Dùng hết bản ghi chưa dùng</button>
+          <button type="button" class="jobs-tb-btn" id="btnUseAllGmailApiUrlV2" title="Đặt số nhóm theo toàn bộ alias còn khả dụng trong kho">Dùng hết alias khả dụng</button>
           <span class="hint">
             Ô <b>Số bản ghi</b> chọn bao nhiêu email chưa dùng trong kho sẽ đăng ký.
-            Email gốc còn sẵn sàng: <b id="gmailApiUrlPoolAvailableV2">?</b> · Alias còn khả dụng: <b id="gmailApiUrlAliasAvailableV2">?</b>.
+            Nhóm email gốc còn khả dụng: <b id="gmailApiUrlPoolAvailableV2">?</b> · Alias còn khả dụng: <b id="gmailApiUrlAliasAvailableV2">?</b>.
             Bấm <b>Dùng hết</b> để lấy toàn bộ.<br>
             Hệ thống nhân với số bí danh mỗi bản ghi (tối đa 12). Ví dụ: 3 × 12 = 36 tài khoản.
           </span>
@@ -3232,16 +3232,16 @@ async function startRegistrationFromInputs(countEl, workersEl, providerEl, start
   const providerPanel = providerEl?.closest('#tab-register')?.querySelector(`[data-provider-input="${email_source}"]`);
   const provider_cdks = parseProviderCdkBatch(providerPanel?.querySelector('[data-cdk-batch-input]')?.value || '');
   const gmailApiUrlAliasCount = email_source === 'gmail_api_url'
-    ? Math.min(12, Math.max(1, parseInt(providerPanel?.querySelector('#gmailApiUrlAliasCountV2')?.value || '12', 10) || 12))
+    ? readGmailApiUrlAliasCount(providerPanel)
     : 1;
   const qan8AliasCount = email_source === 'qan8_gmail_api'
     ? Math.min(12, Math.max(1, parseInt(providerPanel?.querySelector('#qan8AliasCountV2')?.value || '12', 10) || 12))
     : 1;
-  const unusedRecords = gmailApiUrlAvailableCount();
+  const unusedRecords = gmailApiUrlAvailableCount(gmailApiUrlAliasCount);
   if (email_source === 'gmail_api_url') {
     if (unusedRecords < 1) {
       const warnEl = $('#regWarnV2');
-      if (warnEl) warnEl.innerHTML = '<div class="banner warn">Kho Gmail API URL không còn bản ghi chưa dùng.</div>';
+      if (warnEl) warnEl.innerHTML = '<div class="banner warn">Kho Gmail API URL không còn đủ alias cho nhóm đã chọn.</div>';
       return;
     }
     count = Math.min(Math.max(1, count || 1), unusedRecords);
@@ -3369,6 +3369,8 @@ function bindJobsBodyEvents(bodyEl) {
   if (startV2) startV2.addEventListener('click', () => startRegistrationFromInputs($('#regCountV2'), $('#regWorkersV2'), providerV2, startV2));
   if (providerV2) providerV2.addEventListener('change', () => { syncProviderInputs(providerV2); syncCdkBatchCount(providerV2); });
   if (providerV2) syncProviderInputs(providerV2);
+  const gmailAliasCountV2 = $('#gmailApiUrlAliasCountV2');
+  if (gmailAliasCountV2) gmailAliasCountV2.addEventListener('input', () => syncGmailApiUrlCountLabel(providerV2));
   const useAllGmailApiUrl = $('#btnUseAllGmailApiUrlV2');
   if (useAllGmailApiUrl) useAllGmailApiUrl.addEventListener('click', useAllUnusedGmailApiUrlRecords);
   if (cdkBatchV2) cdkBatchV2.addEventListener('input', () => updateCdkBatchCount(cdkBatchV2));
@@ -7920,7 +7922,15 @@ function readConfigElementValue(el, f) {
   return isPlaceholderEmpty(el.value) ? '' : el.value.trim();
 }
 
-function gmailApiUrlAvailableCount() {
+function readGmailApiUrlAliasCount(root = document) {
+  return Math.min(12, Math.max(1, parseInt(root?.querySelector?.('#gmailApiUrlAliasCountV2')?.value || '12', 10) || 12));
+}
+
+function gmailApiUrlAvailableCount(aliasCount = 1) {
+  const aliases = Math.max(1, Number(aliasCount || 1));
+  if (aliases > 1) {
+    return Math.floor(gmailApiUrlAliasAvailableCount() / aliases);
+  }
   return Math.max(0, Number(window.GMAIL_API_URL_POOL_AVAILABLE || 0));
 }
 
@@ -7930,7 +7940,8 @@ function gmailApiUrlAliasAvailableCount() {
 
 function clampGmailApiUrlRecordCount() {
   const countEl = $('#regCountV2');
-  const available = gmailApiUrlAvailableCount();
+  const aliasCount = readGmailApiUrlAliasCount();
+  const available = gmailApiUrlAvailableCount(aliasCount);
   if (!countEl) return;
   const current = parseInt(countEl.value || '1', 10) || 1;
   const max = Math.max(1, available || 1);
@@ -7940,7 +7951,8 @@ function clampGmailApiUrlRecordCount() {
 
 function useAllUnusedGmailApiUrlRecords() {
   const countEl = $('#regCountV2');
-  const available = gmailApiUrlAvailableCount();
+  const aliasCount = readGmailApiUrlAliasCount();
+  const available = gmailApiUrlAvailableCount(aliasCount);
   if (!countEl || available < 1) return;
   countEl.max = String(available);
   countEl.value = String(available);
@@ -7953,13 +7965,16 @@ function syncGmailApiUrlCountLabel(providerEl) {
   const availableEl = $('#gmailApiUrlPoolAvailableV2');
   const aliasAvailableEl = $('#gmailApiUrlAliasAvailableV2');
   const useAllBtn = $('#btnUseAllGmailApiUrlV2');
-  const available = gmailApiUrlAvailableCount();
   const aliasAvailable = gmailApiUrlAliasAvailableCount();
   const isGmailApiUrl = (providerEl?.value || '') === 'gmail_api_url';
+  const aliasCount = isGmailApiUrl ? readGmailApiUrlAliasCount() : 1;
+  const available = gmailApiUrlAvailableCount(aliasCount);
   if (field) {
     const first = field.childNodes[0];
     if (first && first.nodeType === Node.TEXT_NODE) {
-      first.textContent = isGmailApiUrl ? 'Số bản ghi chưa dùng' : '注册数量';
+      first.textContent = isGmailApiUrl
+        ? (aliasCount > 1 ? 'Số nhóm email gốc còn khả dụng' : 'Số bản ghi chưa dùng')
+        : '注册数量';
     }
   }
   if (availableEl) availableEl.textContent = String(available);

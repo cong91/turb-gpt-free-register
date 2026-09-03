@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from config import email as email_config
 from config import proxy as proxy_config
 from core import db, registration_service
+from core.gmail_batch_store_base import GmailBatchError
 from webui.registration_jobs_api import create_registration_jobs
 
 
@@ -60,7 +61,10 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
         service.effective_registration_workers.return_value = 3
         database = MagicMock()
         database.outlook_pool_summary.return_value = {"available": 0}
-        database.gmail_api_url_email_pool_summary.return_value = {"available": 3}
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 3,
+            "alias_available": 36,
+        }
 
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
             email_config, "EMAIL_SOURCE", "gmail_api_url"
@@ -91,7 +95,10 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
         service.submit_registration.return_value = [{"id": index} for index in range(36)]
         service.effective_registration_workers.return_value = 3
         database = MagicMock()
-        database.gmail_api_url_email_pool_summary.return_value = {"available": 3}
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 3,
+            "alias_available": 36,
+        }
 
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
             email_config, "EMAIL_SOURCE", "gmail_api_url"
@@ -117,12 +124,78 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
             gmail_api_url_aliases_per_email=12,
         )
 
+    def test_webui_count_three_records_uses_remaining_alias_capacity(self):
+        service = MagicMock()
+        service.submit_registration.return_value = [{"id": index} for index in range(36)]
+        service.effective_registration_workers.return_value = 3
+        database = MagicMock()
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 0,
+            "alias_source_available": 11,
+            "alias_available": 176,
+        }
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "gmail_api_url"
+        ):
+            payload, status = create_registration_jobs(
+                {
+                    "count": 3,
+                    "workers": 3,
+                    "email_source": "gmail_api_url",
+                    "gmail_api_url_alias_count": 12,
+                },
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["submitted"], 36)
+        service.submit_registration.assert_called_once_with(
+            count=36,
+            workers=3,
+            email_source="gmail_api_url",
+            gmail_api_url_aliases_per_email=12,
+        )
+
+    def test_webui_returns_batch_exhaustion_as_bad_request(self):
+        service = MagicMock()
+        service.submit_registration.side_effect = GmailBatchError(
+            "Gmail API URL pool không đủ alias mới"
+        )
+        database = MagicMock()
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 0,
+            "alias_available": 12,
+        }
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "gmail_api_url"
+        ):
+            payload, status = create_registration_jobs(
+                {
+                    "count": 1,
+                    "workers": 3,
+                    "email_source": "gmail_api_url",
+                    "gmail_api_url_alias_count": 12,
+                },
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 400)
+        self.assertIn("không đủ alias", payload["error"])
+        service.effective_registration_workers.assert_not_called()
+
     def test_webui_clamps_requested_records_to_unused_pool(self):
         service = MagicMock()
         service.submit_registration.return_value = [{"id": index} for index in range(36)]
         service.effective_registration_workers.return_value = 3
         database = MagicMock()
-        database.gmail_api_url_email_pool_summary.return_value = {"available": 3}
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 3,
+            "alias_available": 36,
+        }
 
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
             email_config, "EMAIL_SOURCE", "gmail_api_url"
@@ -151,7 +224,10 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
     def test_webui_rejects_empty_gmail_api_url_pool(self):
         service = MagicMock()
         database = MagicMock()
-        database.gmail_api_url_email_pool_summary.return_value = {"available": 0}
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 0,
+            "alias_available": 0,
+        }
 
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
             email_config, "EMAIL_SOURCE", "gmail_api_url"
@@ -168,14 +244,17 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 400)
-        self.assertIn("không còn bản ghi chưa dùng", payload["error"])
+        self.assertIn("không còn alias khả dụng", payload["error"])
         service.submit_registration.assert_not_called()
 
     def test_webui_rejects_expanded_job_count_over_limit(self):
         service = MagicMock()
         database = MagicMock()
         database.outlook_pool_summary.return_value = {"available": 0}
-        database.gmail_api_url_email_pool_summary.return_value = {"available": 84}
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 84,
+            "alias_available": 1008,
+        }
 
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
             email_config, "EMAIL_SOURCE", "gmail_api_url"
