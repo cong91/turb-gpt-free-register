@@ -242,6 +242,7 @@
     .import-plan-badge--free_without_trial, .import-plan-badge--free_plus_trial { color:#166534; background:#edf8f1; }
     .import-plan-badge--not_free_plan { color:#475467; background:#f2f4f7; }
     .import-plan-badge--needs_live_check { color:#8a5700; background:#fff7e6; }
+    .import-plan-badge--deactivated { color:#b42318; background:#ffe4e1; }
     .import-plan-badge--login_failed, .import-plan-badge--check_failed { color:#b42318; background:#fff1f0; }
     .import-plan-badge--not_found, .import-plan-badge--not_checked { color:#667085; background:#f2f4f7; }
     .import-plan-badge--pending { color:#1d4ed8; background:#eef4ff; }
@@ -2688,6 +2689,7 @@
             <option value="not_free_plan">Không phải Free</option>
             <option value="needs_live_check">Cần kiểm tra lại</option>
             <option value="login_failed">Đăng nhập thất bại</option>
+            <option value="deactivated">Tài khoản đã bị khóa</option>
             <option value="check_failed">Lỗi khi kiểm tra</option>
             <option value="not_found">Không tìm thấy trong DB</option>
             <option value="not_checked">Chưa được kiểm tra</option>
@@ -4292,6 +4294,7 @@ const IMPORT_PLAN_RESULT_LABELS = {
   not_free_plan: 'Không phải Free',
   needs_live_check: 'Cần kiểm tra lại',
   login_failed: 'Đăng nhập thất bại',
+  deactivated: 'Tài khoản đã bị khóa',
   check_failed: 'Lỗi khi kiểm tra',
   not_found: 'Không tìm thấy trong DB',
   not_checked: 'Chưa được kiểm tra',
@@ -4312,6 +4315,7 @@ function importedPlanDetail(item) {
   if (classification === 'not_free_plan') return 'Gói hiện tại không phải Free';
   if (classification === 'needs_live_check') return 'Token cần được kiểm tra lại hoặc làm mới';
   if (classification === 'login_failed') return 'Không lấy được accessToken, chưa chạy kiểm tra gói';
+  if (classification === 'deactivated') return 'OpenAI đã khóa tài khoản; bỏ qua đăng nhập lại';
   if (classification === 'not_found') return 'Không có tài khoản tương ứng trong database';
   if (classification === 'pending') {
     return String(item?.status || '').toLowerCase() === 'login_pending'
@@ -4346,6 +4350,8 @@ function importedPlanPrecheckItemsFromResult(result) {
     const reason = String(item.reason || '');
     if (reason === 'account_not_found') {
       items.push(importedPlanPrecheckItem(item, 'not_found'));
+    } else if (reason === 'account_deactivated') {
+      items.push(importedPlanPrecheckItem(item, 'deactivated', 'OpenAI đã khóa tài khoản; bỏ qua đăng nhập lại'));
     } else if (reason === 'missing_access_token') {
       items.push(importedPlanPrecheckItem(item, 'check_failed', 'Tài khoản không có accessToken đã lưu'));
     } else if (reason === 'busy') {
@@ -4496,12 +4502,13 @@ function renderImportPlanStatus(result) {
   const notFreeCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_free_plan').length;
   const needsLiveCheckCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'needs_live_check').length;
   const loginFailedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'login_failed').length;
+  const deactivatedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'deactivated').length;
   const checkFailedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'check_failed').length;
   const notFoundCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_found').length;
   const notCheckedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_checked').length;
   $('#importPlanSummary').textContent = pendingCount
-    ? `Đã nhận ${importedPlanItems.length} email; đang kiểm tra ${pendingCount}; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; đăng nhập lỗi ${loginFailedCount}; lỗi check ${checkFailedCount}`
-    : `Đã xử lý ${importedPlanItems.length} email; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; không phải Free ${notFreeCount}; cần kiểm tra lại ${needsLiveCheckCount}; đăng nhập lỗi ${loginFailedCount}; lỗi check ${checkFailedCount}; không tìm thấy ${notFoundCount}; chưa kiểm tra ${notCheckedCount}`;
+    ? `Đã nhận ${importedPlanItems.length} email; đang kiểm tra ${pendingCount}; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; đăng nhập lỗi ${loginFailedCount}; đã bị khóa ${deactivatedCount}; lỗi check ${checkFailedCount}`
+    : `Đã xử lý ${importedPlanItems.length} email; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; không phải Free ${notFreeCount}; cần kiểm tra lại ${needsLiveCheckCount}; đăng nhập lỗi ${loginFailedCount}; đã bị khóa ${deactivatedCount}; lỗi check ${checkFailedCount}; không tìm thấy ${notFoundCount}; chưa kiểm tra ${notCheckedCount}`;
   renderImportedPlanRows();
 }
 async function pollImportedPlanStatus() {
@@ -4522,7 +4529,7 @@ async function pollImportedPlanStatus() {
     return true;
   }
 }
-async function startImportedPlanCheck(inputText = null, requireConfirm = true) {
+async function startImportedPlanCheck(inputText = null, requireConfirm = true, forceLoginEmails = []) {
   const text = inputText == null ? ($('#importPlanEmails').value || '') : String(inputText || '');
   if (!text.trim()) { showToast('Vui lòng nhập danh sách email'); return; }
   if (requireConfirm && !confirm('Bạn có chắc muốn kiểm tra gói hiện tại theo từng email không?')) return;
@@ -4546,6 +4553,7 @@ async function startImportedPlanCheck(inputText = null, requireConfirm = true) {
       body: JSON.stringify({
         emails: text,
         login_network_mode: $('#importPlanLoginNetwork')?.value || 'auto',
+        force_login_emails: forceLoginEmails,
       }),
     });
     importedPlanPrecheckItems = importedPlanPrecheckItemsFromResult(result);
@@ -4589,7 +4597,11 @@ async function retrySelectedImportedPlanItems() {
     return;
   }
   if (!confirm(`Kiểm tra lại ${selectedItems.length} email đã chọn?`)) return;
-  await startImportedPlanCheck(importedPlanRetryInput(selectedItems), false);
+  const forceLoginEmails = selectedItems
+    .filter(item => importedPlanClassification(item) === 'login_failed')
+    .map(item => String(item.email || '').trim())
+    .filter(Boolean);
+  await startImportedPlanCheck(importedPlanRetryInput(selectedItems), false, forceLoginEmails);
 }
 $('#btnCloseImportPlan').addEventListener('click', closeImportPlanPanel);
 $('#btnStartImportPlan').addEventListener('click', () => startImportedPlanCheck());
