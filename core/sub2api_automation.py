@@ -17,12 +17,22 @@ logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset({"success", "failed", "stopped", "cancelled"})
 
 
+def _retry_sort_key(job: dict) -> tuple[int, int]:
+    def _number(value: object) -> int:
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return _number(job.get("retry_attempt")), _number(job.get("id"))
+
+
 def registration_completion_event(request_id: str, jobs: list[dict]) -> dict | None:
     """Build one deterministic event after every registration job is terminal."""
     request_id = str(request_id or "").strip()
     if not request_id or not jobs:
         return None
-    expected_count = len(jobs)
+    expected_count = 0
     for job in jobs:
         context = job.get("provider_context") if isinstance(job, dict) else None
         if isinstance(context, dict):
@@ -33,15 +43,30 @@ def registration_completion_event(request_id: str, jobs: list[dict]) -> dict | N
                 )
             except (TypeError, ValueError):
                 pass
-    if len(jobs) < expected_count:
+    logical_jobs: dict[object, dict] = {}
+    for index, job in enumerate(jobs):
+        if not isinstance(job, dict):
+            continue
+        root_id = job.get("root_job_id")
+        if root_id is None:
+            root_id = job.get("id")
+        key = root_id if root_id is not None else ("item", index)
+        current = logical_jobs.get(key)
+        if current is None or _retry_sort_key(job) > _retry_sort_key(current):
+            logical_jobs[key] = job
+    if expected_count <= 0:
+        expected_count = len(logical_jobs)
+    if len(logical_jobs) < expected_count:
         return None
     if any(
         str(job.get("status") or "").strip().lower() not in _TERMINAL_STATUSES
-        for job in jobs
+        for job in logical_jobs.values()
     ):
         return None
     succeeded = sum(
-        1 for job in jobs if str(job.get("status") or "").strip().lower() == "success"
+        1
+        for job in logical_jobs.values()
+        if str(job.get("status") or "").strip().lower() == "success"
     )
     return {
         "request_id": request_id,
@@ -50,7 +75,7 @@ def registration_completion_event(request_id: str, jobs: list[dict]) -> dict | N
         "status": "completed",
         "requested_count": expected_count,
         "succeeded_count": succeeded,
-        "failed_count": len(jobs) - succeeded,
+        "failed_count": len(logical_jobs) - succeeded,
         "pending_count": 0,
     }
 

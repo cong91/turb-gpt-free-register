@@ -260,6 +260,45 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         )
 
     @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator")
+    def test_submit_uses_only_as_many_qan8_lanes_as_sources_needed(self, allocator_factory):
+        allocator_factory.return_value.create_batch.return_value = {
+            "batch_id": "batch-13",
+            "effective_workers": 2,
+        }
+
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(registration_service, "get_executor_workers", return_value=3), patch.object(
+            proxy_config, "ROTATING_PROXY_ENABLED", False
+        ):
+            jobs = registration_service.submit_registration(
+                count=13,
+                workers=3,
+                email_source="qan8_gmail_api",
+                qan8_aliases_per_source=12,
+                automation_context={
+                    "sub2api_automation_request_id": "req-13",
+                    "sub2api_automation_kind": "registration",
+                    "sub2api_callback_url": "https://sub2.example/callback",
+                },
+            )
+
+        allocator_factory.return_value.create_batch.assert_called_once_with(
+            13, requested_workers=2, aliases_per_source=12
+        )
+        self.assertEqual(len(submitted), 13)
+        self.assertEqual(
+            [job["provider_context"]["qan8_gmail_api_lane_id"] for job in jobs],
+            [0, 1] * 6 + [0],
+        )
+
+    @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator")
     def test_submit_uses_configured_source_for_lazy_worker_inputs(self, allocator_factory):
         allocator_factory.return_value.create_batch.return_value = {
             "batch_id": "batch-1",

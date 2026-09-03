@@ -1679,6 +1679,54 @@ def update_account_access_token(
         return True
 
 
+def mark_account_plan_login_pending(
+    acc_id: int,
+    *,
+    trigger: str = "manual_import",
+) -> bool:
+    """Mark an account as waiting for credential login before plan check."""
+    target_id = int(acc_id)
+    with _LOCK:
+        accounts = _load_accounts()
+        row = next((item for item in accounts if int(item.get("id") or 0) == target_id), None)
+        if row is None:
+            return False
+        now = _now()
+        row["plan_check_status"] = "login_pending"
+        row["plan_check_ok"] = None
+        row["plan_check_trigger"] = str(trigger or "manual_import")
+        row["plan_check_queued_at"] = now
+        row["plan_check_started_at"] = None
+        row["plan_check_completed_at"] = None
+        row["plan_check_error"] = None
+        row["updated_at"] = now
+        _save_accounts(accounts)
+        return True
+
+
+def update_account_login_credentials(
+    acc_id: int,
+    *,
+    password: str,
+    totp_secret: str,
+) -> bool:
+    """Persist credentials supplied for a tokenless account without replacing its other data."""
+    target_id = int(acc_id)
+    with _LOCK:
+        accounts = _load_accounts()
+        row = next((item for item in accounts if int(item.get("id") or 0) == target_id), None)
+        if row is None:
+            return False
+        row["registration_password"] = str(password or "")
+        row["totp_secret"] = str(totp_secret or "") or None
+        row["twofa_status"] = "active"
+        row["twofa_error"] = None
+        row["codex_login_mode"] = "credentials"
+        row["updated_at"] = _now()
+        _save_accounts(accounts)
+        return True
+
+
 
 def update_account_codex_status(email: str, codex_status: str, codex_error: str | None = None) -> bool:
     """

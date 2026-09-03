@@ -1485,6 +1485,7 @@ def submit_registration(
         executor = get_executor(max_workers=effective_workers)
         effective_workers = get_executor_workers()
         qan8_batch_id: str | None = None
+        qan8_lane_workers = effective_workers
         from config import email as _email_cfg
         qan8_aliases = int(
             qan8_aliases_per_source
@@ -1496,14 +1497,28 @@ def submit_registration(
                 raise ValueError("qan8_aliases_per_source must be between 1 and 12")
             from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
 
+            qan8_workers = effective_workers
+            automation_registration = (
+                isinstance(automation_context, dict)
+                and automation_context.get("sub2api_automation_kind") == "registration"
+            )
+            if automation_registration:
+                # Sub2API count is the number of accounts, while one QAN8
+                # source provides a fixed alias capacity. Keep provider lanes
+                # proportional to sources required so automation never buys
+                # unused sources merely because workers is larger.
+                qan8_source_count = (count + qan8_aliases - 1) // qan8_aliases
+                qan8_workers = min(effective_workers, qan8_source_count)
+            qan8_lane_workers = qan8_workers
             qan8_batch = Qan8GmailApiAllocator().create_batch(
                 count,
-                requested_workers=effective_workers,
+                requested_workers=qan8_workers,
                 aliases_per_source=qan8_aliases,
             )
             qan8_batch_id = str(qan8_batch["batch_id"])
             provider_context["qan8_gmail_api_batch_id"] = qan8_batch_id
             provider_context["qan8_aliases_per_source"] = qan8_aliases
+            qan8_lane_workers = int(qan8_batch.get("effective_workers") or qan8_workers)
         jobs = []
         for index in range(count):
             job_provider_context = dict(provider_context)
@@ -1511,7 +1526,7 @@ def submit_registration(
                 job_provider_context["proxy_lane_id"] = index % effective_workers
             qan8_lane_id = None
             if qan8_batch_id:
-                qan8_lane_id = index % effective_workers
+                qan8_lane_id = index % qan8_lane_workers
                 job_provider_context["qan8_gmail_api_lane_id"] = qan8_lane_id
             paymesh_inventory_id = (
                 paymesh_assignments[index] if paymesh_assignments else None
