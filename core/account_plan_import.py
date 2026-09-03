@@ -410,7 +410,7 @@ def queue_imported_plan_checks(
 
 
 def _classify_plan_status(row: dict) -> str:
-    if str(row.get("live_check_status") or "").strip().lower() == "deactivated":
+    if _is_deactivated_account(row):
         return "deactivated"
     status = str(row.get("plan_check_status") or "").strip().lower()
     if status in {"login_pending", "queued", "running"}:
@@ -427,6 +427,18 @@ def _classify_plan_status(row: dict) -> str:
     if plan == "free":
         return "free_plus_trial" if is_free_plus_account(row) else "free_without_trial"
     return "not_free_plan"
+
+
+def _is_deactivated_account(row: dict) -> bool:
+    status = str(row.get("live_check_status") or "").strip().lower()
+    if status in {"deactivated", "deactive", "locked"}:
+        return True
+    error = str(row.get("live_check_error") or row.get("plan_check_error") or "")
+    normalized_error = error.lower()
+    return bool(detect_account_unusable_text(error)) or any(
+        marker in normalized_error
+        for marker in ("đã khóa tài khoản", "tài khoản đã bị khóa", "account is locked")
+    )
 
 
 def build_import_plan_status(rows: Iterable[dict]) -> dict:
