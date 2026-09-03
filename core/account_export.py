@@ -10,6 +10,7 @@
 import json
 import logging
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -26,6 +27,10 @@ logger = logging.getLogger(__name__)
 
 _TWOFA_ACTION_URL = "https://chatgpt.com/?action=enable&factor=totp"
 _TWOFA_REAUTH_MAX_ATTEMPTS = 3
+_TWOFA_REAUTH_RETRY_BACKOFF_BASE_SECONDS = 5.0
+_TWOFA_REAUTH_RATE_LIMIT_BACKOFF_BASE_SECONDS = 15.0
+_TWOFA_REAUTH_RETRY_BACKOFF_MAX_SECONDS = 60.0
+_TWOFA_API_MAX_ATTEMPTS = 3
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _ACCOUNTS_DIR = _PROJECT_ROOT / "accounts"
 _BATCH_ARCHIVE_LOCK = threading.RLock()
@@ -566,12 +571,21 @@ def _is_reauth_retryable_error(exc: Exception) -> bool:
     """判断 re-auth 是否应重新建立认证步骤并重新获取邮箱 OTP。"""
     if _is_wrong_email_otp_error(exc):
         return True
+    try:
+        if int(getattr(exc, "status_code", 0) or 0) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
     error_text = str(exc).lower()
+    if re.search(r"\bhttp\s+429\b", error_text):
+        return True
     return any(
         marker in error_text
         for marker in (
             "invalid_auth_step",
             "invalid authorization step",
+            "rate_limit_exceeded",
+            "rate limit exceeded",
             "未进入 email-verification",
             "waiting for new otp",
             "response is not json",
@@ -580,6 +594,24 @@ def _is_reauth_retryable_error(exc: Exception) -> bool:
             "missing csrf token",
         )
     )
+
+
+def _is_reauth_rate_limit_error(exc: Exception) -> bool:
+    """Return whether the auth provider explicitly rate-limited the retry."""
+    error_text = str(exc).lower()
+    return "rate_limit_exceeded" in error_text or "rate limit exceeded" in error_text
+
+
+def _reauth_retry_backoff_seconds(exc: Exception, attempt: int) -> float:
+    """Calculate the bounded delay before the next re-auth attempt."""
+    if attempt < 1:
+        raise ValueError("attempt must be at least 1")
+    base = (
+        _TWOFA_REAUTH_RATE_LIMIT_BACKOFF_BASE_SECONDS
+        if _is_reauth_rate_limit_error(exc)
+        else _TWOFA_REAUTH_RETRY_BACKOFF_BASE_SECONDS
+    )
+    return min(base * (2 ** (attempt - 1)), _TWOFA_REAUTH_RETRY_BACKOFF_MAX_SECONDS)
 
 
 def _reset_reauth_context(session: BrowserSessionTransport) -> None:
@@ -689,6 +721,54 @@ def _activate_totp(
     return True
 
 
+def _is_transient_twofa_error(exc: Exception) -> bool:
+    """Return whether a 2FA API failure can recover on a repeated request."""
+    if isinstance(exc, TimeoutError):
+        return True
+    status_code = int(getattr(exc, "status_code", 0) or 0)
+    if 500 <= status_code <= 599:
+        return True
+    message = str(exc or "").lower()
+    if re.search(r"\bhttp\s+5\d{2}\b", message):
+        return True
+    return any(
+        marker in message
+        for marker in (
+            "request timeout",
+            "timed out",
+            "timeout",
+            "temporarily unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "service unavailable",
+            "connection reset",
+            "connection aborted",
+        )
+    )
+
+
+def _run_twofa_api_with_retry(action: str, operation):
+    """Retry only transient enroll/activate transport failures."""
+    for attempt in range(1, _TWOFA_API_MAX_ATTEMPTS + 1):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _is_transient_twofa_error(exc) or attempt >= _TWOFA_API_MAX_ATTEMPTS:
+                raise
+            backoff = min(1.0 * (2 ** (attempt - 1)), 4.0)
+            logger.warning(
+                "[2FA] %s 暂时失败，第 %s/%s 次后将在 %.1fs 后重试：%s: %s",
+                action,
+                attempt,
+                _TWOFA_API_MAX_ATTEMPTS,
+                backoff,
+                type(exc).__name__,
+                str(exc)[:180],
+            )
+            human_delay("api", minimum=backoff, maximum=backoff)
+    raise RuntimeError(f"2FA {action} retry loop exited unexpectedly")
+
+
 def setup_2fa(
     session: BrowserSession,
     email: str,
@@ -786,10 +866,12 @@ def setup_2fa(
                     raise
                 if current_otp:
                     previous_submitted_otp = current_otp
+                backoff = _reauth_retry_backoff_seconds(exc, reauth_attempt)
                 logger.warning(
-                    "[2FA] re-auth 步骤失败，第 %s/%s 次，重新登录并获取新验证码：%s",
+                    "[2FA] re-auth 步骤失败，第 %s/%s 次，%.1fs 后重新登录并获取新验证码：%s",
                     reauth_attempt,
                     _TWOFA_REAUTH_MAX_ATTEMPTS,
+                    backoff,
                     str(exc)[:180],
                 )
                 try:
@@ -800,6 +882,8 @@ def setup_2fa(
                         type(reset_exc).__name__,
                         str(reset_exc)[:160],
                     )
+                backoff_max = min(backoff * 1.25, _TWOFA_REAUTH_RETRY_BACKOFF_MAX_SECONDS)
+                human_delay("api", minimum=backoff, maximum=backoff_max)
                 continue
             break
         if not continue_url:
@@ -817,9 +901,15 @@ def setup_2fa(
         access_token = home_session["accessToken"]
     human_delay("api")
 
-    secret, session_id = _enroll_totp(session, access_token)
+    secret, session_id = _run_twofa_api_with_retry(
+        "enroll",
+        lambda: _enroll_totp(session, access_token),
+    )
     human_delay("form")
-    _activate_totp(session, access_token, secret, session_id)
+    _run_twofa_api_with_retry(
+        "activate",
+        lambda: _activate_totp(session, access_token, secret, session_id),
+    )
 
     logger.info("=" * 60)
     logger.info(f"✅ 2FA 设置完成! Secret: {secret[:4]}...{secret[-4:]}")
