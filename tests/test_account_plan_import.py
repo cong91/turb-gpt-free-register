@@ -163,6 +163,51 @@ missing@example.com
         ):
             _mark_login_failed(9, "login failed")
 
+    def test_deactivated_login_is_persisted_as_locked_and_not_queued(self):
+        from core.account_plan_import import _run_login_then_plan_check
+
+        with patch("core.account_plan_import.db.update_account_plan_check") as update:
+            _run_login_then_plan_check(
+                account_id=9,
+                email="locked@example.com",
+                password="password",
+                totp_secret="JBSWY3DPEHPK3PXP",
+                network_mode="auto",
+                login_and_save=lambda **_kwargs: {
+                    "ok": False,
+                    "status": "deactivated",
+                    "error": "OpenAI đã khóa tài khoản",
+                },
+                enqueue=MagicMock(),
+            )
+
+        result = update.call_args.kwargs["result"]
+        self.assertEqual(result["account_status"], "deactivated")
+        self.assertEqual(result["check_stage"], "login")
+
+    def test_deactivated_account_is_skipped_before_login_or_plan_queue(self):
+        from core.account_plan_import import queue_imported_plan_checks
+
+        enqueue = MagicMock()
+        result = queue_imported_plan_checks(
+            "locked@example.com",
+            get_account_by_email=lambda _email: {
+                "id": 9,
+                "email": "locked@example.com",
+                "access_token": "old-token",
+                "live_check_status": "deactivated",
+            },
+            enqueue=enqueue,
+        )
+
+        self.assertEqual(result["started_count"], 0)
+        self.assertEqual(result["skipped"], [{
+            "id": 9,
+            "email": "locked@example.com",
+            "reason": "account_deactivated",
+        }])
+        enqueue.assert_not_called()
+
     def test_tokenless_existing_account_uses_imported_credentials_before_login(self):
         from core.account_plan_import import queue_imported_plan_checks
 
@@ -198,6 +243,39 @@ missing@example.com
         self.assertEqual(credential_updates, [
             (7, {"password": "new-password", "totp_secret": "JBSWY3DPEHPK3PXP"}),
         ])
+
+    def test_force_login_email_restarts_login_even_when_old_token_exists(self):
+        from core.account_plan_import import queue_imported_plan_checks
+
+        login_finished = Event()
+        login_calls = []
+
+        def login_and_save(**kwargs):
+            login_calls.append(kwargs["email"])
+            return {"ok": True}
+
+        with (
+            patch("core.account_plan_import.db.mark_account_plan_login_pending", return_value=True),
+            patch(
+                "core.account_plan_import.db.get_account",
+                return_value={"id": 7, "email": "retry@example.com", "access_token": "old-token"},
+            ),
+        ):
+            result = queue_imported_plan_checks(
+                "retry@example.com | password | JBSWY3DPEHPK3PXP",
+                get_account_by_email=lambda _email: {
+                    "id": 7,
+                    "email": "retry@example.com",
+                    "access_token": "old-token",
+                },
+                enqueue=lambda **_kwargs: login_finished.set() or {"accepted": True},
+                login_and_save=login_and_save,
+                force_login_emails=["retry@example.com"],
+            )
+
+        self.assertEqual(result["login_started_count"], 1)
+        self.assertTrue(login_finished.wait(2), "forced login worker did not finish")
+        self.assertEqual(login_calls, ["retry@example.com"])
 
     def test_selected_login_network_mode_is_forwarded_to_login_worker(self):
         from core.account_plan_import import queue_imported_plan_checks
@@ -346,6 +424,22 @@ missing@example.com
         self.assertEqual(result["pending_count"], 0)
         self.assertEqual(result["items"][3]["classification"], "needs_live_check")
 
+    def test_deactivated_account_is_reported_separately_and_not_retryable(self):
+        from core.account_plan_import import build_import_plan_status
+
+        result = build_import_plan_status([{
+            "id": 11,
+            "email": "locked@example.com",
+            "live_check_status": "deactivated",
+            "live_check_error": "OpenAI đã khóa tài khoản",
+            "plan_check_status": "failed",
+            "plan_check_ok": False,
+        }])
+
+        self.assertEqual(result["items"][0]["classification"], "deactivated")
+        self.assertEqual(result["items"][0]["error"], "OpenAI đã khóa tài khoản")
+        self.assertEqual(result["deactivated_count"], 1)
+
 
 class AccountPlanImportApiTests(unittest.TestCase):
     def setUp(self):
@@ -481,6 +575,8 @@ class AccountPlanImportApiTests(unittest.TestCase):
         self.assertIn('Không phải Free', template)
         self.assertIn('Cần kiểm tra lại', template)
         self.assertIn('Đăng nhập thất bại', template)
+        self.assertIn('Tài khoản đã bị khóa', template)
+        self.assertIn('force_login_emails', template)
         self.assertIn('Lỗi khi kiểm tra', template)
         self.assertIn('Không tìm thấy trong DB', template)
         self.assertIn('/api/accounts/check-plan-import', template)
