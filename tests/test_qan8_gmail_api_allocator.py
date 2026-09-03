@@ -70,6 +70,43 @@ class Qan8GmailApiAllocatorTests(unittest.TestCase):
         self.assertEqual(len(self.client.created), 0)
         self.assertEqual(self.store.batch_status(batch["batch_id"])["active_sources"], 0)
 
+    def test_busy_lane_uses_default_timeout_and_honors_stop_check(self):
+        batch = self.allocator.create_batch(2, requested_workers=1, aliases_per_source=12)
+        batch_id = batch["batch_id"]
+        self.allocator.acquire_account(batch_id, "owner", 0)
+
+        stopped = []
+
+        def stop_check():
+            stopped.append(True)
+            raise RuntimeError("stop requested")
+
+        with self.assertRaisesRegex(RuntimeError, "stop requested"):
+            self.allocator.acquire_account(batch_id, "waiting", 0, stop_check=stop_check)
+        self.assertEqual(stopped, [True])
+
+    def test_busy_lane_uses_order_timeout_when_wait_timeout_is_omitted(self):
+        batch = self.allocator.create_batch(2, requested_workers=1, aliases_per_source=12)
+        batch_id = batch["batch_id"]
+        self.allocator.acquire_account(batch_id, "owner", 0)
+
+        clock = [0.0]
+        sleeps = []
+
+        def monotonic():
+            return clock[0]
+
+        def sleep(_seconds):
+            sleeps.append(True)
+            clock[0] += 2.0
+            if len(sleeps) > 2:
+                raise RuntimeError("test guard: lane wait did not time out")
+
+        with patch("core.qan8_gmail_api_allocator.time.monotonic", side_effect=monotonic), patch(
+            "core.qan8_gmail_api_allocator.time.sleep", side_effect=sleep
+        ), self.assertRaisesRegex(RuntimeError, "QAN8 lane is busy"):
+            self.allocator.acquire_account(batch_id, "waiting", 0)
+
     def test_purchase_uses_one_nordvpn_route_for_the_full_cycle(self):
         batch = self.allocator.create_batch(1, requested_workers=1, aliases_per_source=12)
 

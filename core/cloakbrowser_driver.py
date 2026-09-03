@@ -399,6 +399,20 @@ class BrowserSeleniumDriver:
     def execute_async_script(self, script: str, *args: Any) -> Any:
         return self._evaluate(script, args=args, async_mode=True)
 
+    def get_chatgpt_auth_session(self) -> dict | None:
+        """Read the session through Playwright's cookie-sharing request client."""
+        request = getattr(self.context, "request", None)
+        if request is None:
+            return None
+        response = request.get(
+            "https://chatgpt.com/api/auth/session",
+            timeout=self._script_timeout_ms,
+        )
+        if int(getattr(response, "status", 0) or 0) != 200:
+            return None
+        payload = response.json()
+        return payload if isinstance(payload, dict) else None
+
     def execute_cdp_cmd(self, cmd: str, params: dict | None = None) -> Any:
         params = params or {}
         try:

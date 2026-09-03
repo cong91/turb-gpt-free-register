@@ -727,6 +727,65 @@ def shutdown_executor(wait: bool = True) -> None:
         ex.shutdown(wait=wait, cancel_futures=False)
 
 
+def reconcile_interrupted_registration_jobs() -> dict[str, int]:
+    """Close registration state left behind by a previous WebUI process."""
+    if _ACTIVE_JOBS:
+        return {
+            "stopped_jobs": 0,
+            "failed_qan8_assignments": 0,
+            "completed_qan8_assignments": 0,
+        }
+
+    from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
+
+    result = {
+        "stopped_jobs": 0,
+        "failed_qan8_assignments": 0,
+        "completed_qan8_assignments": 0,
+    }
+    now_iso = _local_now().isoformat(timespec="seconds")
+    jobs = db.list_jobs(limit=10_000)
+    allocator = Qan8GmailApiAllocator()
+    for job in jobs:
+        job_id = int(job["id"])
+        status = str(job.get("status") or "")
+        assignment = allocator.store.get_assignment(job_id)
+        active_assignment = assignment is not None and str(assignment.get("state") or "") == "active"
+        account = _account_for_job(job) if status in {"running", "stopping"} or active_assignment else None
+        if status in {"running", "stopping"}:
+            db.update_job(
+                job_id,
+                status="stopped",
+                completed_at=now_iso,
+                error="WebUI đã khởi động lại trước khi worker hoàn tất",
+            )
+            result["stopped_jobs"] += 1
+
+        if not active_assignment:
+            if (
+                status in {"running", "stopping"}
+                and account is None
+                and str(job.get("email_source") or "")
+                in {"gmail_api_url", "qan8_gmail_api", "outlook", "generic_api", "cloudflare_domain"}
+            ):
+                _release_unconsumed_job_email(
+                    str(job.get("email") or "").strip() or None,
+                    "WebUI restarted before registration completed",
+                )
+            continue
+        batch_id = str(assignment["batch_id"])
+        if account is not None:
+            if allocator.complete_account(batch_id, job_id):
+                result["completed_qan8_assignments"] += 1
+        elif allocator.fail_account(
+            batch_id,
+            job_id,
+            reason="WebUI restarted before registration completed",
+        ):
+            result["failed_qan8_assignments"] += 1
+    return result
+
+
 def nordvpn_rotation_status() -> dict:
     """Return the current automatic-rotation and registration-gate state."""
     from core.nordvpn_cli import rotation_status_detail

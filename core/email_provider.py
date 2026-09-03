@@ -269,10 +269,13 @@ def _pick_from_source(
     if source == "qan8_gmail_api":
         if not qan8_gmail_api_batch_id or qan8_gmail_api_lane_id is None:
             raise ValueError("QAN8 Gmail API requires a batch_id and lane_id")
+        from core.registration_service import check_stop_requested
+
         return Qan8GmailApiAllocator().acquire_account(
             batch_id=qan8_gmail_api_batch_id,
             job_id=job_id or "standalone",
             lane_id=int(qan8_gmail_api_lane_id),
+            stop_check=check_stop_requested,
         ).email
     if source == "mailnest":
         from core.mailnest_client import pick_account

@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -81,6 +82,7 @@ class Qan8GmailApiAllocator:
         lane_id: int,
         *,
         wait_timeout: float | None = None,
+        stop_check: Callable[[], None] | None = None,
     ) -> Qan8GmailApiAccount:
         batch = self.store.get_batch(batch_id)
         if batch is None:
@@ -91,8 +93,11 @@ class Qan8GmailApiAllocator:
             raise ValueError("QAN8 lane does not exist")
         if str(lane_record.get("state") or "active") != "active":
             raise RuntimeError("QAN8 lane is quarantined")
-        deadline = None if wait_timeout is None else time.monotonic() + max(0.0, float(wait_timeout))
+        timeout = self.order_timeout if wait_timeout is None else max(0.0, float(wait_timeout))
+        deadline = time.monotonic() + timeout
         while True:
+            if stop_check is not None:
+                stop_check()
             current = self.store.get_current_source(batch_id, lane)
             if current is not None:
                 assignment = self.store.claim_alias(batch_id, lane, job_id)
@@ -104,7 +109,7 @@ class Qan8GmailApiAllocator:
                         lane_id=lane,
                         job_id=str(job_id),
                     )
-                if deadline is not None and time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     raise RuntimeError("QAN8 lane is busy")
                 time.sleep(self.poll_interval)
                 continue
@@ -120,7 +125,7 @@ class Qan8GmailApiAllocator:
                     job_id=str(job_id),
                 )
             if account is None:
-                if deadline is not None and time.monotonic() >= deadline:
+                if time.monotonic() >= deadline:
                     raise RuntimeError("QAN8 lane has no available alias")
                 time.sleep(self.poll_interval)
 
