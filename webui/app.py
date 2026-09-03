@@ -368,20 +368,23 @@ def create_app(auth_code: str | None = None) -> Flask:
         from config import email as _email_cfg
         from core.email_provider import parse_email_sources
         pool = {"total": 0, "available": 0, "used": 0, "failed": 0}
+        summaries = {}
         for src in parse_email_sources(_email_cfg.EMAIL_SOURCE):
             # GPTMail/MailNest/CloudMail 地址按需生成，不属于本地邮箱池。
             if src in ("gptmail", "mailnest", "cloudmail", "cloudflare"):
                 continue
-            one = (
-                db.generic_api_email_pool_summary() if src == "generic_api"
-                else db.gmail_api_url_email_pool_summary() if src == "gmail_api_url"
-                else db.domain_email_pool_summary() if src == "cloudflare_domain"
-                else db.outlook_pool_summary()
-            )
+            if src not in summaries:
+                summaries[src] = (
+                    db.generic_api_email_pool_summary() if src == "generic_api"
+                    else db.gmail_api_url_email_pool_summary() if src == "gmail_api_url"
+                    else db.domain_email_pool_summary() if src == "cloudflare_domain"
+                    else db.outlook_pool_summary()
+                )
+            one = summaries[src]
             for k in pool:
                 pool[k] += int(one.get(k, 0) or 0)
-        domain_pool = db.domain_email_pool_summary()
-        gmail_api_url_pool = db.gmail_api_url_email_pool_summary()
+        domain_pool = summaries.get("cloudflare_domain") or db.domain_email_pool_summary()
+        gmail_api_url_pool = summaries.get("gmail_api_url") or db.gmail_api_url_email_pool_summary()
         return jsonify({
             "accounts": db.count_accounts(),
             "outlook_total": pool.get("total", 0),
@@ -2722,21 +2725,23 @@ def create_app(auth_code: str | None = None) -> Flask:
         page_size_arg = request.args.get("page_size", default=None, type=int)
         from config import email as _email_cfg
         manual_otp_required = not bool(getattr(_email_cfg, "USE_EMAIL_SERVICE", True))
-        fetch_limit = 1_000_000 if (paged or page_arg is not None or page_size_arg is not None) else limit
-        rows = db.list_jobs(limit=fetch_limit)
         if paged or page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
-            status_counts = _job_status_counts(rows)
-            result = _paginate_items(rows, page=page, page_size=page_size)
+            result = db.list_jobs_page(
+                limit=page_size,
+                offset=(page - 1) * page_size,
+            )
+            result.update({"ok": True, "page": page, "page_size": page_size})
             page_rows = result.get("items") or []
             for row in page_rows:
                 row["manual_otp_required"] = manual_otp_required
                 row.update(svc.get_retry_info(row))
             result["items"] = [_compact_job_for_list(r) for r in page_rows]
-            result["status_counts"] = status_counts
+            result["status_counts"] = db.job_status_counts()
             result["compact"] = True
             return jsonify(result)
+        rows = db.list_jobs(limit=limit)
         for row in rows:
             row["manual_otp_required"] = manual_otp_required
             row.update(svc.get_retry_info(row))
