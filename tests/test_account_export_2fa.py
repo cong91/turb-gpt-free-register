@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlparse
 from core.account_export import (
     BrowserPageTransport,
     _follow_reauth,
+    _is_reauth_retryable_error,
     _ScriptResponse,
     _trigger_reauth,
     setup_2fa,
@@ -14,6 +15,78 @@ from core.gmail_api_url_client import GmailApiUrlError
 
 
 class AccountExportTwofaTransportTests(unittest.TestCase):
+    def test_rate_limit_reauth_error_is_retryable(self):
+        self.assertTrue(_is_reauth_retryable_error(RuntimeError("HTTP 429: rate_limit_exceeded")))
+
+    @patch("core.account_export.human_delay")
+    @patch("core.account_export._activate_totp")
+    @patch(
+        "core.account_export._enroll_totp",
+        side_effect=[RuntimeError('HTTP 500: {"detail":"Request timeout"}'), ("SECRET", "session-id")],
+    )
+    @patch("core.account_export.fetch_session", return_value={"accessToken": "home-token"})
+    @patch("core.account_export._open_twofa_action")
+    def test_setup_2fa_retries_transient_enroll_timeout(
+        self,
+        open_action,
+        fetch_session,
+        enroll_totp,
+        activate_totp,
+        _human_delay,
+    ):
+        secret = setup_2fa(Mock(), "user@example.com")
+
+        self.assertEqual(secret, "SECRET")
+        self.assertEqual(enroll_totp.call_count, 2)
+        activate_totp.assert_called_once_with(
+            enroll_totp.call_args.args[0],
+            "home-token",
+            "SECRET",
+            "session-id",
+        )
+        open_action.assert_called_once()
+        fetch_session.assert_called_once()
+
+    @patch("core.account_export.human_delay")
+    @patch("core.account_export._activate_totp")
+    @patch("core.account_export._enroll_totp", side_effect=RuntimeError("HTTP 401: unauthorized"))
+    @patch("core.account_export.fetch_session", return_value={"accessToken": "home-token"})
+    @patch("core.account_export._open_twofa_action")
+    def test_setup_2fa_does_not_retry_non_transient_enroll_error(
+        self,
+        _open_action,
+        _fetch_session,
+        enroll_totp,
+        activate_totp,
+        _human_delay,
+    ):
+        with self.assertRaisesRegex(RuntimeError, "HTTP 401"):
+            setup_2fa(Mock(), "user@example.com")
+
+        enroll_totp.assert_called_once()
+        activate_totp.assert_not_called()
+
+    @patch("core.account_export.human_delay")
+    @patch(
+        "core.account_export._activate_totp",
+        side_effect=[RuntimeError('HTTP 500: {"detail":"Request timeout"}'), True],
+    )
+    @patch("core.account_export._enroll_totp", return_value=("SECRET", "session-id"))
+    @patch("core.account_export.fetch_session", return_value={"accessToken": "home-token"})
+    @patch("core.account_export._open_twofa_action")
+    def test_setup_2fa_retries_transient_activate_timeout(
+        self,
+        _open_action,
+        _fetch_session,
+        _enroll_totp,
+        activate_totp,
+        _human_delay,
+    ):
+        secret = setup_2fa(Mock(), "user@example.com")
+
+        self.assertEqual(secret, "SECRET")
+        self.assertEqual(activate_totp.call_count, 2)
+
     def test_registration_twofa_always_reauthenticates_before_enrollment(self):
         transport = Mock()
 
@@ -99,6 +172,7 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
         with (
             patch("core.account_export.time.time", side_effect=[100.0, 200.0]),
             patch("core.account_export.human_delay"),
+            patch("core.account_export.time.sleep"),
             patch("core.account_export._trigger_reauth", side_effect=["first-auth-url", "second-auth-url"]) as trigger_reauth,
             patch("core.account_export._follow_reauth") as follow_reauth,
             patch(
@@ -163,6 +237,7 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
         with (
             patch("core.account_export.time.time", side_effect=[100.0, 200.0]),
             patch("core.account_export.human_delay"),
+            patch("core.account_export.time.sleep"),
             patch("core.account_export._trigger_reauth", side_effect=["first-auth-url", "second-auth-url"]) as trigger_reauth,
             patch("core.account_export._follow_reauth"),
             patch(
@@ -209,6 +284,7 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
         with (
             patch("core.account_export.time.time", side_effect=[100.0, 200.0]),
             patch("core.account_export.human_delay"),
+            patch("core.account_export.time.sleep"),
             patch("core.account_export._trigger_reauth", side_effect=["first-auth-url", "second-auth-url"]) as trigger_reauth,
             patch("core.account_export._follow_reauth") as follow_reauth,
             patch("core.account_export._validate_reauth_otp", return_value="continue-url") as validate_otp,
@@ -250,6 +326,35 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
             ],
         )
         validate_otp.assert_called_once_with(transport, "222222")
+
+    def test_reauth_rate_limit_uses_long_exponential_backoff(self):
+        transport = Mock()
+        rate_limit_error = RuntimeError(
+            "re-auth 未进入 email-verification 页面: "
+            "https://auth.openai.com/error?errorCode=rate_limit_exceeded"
+        )
+        with (
+            patch("core.account_export.time.time", side_effect=[100.0, 200.0, 300.0]),
+            patch("core.account_export.human_delay") as human_delay,
+            patch("core.account_export._trigger_reauth", side_effect=["first-url", "second-url", "third-url"]),
+            patch("core.account_export._follow_reauth", side_effect=[rate_limit_error, rate_limit_error, "email-url"]),
+            patch("core.account_export._validate_reauth_otp", return_value="continue-url"),
+            patch("core.account_export._exchange_new_token", return_value="reauth-token"),
+            patch("core.account_export._enroll_totp", return_value=("SECRET", "session-id")),
+            patch("core.account_export._activate_totp"),
+            patch("core.email_provider.wait_for_otp", return_value="333333"),
+            patch("core.email_provider.snapshot_verification_code", return_value=None),
+            patch("core.openai_auth.send_email_otp"),
+        ):
+            secret = setup_2fa(transport, "user@example.com", reauth=True)
+
+        self.assertEqual(secret, "SECRET")
+        retry_backoffs = [
+            (call.kwargs["minimum"], call.kwargs["maximum"])
+            for call in human_delay.call_args_list
+            if call.kwargs.get("minimum") is not None
+        ]
+        self.assertEqual(retry_backoffs, [(15.0, 18.75), (30.0, 37.5)])
 
     @patch("core.account_export.human_delay")
     @patch("core.account_export._activate_totp")
