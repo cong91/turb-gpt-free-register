@@ -15,6 +15,7 @@ Multi-batch registration support:
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 
@@ -34,6 +35,7 @@ _BEFORE_CODE_UNSET = object()
 # Batch store singleton
 _BATCH_STORE_PATH = APP_STATE_DB_PATH
 _batch_store_instance: GmailApiUrlBatchStore | None = None
+_BATCH_BUILD_LOCK = threading.Lock()
 
 
 def _batch_store() -> GmailApiUrlBatchStore:
@@ -316,6 +318,12 @@ def release_account(email: str, status: str = "available", note: str = "") -> bo
 # Học từ Gmail CDK, nhưng nguồn là kho email----url, KHÔNG dùng CDK.
 
 def create_registration_batch(count: int, aliases_per_email: int | None = None) -> str:
+    """Serialize alias inventory selection and create one registration batch."""
+    with _BATCH_BUILD_LOCK:
+        return _create_registration_batch(count, aliases_per_email=aliases_per_email)
+
+
+def _create_registration_batch(count: int, aliases_per_email: int | None = None) -> str:
     """Claim đủ email gốc từ pool để tạo `count` alias, mỗi email sinh tối đa
     `aliases_per_email` alias (share code_url của email đó).
 
@@ -350,20 +358,27 @@ def create_registration_batch(count: int, aliases_per_email: int | None = None) 
     per_email = max(1, min(MAX_GMAIL_DUAL_DOMAIN_VARIANTS, int(per_email)))
 
     groups: list[dict] = []
-    claimed_sources: list[str] = []
+    claimed_sources: list[tuple[str, bool]] = []
+    excluded_sources: set[str] = set()
     remaining = count
     store = _batch_store()
     try:
         while remaining > 0:
-            record = db.claim_next_gmail_api_url_email()
+            record = db.claim_next_gmail_api_url_email(
+                include_used=True,
+                exclude_emails=excluded_sources,
+            )
             if not record:
                 raise GmailApiUrlBatchError(
                     f"Gmail API URL pool không đủ alias mới cho {count} tài khoản, "
                     f"đã claim {len(claimed_sources)} email gốc, còn thiếu {remaining} alias"
                 )
             source_email = record["email"]
+            source_key = str(source_email or "").strip().casefold()
             code_url = record["code_url"]
-            claimed_sources.append(source_email)
+            claimed_from_available = bool(record.get("_claimed_from_available", True))
+            claimed_sources.append((source_email, claimed_from_available))
+            excluded_sources.add(source_key)
 
             want = min(per_email, remaining)
             try:
@@ -385,7 +400,7 @@ def create_registration_batch(count: int, aliases_per_email: int | None = None) 
                     "used",
                     "Record đã dùng hết alias Gmail khả dụng",
                 )
-                claimed_sources.remove(source_email)
+                claimed_sources.remove((source_email, claimed_from_available))
                 continue
             groups.append({
                 "source_email": source_email,
@@ -397,7 +412,9 @@ def create_registration_batch(count: int, aliases_per_email: int | None = None) 
                 break
     except Exception:
         # Rollback: trả tất cả email gốc đã claim về pool
-        for source_email in claimed_sources:
+        for source_email, claimed_from_available in claimed_sources:
+            if not claimed_from_available:
+                continue
             try:
                 db.release_gmail_api_url_email(
                     source_email, "available", "Tạo batch thất bại"
@@ -409,7 +426,9 @@ def create_registration_batch(count: int, aliases_per_email: int | None = None) 
     try:
         batch_id = store.create_batch_multi(groups)
     except Exception:
-        for source_email in claimed_sources:
+        for source_email, claimed_from_available in claimed_sources:
+            if not claimed_from_available:
+                continue
             try:
                 db.release_gmail_api_url_email(
                     source_email, "available", "Tạo batch thất bại"
