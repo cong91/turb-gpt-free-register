@@ -198,7 +198,15 @@ def _ensure_sqlite() -> None:
                 created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL DEFAULT '',
                 payload TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS registration_jobs AS SELECT * FROM accounts WHERE 0;
+            CREATE TABLE IF NOT EXISTS registration_jobs (
+                id INTEGER NOT NULL PRIMARY KEY,
+                email TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                archived INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                payload TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS codex_accounts (
                 id INTEGER PRIMARY KEY,
                 filename TEXT NOT NULL UNIQUE, email TEXT NOT NULL DEFAULT '',
@@ -221,6 +229,7 @@ def _ensure_sqlite() -> None:
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_archived ON {table}(archived, id DESC)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_email ON {table}(email COLLATE NOCASE)")
             conn.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_created ON {table}(created_at DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_registration_jobs_id ON registration_jobs(id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_email_pool_source_status ON email_pool(source, status, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_archived ON codex_accounts(archived, id DESC)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_codex_accounts_email ON codex_accounts(email COLLATE NOCASE)")
@@ -608,6 +617,10 @@ def _next_registration_job_id(rows: list[dict]) -> int:
     _ensure_sqlite()
     with closing(_sqlite_conn()) as conn:
         conn.execute("BEGIN IMMEDIATE")
+        stored_max = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM registration_jobs"
+        ).fetchone()[0]
+        current_max = max(current_max, int(stored_max or 0))
         try:
             stored = conn.execute(
                 "SELECT value FROM storage_meta WHERE key = ?",
@@ -1134,7 +1147,12 @@ def _run_debounced_static_viewer_refresh() -> None:
         with _LOCK:
             outlook_rows = _load_outlook()
             account_rows = _load_accounts()
-            _render_static_viewer(outlook_rows=outlook_rows, account_rows=account_rows)
+        # Export files are compatibility side effects. Do them after releasing
+        # the DB lock so a large snapshot cannot block job/account mutations.
+        _write_json(_ACCOUNTS_JSON, account_rows)
+        _sync_accounts_txt(account_rows)
+        _sync_tokens_txt(account_rows)
+        _render_static_viewer(outlook_rows=outlook_rows, account_rows=account_rows)
     except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, AttributeError) as exc:
         # 静态查看页只是旁路产物，失败不应影响主流程。
         logger.exception("后台刷新 accounts_viewer.html 失败: %s", reason or "-", exc_info=exc)
@@ -1147,8 +1165,8 @@ def _schedule_static_viewer_refresh(reason: str = "") -> None:
         return
     with _VIEWER_REFRESH_LOCK:
         _VIEWER_REFRESH_REASON = reason or _VIEWER_REFRESH_REASON
-        if _VIEWER_REFRESH_TIMER is not None:
-            _VIEWER_REFRESH_TIMER.cancel()
+        if _VIEWER_REFRESH_TIMER is not None and _VIEWER_REFRESH_TIMER.is_alive():
+            return
         timer = threading.Timer(_VIEWER_DEBOUNCE_SECONDS, _run_debounced_static_viewer_refresh)
         timer.daemon = True
         _VIEWER_REFRESH_TIMER = timer
@@ -1199,6 +1217,111 @@ def _save_accounts(rows: list[dict], *, allow_delete: bool = False) -> None:
     _sync_accounts_txt(persisted_rows)
     _sync_tokens_txt(persisted_rows)
     _schedule_static_viewer_refresh("save_accounts")
+
+
+def _mutate_account_row(
+    *,
+    acc_id: int | None = None,
+    email: str | None = None,
+    mutator: Any,
+) -> bool:
+    """Mutate one account payload and persist it without rewriting the collection."""
+    _ensure_sqlite()
+    target_id = int(acc_id) if acc_id is not None else None
+    target_email = str(email or "").strip().lower()
+    with closing(_sqlite_conn()) as conn:
+        if target_id is not None:
+            stored = conn.execute(
+                "SELECT id, payload FROM accounts WHERE id=? LIMIT 1", (target_id,)
+            ).fetchone()
+        elif target_email:
+            stored = conn.execute(
+                "SELECT id, payload FROM accounts WHERE email = ? COLLATE NOCASE LIMIT 1",
+                (target_email,),
+            ).fetchone()
+        else:
+            return False
+        if stored is None:
+            return False
+        row = json.loads(stored["payload"])
+        if not isinstance(row, dict):
+            return False
+        if mutator(row) is False:
+            return False
+        _persist_account_row(conn, row, int(stored["id"]))
+    return True
+
+
+def _persist_account_row(conn: sqlite3.Connection, row: dict, row_id: int | None = None) -> int:
+    """Write one account row and its indexed columns to SQLite."""
+    account_id = int(row_id if row_id is not None else row.get("id") or 0)
+    row["id"] = account_id
+    row["updated_at"] = _now()
+    row["copy_line"] = _account_line(row)
+    conn.execute(
+        "INSERT INTO accounts(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET email=excluded.email, status=excluded.status, "
+        "archived=excluded.archived, created_at=excluded.created_at, updated_at=excluded.updated_at, payload=excluded.payload",
+        (
+            account_id,
+            str(row.get("email") or ""),
+            str(row.get("status") or ""),
+            int(bool(row.get("archived"))),
+            str(row.get("created_at") or row.get("imported_at") or ""),
+            str(row.get("updated_at") or ""),
+            json.dumps(row, ensure_ascii=False),
+        ),
+    )
+    _schedule_static_viewer_refresh("account_row")
+    return account_id
+
+
+def _mutate_email_pool_row(
+    source: str,
+    *,
+    email: str | None = None,
+    status: str | None = None,
+    mutator: Any,
+) -> dict | None:
+    """Mutate one legacy email-pool row without rewriting the whole pool."""
+    _ensure_sqlite()
+    conditions = ["source=?"]
+    params: list[Any] = [_EMAIL_SOURCES.get(source, source)]
+    if email:
+        conditions.append("email = ? COLLATE NOCASE")
+        params.append(str(email).strip())
+    if status:
+        conditions.append("status=?")
+        params.append(status)
+    with closing(_sqlite_conn()) as conn:
+        stored = conn.execute(
+            "SELECT id, email, status, archived, created_at, updated_at, payload "
+            f"FROM email_pool WHERE {' AND '.join(conditions)} ORDER BY id LIMIT 1",
+            params,
+        ).fetchone()
+        if stored is None:
+            return None
+        row = json.loads(stored["payload"])
+        if not isinstance(row, dict) or mutator(row) is False:
+            return None
+        row["id"] = int(stored["id"])
+        row["updated_at"] = _now()
+        if source == "outlook":
+            row["copy_line"] = _outlook_line(row)
+        elif source == "generic_api":
+            row["copy_line"] = _generic_api_email_line(row)
+        conn.execute(
+            "UPDATE email_pool SET email=?, status=?, archived=?, updated_at=?, payload=? WHERE id=?",
+            (
+                str(row.get("email") or stored["email"] or ""),
+                str(row.get("status") or stored["status"] or ""),
+                int(bool(row.get("archived"))),
+                str(row["updated_at"]),
+                json.dumps(row, ensure_ascii=False),
+                int(stored["id"]),
+            ),
+        )
+    return row
 
 
 def _load_jobs() -> list[dict]:
@@ -1542,85 +1665,75 @@ def insert_account(
     codex_status: str | None = None,   # success / failed / skipped / missing
     codex_error: str | None = None,    # 失败原因（仅 codex_status=failed 时有意义）
 ) -> int:
-    """插入或更新注册成功账号，返回本地文件中的 id。"""
+    """插入或更新注册成功账号，返回本地数据库中的 id。"""
     with _LOCK:
-        accounts = _load_accounts()
-        outlook_rows = _load_outlook()
-        existing = _find_by_email(accounts, email)
-        outlook_row = _find_by_email(outlook_rows, email)
+        _ensure_sqlite()
         extra_json = json.dumps(extra, ensure_ascii=False) if extra else None
         registration_driver = str((extra or {}).get("registration_driver") or "").strip().lower()
-        registration_password = (
+        supplied_password = (
             str(registration_password)
             if registration_password is not None
             else str((extra or {}).get("registration_password") or "")
         )
-
-        if existing is None:
-            row_id = _next_id(accounts)
-            row = {
-                "id": row_id,
-                "email": email,
-                "created_at": _now(),
-            }
-            accounts.append(row)
-        else:
-            row = existing
+        with closing(_sqlite_conn()) as conn:
+            stored = conn.execute(
+                "SELECT id, payload FROM accounts WHERE email = ? COLLATE NOCASE LIMIT 1", (email,)
+            ).fetchone()
+            if stored is None:
+                row = {"id": int(conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM accounts").fetchone()[0]), "email": email, "created_at": _now()}
+            else:
+                row = json.loads(stored["payload"])
             row_id = int(row["id"])
-
-        row.update({
-            "access_token": access_token,
-            "totp_secret": totp_secret if totp_secret is not None else row.get("totp_secret"),
-            "user_id": user_id if user_id is not None else row.get("user_id"),
-            "user_name": user_name if user_name is not None else row.get("user_name"),
-            "plan_type": plan_type if plan_type is not None else row.get("plan_type"),
-            "expires_at": expires_at if expires_at is not None else row.get("expires_at"),
-            "proxy_used": proxy_used if proxy_used is not None else row.get("proxy_used"),
-            "registration_ip": (
-                registration_ip if registration_ip is not None else row.get("registration_ip")
-            ),
-            "account_locale": account_locale if account_locale else row.get("account_locale"),
-            "account_country": account_country if account_country else row.get("account_country"),
-            "account_locale_source": (
-                account_locale_source if account_locale_source else row.get("account_locale_source")
-            ),
-            "email_source": email_source if email_source is not None else row.get("email_source"),
-            "registration_driver": (
-                registration_driver
-                if registration_driver
-                else row.get("registration_driver")
-            ),
-            "source_cdk": source_cdk if source_cdk is not None else row.get("source_cdk"),
-            "registration_password": (
-                registration_password
-                if registration_password
-                else row.get("registration_password") or _registration_password(row)
-            ),
-            "twofa_status": twofa_status if twofa_status is not None else row.get("twofa_status"),
-            "twofa_error": twofa_error if twofa_error is not None else row.get("twofa_error"),
-            "extra_json": extra_json if extra_json is not None else row.get("extra_json"),
-            "codex_status": codex_status if codex_status is not None else row.get("codex_status"),
-            "codex_error": codex_error if codex_error is not None else row.get("codex_error"),
-            "updated_at": _now(),
-        })
-
-        if outlook_row:
-            row["password"] = outlook_row.get("password")
-            row["client_id"] = outlook_row.get("client_id")
-            row["refresh_token"] = outlook_row.get("refresh_token")
-            row["original_email_line"] = _outlook_line(outlook_row)
-            outlook_row["status"] = "used"
-            outlook_row["used_at"] = outlook_row.get("used_at") or _now()
-            outlook_row["registered_account_id"] = row_id
-            outlook_row["access_token"] = access_token
-            outlook_row["completed_at"] = _now()
-            if totp_secret:
-                outlook_row["totp_secret"] = totp_secret
-
-        row["copy_line"] = _account_line(row)
-        _save_accounts(accounts)
-        _save_outlook(outlook_rows)
-        return row_id
+            row.update({
+                "email": email,
+                "access_token": access_token,
+                "totp_secret": totp_secret if totp_secret is not None else row.get("totp_secret"),
+                "user_id": user_id if user_id is not None else row.get("user_id"),
+                "user_name": user_name if user_name is not None else row.get("user_name"),
+                "plan_type": plan_type if plan_type is not None else row.get("plan_type"),
+                "expires_at": expires_at if expires_at is not None else row.get("expires_at"),
+                "proxy_used": proxy_used if proxy_used is not None else row.get("proxy_used"),
+                "registration_ip": registration_ip if registration_ip is not None else row.get("registration_ip"),
+                "account_locale": account_locale if account_locale else row.get("account_locale"),
+                "account_country": account_country if account_country else row.get("account_country"),
+                "account_locale_source": account_locale_source if account_locale_source else row.get("account_locale_source"),
+                "email_source": email_source if email_source is not None else row.get("email_source"),
+                "registration_driver": registration_driver if registration_driver else row.get("registration_driver"),
+                "source_cdk": source_cdk if source_cdk is not None else row.get("source_cdk"),
+                "registration_password": supplied_password if supplied_password else row.get("registration_password") or _registration_password(row),
+                "twofa_status": twofa_status if twofa_status is not None else row.get("twofa_status"),
+                "twofa_error": twofa_error if twofa_error is not None else row.get("twofa_error"),
+                "extra_json": extra_json if extra_json is not None else row.get("extra_json"),
+                "codex_status": codex_status if codex_status is not None else row.get("codex_status"),
+                "codex_error": codex_error if codex_error is not None else row.get("codex_error"),
+                "updated_at": _now(),
+            })
+            outlook_stored = conn.execute(
+                "SELECT id, payload FROM email_pool WHERE source=? AND email = ? COLLATE NOCASE LIMIT 1",
+                (_EMAIL_SOURCES["outlook"], email),
+            ).fetchone()
+            if outlook_stored is not None:
+                outlook_row = json.loads(outlook_stored["payload"])
+                row["password"] = outlook_row.get("password")
+                row["client_id"] = outlook_row.get("client_id")
+                row["refresh_token"] = outlook_row.get("refresh_token")
+                row["original_email_line"] = _outlook_line(outlook_row)
+                outlook_row.update({
+                    "status": "used",
+                    "used_at": outlook_row.get("used_at") or _now(),
+                    "registered_account_id": row_id,
+                    "access_token": access_token,
+                    "completed_at": _now(),
+                })
+                if totp_secret:
+                    outlook_row["totp_secret"] = totp_secret
+                conn.execute(
+                    "UPDATE email_pool SET status=?, updated_at=?, payload=? WHERE id=?",
+                    ("used", _now(), json.dumps(outlook_row, ensure_ascii=False), int(outlook_stored["id"])),
+                )
+            row["copy_line"] = _account_line(row)
+            _persist_account_row(conn, row, row_id)
+            return row_id
 
 
 def update_account_2fa(
@@ -1631,25 +1744,17 @@ def update_account_2fa(
     totp_secret: str | None = None,
     error: str | None = None,
 ) -> bool:
-    """原子更新账号 2FA 字段，并同步账号导出文件。"""
-    target_id = int(acc_id) if acc_id is not None else None
-    target_email = str(email or "").strip().lower()
+    """原子更新账号 2FA 字段。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = None
-        if target_id is not None:
-            row = next((item for item in rows if int(item.get("id") or 0) == target_id), None)
-        if row is None and target_email:
-            row = _find_by_email(rows, target_email)
-        if row is None:
-            return False
-        now = _now()
-        row["totp_secret"] = str(totp_secret or "") or None
-        row["twofa_status"] = str(status or "failed").strip() or "failed"
-        row["twofa_error"] = str(error or "").strip() or None
-        row["updated_at"] = now
-        _save_accounts(rows)
-        return True
+        return _mutate_account_row(
+            acc_id=acc_id,
+            email=email,
+            mutator=lambda row: row.update({
+                "totp_secret": str(totp_secret or "") or None,
+                "twofa_status": str(status or "failed").strip() or "failed",
+                "twofa_error": str(error or "").strip() or None,
+            }),
+        )
 
 
 def update_account_access_token(
@@ -1662,21 +1767,12 @@ def update_account_access_token(
     token = str(access_token or "").strip()
     if not token:
         return False
-    target_id = int(acc_id) if acc_id is not None else None
-    target_email = str(email or "").strip().lower()
     with _LOCK:
-        rows = _load_accounts()
-        row = None
-        if target_id is not None:
-            row = next((item for item in rows if int(item.get("id") or 0) == target_id), None)
-        if row is None and target_email:
-            row = _find_by_email(rows, target_email)
-        if row is None:
-            return False
-        row["access_token"] = token
-        row["updated_at"] = _now()
-        _save_accounts(rows)
-        return True
+        return _mutate_account_row(
+            acc_id=acc_id,
+            email=email,
+            mutator=lambda row: row.update({"access_token": token}),
+        )
 
 
 def mark_account_plan_login_pending(
@@ -1687,21 +1783,20 @@ def mark_account_plan_login_pending(
     """Mark an account as waiting for credential login before plan check."""
     target_id = int(acc_id)
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((item for item in accounts if int(item.get("id") or 0) == target_id), None)
-        if row is None:
-            return False
         now = _now()
-        row["plan_check_status"] = "login_pending"
-        row["plan_check_ok"] = None
-        row["plan_check_trigger"] = str(trigger or "manual_import")
-        row["plan_check_queued_at"] = now
-        row["plan_check_started_at"] = None
-        row["plan_check_completed_at"] = None
-        row["plan_check_error"] = None
-        row["updated_at"] = now
-        _save_accounts(accounts)
-        return True
+        return _mutate_account_row(
+            acc_id=target_id,
+            mutator=lambda row: row.update({
+                "plan_check_status": "login_pending",
+                "plan_check_stage": "login",
+                "plan_check_ok": None,
+                "plan_check_trigger": str(trigger or "manual_import"),
+                "plan_check_queued_at": now,
+                "plan_check_started_at": None,
+                "plan_check_completed_at": None,
+                "plan_check_error": None,
+            }),
+        )
 
 
 def update_account_login_credentials(
@@ -1713,18 +1808,16 @@ def update_account_login_credentials(
     """Persist credentials supplied for a tokenless account without replacing its other data."""
     target_id = int(acc_id)
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((item for item in accounts if int(item.get("id") or 0) == target_id), None)
-        if row is None:
-            return False
-        row["registration_password"] = str(password or "")
-        row["totp_secret"] = str(totp_secret or "") or None
-        row["twofa_status"] = "active"
-        row["twofa_error"] = None
-        row["codex_login_mode"] = "credentials"
-        row["updated_at"] = _now()
-        _save_accounts(accounts)
-        return True
+        return _mutate_account_row(
+            acc_id=target_id,
+            mutator=lambda row: row.update({
+                "registration_password": str(password or ""),
+                "totp_secret": str(totp_secret or "") or None,
+                "twofa_status": "active",
+                "twofa_error": None,
+                "codex_login_mode": "credentials",
+            }),
+        )
 
 
 
@@ -1734,69 +1827,65 @@ def update_account_codex_status(email: str, codex_status: str, codex_error: str 
     返回是否找到该账号。
     """
     with _LOCK:
-        accounts = _load_accounts()
-        row = _find_by_email(accounts, email)
-        if row is None:
-            return False
-        is_deactivated = str(codex_status or "").strip().lower() == "deactivated"
-        row["codex_status"] = codex_status
-        row["codex_error"] = account_unusable_message("account_deactivated") if is_deactivated else codex_error
-        if is_deactivated:
-            # Codex 授权阶段判定为 deactivated，按账号废号处理，便于账号列表统一筛选。
-            row["live_check_status"] = "deactivated"
-            row["live_check_ok"] = False
-            row["live_check_error"] = account_unusable_message("account_deactivated")
-            row["live_checked_at"] = _now()
-        row["updated_at"] = _now()
-        _save_accounts(accounts)
-        return True
+        def mutate(row: dict) -> None:
+            is_deactivated = str(codex_status or "").strip().lower() == "deactivated"
+            row["codex_status"] = codex_status
+            row["codex_error"] = account_unusable_message("account_deactivated") if is_deactivated else codex_error
+            if is_deactivated:
+                # Codex 授权阶段判定为 deactivated，按账号废号处理，便于账号列表统一筛选。
+                row["live_check_status"] = "deactivated"
+                row["live_check_ok"] = False
+                row["live_check_error"] = account_unusable_message("account_deactivated")
+                row["live_checked_at"] = _now()
+
+        return _mutate_account_row(email=email, mutator=mutate)
 
 
 def claim_account_codex_agent(acc_id: int, trigger: str = "manual") -> bool:
     """原子占用账号 Codex Agent Token 生成任务；已有未超时任务时返回 False。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
-            return False
-        current_status = row.get("codex_agent_status")
-        if current_status in {"queued", "running"}:
-            try:
-                stamp_key = "codex_agent_queued_at" if current_status == "queued" else "codex_agent_started_at"
-                stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
-                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (_local_now() - started_at).total_seconds() < stale_after:
-                    return False
-            except (TypeError, ValueError):
-                pass
-        now = _now()
-        row["codex_agent_status"] = "queued"
-        row["codex_agent_ok"] = False
-        row["codex_agent_trigger"] = str(trigger or "manual")
-        row["codex_agent_queued_at"] = now
-        row["codex_agent_started_at"] = None
-        row["codex_agent_completed_at"] = None
-        row["codex_agent_error"] = None
-        row["codex_agent_message"] = "已入队"
-        row["updated_at"] = now
-        _save_accounts(accounts)
-        return True
+        def mutate(row: dict) -> bool:
+            current_status = row.get("codex_agent_status")
+            if current_status in {"queued", "running"}:
+                try:
+                    stamp_key = "codex_agent_queued_at" if current_status == "queued" else "codex_agent_started_at"
+                    stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
+                    started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+                    if (_local_now() - started_at).total_seconds() < stale_after:
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            now = _now()
+            row.update({
+                "codex_agent_status": "queued",
+                "codex_agent_ok": False,
+                "codex_agent_trigger": str(trigger or "manual"),
+                "codex_agent_queued_at": now,
+                "codex_agent_started_at": None,
+                "codex_agent_completed_at": None,
+                "codex_agent_error": None,
+                "codex_agent_message": "已入队",
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def mark_account_codex_agent_running(acc_id: int) -> bool:
     """把 Codex Agent Token 生成任务标记为运行中。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None or row.get("codex_agent_status") not in {"queued", "running"}:
-            return False
-        row["codex_agent_status"] = "running"
-        row["codex_agent_started_at"] = _now()
-        row["codex_agent_error"] = None
-        row["codex_agent_message"] = "正在生成 Codex Agent Token"
-        row["updated_at"] = _now()
-        _save_accounts(accounts)
-        return True
+        def mutate(row: dict) -> bool:
+            if row.get("codex_agent_status") not in {"queued", "running"}:
+                return False
+            row.update({
+                "codex_agent_status": "running",
+                "codex_agent_started_at": _now(),
+                "codex_agent_error": None,
+                "codex_agent_message": "正在生成 Codex Agent Token",
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def update_account_codex_agent(acc_id: int, result: dict | None = None) -> bool:
@@ -1893,52 +1982,47 @@ def claim_account_plan_check(
 ) -> bool:
     """原子占用账号的套餐查询；已有未超时查询时返回 False。"""
     with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
-        if row is None:
-            return False
+        def mutate(row: dict) -> bool:
+            current_status = row.get("plan_check_status")
+            if current_status in {"queued", "running"}:
+                try:
+                    stamp_key = "plan_check_queued_at" if current_status == "queued" else "plan_check_started_at"
+                    stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
+                    started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+                    if (_local_now() - started_at).total_seconds() < stale_after:
+                        return False
+                except (TypeError, ValueError):
+                    pass
 
-        current_status = row.get("plan_check_status")
-        if current_status in {"queued", "running"}:
-            try:
-                stamp_key = "plan_check_queued_at" if current_status == "queued" else "plan_check_started_at"
-                stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
-                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (_local_now() - started_at).total_seconds() < stale_after:
-                    return False
-            except (TypeError, ValueError):
-                pass
+            now = _now()
+            row.update({
+                "plan_check_status": "queued",
+                "plan_check_stage": "plan",
+                "plan_check_trigger": str(trigger or "manual"),
+                "plan_check_queued_at": now,
+                "plan_check_started_at": None,
+                "plan_check_completed_at": None,
+                "plan_check_error": None,
+            })
+            return True
 
-        now = _now()
-        row["plan_check_status"] = "queued"
-        row["plan_check_trigger"] = str(trigger or "manual")
-        row["plan_check_queued_at"] = now
-        row["plan_check_started_at"] = None
-        row["plan_check_completed_at"] = None
-        row["plan_check_error"] = None
-        row["updated_at"] = now
-        _save_accounts(accounts)
-        return True
+        return _mutate_account_row(acc_id=acc_id, email=email, mutator=mutate)
 
 
 def mark_account_plan_check_running(acc_id: int) -> bool:
     """把已排队的套餐查询标记为执行中。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None or row.get("plan_check_status") not in {"queued", "running"}:
-            return False
-        row["plan_check_status"] = "running"
-        row["plan_check_started_at"] = _now()
-        row["plan_check_error"] = None
-        row["updated_at"] = _now()
-        _save_accounts(accounts)
-        return True
+        def mutate(row: dict) -> bool:
+            if row.get("plan_check_status") not in {"queued", "running"}:
+                return False
+            row.update({
+                "plan_check_status": "running",
+                "plan_check_started_at": _now(),
+                "plan_check_error": None,
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def recover_interrupted_plan_checks() -> int:
@@ -1965,184 +2049,166 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
     """更新账号套餐/Plus 试用资格查询结果。"""
     result = result or {}
     with _LOCK:
-        accounts = _load_accounts()
-        target_email = (email or "").lower()
-        row = next((
-            r for r in accounts
-            if (acc_id is not None and int(r.get("id") or 0) == int(acc_id))
-            or (target_email and (r.get("email") or "").lower() == target_email)
-        ), None)
-        if row is None:
-            return False
+        def mutate(row: dict) -> None:
+            now = _now()
+            ok = bool(result.get("ok"))
+            row["plan_check_status"] = "success" if ok else "failed"
+            if result.get("check_stage") is not None:
+                row["plan_check_stage"] = str(result.get("check_stage") or "").strip() or None
+            row["plan_check_ok"] = ok
+            row["plan_checked_at"] = result.get("checked_at") or now
+            row["plan_check_completed_at"] = now
+            row["plan_check_http_status"] = result.get("http_status")
+            row["plan_check_error"] = None if ok else result.get("error")
 
-        ok = bool(result.get("ok"))
-        row["plan_check_status"] = "success" if ok else "failed"
-        row["plan_check_ok"] = ok
-        row["plan_checked_at"] = result.get("checked_at") or _now()
-        row["plan_check_completed_at"] = _now()
-        row["plan_check_http_status"] = result.get("http_status")
-        row["plan_check_error"] = None if ok else result.get("error")
+            if result.get("account_id"):
+                row["account_id"] = result.get("account_id")
+            # 查询失败只更新本次错误和网络信息，不覆盖上一次成功拿到的套餐、
+            # 试用资格、优惠及有效期，避免临时网络故障把真实权益清空。
+            if ok:
+                if result.get("current_plan_type"):
+                    row["current_plan_type"] = result.get("current_plan_type")
+                    row["plan_type"] = result.get("current_plan_type")
+                if result.get("subscription_plan") is not None:
+                    row["subscription_plan"] = result.get("subscription_plan")
+                if result.get("has_active_subscription") is not None:
+                    row["has_active_subscription"] = bool(result.get("has_active_subscription"))
+                if result.get("expires_at") is not None:
+                    row["plan_expires_at"] = result.get("expires_at")
+                if result.get("renews_at") is not None:
+                    row["plan_renews_at"] = result.get("renews_at")
+                if result.get("cancels_at") is not None:
+                    row["plan_cancels_at"] = result.get("cancels_at")
+                if result.get("billing_period") is not None:
+                    row["billing_period"] = result.get("billing_period")
+                if result.get("billing_currency") is not None:
+                    row["billing_currency"] = result.get("billing_currency")
+                if result.get("is_delinquent") is not None:
+                    row["is_delinquent"] = bool(result.get("is_delinquent"))
+                for _k in (
+                    "discount_type", "discount_amount", "discount_duration_num_periods",
+                    "discount_expires_at", "discount_cancellation_policy",
+                    "discount_promo_campaign_id", "last_purchase_origin_platform", "last_will_renew",
+                ):
+                    if result.get(_k) is not None:
+                        row[_k] = result.get(_k)
 
-        if result.get("account_id"):
-            row["account_id"] = result.get("account_id")
-        # 查询失败只更新本次错误和网络信息，不覆盖上一次成功拿到的套餐、
-        # 试用资格、优惠及有效期，避免临时网络故障把真实权益清空。
-        if ok:
-            if result.get("current_plan_type"):
-                row["current_plan_type"] = result.get("current_plan_type")
-                row["plan_type"] = result.get("current_plan_type")
-            if result.get("subscription_plan") is not None:
-                row["subscription_plan"] = result.get("subscription_plan")
-            if result.get("has_active_subscription") is not None:
-                row["has_active_subscription"] = bool(result.get("has_active_subscription"))
-            if result.get("expires_at") is not None:
-                row["plan_expires_at"] = result.get("expires_at")
-            if result.get("renews_at") is not None:
-                row["plan_renews_at"] = result.get("renews_at")
-            if result.get("cancels_at") is not None:
-                row["plan_cancels_at"] = result.get("cancels_at")
-            if result.get("billing_period") is not None:
-                row["billing_period"] = result.get("billing_period")
-            if result.get("billing_currency") is not None:
-                row["billing_currency"] = result.get("billing_currency")
-            if result.get("is_delinquent") is not None:
-                row["is_delinquent"] = bool(result.get("is_delinquent"))
-            for _k in (
-                "discount_type",
-                "discount_amount",
-                "discount_duration_num_periods",
-                "discount_expires_at",
-                "discount_cancellation_policy",
-                "discount_promo_campaign_id",
-                "last_purchase_origin_platform",
-                "last_will_renew",
-            ):
-                if result.get(_k) is not None:
-                    row[_k] = result.get(_k)
+                row["plus_trial_eligible"] = bool(result.get("plus_trial_eligible"))
+                row["plus_trial_campaign_id"] = result.get("plus_trial_campaign_id")
+                row["plus_trial_title"] = result.get("plus_trial_title")
+                row["plus_trial_discount_percentage"] = result.get("plus_trial_discount_percentage")
+                row["plus_trial_duration_num_periods"] = result.get("plus_trial_duration_num_periods")
+                row["plus_trial_duration_period"] = result.get("plus_trial_duration_period")
+                row["eligible_offer_ids"] = result.get("eligible_offer_ids") or []
+                row["plan_last_success_at"] = result.get("checked_at") or now
+                row["plan_last_success_result_json"] = json.dumps(result, ensure_ascii=False)
 
-            row["plus_trial_eligible"] = bool(result.get("plus_trial_eligible"))
-            row["plus_trial_campaign_id"] = result.get("plus_trial_campaign_id")
-            row["plus_trial_title"] = result.get("plus_trial_title")
-            row["plus_trial_discount_percentage"] = result.get("plus_trial_discount_percentage")
-            row["plus_trial_duration_num_periods"] = result.get("plus_trial_duration_num_periods")
-            row["plus_trial_duration_period"] = result.get("plus_trial_duration_period")
-            row["eligible_offer_ids"] = result.get("eligible_offer_ids") or []
-            row["plan_last_success_at"] = result.get("checked_at") or _now()
-            row["plan_last_success_result_json"] = json.dumps(result, ensure_ascii=False)
+                if (
+                    str(result.get("current_plan_type") or "").strip().lower() == "free"
+                    and result.get("plus_trial_eligible") is False
+                    and row.get("free_plus_exported_at")
+                ):
+                    row["free_plus_exported_at"] = None
+                    row["free_plus_export_count"] = 0
+                    row["free_plus_export_format"] = None
+                    row["free_plus_export_source"] = None
+                    if row.get("archived"):
+                        row["archived"] = False
+                        row["archived_at"] = None
+            row["plan_check_proxy_mode"] = result.get("proxy_mode")
+            row["plan_check_network_route"] = result.get("network_route")
+            row["plan_check_proxy_used"] = result.get("proxy_used")
+            row["plan_check_proxy_fallback_reason"] = result.get("proxy_fallback_reason")
+            row["token_expired"] = result.get("token_expired")
+            row["token_expires_at"] = result.get("token_expires_at")
+            row["plan_check_result_json"] = json.dumps(result, ensure_ascii=False)
 
-            if (
-                str(result.get("current_plan_type") or "").strip().lower() == "free"
-                and result.get("plus_trial_eligible") is False
-                and row.get("free_plus_exported_at")
-            ):
-                # A fresh plan check confirms that a previously exported account no
-                # longer has the Plus trial; clear the stale export marker and archive flag.
-                row["free_plus_exported_at"] = None
-                row["free_plus_export_count"] = 0
-                row["free_plus_export_format"] = None
-                row["free_plus_export_source"] = None
-                if row.get("archived"):
-                    row["archived"] = False
-                    row["archived_at"] = None
-        row["plan_check_proxy_mode"] = result.get("proxy_mode")
-        row["plan_check_network_route"] = result.get("network_route")
-        row["plan_check_proxy_used"] = result.get("proxy_used")
-        row["plan_check_proxy_fallback_reason"] = result.get("proxy_fallback_reason")
-        row["token_expired"] = result.get("token_expired")
-        row["token_expires_at"] = result.get("token_expires_at")
-        row["plan_check_result_json"] = json.dumps(result, ensure_ascii=False)
-        row["updated_at"] = _now()
-        _save_accounts(accounts)
-        return True
+        return _mutate_account_row(acc_id=acc_id, email=email, mutator=mutate)
 
 
 def claim_account_extract(acc_id: int, trigger: str = "manual", link_type: str = "pix") -> bool:
     """原子占用账号提链任务；已有未超时任务时返回 False。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
-            return False
-        current_status = row.get("extract_link_status")
-        if current_status in {"queued", "running"}:
-            try:
-                stamp_key = "extract_link_queued_at" if current_status == "queued" else "extract_link_started_at"
-                stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
-                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (_local_now() - started_at).total_seconds() < stale_after:
-                    return False
-            except (TypeError, ValueError):
-                pass
-        now = _now()
-        row["extract_link_status"] = "queued"
-        row["extract_link_ok"] = False
-        row["extract_link_trigger"] = str(trigger or "manual")
-        row["extract_link_type"] = str(link_type or "pix").lower()
-        row["extract_link_queued_at"] = now
-        row["extract_link_started_at"] = None
-        row["extract_link_completed_at"] = None
-        row["extract_link_error"] = None
-        row["extract_link_message"] = "已入队"
-        row["updated_at"] = now
-        _save_accounts(accounts)
-        return True
+        def mutate(row: dict) -> bool:
+            current_status = row.get("extract_link_status")
+            if current_status in {"queued", "running"}:
+                try:
+                    stamp_key = "extract_link_queued_at" if current_status == "queued" else "extract_link_started_at"
+                    stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
+                    started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+                    if (_local_now() - started_at).total_seconds() < stale_after:
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            now = _now()
+            row.update({
+                "extract_link_status": "queued",
+                "extract_link_ok": False,
+                "extract_link_trigger": str(trigger or "manual"),
+                "extract_link_type": str(link_type or "pix").lower(),
+                "extract_link_queued_at": now,
+                "extract_link_started_at": None,
+                "extract_link_completed_at": None,
+                "extract_link_error": None,
+                "extract_link_message": "已入队",
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def mark_account_extract_running(acc_id: int) -> bool:
     """把提链任务标记为运行中。"""
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None or row.get("extract_link_status") not in {"queued", "running"}:
-            return False
-        row["extract_link_status"] = "running"
-        row["extract_link_started_at"] = _now()
-        row["extract_link_error"] = None
-        row["extract_link_message"] = "任务运行中"
-        row["updated_at"] = _now()
-        _save_accounts(accounts)
-        return True
+        def mutate(row: dict) -> bool:
+            if row.get("extract_link_status") not in {"queued", "running"}:
+                return False
+            row.update({
+                "extract_link_status": "running",
+                "extract_link_started_at": _now(),
+                "extract_link_error": None,
+                "extract_link_message": "任务运行中",
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def update_account_extract(acc_id: int, result: dict | None = None) -> bool:
     """更新账号提链任务结果/进度。"""
     result = result or {}
     with _LOCK:
-        accounts = _load_accounts()
-        row = next((r for r in accounts if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
-            return False
-        status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
-        ok = bool(result.get("ok")) and status == "success"
-        row["extract_link_status"] = status
-        row["extract_link_ok"] = ok
-        row["extract_link_checked_at"] = result.get("checked_at") or _now()
-        if status in {"success", "failed", "stopped"}:
-            row["extract_link_completed_at"] = _now()
-        row["extract_link_error"] = None if ok or status == "running" else result.get("error")
-        if result.get("message") is not None:
-            row["extract_link_message"] = result.get("message")
-        if result.get("job_id") is not None:
-            row["extract_link_job_id"] = result.get("job_id")
-        if result.get("link_type") is not None:
-            row["extract_link_type"] = result.get("link_type")
-        if result.get("cdk_remaining") is not None:
-            row["extract_link_cdk_remaining"] = result.get("cdk_remaining")
-        payload = result.get("result") if isinstance(result.get("result"), dict) else {}
-        if payload:
-            row["extract_link_long_url"] = payload.get("long_url")
-            row["extract_link_copy_paste"] = payload.get("copy_paste")
-            row["extract_link_image_url_png"] = payload.get("image_url_png")
-            row["extract_link_image_url_svg"] = payload.get("image_url_svg")
-            row["extract_link_payment_method"] = payload.get("payment_method")
-            row["extract_link_payment_link_type"] = payload.get("payment_link_type")
-            row["extract_link_expires_at"] = payload.get("expires_at")
-            if payload.get("cdk_remaining") is not None:
-                row["extract_link_cdk_remaining"] = payload.get("cdk_remaining")
-            row["extract_link_result_json"] = json.dumps(payload, ensure_ascii=False)
-        row["updated_at"] = _now()
-        _save_accounts(accounts)
-        return True
+        def mutate(row: dict) -> None:
+            status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
+            ok = bool(result.get("ok")) and status == "success"
+            row["extract_link_status"] = status
+            row["extract_link_ok"] = ok
+            row["extract_link_checked_at"] = result.get("checked_at") or _now()
+            if status in {"success", "failed", "stopped"}:
+                row["extract_link_completed_at"] = _now()
+            row["extract_link_error"] = None if ok or status == "running" else result.get("error")
+            if result.get("message") is not None:
+                row["extract_link_message"] = result.get("message")
+            if result.get("job_id") is not None:
+                row["extract_link_job_id"] = result.get("job_id")
+            if result.get("link_type") is not None:
+                row["extract_link_type"] = result.get("link_type")
+            if result.get("cdk_remaining") is not None:
+                row["extract_link_cdk_remaining"] = result.get("cdk_remaining")
+            payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if payload:
+                row["extract_link_long_url"] = payload.get("long_url")
+                row["extract_link_copy_paste"] = payload.get("copy_paste")
+                row["extract_link_image_url_png"] = payload.get("image_url_png")
+                row["extract_link_image_url_svg"] = payload.get("image_url_svg")
+                row["extract_link_payment_method"] = payload.get("payment_method")
+                row["extract_link_payment_link_type"] = payload.get("payment_link_type")
+                row["extract_link_expires_at"] = payload.get("expires_at")
+                if payload.get("cdk_remaining") is not None:
+                    row["extract_link_cdk_remaining"] = payload.get("cdk_remaining")
+                row["extract_link_result_json"] = json.dumps(payload, ensure_ascii=False)
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def recover_interrupted_extract_links() -> int:
@@ -2495,25 +2561,82 @@ def list_accounts_page(
     totp_filter: str | None = None,
 ) -> dict:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter, totp_filter=totp_filter)
-        total = len(rows)
         limit = max(1, int(limit))
         offset = max(0, int(offset or 0))
-        items = rows[offset: offset + limit]
-        latest = max((str(row.get("updated_at") or "") for row in rows), default="")
+        extended_filters = any(
+            str(value or "").strip()
+            for value in (
+                twofa_filter,
+                account_locale_filter,
+                email_source_filter,
+                email_domain_filter,
+                totp_filter,
+            )
+        )
+        if extended_filters:
+            rows = _filtered_decorated_accounts(
+                archived=archived,
+                plan_filter=plan_filter,
+                codex_filter=codex_filter,
+                q=q,
+                free_plus_export_filter=free_plus_export_filter,
+                date_from=date_from,
+                date_to=date_to,
+                twofa_filter=twofa_filter,
+                account_locale_filter=account_locale_filter,
+                email_source_filter=email_source_filter,
+                email_domain_filter=email_domain_filter,
+                totp_filter=totp_filter,
+            )
+            total = len(rows)
+            items = rows[offset: offset + limit]
+            latest = max((str(row.get("updated_at") or "") for row in rows), default="")
+        else:
+            extra_where, extra_params = _account_filter_sql(
+                plan_filter,
+                codex_filter,
+                free_plus_export_filter,
+                totp_filter,
+            )
+            items, total, latest = _query_collection_page(
+                "accounts",
+                archived=archived,
+                q=q,
+                date_from=date_from,
+                date_to=date_to,
+                extra_where=extra_where,
+                extra_params=extra_params,
+                limit=limit,
+                offset=offset,
+            )
+            items = [_decorate_account(row) for row in items]
         return {"items": items, "total": total, "offset": offset, "limit": limit, "revision": f"{total}:{latest}"}
 
 
 def get_account(acc_id: int) -> dict | None:
     with _LOCK:
-        row = next((r for r in _load_accounts() if int(r.get("id") or 0) == int(acc_id)), None)
-        return _decorate_account(row) if row else None
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            stored = conn.execute(
+                "SELECT payload FROM accounts WHERE id=? LIMIT 1", (int(acc_id),)
+            ).fetchone()
+        if stored is None:
+            return None
+        row = json.loads(stored["payload"])
+        return _decorate_account(row) if isinstance(row, dict) else None
 
 
 def get_account_by_email(email: str) -> dict | None:
     with _LOCK:
-        row = _find_by_email(_load_accounts(), email)
-        return _decorate_account(row) if row else None
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            stored = conn.execute(
+                "SELECT payload FROM accounts WHERE email = ? COLLATE NOCASE LIMIT 1", (email,)
+            ).fetchone()
+        if stored is None:
+            return None
+        row = json.loads(stored["payload"])
+        return _decorate_account(row) if isinstance(row, dict) else None
 
 
 def save_personal_info_change_batch(
@@ -2662,121 +2785,107 @@ def update_account_liveness(acc_id: int, result: dict | None = None) -> bool:
     """写回账号查活结果；成功时同步刷新最新 access_token 和账号基础信息。"""
     result = result or {}
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
-            return False
+        def mutate(row: dict) -> None:
+            now = _now()
+            ok = bool(result.get("ok"))
+            status = str(result.get("status") or ("live" if ok else "failed"))
+            row["live_check_status"] = status
+            row["live_check_ok"] = ok
+            row["live_checked_at"] = result.get("checked_at") or now
+            row["live_check_error"] = None if ok else (
+                account_unusable_message("account_deactivated")
+                if status == "deactivated"
+                else result.get("error")
+            )
+            if ok:
+                token = str(result.get("access_token") or "").strip()
+                if token:
+                    row["access_token"] = token
+                session = result.get("session") or {}
+                user = session.get("user") or {}
+                account = session.get("account") or {}
+                if user.get("id"):
+                    row["user_id"] = user.get("id")
+                if user.get("name") is not None:
+                    row["user_name"] = user.get("name")
+                if account.get("planType"):
+                    row["plan_type"] = account.get("planType")
+                if session.get("expires"):
+                    row["expires_at"] = session.get("expires")
+                row["live_check_proxy_used"] = result.get("proxy_used") or row.get("live_check_proxy_used")
+                row["live_check_fingerprint_text"] = result.get("fingerprint_text") or row.get("live_check_fingerprint_text")
+                if result.get("fingerprint"):
+                    row["live_check_fingerprint"] = result.get("fingerprint")
+                row["live_check_error"] = None
 
-        now = _now()
-        ok = bool(result.get("ok"))
-        status = str(result.get("status") or ("live" if ok else "failed"))
-        row["live_check_status"] = status
-        row["live_check_ok"] = ok
-        row["live_checked_at"] = result.get("checked_at") or now
-        row["live_check_error"] = None if ok else (
-            account_unusable_message("account_deactivated")
-            if status == "deactivated"
-            else result.get("error")
-        )
-        row["updated_at"] = now
-
-        if ok:
-            token = str(result.get("access_token") or "").strip()
-            if token:
-                row["access_token"] = token
-            session = result.get("session") or {}
-            user = session.get("user") or {}
-            account = session.get("account") or {}
-            if user.get("id"):
-                row["user_id"] = user.get("id")
-            if user.get("name") is not None:
-                row["user_name"] = user.get("name")
-            if account.get("planType"):
-                row["plan_type"] = account.get("planType")
-            if session.get("expires"):
-                row["expires_at"] = session.get("expires")
-            row["live_check_proxy_used"] = result.get("proxy_used") or row.get("live_check_proxy_used")
-            row["live_check_fingerprint_text"] = result.get("fingerprint_text") or row.get("live_check_fingerprint_text")
-            if result.get("fingerprint"):
-                row["live_check_fingerprint"] = result.get("fingerprint")
-            row["live_check_error"] = None
-
-        row["copy_line"] = _account_line(row)
-        _save_accounts(rows)
-        return True
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def claim_account_totp_setup(acc_id: int, trigger: str = "manual") -> bool:
     """原子占用账号 2FA 设置任务；已有未超时任务时返回 False。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
-            return False
-        current_status = row.get("totp_setup_status")
-        if current_status in {"queued", "running"}:
-            try:
-                stamp_key = "totp_setup_queued_at" if current_status == "queued" else "totp_setup_started_at"
-                stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
-                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (_local_now() - started_at).total_seconds() < stale_after:
-                    return False
-            except (TypeError, ValueError):
-                pass
-        now = _now()
-        row["totp_setup_status"] = "queued"
-        row["totp_setup_ok"] = False
-        row["totp_setup_trigger"] = str(trigger or "manual")
-        row["totp_setup_queued_at"] = now
-        row["totp_setup_started_at"] = None
-        row["totp_setup_completed_at"] = None
-        row["totp_setup_error"] = None
-        row["updated_at"] = now
-        _save_accounts(rows)
-        return True
+        def mutate(row: dict) -> bool:
+            current_status = row.get("totp_setup_status")
+            if current_status in {"queued", "running"}:
+                try:
+                    stamp_key = "totp_setup_queued_at" if current_status == "queued" else "totp_setup_started_at"
+                    stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if current_status == "queued" else _PLAN_CHECK_STALE_SECONDS
+                    started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+                    if (_local_now() - started_at).total_seconds() < stale_after:
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            now = _now()
+            row.update({
+                "totp_setup_status": "queued",
+                "totp_setup_ok": False,
+                "totp_setup_trigger": str(trigger or "manual"),
+                "totp_setup_queued_at": now,
+                "totp_setup_started_at": None,
+                "totp_setup_completed_at": None,
+                "totp_setup_error": None,
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def mark_account_totp_setup_running(acc_id: int) -> bool:
     """把 2FA 设置任务标记为运行中。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None or row.get("totp_setup_status") not in {"queued", "running"}:
-            return False
-        now = _now()
-        row["totp_setup_status"] = "running"
-        row["totp_setup_started_at"] = now
-        row["totp_setup_error"] = None
-        row["updated_at"] = now
-        _save_accounts(rows)
-        return True
+        def mutate(row: dict) -> bool:
+            if row.get("totp_setup_status") not in {"queued", "running"}:
+                return False
+            row.update({
+                "totp_setup_status": "running",
+                "totp_setup_started_at": _now(),
+                "totp_setup_error": None,
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def update_account_totp_secret(acc_id: int, result: dict | None = None) -> bool:
     """更新账号 2FA/TOTP 设置结果。"""
     result = result or {}
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
-            return False
-        status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
-        ok = bool(result.get("ok")) and status == "success"
-        row["totp_setup_status"] = status
-        row["totp_setup_ok"] = ok
-        row["totp_setup_checked_at"] = result.get("checked_at") or _now()
-        if status in {"success", "failed", "stopped"}:
-            row["totp_setup_completed_at"] = _now()
-        row["totp_setup_error"] = None if ok or status == "running" else result.get("error")
-        secret = str(result.get("totp_secret") or "").strip()
-        if ok and secret:
-            row["totp_secret"] = secret
-        if result.get("message") is not None:
-            row["totp_setup_message"] = result.get("message")
-        row["copy_line"] = _account_line(row)
-        row["updated_at"] = _now()
-        _save_accounts(rows)
-        return True
+        def mutate(row: dict) -> None:
+            status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
+            ok = bool(result.get("ok")) and status == "success"
+            row["totp_setup_status"] = status
+            row["totp_setup_ok"] = ok
+            row["totp_setup_checked_at"] = result.get("checked_at") or _now()
+            if status in {"success", "failed", "stopped"}:
+                row["totp_setup_completed_at"] = _now()
+            row["totp_setup_error"] = None if ok or status == "running" else result.get("error")
+            secret = str(result.get("totp_secret") or "").strip()
+            if ok and secret:
+                row["totp_secret"] = secret
+            if result.get("message") is not None:
+                row["totp_setup_message"] = result.get("message")
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def recover_interrupted_totp_setups() -> int:
@@ -2802,30 +2911,29 @@ def recover_interrupted_totp_setups() -> int:
 def claim_account_live_check(acc_id: int, trigger: str = "manual") -> bool:
     """原子占用账号查活任务；已有 queued/running 时返回 False。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None:
-            return False
-        if row.get("live_check_status") in {"queued", "running"}:
-            try:
-                stamp_key = "live_check_queued_at" if row.get("live_check_status") == "queued" else "live_check_started_at"
-                stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if row.get("live_check_status") == "queued" else _PLAN_CHECK_STALE_SECONDS
-                started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
-                if (_local_now() - started_at).total_seconds() < stale_after:
-                    return False
-            except (TypeError, ValueError):
-                pass
-        now = _now()
-        row["live_check_status"] = "queued"
-        row["live_check_ok"] = False
-        row["live_check_trigger"] = str(trigger or "manual")
-        row["live_check_queued_at"] = now
-        row["live_check_started_at"] = None
-        row["live_checked_at"] = None
-        row["live_check_error"] = None
-        row["updated_at"] = now
-        _save_accounts(rows)
-        return True
+        def mutate(row: dict) -> bool:
+            if row.get("live_check_status") in {"queued", "running"}:
+                try:
+                    stamp_key = "live_check_queued_at" if row.get("live_check_status") == "queued" else "live_check_started_at"
+                    stale_after = _PLAN_CHECK_QUEUE_STALE_SECONDS if row.get("live_check_status") == "queued" else _PLAN_CHECK_STALE_SECONDS
+                    started_at = datetime.fromisoformat(str(row.get(stamp_key) or ""))
+                    if (_local_now() - started_at).total_seconds() < stale_after:
+                        return False
+                except (TypeError, ValueError):
+                    pass
+            now = _now()
+            row.update({
+                "live_check_status": "queued",
+                "live_check_ok": False,
+                "live_check_trigger": str(trigger or "manual"),
+                "live_check_queued_at": now,
+                "live_check_started_at": None,
+                "live_checked_at": None,
+                "live_check_error": None,
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def recover_interrupted_live_checks() -> int:
@@ -2851,17 +2959,17 @@ def recover_interrupted_live_checks() -> int:
 def mark_account_live_check_running(acc_id: int) -> bool:
     """把账号查活任务标记为运行中。"""
     with _LOCK:
-        rows = _load_accounts()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(acc_id)), None)
-        if row is None or row.get("live_check_status") not in {"queued", "running"}:
-            return False
-        now = _now()
-        row["live_check_status"] = "running"
-        row["live_check_started_at"] = now
-        row["live_check_error"] = None
-        row["updated_at"] = now
-        _save_accounts(rows)
-        return True
+        def mutate(row: dict) -> bool:
+            if row.get("live_check_status") not in {"queued", "running"}:
+                return False
+            row.update({
+                "live_check_status": "running",
+                "live_check_started_at": _now(),
+                "live_check_error": None,
+            })
+            return True
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
 def update_accounts_note(account_ids: list[int] | None, note: str) -> tuple[list[dict], list[dict]]:
@@ -3324,49 +3432,41 @@ def import_codex_credential_accounts(records: list[dict]) -> tuple[int, int, int
 def claim_next_outlook() -> dict | None:
     """原子领取一个可用 Outlook 账号并标记为 used。"""
     with _LOCK:
-        rows = sorted(_load_outlook(), key=lambda x: int(x.get("id") or 0))
-        row = next((r for r in rows if r.get("status") == "available"), None)
-        if row is None:
-            return None
-        row["status"] = "used"
-        row["used_at"] = _now()
-        row["note"] = None
-        _save_outlook(rows)
-        return _decorate_outlook(row)
+        row = _mutate_email_pool_row(
+            "outlook",
+            status="available",
+            mutator=lambda item: item.update({"status": "used", "used_at": _now(), "note": None}),
+        )
+        return _decorate_outlook(row) if row else None
 
 
 def release_outlook(email: str, status: str = "available", note: str | None = None) -> None:
     """把账号状态改回 available，或标记为 used/failed/disabled。"""
     with _LOCK:
-        rows = _load_outlook()
-        row = _find_by_email(rows, email)
-        if row is None:
-            return
-        row["status"] = status
-        if status == "available":
-            row["used_at"] = None
-        elif status in ("used", "failed", "disabled"):
-            row["used_at"] = row.get("used_at") or _now()
-        if note is not None:
-            row["note"] = note
-        _save_outlook(rows)
+        def mutate(row: dict) -> None:
+            row["status"] = status
+            if status == "available":
+                row["used_at"] = None
+            elif status in ("used", "failed", "disabled"):
+                row["used_at"] = row.get("used_at") or _now()
+            if note is not None:
+                row["note"] = note
+
+        _mutate_email_pool_row("outlook", email=email, mutator=mutate)
 
 
 def release_unconsumed_outlook(email: str, note: str | None = None) -> bool:
     """原子回收未生成本地账号且仍为 used 的 Outlook 邮箱。"""
     with _LOCK:
-        if _find_by_email(_load_accounts(), email) is not None:
+        if get_account_by_email(email) is not None:
             return False
-        rows = _load_outlook()
-        row = _find_by_email(rows, email)
-        if row is None or row.get("status") != "used":
-            return False
-        row["status"] = "available"
-        row["used_at"] = None
-        if note is not None:
-            row["note"] = note
-        _save_outlook(rows)
-        return True
+        def mutate(row: dict) -> None:
+            row["status"] = "available"
+            row["used_at"] = None
+            if note is not None:
+                row["note"] = note
+
+        return _mutate_email_pool_row("outlook", email=email, status="used", mutator=mutate) is not None
 
 
 def delete_outlook(email: str) -> bool:
@@ -3396,8 +3496,16 @@ def outlook_pool_summary() -> dict:
 
 def get_outlook_by_email(email: str) -> dict | None:
     with _LOCK:
-        row = _find_by_email(_load_outlook(), email)
-        return _decorate_outlook(row) if row else None
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            stored = conn.execute(
+                "SELECT payload FROM email_pool WHERE source=? AND email=? COLLATE NOCASE LIMIT 1",
+                ("outlook", email),
+            ).fetchone()
+        if stored is None:
+            return None
+        row = json.loads(stored["payload"])
+        return _decorate_outlook(row) if isinstance(row, dict) else None
 
 
 # ============================================================
@@ -3441,15 +3549,12 @@ def import_generic_api_emails(records: list[dict]) -> tuple[int, int]:
 def claim_next_generic_api_email() -> dict | None:
     """原子领取一个可用通用 API 邮箱并标记为 used。"""
     with _LOCK:
-        rows = sorted(_load_generic_api_emails(), key=lambda x: int(x.get("id") or 0))
-        row = next((r for r in rows if r.get("status") == "available"), None)
-        if row is None:
-            return None
-        row["status"] = "used"
-        row["used_at"] = _now()
-        row["note"] = None
-        _save_generic_api_emails(rows)
-        return _decorate_generic_api_email(row)
+        row = _mutate_email_pool_row(
+            "generic_api",
+            status="available",
+            mutator=lambda item: item.update({"status": "used", "used_at": _now(), "note": None}),
+        )
+        return _decorate_generic_api_email(row) if row else None
 
 
 # ============================================================
@@ -3584,18 +3689,16 @@ def record_gmail_api_url_otp(code_url: str, otp: str) -> bool:
 def release_generic_api_email(email: str, status: str = "available", note: str | None = None) -> None:
     """把通用 API 邮箱状态改回 available，或标记为 failed/used。"""
     with _LOCK:
-        rows = _load_generic_api_emails()
-        row = _find_by_email(rows, email)
-        if row is None:
-            return
-        row["status"] = status
-        if status == "available":
-            row["used_at"] = None
-        elif status in ("used", "failed", "disabled"):
-            row["used_at"] = row.get("used_at") or _now()
-        if note is not None:
-            row["note"] = note
-        _save_generic_api_emails(rows)
+        def mutate(row: dict) -> None:
+            row["status"] = status
+            if status == "available":
+                row["used_at"] = None
+            elif status in ("used", "failed", "disabled"):
+                row["used_at"] = row.get("used_at") or _now()
+            if note is not None:
+                row["note"] = note
+
+        _mutate_email_pool_row("generic_api", email=email, mutator=mutate)
 
 
 def release_gmail_api_url_email(email: str, status: str = "available", note: str | None = None) -> None:
@@ -3618,18 +3721,15 @@ def release_gmail_api_url_email(email: str, status: str = "available", note: str
 def release_unconsumed_generic_api_email(email: str, note: str | None = None) -> bool:
     """原子回收未生成本地账号且仍为 used 的通用 API 邮箱。"""
     with _LOCK:
-        if _find_by_email(_load_accounts(), email) is not None:
+        if get_account_by_email(email) is not None:
             return False
-        rows = _load_generic_api_emails()
-        row = _find_by_email(rows, email)
-        if row is None or row.get("status") != "used":
-            return False
-        row["status"] = "available"
-        row["used_at"] = None
-        if note is not None:
-            row["note"] = note
-        _save_generic_api_emails(rows)
-        return True
+        def mutate(row: dict) -> None:
+            row["status"] = "available"
+            row["used_at"] = None
+            if note is not None:
+                row["note"] = note
+
+        return _mutate_email_pool_row("generic_api", email=email, status="used", mutator=mutate) is not None
 
 
 def release_unconsumed_gmail_api_url_email(email: str, note: str | None = None) -> bool:
@@ -4011,7 +4111,7 @@ def codex_accounts_summary() -> dict:
 # ============================================================
 
 def _new_job_row(
-    rows: list[dict],
+    rows: list[dict] | None = None,
     *,
     email_source: str,
     job_type: str = "registration",
@@ -4027,7 +4127,7 @@ def _new_job_row(
     log_file = str(_LOG_DIR / f"{job_uuid}.log")
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
     return {
-        "id": _next_registration_job_id(rows),
+        "id": _next_registration_job_id(rows or []),
         "job_uuid": job_uuid,
         "job_type": job_type,
         "parent_job_id": parent_job_id,
@@ -4057,17 +4157,28 @@ def create_job(
 ) -> dict:
     """创建一个首次执行的 pending 任务。"""
     with _LOCK:
-        rows = _load_jobs()
         row = _new_job_row(
-            rows,
             email_source=email_source,
             job_type=job_type,
             email=email,
             account_id=account_id,
             provider_context=provider_context,
         )
-        rows.append(row)
-        _save_jobs(rows)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            conn.execute(
+                "INSERT INTO registration_jobs(id,email,status,archived,created_at,updated_at,payload) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    int(row["id"]),
+                    str(row.get("email") or ""),
+                    str(row.get("status") or ""),
+                    int(bool(row.get("archived"))),
+                    str(row.get("created_at") or ""),
+                    str(row.get("updated_at") or ""),
+                    json.dumps(row, ensure_ascii=False),
+                ),
+            )
         return dict(row)
 
 
@@ -4082,36 +4193,43 @@ def create_retry_job(
 ) -> tuple[dict, bool]:
     """原子创建重试子任务；同一任务链已有活跃任务时直接复用。"""
     with _LOCK:
-        rows = _load_jobs()
-        source = next((r for r in rows if int(r.get("id") or 0) == int(source_job_id)), None)
-        if source is None:
-            raise LookupError("任务不存在")
-        allowed_statuses = {"failed", "stopped", "cancelled"}
-        if allow_success_for_twofa and job_type == "twofa_retry":
-            allowed_statuses.add("success")
-        if source.get("status") not in allowed_statuses:
-            raise ValueError(f"当前状态不支持重试：{source.get('status')}")
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            source_stored = conn.execute(
+                "SELECT payload FROM registration_jobs WHERE id=? LIMIT 1",
+                (int(source_job_id),),
+            ).fetchone()
+            if source_stored is None:
+                raise LookupError("任务不存在")
+            source = json.loads(source_stored["payload"])
+            if not isinstance(source, dict):
+                raise TypeError("任务 payload 格式非法")
+            allowed_statuses = {"failed", "stopped", "cancelled"}
+            if allow_success_for_twofa and job_type == "twofa_retry":
+                allowed_statuses.add("success")
+            if source.get("status") not in allowed_statuses:
+                raise ValueError(f"当前状态不支持重试：{source.get('status')}")
 
-        root_id = int(source.get("root_job_id") or source.get("id"))
-        active_states = {"pending", "running", "stopping"}
-        active = next((
-            r for r in rows
-            if int(r.get("id") or 0) != int(source_job_id)
-            and int(r.get("root_job_id") or 0) == root_id
-            and r.get("status") in active_states
-        ), None)
-        if active is not None:
-            if active.get("job_type", "registration") != job_type:
-                raise ValueError(f"已有其他类型重试任务 #{active.get('id')} 在排队或运行中")
-            return dict(active), False
+            root_id = int(source.get("root_job_id") or source.get("id"))
+            active_states = ("pending", "running", "stopping")
+            active = conn.execute(
+                "SELECT payload FROM registration_jobs "
+                "WHERE id<>? AND status IN (?,?,?) "
+                "AND CAST(json_extract(payload, '$.root_job_id') AS INTEGER)=? LIMIT 1",
+                (int(source_job_id), *active_states, root_id),
+            ).fetchone()
+            if active is not None:
+                active_row = json.loads(active["payload"])
+                if active_row.get("job_type", "registration") != job_type:
+                    raise ValueError(f"已有其他类型重试任务 #{active_row.get('id')} 在排队或运行中")
+                return dict(active_row), False
 
-        attempts = [
-            int(r.get("retry_attempt") or 0)
-            for r in rows
-            if int(r.get("id") or 0) == root_id or int(r.get("root_job_id") or 0) == root_id
-        ]
+            attempts = [int(item[0] or 0) for item in conn.execute(
+                "SELECT json_extract(payload, '$.retry_attempt') FROM registration_jobs "
+                "WHERE id=? OR CAST(json_extract(payload, '$.root_job_id') AS INTEGER)=?",
+                (root_id, root_id),
+            )]
         row = _new_job_row(
-            rows,
             email_source=email_source,
             job_type=job_type,
             parent_job_id=int(source_job_id),
@@ -4126,8 +4244,16 @@ def create_retry_job(
             account_id=account_id,
             provider_context=dict(source.get("provider_context") or {}),
         )
-        rows.append(row)
-        _save_jobs(rows)
+        with closing(_sqlite_conn()) as conn:
+            conn.execute(
+                "INSERT INTO registration_jobs(id,email,status,archived,created_at,updated_at,payload) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    int(row["id"]), str(row.get("email") or ""), str(row.get("status") or ""),
+                    int(bool(row.get("archived"))), str(row.get("created_at") or ""),
+                    str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False),
+                ),
+            )
         return dict(row), True
 
 
@@ -4143,25 +4269,41 @@ def update_job(
     network_identity: dict | None = None,
 ) -> None:
     with _LOCK:
-        rows = _load_jobs()
-        row = next((r for r in rows if int(r.get("id") or 0) == int(job_id)), None)
-        if row is None:
-            return
-        if status is not None:
-            row["status"] = status
-        if email is not None:
-            row["email"] = email
-        if error is not None:
-            row["error_message"] = error
-        if started_at is not None:
-            row["started_at"] = started_at
-        if completed_at is not None:
-            row["completed_at"] = completed_at
-        if account_id is not None:
-            row["account_id"] = account_id
-        if network_identity is not None:
-            row["network_identity"] = dict(network_identity)
-        _save_jobs(rows)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            stored = conn.execute(
+                "SELECT payload FROM registration_jobs WHERE id = ?",
+                (int(job_id),),
+            ).fetchone()
+            if stored is None:
+                return
+            row = json.loads(stored["payload"])
+            if status is not None:
+                row["status"] = status
+            if email is not None:
+                row["email"] = email
+            if error is not None:
+                row["error_message"] = error
+            if started_at is not None:
+                row["started_at"] = started_at
+            if completed_at is not None:
+                row["completed_at"] = completed_at
+            if account_id is not None:
+                row["account_id"] = account_id
+            if network_identity is not None:
+                row["network_identity"] = dict(network_identity)
+            now = _now()
+            row["updated_at"] = now
+            conn.execute(
+                "UPDATE registration_jobs SET email=?, status=?, updated_at=?, payload=? WHERE id=?",
+                (
+                    str(row.get("email") or ""),
+                    str(row.get("status") or ""),
+                    now,
+                    json.dumps(row, ensure_ascii=False),
+                    int(job_id),
+                ),
+            )
 
 
 def list_jobs(limit: int = 100) -> list[dict]:
@@ -4216,8 +4358,15 @@ def list_jobs_for_automation_request(request_id: str) -> list[dict]:
 
 def get_job(job_id: int) -> dict | None:
     with _LOCK:
-        row = next((r for r in _load_jobs() if int(r.get("id") or 0) == int(job_id)), None)
-        return dict(row) if row else None
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            stored = conn.execute(
+                "SELECT payload FROM registration_jobs WHERE id=? LIMIT 1", (int(job_id),)
+            ).fetchone()
+        if stored is None:
+            return None
+        row = json.loads(stored["payload"])
+        return dict(row) if isinstance(row, dict) else None
 
 
 def get_latest_job_for_account(account_id: int) -> dict | None:
@@ -4467,56 +4616,58 @@ def _find_domain_email(rows: list[dict], email: str) -> dict | None:
 def claim_next_domain_email(email: str) -> dict:
     """记录一个新的域名邮箱地址到池中（标记为 available）。"""
     with _LOCK:
-        rows = _load_domain_pool()
-        if _find_domain_email(rows, email):
-            # 已存在，直接返回
-            row = _find_domain_email(rows, email)
-            return row
-        row = {
-            "id": _next_id(rows),
-            "email": email,
-            "status": "available",
-            "used_at": None,
-            "note": None,
-            "created_at": _now(),
-        }
-        rows.append(row)
-        _save_domain_pool(rows)
-        return dict(row)
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            existing = conn.execute(
+                "SELECT payload FROM email_pool WHERE source=? AND email=? COLLATE NOCASE LIMIT 1",
+                ("cloudflare_domain", email),
+            ).fetchone()
+            if existing is not None:
+                row = json.loads(existing["payload"])
+                return dict(row) if isinstance(row, dict) else {"email": email}
+            row_id = int(conn.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM email_pool").fetchone()[0])
+            row = {
+                "id": row_id,
+                "email": email,
+                "status": "available",
+                "used_at": None,
+                "note": None,
+                "created_at": _now(),
+            }
+            conn.execute(
+                "INSERT INTO email_pool(id,email,source,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?,?)",
+                (row_id, email, "cloudflare_domain", "available", 0, row["created_at"], row["created_at"], json.dumps(row, ensure_ascii=False)),
+            )
+            return dict(row)
 
 
 def release_domain_email(email: str, status: str = "available", note: str | None = None) -> None:
     """更新域名邮箱状态。"""
     with _LOCK:
-        rows = _load_domain_pool()
-        row = _find_domain_email(rows, email)
-        if row is None:
-            return
-        row["status"] = status
-        if status == "available":
-            row["used_at"] = None
-        elif status in ("used", "failed", "disabled"):
-            row["used_at"] = row.get("used_at") or _now()
-        if note is not None:
-            row["note"] = note
-        _save_domain_pool(rows)
+        def mutate(row: dict) -> None:
+            row["status"] = status
+            if status == "available":
+                row["used_at"] = None
+            elif status in ("used", "failed", "disabled"):
+                row["used_at"] = row.get("used_at") or _now()
+            if note is not None:
+                row["note"] = note
+
+        _mutate_email_pool_row("cloudflare_domain", email=email, mutator=mutate)
 
 
 def release_unconsumed_domain_email(email: str, note: str | None = None) -> bool:
     """原子回收未生成本地账号且仍为 used 的域名邮箱。"""
     with _LOCK:
-        if _find_by_email(_load_accounts(), email) is not None:
+        if get_account_by_email(email) is not None:
             return False
-        rows = _load_domain_pool()
-        row = _find_domain_email(rows, email)
-        if row is None or row.get("status") != "used":
-            return False
-        row["status"] = "available"
-        row["used_at"] = None
-        if note is not None:
-            row["note"] = note
-        _save_domain_pool(rows)
-        return True
+        def mutate(row: dict) -> None:
+            row["status"] = "available"
+            row["used_at"] = None
+            if note is not None:
+                row["note"] = note
+
+        return _mutate_email_pool_row("cloudflare_domain", email=email, status="used", mutator=mutate) is not None
 
 
 def get_domain_email_by_email(email: str) -> dict | None:
