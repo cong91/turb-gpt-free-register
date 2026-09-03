@@ -1103,11 +1103,17 @@ def create_app(auth_code: str | None = None) -> Flask:
 
         try:
             login_network_mode = data.get("login_network_mode") or "auto"
+            force_login_emails = data.get("force_login_emails") or []
+            if not isinstance(force_login_emails, list) or any(not isinstance(email, str) for email in force_login_emails):
+                return jsonify({"ok": False, "error": "force_login_emails phải là danh sách email"}), 400
+            if len(force_login_emails) > 500:
+                return jsonify({"ok": False, "error": "force_login_emails tối đa 500 email"}), 400
             result = account_plan_import.queue_imported_plan_checks(
                 emails,
                 get_account_by_email=db.get_account_by_email,
                 enqueue=plan_check_service.enqueue_account_plan_check,
                 login_network_mode=login_network_mode,
+                force_login_emails=force_login_emails,
                 preflight_login_network=account_plan_import.preflight_login_network,
             )
         except ValueError as exc:

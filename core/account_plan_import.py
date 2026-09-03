@@ -12,6 +12,7 @@ from core.account_network import (
     selected_account_proxy,
 )
 from core.free_plus_export import is_free_plus_account
+from core.openai_auth import account_unusable_message, detect_account_unusable_text
 from core.rotating_proxy_runtime import PLAN_IMPORT_LOGIN_PROXY_SCOPE
 
 MAX_IMPORTED_PLAN_RECORDS = 500
@@ -69,6 +70,10 @@ def _login_and_save_account(
     """Login with imported credentials, then persist the resulting access token."""
     from core.account_security import TwofaChangeInput, _login_and_get_access_token
     from core.browser_profile import open_browser_profile
+    from core.openai_auth import (
+        account_unusable_message,
+        detect_account_unusable_text,
+    )
 
     profile = None
     try:
@@ -87,6 +92,14 @@ def _login_and_save_account(
                 raise RuntimeError("无法把登录后的 accessToken 写入账号")
             return {"ok": True, "network_mode": resolved_mode}
     except Exception as exc:  # noqa: BLE001 - one failed login must not stop the batch.
+        error_code = detect_account_unusable_text(str(exc))
+        if error_code:
+            return {
+                "ok": False,
+                "status": "deactivated",
+                "error_code": error_code,
+                "error": account_unusable_message(error_code),
+            }
         return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
     finally:
         if profile is not None:
@@ -100,11 +113,28 @@ def _login_and_save_account(
                 logger.debug("Plan-import browser cleanup failed", exc_info=True)
 
 
-def _mark_login_failed(account_id: int, error: str) -> None:
-    db.update_account_plan_check(
-        acc_id=account_id,
-        result={"ok": False, "error": str(error or "账号登录失败")[:240]},
-    )
+def _mark_login_failed(
+    account_id: int,
+    error: str,
+    *,
+    stage: str = "login",
+    account_status: str | None = None,
+) -> None:
+    try:
+        updated = db.update_account_plan_check(
+            acc_id=account_id,
+            result={
+                "ok": False,
+                "error": str(error or "账号登录失败")[:240],
+                "check_stage": stage,
+                "account_status": account_status,
+            },
+        )
+    except Exception:
+        logger.exception("[Plan import] failed to persist account failure: account_id=%s", account_id)
+        return
+    if not updated:
+        logger.error("[Plan import] account failure target not found: account_id=%s", account_id)
 
 
 def _run_login_then_plan_check(
@@ -127,13 +157,19 @@ def _run_login_then_plan_check(
         )
         if not isinstance(login_result, dict) or not login_result.get("ok"):
             error = login_result.get("error") if isinstance(login_result, dict) else "账号登录失败"
-            _mark_login_failed(account_id, str(error or "账号登录失败"))
+            account_status = login_result.get("status") if isinstance(login_result, dict) else None
+            _mark_login_failed(
+                account_id,
+                str(error or "账号登录失败"),
+                stage="login",
+                account_status=str(account_status or "").strip().lower() or None,
+            )
             return
 
         account = db.get_account(account_id) or {}
         access_token = str(account.get("access_token") or "").strip()
         if not access_token:
-            _mark_login_failed(account_id, "登录完成但没有保存 accessToken")
+            _mark_login_failed(account_id, "登录完成但没有保存 accessToken", stage="login")
             return
         queued = enqueue(
             account_id=account_id,
@@ -144,9 +180,16 @@ def _run_login_then_plan_check(
             timezone_offset_min="-",
         )
         if not queued.get("accepted"):
-            _mark_login_failed(account_id, queued.get("error") or "账号无法进入套餐检查队列")
+            _mark_login_failed(account_id, queued.get("error") or "账号无法进入套餐检查队列", stage="plan")
     except Exception as exc:  # noqa: BLE001 - isolate one account from the batch.
-        _mark_login_failed(account_id, f"{type(exc).__name__}: {str(exc)[:180]}")
+        error_text = str(exc)
+        error_code = detect_account_unusable_text(error_text)
+        _mark_login_failed(
+            account_id,
+            account_unusable_message(error_code) if error_code else f"{type(exc).__name__}: {error_text[:180]}",
+            stage="login",
+            account_status="deactivated" if error_code else None,
+        )
 
 
 def _schedule_login_tasks(
@@ -193,6 +236,7 @@ def queue_imported_plan_checks(
     login_network_mode: str = "auto",
     login_workers: int = 1,
     preflight_login_network: Callable[[str], str] | None = None,
+    force_login_emails: Iterable[str] | None = None,
     max_records: int = MAX_IMPORTED_PLAN_RECORDS,
 ) -> dict:
     """Queue plan checks, logging in and persisting accounts missing a token."""
@@ -203,6 +247,11 @@ def queue_imported_plan_checks(
     login_network_mode = normalize_account_network_mode(login_network_mode)
     emails = parse_imported_emails(text)
     credentials = parse_imported_credentials(text)
+    force_login_keys = {
+        str(email or "").strip().casefold()
+        for email in (force_login_emails or ())
+        if str(email or "").strip()
+    }
     if len(emails) > max_records:
         raise ValueError(f"Mỗi lần chỉ được nhập tối đa {max_records} tài khoản")
 
@@ -253,13 +302,21 @@ def queue_imported_plan_checks(
                 continue
             account = {"id": account_id, "email": email, "access_token": ""}
 
+        if str(account.get("live_check_status") or "").strip().lower() == "deactivated":
+            skipped.append({
+                "id": account.get("id"),
+                "email": str(account.get("email") or email),
+                "reason": "account_deactivated",
+            })
+            continue
+
         try:
             account_id = int(account.get("id"))
         except (TypeError, ValueError):
             failed.append({"email": email, "reason": "account_id_invalid"})
             continue
 
-        access_token = str(account.get("access_token") or "").strip()
+        access_token = "" if email_key in force_login_keys else str(account.get("access_token") or "").strip()
         if not access_token:
             credential = credentials.get(email_key)
             if not credential:
@@ -353,11 +410,16 @@ def queue_imported_plan_checks(
 
 
 def _classify_plan_status(row: dict) -> str:
+    if str(row.get("live_check_status") or "").strip().lower() == "deactivated":
+        return "deactivated"
     status = str(row.get("plan_check_status") or "").strip().lower()
     if status in {"login_pending", "queued", "running"}:
         return "pending"
     if status != "success" or row.get("plan_check_ok") is False:
         error = str(row.get("plan_check_error") or "").lower()
+        stage = str(row.get("plan_check_stage") or "").strip().lower()
+        if stage == "login" or "credential login" in error or "accesstoken" in error:
+            return "login_failed"
         if row.get("needs_live_check") or "过期" in error or "expired" in error or "失效" in error:
             return "needs_live_check"
         return "check_failed"
@@ -381,6 +443,7 @@ def build_import_plan_status(rows: Iterable[dict]) -> dict:
             "plus_trial_eligible": row.get("plus_trial_eligible"),
             "checked_at": row.get("plan_checked_at"),
             "error": row.get("plan_check_error"),
+            "stage": row.get("plan_check_stage"),
             "classification": classification,
         }
         items.append(item)
@@ -401,6 +464,8 @@ def build_import_plan_status(rows: Iterable[dict]) -> dict:
         item["classification"] == "needs_live_check" for item in items
     )
     check_failed_count = sum(item["classification"] == "check_failed" for item in items)
+    login_failed_count = sum(item["classification"] == "login_failed" for item in items)
+    deactivated_count = sum(item["classification"] == "deactivated" for item in items)
     return {
         "ok": True,
         "items": items,
@@ -415,4 +480,6 @@ def build_import_plan_status(rows: Iterable[dict]) -> dict:
         "not_free_plan_count": not_free_plan_count,
         "needs_live_check_count": needs_live_check_count,
         "check_failed_count": check_failed_count,
+        "login_failed_count": login_failed_count,
+        "deactivated_count": deactivated_count,
     }
