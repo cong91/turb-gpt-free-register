@@ -35,10 +35,15 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
         )
 
         self.assertEqual(email, "alias+one@gmail.com")
-        allocator_factory.return_value.acquire_account.assert_called_once_with(
-            batch_id="batch-1",
-            job_id=7,
-            lane_id=2,
+        allocator_factory.return_value.acquire_account.assert_called_once()
+        self.assertEqual(
+            allocator_factory.return_value.acquire_account.call_args.kwargs,
+            {
+                "batch_id": "batch-1",
+                "job_id": 7,
+                "lane_id": 2,
+                "stop_check": registration_service.check_stop_requested,
+            },
         )
 
     @patch("core.email_provider.Qan8GmailApiAllocator", create=True)
