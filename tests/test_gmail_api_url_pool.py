@@ -87,6 +87,28 @@ class GmailApiUrlPoolTests(unittest.TestCase):
 
     @patch("core.db._load_gmail_api_url_emails")
     @patch("core.db._save_gmail_api_url_emails")
+    def test_claim_can_reuse_used_source_for_alias_batch(self, mock_save, mock_load):
+        """A used source remains eligible while its alias inventory has capacity."""
+        mock_load.return_value = [
+            {
+                "id": 1,
+                "email": "used@gmail.com",
+                "code_url": "http://example.com/otp",
+                "status": "used",
+                "note": "previous alias batch",
+            },
+        ]
+
+        row = db.claim_next_gmail_api_url_email(include_used=True)
+
+        self.assertIsNotNone(row)
+        self.assertEqual(row["email"], "used@gmail.com")
+        self.assertEqual(row["status"], "used")
+        self.assertFalse(row["_claimed_from_available"])
+        mock_save.assert_not_called()
+
+    @patch("core.db._load_gmail_api_url_emails")
+    @patch("core.db._save_gmail_api_url_emails")
     def test_release_updates_status_and_note(self, mock_save, mock_load):
         """release 更新邮箱状态和备注。"""
         mock_load.return_value = [
@@ -174,14 +196,21 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         self.assertFalse(deleted)
         self.assertEqual(mock_save.call_count, 0)
 
+    @patch("core.db._attach_gmail_api_url_alias_stats")
     @patch("core.db._load_gmail_api_url_emails")
-    def test_summary_returns_count_by_status(self, mock_load):
+    def test_summary_returns_count_by_status(self, mock_load, mock_attach):
         """summary 返回按状态统计的数量。"""
         mock_load.return_value = [
             {"id": 1, "email": "available1@gmail.com", "status": "available"},
             {"id": 2, "email": "available2@gmail.com", "status": "available"},
             {"id": 3, "email": "used@gmail.com", "status": "used"},
             {"id": 4, "email": "failed@gmail.com", "status": "failed"},
+        ]
+        mock_attach.return_value = [
+            {"status": "available", "alias_total": 12, "alias_available": 12, "alias_used": 0, "alias_failed": 0, "alias_reserved": 0},
+            {"status": "available", "alias_total": 12, "alias_available": 0, "alias_used": 12, "alias_failed": 0, "alias_reserved": 0},
+            {"status": "used", "alias_total": 12, "alias_available": 10, "alias_used": 2, "alias_failed": 0, "alias_reserved": 0},
+            {"status": "failed", "alias_total": 12, "alias_available": 12, "alias_used": 0, "alias_failed": 0, "alias_reserved": 0},
         ]
 
         summary = db.gmail_api_url_email_pool_summary()
@@ -190,6 +219,8 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         self.assertEqual(summary["available"], 2)
         self.assertEqual(summary["used"], 1)
         self.assertEqual(summary["failed"], 1)
+        self.assertEqual(summary["alias_available"], 22)
+        self.assertEqual(summary["alias_source_available"], 2)
 
     @patch("core.db._load_gmail_api_url_emails")
     def test_get_by_email_returns_matching_account(self, mock_load):

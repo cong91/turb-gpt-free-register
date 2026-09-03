@@ -3644,18 +3644,47 @@ def record_gmail_api_url_email(
         return True
 
 
-def claim_next_gmail_api_url_email() -> dict | None:
-    """原子领取一个可用 Gmail API URL 邮箱并标记为 used。"""
+def claim_next_gmail_api_url_email(
+    *,
+    include_used: bool = False,
+    exclude_emails: set[str] | None = None,
+) -> dict | None:
+    """Claim a source mailbox, optionally reusing used rows with free aliases."""
     with _LOCK:
         rows = sorted(_load_gmail_api_url_emails(), key=lambda x: int(x.get("id") or 0))
-        row = next((r for r in rows if r.get("status") == "available"), None)
+        excluded = {
+            str(email or "").strip().casefold()
+            for email in (exclude_emails or set())
+            if str(email or "").strip()
+        }
+        row = next(
+            (
+                r for r in rows
+                if str(r.get("status") or "").strip().lower() == "available"
+                and str(r.get("email") or "").strip().casefold() not in excluded
+            ),
+            None,
+        )
+        claimed_from_available = row is not None
+        if row is None and include_used:
+            row = next(
+                (
+                    r for r in rows
+                    if str(r.get("status") or "").strip().lower() == "used"
+                    and str(r.get("email") or "").strip().casefold() not in excluded
+                ),
+                None,
+            )
         if row is None:
             return None
-        row["status"] = "used"
-        row["used_at"] = _now()
-        row["note"] = None
-        _save_gmail_api_url_emails(rows)
-        return _decorate_gmail_api_url_email(row)
+        if claimed_from_available:
+            row["status"] = "used"
+            row["used_at"] = _now()
+            row["note"] = None
+            _save_gmail_api_url_emails(rows)
+        result = _decorate_gmail_api_url_email(row)
+        result["_claimed_from_available"] = claimed_from_available
+        return result
 
 
 def get_gmail_api_url_last_otp(code_url: str) -> str | None:
@@ -3813,8 +3842,16 @@ def gmail_api_url_email_pool_summary() -> dict:
             out[status] = out.get(status, 0) + 1
         out["total"] = sum(v for k, v in out.items() if k != "total")
         alias_rows = _attach_gmail_api_url_alias_stats(rows)
-        for key in ("alias_total", "alias_available", "alias_used", "alias_failed", "alias_reserved"):
+        eligible_rows = [
+            row for row in alias_rows
+            if str(row.get("status") or "").strip().lower() in {"available", "used"}
+        ]
+        for key in ("alias_total", "alias_used", "alias_failed", "alias_reserved"):
             out[key] = sum(int(row.get(key) or 0) for row in alias_rows)
+        out["alias_available"] = sum(int(row.get("alias_available") or 0) for row in eligible_rows)
+        out["alias_source_available"] = sum(
+            1 for row in eligible_rows if int(row.get("alias_available") or 0) > 0
+        )
         return out
 
 

@@ -7,6 +7,7 @@ from core.email_provider import (
     normalize_email_source,
     parse_email_sources,
 )
+from core.gmail_batch_store_base import GmailBatchError
 from core.gmail_aliases import GmailAliasError, normalize_routed_domains
 from core.paymesh_aliases import PaymeshAliasError, normalize_paymesh_routed_domains
 from core.registration_limits import MAX_REGISTRATION_TASKS
@@ -96,14 +97,25 @@ def _provider_error(
     return None
 
 
-def _pool_warning(database, sources: list[str], count: int) -> str:
+def _pool_warning(
+    database,
+    sources: list[str],
+    count: int,
+    *,
+    gmail_api_url_aliases_per_email: int = 1,
+) -> str:
     if any(source in sources for source in (
         "gptmail", "mailnest", "cloudmail", "tinyhost", "cloudflare", "gmail_123452026", "paymesh", "remail",
         "qan8_gmail_api",
     )):
         return ""
     if sources == ["gmail_api_url"]:
-        available = database.gmail_api_url_email_pool_summary().get("available", 0)
+        summary = database.gmail_api_url_email_pool_summary()
+        available = (
+            summary.get("alias_available", 0)
+            if gmail_api_url_aliases_per_email > 1
+            else summary.get("available", 0)
+        )
         return (
             f"Kho Gmail API URL còn {available} bản ghi, ít hơn số bản ghi yêu cầu {count}，bản ghi thiếu sẽ thất bại"
             if available < count else ""
@@ -223,12 +235,30 @@ def create_registration_jobs(
         except (TypeError, ValueError):
             return {"ok": False, "error": "gmail_api_url_alias_count 非法"}, 400
         aliases_per_email = max(1, min(12, aliases_per_email))
-        available = int(database.gmail_api_url_email_pool_summary().get("available", 0) or 0)
-        if available < 1:
-            return {"ok": False, "error": "Kho Gmail API URL không còn bản ghi chưa dùng"}, 400
-        if count > available:
-            count = available
-            submit_kwargs["count"] = count
+        summary = database.gmail_api_url_email_pool_summary()
+        source_available = int(summary.get("available", 0) or 0)
+        alias_available = int(summary.get("alias_available", 0) or 0)
+        if source_available < 1 and alias_available < 1:
+            return {"ok": False, "error": "Kho Gmail API URL không còn alias khả dụng"}, 400
+        if aliases_per_email > 1 and not automation_registration:
+            max_sources = alias_available // aliases_per_email
+            if max_sources < 1:
+                return {
+                    "ok": False,
+                    "error": (
+                        f"Kho Gmail API URL chỉ còn {alias_available} alias khả dụng, "
+                        f"chưa đủ 1 nhóm {aliases_per_email} alias"
+                    ),
+                }, 400
+            count = min(count, max_sources)
+        else:
+            if source_available < 1:
+                return {
+                    "ok": False,
+                    "error": "Luồng alias_count=1 cần mailbox Gmail API URL ở trạng thái chưa dùng",
+                }, 400
+            count = min(count, source_available)
+        submit_kwargs["count"] = count
         if aliases_per_email > 1 and not automation_registration:
             # count = số email gốc; mỗi email gốc sinh aliases_per_email tài khoản.
             job_count = count * aliases_per_email
@@ -270,13 +300,23 @@ def create_registration_jobs(
             submit_kwargs["count"] = count
     if automation_context:
         submit_kwargs["automation_context"] = automation_context
-    jobs = service.submit_registration(**submit_kwargs)
+    try:
+        jobs = service.submit_registration(**submit_kwargs)
+    except GmailBatchError as exc:
+        return {"ok": False, "error": str(exc)}, 400
     effective_workers = service.effective_registration_workers(workers)
     response = {
         "ok": True,
         "submitted": len(jobs),
         "jobs": jobs,
-        "warning": _pool_warning(database, sources, count),
+        "warning": _pool_warning(
+            database,
+            sources,
+            count,
+            gmail_api_url_aliases_per_email=aliases_per_email
+            if "gmail_api_url" in sources
+            else 1,
+        ),
         "workers": effective_workers,
     }, 200
     if "qan8_gmail_api" in sources:
