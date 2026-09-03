@@ -120,6 +120,27 @@ class _CookieContext:
         return [{"name": "oai-did", "value": "device-123"}]
 
 
+class _SessionResponse:
+    status = 200
+
+    def json(self):
+        return {"accessToken": "request-token"}
+
+
+class _SessionRequest:
+    def __init__(self):
+        self.calls = []
+
+    def get(self, url, *, timeout):
+        self.calls.append((url, timeout))
+        return _SessionResponse()
+
+
+class _SessionContext(_CookieContext):
+    def __init__(self):
+        self.request = _SessionRequest()
+
+
 class _ScriptTimeoutPage:
     def set_default_navigation_timeout(self, _timeout):
         pass
@@ -148,6 +169,21 @@ class CloakAdapterContractTests(unittest.TestCase):
 
         self.assertEqual("device-123", driver.get_cookie("oai-did")["value"])
         self.assertEqual(7, driver.script_timeout)
+
+    def test_chatgpt_session_uses_context_request_with_script_timeout(self):
+        context = _SessionContext()
+        driver = BrowserSeleniumDriver(
+            browser=None,
+            context=context,
+            page=_ScriptTimeoutPage(),
+        )
+        driver.set_script_timeout(7)
+
+        self.assertEqual(driver.get_chatgpt_auth_session(), {"accessToken": "request-token"})
+        self.assertEqual(
+            context.request.calls,
+            [("https://chatgpt.com/api/auth/session", 7000)],
+        )
 
 
 class BrowserSeleniumDriverTests(unittest.TestCase):

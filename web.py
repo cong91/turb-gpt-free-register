@@ -18,7 +18,7 @@ import webbrowser
 from pathlib import Path
 from threading import Timer
 
-from core import codex_retry_service
+from core import codex_retry_service, registration_service
 from webui.app import create_app
 from webui.auth import is_generated_code
 
@@ -109,6 +109,14 @@ def main() -> None:
         raise SystemExit(2) from exc
 
     app = create_app(auth_code=args.auth_code)
+    registration_recovery = registration_service.reconcile_interrupted_registration_jobs()
+    if any(registration_recovery.values()):
+        logger.warning(
+            "Đã dọn trạng thái worker cũ: stopped_jobs=%s failed_qan8_assignments=%s completed_qan8_assignments=%s",
+            registration_recovery["stopped_jobs"],
+            registration_recovery["failed_qan8_assignments"],
+            registration_recovery["completed_qan8_assignments"],
+        )
     retry_recovery = codex_retry_service.reconcile_persisted_retrying_statuses()
     if retry_recovery["reset"]:
         logger.warning(

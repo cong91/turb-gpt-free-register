@@ -2416,6 +2416,18 @@ def _click_if_enabled_submit(driver) -> bool:
 
 def _read_chatgpt_session_once(driver) -> dict | None:
     """当前页面必须在 chatgpt.com；读取 /api/auth/session，拿不到 token 返回 None。"""
+    request_session = getattr(driver, "get_chatgpt_auth_session", None)
+    if callable(request_session):
+        try:
+            data = request_session()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("%s /api/auth/session request failed: %s", _log_prefix(driver), exc)
+            return None
+        if isinstance(data, dict) and data.get("accessToken"):
+            logger.info("%s /api/auth/session 已返回 accessToken", _log_prefix(driver))
+            return data
+        return None
+
     script = r"""
     const done = arguments[0];
     fetch('/api/auth/session', {credentials: 'include'})
