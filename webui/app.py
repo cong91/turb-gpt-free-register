@@ -1086,7 +1086,7 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/accounts/check-plan-import")
     def api_accounts_check_plan_import():
-        """Đối chiếu email với tài khoản trong DB và kiểm tra gói bằng token đã lưu."""
+        """Đối chiếu email, đăng nhập/lưu tài khoản thiếu token, rồi kiểm tra gói."""
         data = request.get_json(silent=True)
         if not isinstance(data, dict):
             return jsonify({"ok": False, "error": "Body phải là một đối tượng JSON"}), 400
@@ -1099,10 +1099,13 @@ def create_app(auth_code: str | None = None) -> Flask:
         from core import account_plan_import
 
         try:
+            login_network_mode = data.get("login_network_mode") or "auto"
             result = account_plan_import.queue_imported_plan_checks(
                 emails,
                 get_account_by_email=db.get_account_by_email,
                 enqueue=plan_check_service.enqueue_account_plan_check,
+                login_network_mode=login_network_mode,
+                preflight_login_network=account_plan_import.preflight_login_network,
             )
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400

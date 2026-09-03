@@ -1,5 +1,6 @@
 import unittest
-from unittest.mock import patch
+from threading import Event
+from unittest.mock import MagicMock, patch
 
 
 class AccountPlanImportTests(unittest.TestCase):
@@ -77,6 +78,196 @@ missing@example.com
 
         self.assertEqual(result["started_count"], 1)
         self.assertEqual(lookup_emails, ["known@example.com"])
+
+    def test_missing_account_with_credentials_is_saved_logged_in_and_checked(self):
+        from core.account_plan_import import queue_imported_plan_checks
+
+        login_finished = Event()
+        enqueue_calls = []
+
+        def insert_account(**kwargs):
+            self.assertEqual(kwargs["email"], "missing@example.com")
+            self.assertEqual(kwargs["registration_password"], "password")
+            self.assertEqual(kwargs["totp_secret"], "JBSWY3DPEHPK3PXP")
+            return 9
+
+        def login_and_save(**kwargs):
+            self.assertEqual(kwargs["account_id"], 9)
+            self.assertEqual(kwargs["password"], "password")
+            return {"ok": True}
+
+        def enqueue(**kwargs):
+            enqueue_calls.append(kwargs)
+            login_finished.set()
+            return {"accepted": True, "status": "queued"}
+
+        with (
+            patch("core.account_plan_import.db.mark_account_plan_login_pending", return_value=True),
+            patch(
+                "core.account_plan_import.db.get_account",
+                return_value={"id": 9, "email": "missing@example.com", "access_token": "saved-token"},
+            ),
+        ):
+            result = queue_imported_plan_checks(
+                "missing@example.com | password | JBSWY3DPEHPK3PXP",
+                get_account_by_email=lambda _email: None,
+                enqueue=enqueue,
+                insert_account=insert_account,
+                login_and_save=login_and_save,
+            )
+            self.assertEqual(result["started_count"], 1)
+            self.assertEqual(result["login_started_count"], 1)
+            self.assertEqual(result["started"][0]["status"], "login_queued")
+            self.assertEqual(result["skipped_count"], 0)
+            self.assertTrue(login_finished.wait(2), "login worker did not enqueue plan check")
+
+        self.assertEqual(enqueue_calls[0]["account_id"], 9)
+        self.assertEqual(enqueue_calls[0]["access_token"], "saved-token")
+
+    def test_login_pending_is_reported_as_pending(self):
+        from core.account_plan_import import build_import_plan_status
+
+        result = build_import_plan_status([
+            {
+                "id": 9,
+                "email": "missing@example.com",
+                "plan_check_status": "login_pending",
+                "plan_check_ok": None,
+            }
+        ])
+
+        self.assertEqual(result["pending_count"], 1)
+        self.assertEqual(result["items"][0]["classification"], "pending")
+
+    def test_tokenless_existing_account_uses_imported_credentials_before_login(self):
+        from core.account_plan_import import queue_imported_plan_checks
+
+        login_finished = Event()
+        credential_updates = []
+
+        def login_and_save(**kwargs):
+            self.assertEqual(kwargs["account_id"], 7)
+            self.assertEqual(kwargs["password"], "new-password")
+            self.assertEqual(kwargs["totp_secret"], "JBSWY3DPEHPK3PXP")
+            return {"ok": True}
+
+        with (
+            patch("core.account_plan_import.db.mark_account_plan_login_pending", return_value=True),
+            patch(
+                "core.account_plan_import.db.update_account_login_credentials",
+                side_effect=lambda account_id, **kwargs: credential_updates.append((account_id, kwargs)) or True,
+            ),
+            patch(
+                "core.account_plan_import.db.get_account",
+                return_value={"id": 7, "email": "known@example.com", "access_token": "saved-token"},
+            ),
+        ):
+            result = queue_imported_plan_checks(
+                "known@example.com | new-password | JBSWY3DPEHPK3PXP",
+                get_account_by_email=lambda _email: {"id": 7, "email": "known@example.com", "access_token": ""},
+                enqueue=lambda **_kwargs: login_finished.set() or {"accepted": True},
+                login_and_save=login_and_save,
+            )
+            self.assertEqual(result["started_count"], 1)
+            self.assertTrue(login_finished.wait(2), "login worker did not enqueue plan check")
+
+        self.assertEqual(credential_updates, [
+            (7, {"password": "new-password", "totp_secret": "JBSWY3DPEHPK3PXP"}),
+        ])
+
+    def test_selected_login_network_mode_is_forwarded_to_login_worker(self):
+        from core.account_plan_import import queue_imported_plan_checks
+
+        login_finished = Event()
+        login_modes = []
+
+        def login_and_save(**kwargs):
+            login_modes.append(kwargs["network_mode"])
+            return {"ok": True}
+
+        with (
+            patch("core.account_plan_import.db.mark_account_plan_login_pending", return_value=True),
+            patch(
+                "core.account_plan_import.db.get_account",
+                return_value={"id": 7, "email": "known@example.com", "access_token": "saved-token"},
+            ),
+        ):
+            result = queue_imported_plan_checks(
+                "known@example.com | password | JBSWY3DPEHPK3PXP",
+                get_account_by_email=lambda _email: {"id": 7, "email": "known@example.com", "access_token": ""},
+                enqueue=lambda **_kwargs: login_finished.set() or {"accepted": True},
+                login_and_save=login_and_save,
+                login_network_mode="rotating_proxy",
+            )
+
+        self.assertEqual(result["login_network_mode"], "rotating_proxy")
+        self.assertTrue(login_finished.wait(2), "login worker did not finish")
+        self.assertEqual(login_modes, ["rotating_proxy"])
+
+    def test_import_rejects_unknown_login_network_mode(self):
+        from core.account_plan_import import queue_imported_plan_checks
+
+        with self.assertRaises(ValueError):
+            queue_imported_plan_checks(
+                "known@example.com",
+                get_account_by_email=lambda _email: {"id": 7, "email": "known@example.com", "access_token": "token"},
+                enqueue=lambda **_kwargs: {"accepted": True},
+                login_network_mode="unknown",
+            )
+
+    def test_login_route_failure_is_reported_before_account_is_saved(self):
+        from core.account_plan_import import queue_imported_plan_checks
+
+        insert_account = MagicMock()
+
+        def preflight(_mode):
+            raise RuntimeError("wireproxy unavailable")
+
+        result = queue_imported_plan_checks(
+            "missing@example.com | password | JBSWY3DPEHPK3PXP",
+            get_account_by_email=lambda _email: None,
+            enqueue=lambda **_kwargs: {"accepted": True},
+            insert_account=insert_account,
+            preflight_login_network=preflight,
+            login_network_mode="nord_wire",
+        )
+
+        self.assertEqual(result["started_count"], 0)
+        self.assertEqual(result["failed_count"], 1)
+        self.assertIn("wireproxy unavailable", result["failed"][0]["reason"])
+        insert_account.assert_called_once()
+
+    def test_login_uses_the_selected_proxy_for_browser_profile(self):
+        from core.account_plan_import import _login_and_save_account
+
+        profile = MagicMock()
+        profile.driver = object()
+
+        def selected_route(*_args, **_kwargs):
+            from contextlib import contextmanager
+
+            @contextmanager
+            def route_context():
+                yield "socks5://proxy.example:1080", "proxy_pool"
+
+            return route_context()
+
+        with (
+            patch("core.account_plan_import.selected_account_proxy", side_effect=selected_route),
+            patch("core.browser_profile.open_browser_profile", return_value=profile) as open_profile,
+            patch("core.account_security._login_and_get_access_token", return_value="saved-token"),
+            patch("core.account_plan_import.db.update_account_access_token", return_value=True),
+        ):
+            result = _login_and_save_account(
+                account_id=7,
+                email="known@example.com",
+                password="password",
+                totp_secret="JBSWY3DPEHPK3PXP",
+                network_mode="proxy_pool",
+            )
+
+        self.assertTrue(result["ok"])
+        open_profile.assert_called_once_with(proxy="socks5://proxy.example:1080")
 
     def test_reports_free_accounts_and_marks_free_plus_trial_subset(self):
         from core.account_plan_import import build_import_plan_status
@@ -163,6 +354,34 @@ class AccountPlanImportApiTests(unittest.TestCase):
         enqueue.assert_called_once()
         self.assertEqual(enqueue.call_args.kwargs["access_token"], "stored-access-token")
 
+    @patch("core.account_plan_import._schedule_login_tasks")
+    @patch("webui.app.db.mark_account_plan_login_pending", return_value=True)
+    @patch("webui.app.db.insert_account", return_value=9)
+    @patch("webui.app.db.get_account_by_email", return_value=None)
+    @patch("core.account_plan_import.preflight_login_network", return_value="proxy_pool")
+    def test_import_route_saves_missing_credential_account_for_login(
+        self, _preflight, _get_account, insert_account, _mark_pending, _schedule_login
+    ):
+        response = self.client.post(
+            "/api/accounts/check-plan-import",
+            headers=self.headers,
+            json={
+                "emails": "missing@example.com | password | JBSWY3DPEHPK3PXP",
+                "login_network_mode": "proxy_pool",
+            },
+        )
+
+        self.assertEqual(response.status_code, 202, response.get_json())
+        payload = response.get_json()
+        self.assertEqual(payload["started_count"], 1)
+        self.assertEqual(payload["started"][0]["status"], "login_queued")
+        self.assertEqual(payload["skipped_count"], 0)
+        insert_account.assert_called_once()
+        self.assertEqual(insert_account.call_args.kwargs["access_token"], "")
+        self.assertEqual(insert_account.call_args.kwargs["registration_password"], "password")
+        _schedule_login.assert_called_once()
+        self.assertEqual(_schedule_login.call_args.args[0][0]["network_mode"], "proxy_pool")
+
     @patch("webui.app.db.get_account")
     def test_import_status_route_reports_free_accounts_without_secrets(self, get_account):
         get_account.side_effect = [
@@ -218,6 +437,7 @@ class AccountPlanImportApiTests(unittest.TestCase):
 
         self.assertIn('id="btnImportPlanEmailsV2"', template)
         self.assertIn('id="importPlanEmails"', template)
+        self.assertIn('id="importPlanLoginNetwork"', template)
         self.assertIn('id="btnCopyFreePlanEmails"', template)
         self.assertIn('id="importPlanResults"', template)
         self.assertIn('id="importPlanResultFilter"', template)

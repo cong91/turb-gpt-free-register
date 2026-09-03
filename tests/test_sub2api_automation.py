@@ -68,6 +68,36 @@ class Sub2APIAutomationContractTests(unittest.TestCase):
             )
         )
 
+    def test_registration_callback_counts_retries_as_one_account(self):
+        from core.sub2api_automation import registration_completion_event
+
+        context = {
+            "sub2api_automation_requested_count": 1,
+        }
+        event = registration_completion_event(
+            "req-retry",
+            [
+                {
+                    "id": 10,
+                    "root_job_id": 10,
+                    "retry_attempt": 0,
+                    "status": "failed",
+                    "provider_context": context,
+                },
+                {
+                    "id": 11,
+                    "root_job_id": 10,
+                    "retry_attempt": 1,
+                    "status": "success",
+                    "provider_context": context,
+                },
+            ],
+        )
+
+        self.assertEqual(event["requested_count"], 1)
+        self.assertEqual(event["succeeded_count"], 1)
+        self.assertEqual(event["failed_count"], 0)
+
     def test_reauthorization_completion_contains_no_credentials(self):
         from core.sub2api_automation import reauthorization_completion_event
 
