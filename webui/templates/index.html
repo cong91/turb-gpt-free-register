@@ -232,6 +232,8 @@
     .import-plan-table-wrap { max-height:390px; overflow:auto; }
     .import-plan-table { min-width:680px; table-layout:fixed; }
     .import-plan-table th { position:sticky; top:0; z-index:1; background:#f8fafc; color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.03em; }
+    .import-plan-table .import-plan-select { width:52px; text-align:center; }
+    .import-plan-table .import-plan-select input { width:16px; min-height:16px; margin:0; padding:0; }
     .import-plan-table .import-plan-email { width:38%; white-space:normal; overflow-wrap:anywhere; font-family:ui-monospace,Consolas,monospace; font-size:12px; }
     .import-plan-table .import-plan-result { width:23%; white-space:normal; }
     .import-plan-table .import-plan-plan { width:15%; white-space:normal; }
@@ -240,7 +242,7 @@
     .import-plan-badge--free_without_trial, .import-plan-badge--free_plus_trial { color:#166534; background:#edf8f1; }
     .import-plan-badge--not_free_plan { color:#475467; background:#f2f4f7; }
     .import-plan-badge--needs_live_check { color:#8a5700; background:#fff7e6; }
-    .import-plan-badge--check_failed { color:#b42318; background:#fff1f0; }
+    .import-plan-badge--login_failed, .import-plan-badge--check_failed { color:#b42318; background:#fff1f0; }
     .import-plan-badge--not_found, .import-plan-badge--not_checked { color:#667085; background:#f2f4f7; }
     .import-plan-badge--pending { color:#1d4ed8; background:#eef4ff; }
     .import-plan-empty { padding:18px 12px; color:var(--muted); font-size:12px; text-align:center; }
@@ -2671,7 +2673,8 @@
       </div>
       <div class="import-plan-actions">
         <button type="button" class="btn primary" id="btnStartImportPlan">Bắt đầu kiểm tra</button>
-        <button type="button" class="btn" id="btnCopyFreePlanEmails" disabled>Sao chép email Free</button>
+        <button type="button" class="btn" id="btnRetryImportPlan" disabled>Kiểm tra lại mục đã chọn</button>
+        <button type="button" class="btn" id="btnCopyFreePlanEmails" disabled>Sao chép email đang lọc</button>
       </div>
       <div class="import-plan-summary" id="importPlanSummary" role="status" aria-live="polite">Chờ nhập danh sách email</div>
       <div class="import-plan-results" id="importPlanResults" hidden>
@@ -2684,6 +2687,7 @@
             <option value="free_without_trial">Free, không có Trial</option>
             <option value="not_free_plan">Không phải Free</option>
             <option value="needs_live_check">Cần kiểm tra lại</option>
+            <option value="login_failed">Đăng nhập thất bại</option>
             <option value="check_failed">Lỗi khi kiểm tra</option>
             <option value="not_found">Không tìm thấy trong DB</option>
             <option value="not_checked">Chưa được kiểm tra</option>
@@ -2694,6 +2698,7 @@
           <table class="import-plan-table">
             <thead>
               <tr>
+                <th class="import-plan-select"><input type="checkbox" id="importPlanSelectFiltered" title="Chọn toàn bộ dòng đang lọc" aria-label="Chọn toàn bộ dòng đang lọc"></th>
                 <th class="import-plan-email">Email</th>
                 <th class="import-plan-result">Kết quả</th>
                 <th class="import-plan-plan">Gói hiện tại</th>
@@ -4277,13 +4282,16 @@ let importedPlanTimer = null;
 let importedPlanPrecheckItems = [];
 let importedPlanQueuedItems = [];
 let importedPlanItems = [];
-let importedFreePlanEmails = [];
+let importedPlanSelectedEmails = new Set();
+let importedFilteredPlanEmails = [];
+let importedPlanBusy = false;
 
 const IMPORT_PLAN_RESULT_LABELS = {
   free_plus_trial: 'Có Free Trial',
   free_without_trial: 'Free, không có Trial',
   not_free_plan: 'Không phải Free',
   needs_live_check: 'Cần kiểm tra lại',
+  login_failed: 'Đăng nhập thất bại',
   check_failed: 'Lỗi khi kiểm tra',
   not_found: 'Không tìm thấy trong DB',
   not_checked: 'Chưa được kiểm tra',
@@ -4303,6 +4311,7 @@ function importedPlanDetail(item) {
   if (classification === 'free_without_trial') return 'Đã xác nhận Free nhưng không có Free Trial';
   if (classification === 'not_free_plan') return 'Gói hiện tại không phải Free';
   if (classification === 'needs_live_check') return 'Token cần được kiểm tra lại hoặc làm mới';
+  if (classification === 'login_failed') return 'Không lấy được accessToken, chưa chạy kiểm tra gói';
   if (classification === 'not_found') return 'Không có tài khoản tương ứng trong database';
   if (classification === 'pending') {
     return String(item?.status || '').toLowerCase() === 'login_pending'
@@ -4310,6 +4319,13 @@ function importedPlanDetail(item) {
       : 'Worker đang xử lý tài khoản này';
   }
   return 'Không đưa được email vào lượt kiểm tra';
+}
+function importedPlanCanRetry(item) {
+  const accountId = Number(item?.id);
+  return ['login_failed', 'check_failed', 'needs_live_check', 'not_checked'].includes(importedPlanClassification(item))
+    && Number.isInteger(accountId)
+    && accountId > 0
+    && String(item?.email || '').trim();
 }
 function importedPlanPrecheckItem(item, classification, error) {
   return {
@@ -4341,7 +4357,9 @@ function importedPlanPrecheckItemsFromResult(result) {
     }
   }
   for (const item of (result.failed || [])) {
-    items.push(importedPlanPrecheckItem(item, 'check_failed', String(item.reason || 'Không thể đưa vào hàng đợi')));
+    const reason = String(item.reason || 'Không thể đưa vào hàng đợi');
+    const classification = reason.toLowerCase().includes('route đăng nhập') ? 'login_failed' : 'check_failed';
+    items.push(importedPlanPrecheckItem(item, classification, reason));
   }
   return items.filter(item => item.email);
 }
@@ -4352,16 +4370,68 @@ function importedPlanMatchesFilter(item, filter) {
   if (filter === 'free') return classification === 'free_without_trial' || classification === 'free_plus_trial';
   return classification === filter;
 }
+function importedPlanVisibleItems() {
+  const filter = $('#importPlanResultFilter')?.value || 'all';
+  return importedPlanItems.filter(item => importedPlanMatchesFilter(item, filter));
+}
+function importedPlanSelectedItems() {
+  const seen = new Set();
+  return importedPlanItems.filter(item => {
+    const email = String(item?.email || '').trim().toLowerCase();
+    if (!email || seen.has(email) || !importedPlanSelectedEmails.has(email) || !importedPlanCanRetry(item)) return false;
+    seen.add(email);
+    return true;
+  });
+}
+function updateImportedPlanSelectionControls(visibleItems = importedPlanVisibleItems()) {
+  const selectable = visibleItems.filter(importedPlanCanRetry);
+  const selectedVisible = selectable.filter(item => importedPlanSelectedEmails.has(String(item.email || '').trim().toLowerCase()));
+  const selectAll = $('#importPlanSelectFiltered');
+  if (selectAll) {
+    selectAll.disabled = importedPlanBusy || selectable.length === 0;
+    selectAll.checked = selectable.length > 0 && selectedVisible.length === selectable.length;
+    selectAll.indeterminate = selectedVisible.length > 0 && selectedVisible.length < selectable.length;
+  }
+  const retryBtn = $('#btnRetryImportPlan');
+  if (retryBtn) retryBtn.disabled = importedPlanBusy || importedPlanSelectedItems().length === 0;
+  const copyBtn = $('#btnCopyFreePlanEmails');
+  if (copyBtn) {
+    copyBtn.disabled = importedPlanBusy || importedFilteredPlanEmails.length === 0;
+    const filter = $('#importPlanResultFilter')?.value || 'all';
+    const label = $('#importPlanResultFilter')?.selectedOptions?.[0]?.textContent?.trim() || 'đang lọc';
+    copyBtn.textContent = `Sao chép email ${filter === 'all' ? 'đang lọc' : label} (${importedFilteredPlanEmails.length})`;
+  }
+}
+function copyFilteredImportedPlanEmails() {
+  if (!importedFilteredPlanEmails.length) {
+    showToast('Bộ lọc hiện tại không có email để sao chép');
+    return;
+  }
+  copyText(importedFilteredPlanEmails.join('\n'));
+}
 function renderImportedPlanRows() {
   const resultPanel = $('#importPlanResults');
   const body = $('#importPlanResultBody');
   const empty = $('#importPlanResultEmpty');
   if (!resultPanel || !body || !empty) return;
-  const filter = $('#importPlanResultFilter')?.value || 'all';
-  const visibleItems = importedPlanItems.filter(item => importedPlanMatchesFilter(item, filter));
+  const visibleItems = importedPlanVisibleItems();
+  importedFilteredPlanEmails = [...new Set(visibleItems.map(item => String(item.email || '').trim()).filter(Boolean))];
   body.replaceChildren();
   for (const item of visibleItems) {
     const row = document.createElement('tr');
+    const selectCell = document.createElement('td');
+    selectCell.className = 'import-plan-select';
+    if (importedPlanCanRetry(item)) {
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.dataset.importPlanSelect = '1';
+      checkbox.dataset.email = String(item.email || '').trim().toLowerCase();
+      checkbox.checked = importedPlanSelectedEmails.has(checkbox.dataset.email);
+      checkbox.disabled = importedPlanBusy;
+      checkbox.title = 'Chọn email để kiểm tra lại';
+      checkbox.setAttribute('aria-label', `Chọn ${String(item.email || '').trim()} để kiểm tra lại`);
+      selectCell.append(checkbox);
+    }
     const emailCell = document.createElement('td');
     emailCell.className = 'import-plan-email';
     emailCell.textContent = String(item.email || 'Không rõ email');
@@ -4377,11 +4447,12 @@ function renderImportedPlanRows() {
     const detailCell = document.createElement('td');
     detailCell.className = 'import-plan-detail';
     detailCell.textContent = importedPlanDetail(item);
-    row.append(emailCell, resultCell, planCell, detailCell);
+    row.append(selectCell, emailCell, resultCell, planCell, detailCell);
     body.append(row);
   }
   resultPanel.hidden = importedPlanItems.length === 0;
   empty.hidden = visibleItems.length > 0;
+  updateImportedPlanSelectionControls(visibleItems);
 }
 
 function openImportPlanPanel() {
@@ -4396,7 +4467,9 @@ function closeImportPlanPanel() {
   importedPlanPrecheckItems = [];
   importedPlanQueuedItems = [];
   importedPlanItems = [];
-  importedFreePlanEmails = [];
+  importedPlanSelectedEmails = new Set();
+  importedFilteredPlanEmails = [];
+  importedPlanBusy = false;
   $('#importPlanResultFilter').value = 'all';
   renderImportedPlanRows();
   $('#importPlanPanel').classList.add('hidden');
@@ -4422,15 +4495,13 @@ function renderImportPlanStatus(result) {
   const pendingCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'pending').length;
   const notFreeCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_free_plan').length;
   const needsLiveCheckCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'needs_live_check').length;
+  const loginFailedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'login_failed').length;
   const checkFailedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'check_failed').length;
   const notFoundCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_found').length;
   const notCheckedCount = importedPlanItems.filter(item => importedPlanClassification(item) === 'not_checked').length;
-  importedFreePlanEmails = freeAccounts.map(item => String(item.email || '').trim()).filter(Boolean);
-  const copyBtn = $('#btnCopyFreePlanEmails');
-  copyBtn.disabled = importedFreePlanEmails.length === 0;
   $('#importPlanSummary').textContent = pendingCount
-    ? `Đã nhận ${importedPlanItems.length} email; đang kiểm tra ${pendingCount}; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; lỗi ${checkFailedCount}`
-    : `Đã xử lý ${importedPlanItems.length} email; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; không phải Free ${notFreeCount}; cần kiểm tra lại ${needsLiveCheckCount}; lỗi ${checkFailedCount}; không tìm thấy ${notFoundCount}; chưa kiểm tra ${notCheckedCount}`;
+    ? `Đã nhận ${importedPlanItems.length} email; đang kiểm tra ${pendingCount}; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; đăng nhập lỗi ${loginFailedCount}; lỗi check ${checkFailedCount}`
+    : `Đã xử lý ${importedPlanItems.length} email; Free Trial ${freeTrialAccounts.length}; Free không có Trial ${freeWithoutTrialAccounts.length}; không phải Free ${notFreeCount}; cần kiểm tra lại ${needsLiveCheckCount}; đăng nhập lỗi ${loginFailedCount}; lỗi check ${checkFailedCount}; không tìm thấy ${notFoundCount}; chưa kiểm tra ${notCheckedCount}`;
   renderImportedPlanRows();
 }
 async function pollImportedPlanStatus() {
@@ -4451,19 +4522,22 @@ async function pollImportedPlanStatus() {
     return true;
   }
 }
-async function startImportedPlanCheck() {
-  const text = $('#importPlanEmails').value || '';
+async function startImportedPlanCheck(inputText = null, requireConfirm = true) {
+  const text = inputText == null ? ($('#importPlanEmails').value || '') : String(inputText || '');
   if (!text.trim()) { showToast('Vui lòng nhập danh sách email'); return; }
-  if (!confirm('Bạn có chắc muốn kiểm tra gói hiện tại theo từng email không?')) return;
+  if (requireConfirm && !confirm('Bạn có chắc muốn kiểm tra gói hiện tại theo từng email không?')) return;
   const btn = $('#btnStartImportPlan');
+  importedPlanBusy = true;
   btn.disabled = true;
   clearInterval(importedPlanTimer);
   importedPlanIds = [];
   importedPlanPrecheckItems = [];
   importedPlanQueuedItems = [];
   importedPlanItems = [];
-  importedFreePlanEmails = [];
+  importedPlanSelectedEmails = new Set();
+  importedFilteredPlanEmails = [];
   $('#importPlanResults').hidden = true;
+  $('#btnRetryImportPlan').disabled = true;
   $('#btnCopyFreePlanEmails').disabled = true;
   try {
     const result = await api('/api/accounts/check-plan-import', {
@@ -4490,13 +4564,55 @@ async function startImportedPlanCheck() {
   } catch (err) {
     showToast('Kiểm tra gói theo email thất bại: ' + err.message);
   } finally {
+    importedPlanBusy = false;
     btn.disabled = false;
+    renderImportedPlanRows();
   }
 }
+function importedPlanRetryInput(selectedItems) {
+  const selectedEmails = new Set(selectedItems.map(item => String(item.email || '').trim().toLowerCase()));
+  const seen = new Set();
+  const lines = String($('#importPlanEmails')?.value || '').split(/\r?\n/).filter(rawLine => {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) return false;
+    const email = line.split('|', 1)[0].trim().toLowerCase();
+    if (!selectedEmails.has(email) || seen.has(email)) return false;
+    seen.add(email);
+    return true;
+  });
+  return lines.length ? lines.join('\n') : selectedItems.map(item => String(item.email || '').trim()).join('\n');
+}
+async function retrySelectedImportedPlanItems() {
+  const selectedItems = importedPlanSelectedItems();
+  if (!selectedItems.length) {
+    showToast('Hãy chọn ít nhất một email có thể kiểm tra lại');
+    return;
+  }
+  if (!confirm(`Kiểm tra lại ${selectedItems.length} email đã chọn?`)) return;
+  await startImportedPlanCheck(importedPlanRetryInput(selectedItems), false);
+}
 $('#btnCloseImportPlan').addEventListener('click', closeImportPlanPanel);
-$('#btnStartImportPlan').addEventListener('click', startImportedPlanCheck);
+$('#btnStartImportPlan').addEventListener('click', () => startImportedPlanCheck());
 $('#importPlanResultFilter').addEventListener('change', renderImportedPlanRows);
-$('#btnCopyFreePlanEmails').addEventListener('click', () => copyText(importedFreePlanEmails.join('\n')));
+$('#importPlanSelectFiltered').addEventListener('change', (event) => {
+  const visibleItems = importedPlanVisibleItems().filter(importedPlanCanRetry);
+  for (const item of visibleItems) {
+    const email = String(item.email || '').trim().toLowerCase();
+    if (event.target.checked) importedPlanSelectedEmails.add(email);
+    else importedPlanSelectedEmails.delete(email);
+  }
+  renderImportedPlanRows();
+});
+$('#importPlanResultBody').addEventListener('change', (event) => {
+  const checkbox = event.target.closest('[data-import-plan-select]');
+  if (!checkbox) return;
+  const email = String(checkbox.dataset.email || '').trim().toLowerCase();
+  if (checkbox.checked) importedPlanSelectedEmails.add(email);
+  else importedPlanSelectedEmails.delete(email);
+  updateImportedPlanSelectionControls();
+});
+$('#btnRetryImportPlan').addEventListener('click', retrySelectedImportedPlanItems);
+$('#btnCopyFreePlanEmails').addEventListener('click', copyFilteredImportedPlanEmails);
 
 // 账号操作按钮（事件委托）
 async function onAccountsBodyClick(e) {

@@ -2061,6 +2061,12 @@ def update_account_plan_check(acc_id: int | None = None, email: str | None = Non
             row["plan_check_http_status"] = result.get("http_status")
             row["plan_check_error"] = None if ok else result.get("error")
 
+            if str(result.get("account_status") or "").strip().lower() == "deactivated":
+                row["live_check_status"] = "deactivated"
+                row["live_check_ok"] = False
+                row["live_checked_at"] = result.get("checked_at") or now
+                row["live_check_error"] = account_unusable_message("account_deactivated")
+
             if result.get("account_id"):
                 row["account_id"] = result.get("account_id")
             # 查询失败只更新本次错误和网络信息，不覆盖上一次成功拿到的套餐、

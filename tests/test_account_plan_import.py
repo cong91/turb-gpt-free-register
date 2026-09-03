@@ -139,6 +139,30 @@ missing@example.com
         self.assertEqual(result["pending_count"], 1)
         self.assertEqual(result["items"][0]["classification"], "pending")
 
+    def test_login_failure_is_reported_separately_from_plan_check_failure(self):
+        from core.account_plan_import import build_import_plan_status
+
+        result = build_import_plan_status([{
+            "id": 9,
+            "email": "login-failed@example.com",
+            "plan_check_status": "failed",
+            "plan_check_ok": False,
+            "plan_check_stage": "login",
+            "plan_check_error": "ChatGPT login did not provide accessToken",
+        }])
+
+        self.assertEqual(result["items"][0]["classification"], "login_failed")
+        self.assertEqual(result["login_failed_count"], 1)
+
+    def test_login_failure_persistence_error_does_not_escape_worker(self):
+        from core.account_plan_import import _mark_login_failed
+
+        with patch(
+            "core.account_plan_import.db.update_account_plan_check",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            _mark_login_failed(9, "login failed")
+
     def test_tokenless_existing_account_uses_imported_credentials_before_login(self):
         from core.account_plan_import import queue_imported_plan_checks
 
@@ -439,11 +463,16 @@ class AccountPlanImportApiTests(unittest.TestCase):
         self.assertIn('id="importPlanEmails"', template)
         self.assertIn('id="importPlanLoginNetwork"', template)
         self.assertIn('id="btnCopyFreePlanEmails"', template)
+        self.assertIn('id="btnRetryImportPlan"', template)
+        self.assertIn('id="importPlanSelectFiltered"', template)
+        self.assertIn('data-import-plan-select', template)
         self.assertIn('id="importPlanResults"', template)
         self.assertIn('id="importPlanResultFilter"', template)
         self.assertIn('id="importPlanResultBody"', template)
         self.assertIn('importedPlanPrecheckItemsFromResult', template)
         self.assertIn('renderImportedPlanRows', template)
+        self.assertIn('retrySelectedImportedPlanItems', template)
+        self.assertIn('copyFilteredImportedPlanEmails', template)
         self.assertIn('Tài khoản Free', template)
         self.assertIn('Có Free Trial', template)
         self.assertIn('Free, không có Trial', template)
@@ -451,6 +480,7 @@ class AccountPlanImportApiTests(unittest.TestCase):
         self.assertNotIn('Có gói Free', template)
         self.assertIn('Không phải Free', template)
         self.assertIn('Cần kiểm tra lại', template)
+        self.assertIn('Đăng nhập thất bại', template)
         self.assertIn('Lỗi khi kiểm tra', template)
         self.assertIn('Không tìm thấy trong DB', template)
         self.assertIn('/api/accounts/check-plan-import', template)
