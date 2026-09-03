@@ -442,8 +442,13 @@ def build_import_plan_status(rows: Iterable[dict]) -> dict:
             "plan_type": row.get("current_plan_type") or row.get("plan_type"),
             "plus_trial_eligible": row.get("plus_trial_eligible"),
             "checked_at": row.get("plan_checked_at"),
-            "error": row.get("plan_check_error"),
+            "error": (
+                row.get("live_check_error") or account_unusable_message("account_deactivated")
+                if classification == "deactivated"
+                else row.get("plan_check_error")
+            ),
             "stage": row.get("plan_check_stage"),
+            "live_check_status": row.get("live_check_status"),
             "classification": classification,
         }
         items.append(item)
