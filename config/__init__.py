@@ -17,7 +17,7 @@ config 包的统一入口。
     config.proxy             代理池 + 随机抽取
     config.register          注册默认信息（邮箱、密码、名称、生日）
     config.email             Outlook 邮箱账号池 + OTP 轮询
-    config.twofa             2FA 开关
+    config.twofa             2FA 开关和 re-auth OTP 等待
 """
 
 # ---------- 浏览器 / HTTP ----------
@@ -177,7 +177,7 @@ from config.register import (
 )
 
 # ---------- 2FA ----------
-from config.twofa import ENABLE_2FA
+from config.twofa import ENABLE_2FA, TWOFA_OTP_MAX_WAIT
 
 _RELOADABLE_SUBMODULES = (
     "config.browser",
@@ -390,6 +390,7 @@ __all__ = [
     "TIMEZONE_IANA",
     "TIMEZONE_NAME",
     "TIMEZONE_OFFSET_MINUTES",
+    "TWOFA_OTP_MAX_WAIT",
     # browser
     "USER_AGENT",
     "USER_AGENT_DATA_PLATFORM",

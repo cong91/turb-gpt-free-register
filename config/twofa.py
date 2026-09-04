@@ -14,5 +14,8 @@ from config.env_loader import apply_env_overrides
 
 ENABLE_2FA = False
 
+# 仅用于已有账号登录和 2FA re-auth 的邮箱 OTP 等待；普通注册仍使用独立的 OTP_MAX_WAIT。
+TWOFA_OTP_MAX_WAIT = 90
+
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_2FA': 'bool'})
+apply_env_overrides(globals(), {'ENABLE_2FA': 'bool', 'TWOFA_OTP_MAX_WAIT': 'int'})
