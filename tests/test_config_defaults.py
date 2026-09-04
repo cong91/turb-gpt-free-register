@@ -1,5 +1,6 @@
 import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from config import env_loader, roxy_profile_manager
@@ -80,6 +81,21 @@ class ConfigDefaultFallbackTests(unittest.TestCase):
         self.assertEqual(fields["TINYHOST_API_BASE"]["storage"], "sqlite")
         self.assertEqual(fields["TINYHOST_REQUEST_TIMEOUT"]["type"], "int")
         self.assertEqual(fields["TINYHOST_RANDOM_LOCAL_LENGTH"]["type"], "int")
+
+    def test_twofa_otp_wait_default_and_webui_field_are_exposed(self):
+        from config import twofa
+
+        source = Path(twofa.__file__).read_text(encoding="utf-8")
+        self.assertEqual(
+            config_editor._parse_value_from_source(source, "TWOFA_OTP_MAX_WAIT", "int"),
+            90,
+        )
+        field = next(
+            item for item in config_editor.EDITABLE_FIELDS
+            if item["key"] == "TWOFA_OTP_MAX_WAIT"
+        )
+        self.assertEqual(field["file"], "twofa.py")
+        self.assertEqual(field["type"], "int")
 
     def test_roxy_offline_open_is_enabled_after_parity_gate(self):
         self.assertTrue(roxy_profile_manager.ROXY_PROFILE_OFFLINE_OPEN_SUPPORTED)

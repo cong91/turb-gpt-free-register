@@ -380,6 +380,10 @@ EDITABLE_FIELDS = [
         "label": "OTP 最长等待(秒)", "help": "等待验证码邮件的最长秒数，超时判失败",
     },
     {
+        "key": "TWOFA_OTP_MAX_WAIT", "file": "twofa.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "2FA OTP 最长等待(秒)", "help": "已有账号登录与 2FA re-auth 等待邮箱验证码的最长秒数，默认 90；不改变验证码本身的有效期",
+    },
+    {
         "key": "OTP_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "OTP 轮询间隔(秒)", "help": "每隔多少秒查一次新邮件",
     },

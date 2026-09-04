@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import Mock, call, patch
 from urllib.parse import parse_qs, urlparse
 
+from config import twofa as twofa_config
 from core.account_export import (
     BrowserPageTransport,
     _follow_reauth,
@@ -12,6 +13,8 @@ from core.account_export import (
     setup_2fa_for_registration,
 )
 from core.gmail_api_url_client import GmailApiUrlError
+
+EXPECTED_TWOFA_OTP_MAX_WAIT = int(getattr(twofa_config, "TWOFA_OTP_MAX_WAIT", 90) or 90)
 
 
 class AccountExportTwofaTransportTests(unittest.TestCase):
@@ -209,12 +212,14 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
                     "user@example.com",
                     after_ts=100.0,
                     before_code=None,
+                    max_wait=EXPECTED_TWOFA_OTP_MAX_WAIT,
                     stage="twofa_reauth_email_otp",
                 ),
                 call(
                     "user@example.com",
                     after_ts=200.0,
                     before_code="111111",
+                    max_wait=EXPECTED_TWOFA_OTP_MAX_WAIT,
                     stage="twofa_reauth_email_otp",
                 ),
             ],
@@ -264,12 +269,14 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
                     "user@example.com",
                     after_ts=100.0,
                     before_code=None,
+                    max_wait=EXPECTED_TWOFA_OTP_MAX_WAIT,
                     stage="twofa_reauth_email_otp",
                 ),
                 call(
                     "user@example.com",
                     after_ts=200.0,
                     before_code="111111",
+                    max_wait=EXPECTED_TWOFA_OTP_MAX_WAIT,
                     stage="twofa_reauth_email_otp",
                 ),
             ],
@@ -315,12 +322,14 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
                     "user@example.com",
                     after_ts=100.0,
                     before_code=None,
+                    max_wait=EXPECTED_TWOFA_OTP_MAX_WAIT,
                     stage="twofa_reauth_email_otp",
                 ),
                 call(
                     "user@example.com",
                     after_ts=200.0,
                     before_code=None,
+                    max_wait=EXPECTED_TWOFA_OTP_MAX_WAIT,
                     stage="twofa_reauth_email_otp",
                 ),
             ],
