@@ -809,6 +809,7 @@ def setup_2fa(
 
     if reauth:
         from config import email as _email_cfg
+        from config import twofa as _twofa_cfg
         from core.email_provider import (
             acknowledge_verification_code,
             snapshot_verification_code,
@@ -843,6 +844,7 @@ def setup_2fa(
                     wait_kwargs = {
                         "after_ts": reauth_otp_after_ts,
                         "before_code": reauth_before_code,
+                        "max_wait": int(getattr(_twofa_cfg, "TWOFA_OTP_MAX_WAIT", 90) or 90),
                         "stage": "twofa_reauth_email_otp",
                     }
                     current_otp = wait_for_otp(email, **wait_kwargs)

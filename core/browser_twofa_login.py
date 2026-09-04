@@ -4,12 +4,14 @@ from __future__ import annotations
 import logging
 import time
 
+from config import twofa as _twofa_cfg
 from core.browser_registration import (
     _clear_otp_inputs,
     _click_continue,
     _click_resend_email_otp,
     _fetch_chatgpt_session,
     _has_access_token,
+    _is_email_verification_page,
     _maybe_accept,
     _submit_email_and_wait_next,
     _type_otp,
@@ -97,6 +99,7 @@ def _login_existing_account(driver, email: str, password: str, timeout: int = 12
             wait_kwargs = {
                 "after_ts": otp_after_ts,
                 "before_code": otp_before_code,
+                "max_wait": int(getattr(_twofa_cfg, "TWOFA_OTP_MAX_WAIT", 90) or 90),
                 "stage": "twofa_login_email_otp",
             }
             if previous_submitted_otp:
@@ -109,6 +112,11 @@ def _login_existing_account(driver, email: str, password: str, timeout: int = 12
         except Exception as exc:  # noqa: BLE001 - page state polling is authoritative.
             logger.debug("[Browser 2FA] email OTP submit click unavailable: %s", exc)
         outcome = _wait_after_email_otp_submit(driver, timeout=15)
+        if outcome != "accepted" and not _is_email_verification_page(driver):
+            logger.info(
+                "[Browser 2FA] OTP 提交后页面已离开验证码页，跳过 resend 并继续读取登录态"
+            )
+            outcome = "accepted"
         if outcome == "accepted":
             acknowledge_verification_code(
                 email,
