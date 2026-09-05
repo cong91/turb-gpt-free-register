@@ -333,7 +333,7 @@ QAN8_GMAIL_SKU_ID=your_gmail_sku_id
 QAN8_ALIASES_PER_SOURCE=12
 ```
 
-Số worker hiệu dụng cũng là số lane và số source đang hoạt động. Ví dụ `workers=5` tạo tối đa 5 source Gmail gốc khác nhau, mỗi lane giữ một source và xử lý alias của lane theo thứ tự. Client sinh alias từ mail gốc; mọi alias của source dùng chung `code_url` để nhận OTP. Khi một lane hết alias, lane đó mới mua thêm đúng một source; các lane khác không bị đổi source. QAN8 delivery phải trả về đúng một bản ghi `email----code_url`, vì quantity luôn là 1.
+Số worker hiệu dụng là giới hạn xử lý vật lý; số lane nguồn là `min(workers, ceil(count / aliases_per_source))`. Với `count=6`, `workers=3`, `aliases=12`, hệ thống tạo đúng 6 job nhưng chỉ mở 1 lane nguồn. Ba worker vật lý vẫn có thể được lập lịch, nhưng sẽ xếp hàng trên cùng source/code URL; alias canonical tiếp theo chỉ được claim sau khi assignment trước hoàn tất hoặc được giải phóng. Nếu kho Gmail API đã có alias khả dụng thì dùng lại trước; chỉ khi hết alias khả dụng mới mua thêm đúng một source QAN8 (`quantity=1`). WebUI cũng giữ nguyên `count` là số đăng ký; alias chỉ là sức chứa tái sử dụng của source, không nhân số job. Khi source của một lane hết alias mà vẫn còn job, lane đó mới mua source thay thế. Client sinh alias từ mail gốc; mọi alias của source dùng chung `code_url` để nhận OTP. QAN8 delivery phải trả về đúng một bản ghi `email----code_url`, vì quantity luôn là 1.
 
 Chi tiết lifecycle, recovery và contract delivery xem [docs/qan8_gmail_api_lazy.md](docs/qan8_gmail_api_lazy.md).
 

@@ -31,6 +31,7 @@ _TRANSIENT_MARKERS = (
 def should_auto_retry_registration_failure(
     error: object,
     *,
+    email_source: str,
     retry_attempt: int,
     max_attempts: int,
 ) -> bool:
@@ -38,6 +39,9 @@ def should_auto_retry_registration_failure(
     if int(max_attempts or 0) <= int(retry_attempt or 0):
         return False
     message = str(error or "").strip().lower()
+    source = str(email_source or "").strip().lower()
+    if "code=602" in message and source in {"gmail_api_url", "qan8_gmail_api"}:
+        return True
     if not message or any(marker in message for marker in _TERMINAL_MARKERS):
         return False
     return any(marker in message for marker in _TRANSIENT_MARKERS)

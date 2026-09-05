@@ -293,6 +293,55 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertIs(submitted[0][0], registration_service._run_one_job)
 
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
+    def test_provider_602_queues_fresh_qan8_job_on_same_lane(self):
+        provider_context = {
+            "qan8_gmail_api_batch_id": "batch-1",
+            "qan8_gmail_api_lane_id": 0,
+        }
+        source = db.create_job(
+            email_source="qan8_gmail_api",
+            provider_context=provider_context,
+        )
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            return_value={"success": False, "error": "Provider error code=602"},
+        ), patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+            return_value=True,
+        ) as release_email, patch.object(
+            registration_service,
+            "get_executor",
+            return_value=ImmediateExecutor(),
+        ), patch.object(
+            registration_service,
+            "get_executor_workers",
+            return_value=1,
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            registration_service._run_one_job(source["id"], source["log_file"])
+
+        jobs = db.list_jobs(limit=10)
+        child = next(job for job in jobs if job["id"] != source["id"])
+        self.assertEqual(child["parent_job_id"], source["id"])
+        self.assertEqual(child["provider_context"], provider_context)
+        self.assertEqual(len(submitted), 1)
+        release_email.assert_called_once_with(
+            "alias+one@gmail.com",
+            "Provider error code=602",
+            discard_on_failure=True,
+        )
+
+    @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
     def test_terminal_registration_failure_does_not_queue_a_new_job(self):
         source = db.create_job(email_source="qan8_gmail_api")
         submitted = []

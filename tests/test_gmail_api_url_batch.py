@@ -7,9 +7,11 @@ import pytest
 
 from core.gmail_api_url_batch_store import (
     GmailApiUrlBatchConflict,
+    GmailApiUrlBatchError,
     GmailApiUrlBatchStore,
 )
 from core.gmail_api_url_client import GmailApiUrlAccount
+from core.qan8_gmail_api_store import Qan8GmailApiStore
 
 
 def test_create_batch_with_capacity(tmp_path):
@@ -62,7 +64,7 @@ def test_complete_frees_alias_for_reuse(tmp_path):
 
     batch_id = store.create_batch(
         [("test@gmail.com", "https://api.mail.com/code")],
-        capacity=2
+        capacity=3
     )
 
     # Claim and complete first job
@@ -116,34 +118,148 @@ def test_discard_exhausts_failed_alias_and_claims_next_alias(tmp_path):
 
     next_assignment = store.claim_waiting(batch_id, "job-2")
     assert next_assignment is not None
-    assert next_assignment.inventory_id.startswith("next@gmail.com----")
+    assert next_assignment.inventory_id != first.inventory_id
+    assert next_assignment.inventory_id.endswith("----https://api.mail.com/code")
     status = store.batch_status(batch_id)
     assert status["pending"] == 1
     assert status["exhausted"] == 1
 
 
+def test_claim_blocks_same_code_url_across_batches_until_released(tmp_path):
+    """Workers from separate batches cannot use the same Gmail API URL together."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.mail.com/shared"
+    first_batch = store.create_batch_multi([
+        {
+            "source_email": "first@gmail.com",
+            "code_url": code_url,
+            "aliases": ["first+alias@gmail.com"],
+        },
+    ])
+    second_batch = store.create_batch_multi([
+        {
+            "source_email": "second@gmail.com",
+            "code_url": code_url,
+            "aliases": ["second+alias@gmail.com"],
+        },
+    ])
+
+    first = store.claim(first_batch, "first-job")
+
+    with pytest.raises(GmailApiUrlBatchConflict):
+        store.claim(second_batch, "second-job")
+    assert store.claim_waiting(second_batch, "second-job") is None
+    assert store.release(first.assignment_id, "first job stopped")
+
+    second = store.claim_waiting(second_batch, "second-job")
+    assert second is not None
+    assert second.inventory_id.startswith("second+alias@gmail.com----")
+
+
+def test_claim_blocks_historical_dot_variant_of_same_gmail_root(tmp_path):
+    """Legacy dotted/undotted spellings cannot race two provider URLs."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    first_batch = store.create_batch_multi([
+        {
+            "source_email": "foobar@gmail.com",
+            "code_url": "https://api.mail.com/root-a",
+            "aliases": ["foobar@gmail.com"],
+        },
+    ])
+    second_batch = store.create_batch_multi([
+        {
+            "source_email": "other@gmail.com",
+            "code_url": "https://api.mail.com/root-b",
+            "aliases": ["other@gmail.com"],
+        },
+    ])
+
+    # Simulate a historical row imported before canonical-root ownership was
+    # enforced: the exact email differs, but both spellings map to one inbox.
+    with store._transaction() as connection:
+        connection.execute(
+            "UPDATE gmail_api_url_batch_items SET email = ?, inventory_id = ? "
+            "WHERE batch_id = ?",
+            (
+                "foo.bar@gmail.com",
+                "foo.bar@gmail.com----https://api.mail.com/root-b",
+                second_batch,
+            ),
+        )
+
+    first = store.claim(first_batch, "root-a-job")
+    assert first is not None
+    with pytest.raises(GmailApiUrlBatchConflict):
+        store.claim(second_batch, "root-b-job")
+    assert store.claim_any_available("root-b-any") is None
+
+
+def test_unavailable_aliases_exclude_terminal_released_assignment(tmp_path):
+    """An alias released by a finished job is eligible for a later batch."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.mail.com/code"
+    batch_id = store.create_batch_multi([
+        {
+            "source_email": "source@gmail.com",
+            "code_url": code_url,
+            "aliases": ["released@gmail.com", "active@gmail.com", "failed@gmail.com"],
+        }
+    ])
+
+    failed = store.claim(batch_id, "job-failed")
+    assert store.discard(failed.assignment_id, "registration failed")
+    released = store.claim(batch_id, "job-released")
+    assert store.release(released.assignment_id, "job stopped")
+
+    failed_alias = failed.inventory_id.split("----", 1)[0]
+    released_alias = released.inventory_id.split("----", 1)[0]
+    unavailable = store.list_unavailable_aliases_for_code_url(code_url)
+
+    assert unavailable == {failed_alias}
+    assert released_alias not in unavailable
+
+
+def test_global_unavailable_aliases_keep_qan8_available_aliases_reusable(tmp_path):
+    """QAN8 provenance rows are unavailable only while active or terminal."""
+    path = tmp_path / "shared.db"
+    q8_store = Qan8GmailApiStore(path)
+    q8_batch = q8_store.create_batch(
+        1,
+        requested_workers=1,
+        aliases_per_source=2,
+    )
+    q8_store.create_source_group(
+        q8_batch["batch_id"],
+        0,
+        "source@gmail.com",
+        "https://api.mail.com/qan8",
+        ["available@gmail.com", "other@gmail.com"],
+    )
+    store = GmailApiUrlBatchStore(path)
+
+    assert store.list_globally_unavailable_aliases().isdisjoint(
+        {"available@gmail.com", "other@gmail.com"}
+    )
+
+    assignment = q8_store.claim_alias(q8_batch["batch_id"], 0, "q8-job")
+    assert assignment is not None
+    assert "available@gmail.com" in store.list_globally_unavailable_aliases()
+
+
 def test_quarantine_code_url_exhausts_every_alias_for_that_mailbox(tmp_path):
     """A provider 602 retires every alias sharing the broken code URL."""
     store = GmailApiUrlBatchStore(tmp_path / "batch.db")
-    batch_id = store.create_batch_multi(
-        [
-            {
-                "source_email": "broken-source@gmail.com",
-                "code_url": "https://api.mail.com/broken",
-                "aliases": ["broken-one@gmail.com", "broken-two@gmail.com"],
-            },
-            {
-                "source_email": "healthy-source@gmail.com",
-                "code_url": "https://api.mail.com/healthy",
-                "aliases": ["healthy-one@gmail.com"],
-            },
-        ]
-    )
+    batch_id = store.create_batch_multi([
+        {
+            "source_email": "broken-source@gmail.com",
+            "code_url": "https://api.mail.com/broken",
+            "aliases": ["broken-one@gmail.com", "broken-two@gmail.com"],
+        },
+    ])
 
     broken = store.claim(batch_id, "job-broken")
 
     assert store.quarantine_code_url(
-        batch_id,
         "https://api.mail.com/broken",
         reason="Provider error code=602",
     ) == 2
@@ -156,9 +272,57 @@ def test_quarantine_code_url_exhausts_every_alias_for_that_mailbox(tmp_path):
         batch_id,
         "broken-two@gmail.com----https://api.mail.com/broken",
     ).state == "exhausted"
-    assert store.batch_status(batch_id)["pending"] == 1
+    assert store.batch_status(batch_id)["pending"] == 0
 
-    healthy = store.claim(batch_id, "job-healthy")
+    healthy_batch = store.create_batch_multi([
+        {
+            "source_email": "healthy-source@gmail.com",
+            "code_url": "https://api.mail.com/healthy",
+            "aliases": ["healthy-one@gmail.com"],
+        },
+    ])
+    healthy = store.claim(healthy_batch, "job-healthy")
+    assert healthy.inventory_id.startswith("healthy-one@gmail.com----")
+
+
+def test_quarantine_code_url_exhausts_matching_aliases_across_batches(tmp_path):
+    """A 602 source cannot remain usable through another batch."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    broken_url = "https://api.mail.com/broken"
+    first_batch = store.create_batch_multi(
+        [{
+            "source_email": "broken-source@gmail.com",
+            "code_url": broken_url,
+            "aliases": ["broken-one@gmail.com"],
+        }]
+    )
+    second_batch = store.create_batch_multi([
+        {
+            "source_email": "same-broken-source@gmail.com",
+            "code_url": broken_url,
+            "aliases": ["broken-two@gmail.com"],
+        },
+    ])
+    healthy_batch = store.create_batch_multi([
+        {
+            "source_email": "healthy-source@gmail.com",
+            "code_url": "https://api.mail.com/healthy",
+            "aliases": ["healthy-one@gmail.com"],
+        },
+    ])
+    first = store.claim(first_batch, "job-broken")
+
+    assert store.quarantine_code_url(
+        broken_url,
+        reason="Provider error code=602",
+    ) == 2
+    assert store.get_assignment(first.assignment_id).state == "failed"
+    assert store.get_item(
+        second_batch,
+        "broken-two@gmail.com----https://api.mail.com/broken",
+    ).state == "exhausted"
+
+    healthy = store.claim(healthy_batch, "job-healthy")
     assert healthy.inventory_id.startswith("healthy-one@gmail.com----")
 
 
@@ -236,6 +400,31 @@ def test_batch_status_marks_only_consumed_aliases_exhausted(tmp_path):
     assert remaining["pending"] == 1
     assert remaining["completed"] == 1
     assert remaining["exhausted_batch"] is False
+
+
+def test_batch_status_excludes_globally_unavailable_aliases(tmp_path):
+    """A row reserved in the shared ledger cannot keep a batch pending."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    batch_id = store.create_batch_multi([
+        {
+            "source_email": "source@gmail.com",
+            "code_url": "https://api.mail.com/code",
+            "aliases": ["busy@gmail.com"],
+        }
+    ])
+
+    with patch.object(
+        GmailApiUrlBatchStore,
+        "_globally_unavailable_aliases_in_connection",
+        return_value={"busy@gmail.com"},
+    ):
+        status = store.batch_status(batch_id)
+
+    assert status["total"] == 1
+    assert status["pending"] == 0
+    assert status["exhausted"] == 1
+    assert status["available_code_urls"] == 0
+    assert status["exhausted_batch"] is True
 
 
 def test_batch_status_counts_legacy_capacity_slots(tmp_path):
@@ -341,10 +530,10 @@ def test_capacity_validation(tmp_path):
     store.create_batch([("test@gmail.com", "https://api.mail.com/code")], capacity=12)
     
     # Invalid capacities should fail
-    with pytest.raises(ValueError):
+    with pytest.raises(GmailApiUrlBatchError):
         store.create_batch([("test@gmail.com", "https://api.mail.com/code")], capacity=0)
 
-    with pytest.raises(ValueError):
+    with pytest.raises(GmailApiUrlBatchError):
         store.create_batch([("test@gmail.com", "https://api.mail.com/code")], capacity=13)
 
 
@@ -432,6 +621,59 @@ def test_create_batch_multi_multi_group(tmp_path):
     all_aliases = aliases_concurrent | {remaining}
     assert "a2@gmail.com" in all_aliases
     assert "a2@googlemail.com" in all_aliases
+
+
+def test_create_batch_multi_rejects_alias_owned_by_another_batch(tmp_path):
+    """A canonical alias can never be inserted into two Gmail batches."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.test/shared-alias"
+    first_batch = store.create_batch_multi([
+        {
+            "source_email": "source-one@gmail.com",
+            "code_url": code_url,
+            "aliases": ["same.alias@gmail.com"],
+        }
+    ])
+
+    with pytest.raises(GmailApiUrlBatchConflict, match="already allocated"):
+        store.create_batch_multi([
+            {
+                "source_email": "source-two@gmail.com",
+                "code_url": code_url,
+                "aliases": ["same.alias@gmail.com"],
+            }
+        ])
+
+    assert store.batch_status(first_batch)["total"] == 1
+
+
+def test_claim_skips_historical_duplicate_alias_row(tmp_path):
+    """Legacy duplicate rows cannot make one alias claimable twice."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.test/legacy-duplicate"
+    first_batch = store.create_batch_multi([
+        {
+            "source_email": "source-one@gmail.com",
+            "code_url": code_url,
+            "aliases": ["duplicate@gmail.com"],
+        }
+    ])
+    second_batch = store.create_empty_batch()
+    with store._transaction() as connection:
+        connection.execute(
+            "INSERT INTO gmail_api_url_batch_items "
+            "(batch_id, inventory_id, email, code_url, position) VALUES (?, ?, ?, ?, 0)",
+            (second_batch, f"duplicate@gmail.com----{code_url}", "duplicate@gmail.com", code_url),
+        )
+
+    first = store.claim(first_batch, "first-job")
+    assert first.inventory_id.startswith("duplicate@gmail.com----")
+    assert store.release(first.assignment_id, "legacy duplicate ownership check")
+    status = store.batch_status(second_batch)
+    assert status["total"] == 0
+    assert status["pending"] == 0
+    with pytest.raises(GmailApiUrlBatchConflict, match="No available"):
+        store.claim(second_batch, "second-job")
 
 
 def test_find_item_by_alias_returns_alias_and_code_url(tmp_path):
@@ -541,4 +783,5 @@ def test_poll_otp_uses_gmail_api_url_client(tmp_path):
         "after_ts": 10.0,
         "max_wait": 17.0,
         "poll_interval": 4.0,
+        "sqlite_path": store.path,
     }

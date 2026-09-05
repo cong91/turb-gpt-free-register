@@ -23,7 +23,7 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
 
     @patch("core.email_provider.Qan8GmailApiAllocator", create=True)
     def test_acquire_uses_the_job_lane(self, allocator_factory):
-        allocator_factory.return_value.acquire_account.return_value = SimpleNamespace(
+        allocator_factory.return_value.acquire_gmail_api_account.return_value = SimpleNamespace(
             email="alias+one@gmail.com"
         )
 
@@ -32,37 +32,39 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
             email_source="qan8_gmail_api",
             qan8_gmail_api_batch_id="batch-1",
             qan8_gmail_api_lane_id=2,
+            gmail_api_url_batch_id="gmail-batch",
         )
 
         self.assertEqual(email, "alias+one@gmail.com")
-        allocator_factory.return_value.acquire_account.assert_called_once()
+        allocator_factory.return_value.acquire_gmail_api_account.assert_called_once()
         self.assertEqual(
-            allocator_factory.return_value.acquire_account.call_args.kwargs,
+            allocator_factory.return_value.acquire_gmail_api_account.call_args.kwargs,
             {
                 "batch_id": "batch-1",
+                "gmail_batch_id": "gmail-batch",
                 "job_id": 7,
                 "lane_id": 2,
                 "stop_check": registration_service.check_stop_requested,
             },
         )
 
-    @patch("core.email_provider.Qan8GmailApiAllocator", create=True)
-    def test_resolve_recognizes_qan8_alias_before_other_pools(self, allocator_factory):
-        allocator_factory.return_value.get_account_context.return_value = SimpleNamespace(
+    @patch("core.gmail_api_url_client.get_batch_account_context")
+    def test_resolve_recognizes_qan8_alias_as_canonical_gmail_source(self, batch_context):
+        batch_context.return_value = SimpleNamespace(
             email="alias+one@gmail.com",
             code_url="https://qan8.test/code",
         )
 
         self.assertEqual(
             email_provider.resolve_email_source("alias+one@gmail.com"),
-            "qan8_gmail_api",
+            "gmail_api_url",
         )
 
     @patch("core.gmail_api_url_client.poll_verification_code", return_value="654321")
-    @patch("core.email_provider.Qan8GmailApiAllocator", create=True)
-    @patch("core.email_provider.resolve_email_source", return_value="qan8_gmail_api")
-    def test_wait_for_otp_reuses_qan8_mailbox_and_stale_guard(self, _resolve, allocator_factory, poll):
-        allocator_factory.return_value.get_account_context.return_value = SimpleNamespace(
+    @patch("core.gmail_api_url_client.get_batch_account_context")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    def test_wait_for_otp_reuses_qan8_mailbox_and_stale_guard(self, _resolve, batch_context, poll):
+        batch_context.return_value = SimpleNamespace(
             email="alias+one@gmail.com",
             code_url="https://qan8.test/code",
         )
@@ -108,8 +110,8 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
             )
             with (
                 patch.object(email_config, "USE_EMAIL_SERVICE", True),
-                patch.object(email_provider, "resolve_email_source", return_value="qan8_gmail_api"),
-                patch.object(email_provider, "Qan8GmailApiAllocator", return_value=allocator),
+                patch.object(email_provider, "resolve_email_source", return_value="gmail_api_url"),
+                patch("core.gmail_api_url_client.get_batch_account_context", return_value=allocator.get_account_context("alias+one@gmail.com")),
                 patch("core.gmail_api_url_client.requests.get", return_value=response),
             ):
                 code = email_provider.wait_for_otp(
@@ -125,10 +127,14 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
             self.assertEqual(code, "246810")
             self.assertEqual(db.get_gmail_api_url_last_otp(source_url), "246810")
 
-    @patch("core.email_provider.Qan8GmailApiAllocator", create=True)
-    @patch("core.email_provider.resolve_email_source", return_value="qan8_gmail_api")
-    def test_release_and_consume_use_qan8_assignment_state(self, _resolve, allocator_factory):
-        allocator = allocator_factory.return_value
+    @patch("core.gmail_api_url_client.release_account", return_value=True)
+    @patch("core.gmail_api_url_client.get_batch_account_context", return_value=SimpleNamespace(
+        email="alias+one@gmail.com", code_url="https://qan8.test/code"
+    ))
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    def test_release_and_consume_use_canonical_gmail_assignment_state(
+        self, _resolve, _context, release_account
+    ):
 
         self.assertTrue(
             email_provider.release_email_if_unconsumed(
@@ -137,21 +143,21 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
                 discard_on_failure=True,
             )
         )
-        allocator.release_account.assert_called_once_with(
-            "alias+one@gmail.com", status="failed", reason="registration failed"
+        release_account.assert_called_once_with(
+            "alias+one@gmail.com", status="failed", note="registration failed"
         )
 
-        allocator.reset_mock()
+        release_account.reset_mock()
         self.assertTrue(email_provider.mark_email_consumed("alias+one@gmail.com"))
 
-        allocator.release_account.assert_called_once_with(
-            "alias+one@gmail.com", status="used", reason=""
+        release_account.assert_called_once_with(
+            "alias+one@gmail.com", status="used", note=""
         )
 
     @patch("core.email_provider.Qan8GmailApiAllocator", create=True)
     @patch("core.outlook_client.pick_account")
     def test_explicit_qan8_source_does_not_fallback(self, _outlook, allocator_factory):
-        allocator_factory.return_value.acquire_account.side_effect = RuntimeError("lane busy")
+        allocator_factory.return_value.acquire_gmail_api_account.side_effect = RuntimeError("lane busy")
 
         with self.assertRaisesRegex(RuntimeError, "qan8_gmail_api"):
             email_provider.acquire_email(
@@ -159,6 +165,7 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
                 email_source="qan8_gmail_api",
                 qan8_gmail_api_batch_id="batch-1",
                 qan8_gmail_api_lane_id=0,
+                gmail_api_url_batch_id="gmail-batch",
             )
 
         _outlook.assert_not_called()
@@ -168,7 +175,11 @@ class Qan8GmailApiProviderIntegrationTests(unittest.TestCase):
         create=True,
         return_value={"total": 12, "available": 7, "used": 3, "failed": 1, "reserved": 1},
     )
-    def test_qan8_source_uses_qan8_alias_usage_in_email_pool(self, _usage):
+    @patch(
+        "core.db.GmailApiUrlBatchStore.alias_root_owners",
+        return_value={},
+    )
+    def test_qan8_source_uses_qan8_alias_usage_in_email_pool(self, _root_owners, _usage):
         rows = db._attach_gmail_api_url_alias_stats([
             {"email": "source@gmail.com", "code_url": "https://qan8.test/source-code"},
         ])
@@ -204,6 +215,7 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
             17,
             [],
             email_source="qan8_gmail_api",
+            gmail_api_url_batch_id="gmail-batch",
             qan8_gmail_api_batch_id="batch-1",
             qan8_gmail_api_lane_id=2,
         )
@@ -216,15 +228,16 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         acquire_email.assert_called_once_with(
             job_id=17,
             email_source="qan8_gmail_api",
+            gmail_api_url_batch_id="gmail-batch",
             qan8_gmail_api_batch_id="batch-1",
             qan8_gmail_api_lane_id=2,
         )
 
     @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator")
-    def test_submit_creates_one_lazy_batch_and_persists_lane_per_job(self, allocator_factory):
+    def test_submit_sizes_qan8_lanes_to_requested_concurrency(self, allocator_factory):
         allocator_factory.return_value.create_batch.return_value = {
             "batch_id": "batch-1",
-            "effective_workers": 3,
+            "effective_workers": 1,
         }
 
         submitted = []
@@ -246,7 +259,7 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
             )
 
         allocator_factory.return_value.create_batch.assert_called_once_with(
-            5, requested_workers=3, aliases_per_source=12
+            5, requested_workers=1, aliases_per_source=12
         )
         self.assertEqual(len(submitted), 5)
         self.assertEqual(
@@ -257,7 +270,7 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
                 )
                 for job in jobs
             ],
-            [(0, "batch-1"), (1, "batch-1"), (2, "batch-1"), (0, "batch-1"), (1, "batch-1")],
+            [(0, "batch-1")] * 5,
         )
         self.assertTrue(all(not db.get_job(job["id"])["email"] for job in jobs))
         self.assertTrue(
@@ -265,7 +278,41 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         )
 
     @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator")
-    def test_submit_uses_only_as_many_qan8_lanes_as_sources_needed(self, allocator_factory):
+    def test_submit_keeps_requested_qan8_concurrency_when_alias_capacity_covers_all_jobs(self, allocator_factory):
+        allocator_factory.return_value.create_batch.return_value = {
+            "batch_id": "batch-12",
+            "effective_workers": 1,
+        }
+
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(registration_service, "get_executor_workers", return_value=3), patch.object(
+            proxy_config, "ROTATING_PROXY_ENABLED", False
+        ):
+            jobs = registration_service.submit_registration(
+                count=12,
+                workers=3,
+                email_source="qan8_gmail_api",
+                qan8_aliases_per_source=12,
+            )
+
+        allocator_factory.return_value.create_batch.assert_called_once_with(
+            12, requested_workers=1, aliases_per_source=12
+        )
+        self.assertEqual(len(submitted), 12)
+        self.assertEqual(
+            [job["provider_context"]["qan8_gmail_api_lane_id"] for job in jobs],
+            [0] * 12,
+        )
+
+    @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator")
+    def test_submit_uses_requested_qan8_lanes_for_concurrency(self, allocator_factory):
         allocator_factory.return_value.create_batch.return_value = {
             "batch_id": "batch-13",
             "effective_workers": 2,
@@ -355,17 +402,17 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         mark_consumed.assert_called_once_with("alias+one@gmail.com")
         self.assertEqual(db.get_job(job["id"])["status"], "success")
 
-    def test_webui_expands_qan8_sources_into_lane_jobs(self):
+    def test_webui_keeps_qan8_registration_count_and_concurrency(self):
         service = MagicMock()
         service.submit_registration.return_value = [
             {
                 "id": index,
                 "provider_context": {
                     "qan8_gmail_api_batch_id": "batch-1",
-                    "qan8_gmail_api_lane_id": index % 3,
+                    "qan8_gmail_api_lane_id": 0,
                 },
             }
-            for index in range(36)
+            for index in range(3)
         ]
         service.effective_registration_workers.return_value = 3
         database = MagicMock()
@@ -387,7 +434,7 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 200)
-        self.assertEqual(payload["submitted"], 36)
+        self.assertEqual(payload["submitted"], 3)
         self.assertEqual(
             [
                 sum(
@@ -396,15 +443,15 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
                 )
                 for lane in range(3)
             ],
-            [12, 12, 12],
+            [3, 0, 0],
         )
         self.assertEqual(payload["warning"], "")
         self.assertEqual(
             payload["qan8"],
             {
                 "batch_id": "batch-1",
-                "target_count": 36,
-                "effective_workers": 3,
+                "target_count": 3,
+                "effective_workers": 1,
                 "aliases_per_source": 12,
                 "active_sources": 0,
                 "orders_placed": 0,
@@ -414,12 +461,57 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
         self.assertNotIn("api_key", str(payload))
         self.assertNotIn("code_url", str(payload))
         service.submit_registration.assert_called_once_with(
-            count=36,
+            count=3,
             workers=3,
             email_source="qan8_gmail_api",
             qan8_aliases_per_source=12,
         )
         database.gmail_api_url_email_pool_summary.assert_not_called()
+
+    def test_webui_count_one_submits_one_qan8_job(self):
+        service = MagicMock()
+        service.submit_registration.return_value = [
+            {
+                "id": 0,
+                "provider_context": {
+                    "qan8_gmail_api_batch_id": "batch-one",
+                    "qan8_gmail_api_lane_id": 0,
+                },
+            }
+        ]
+        service.effective_registration_workers.return_value = 3
+        database = MagicMock()
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "qan8_gmail_api"
+        ), patch.object(email_config, "QAN8_API_BASE", "https://shop.qan8.com", create=True), patch.object(
+            email_config, "QAN8_API_KEY", "key", create=True
+        ), patch.object(email_config, "QAN8_GMAIL_SKU_ID", "42", create=True):
+            payload, status = create_registration_jobs(
+                {
+                    "count": 1,
+                    "workers": 3,
+                    "email_source": "qan8_gmail_api",
+                    "qan8_alias_count": 12,
+                },
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["submitted"], 1)
+        self.assertEqual(payload["qan8"]["target_count"], 1)
+        self.assertEqual(payload["qan8"]["effective_workers"], 1)
+        self.assertEqual(
+            [job["provider_context"]["qan8_gmail_api_lane_id"] for job in payload["jobs"]],
+            [0],
+        )
+        service.submit_registration.assert_called_once_with(
+            count=1,
+            workers=3,
+            email_source="qan8_gmail_api",
+            qan8_aliases_per_source=12,
+        )
 
     def test_automation_qan8_count_is_account_count_not_source_count(self):
         service = MagicMock()
@@ -461,8 +553,10 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
             },
         )
 
-    def test_webui_rejects_qan8_expanded_count_over_limit(self):
+    def test_webui_does_not_multiply_qan8_count_by_alias_capacity(self):
         service = MagicMock()
+        service.submit_registration.return_value = []
+        service.effective_registration_workers.return_value = 16
         database = MagicMock()
 
         with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
@@ -481,9 +575,14 @@ class Qan8GmailApiRegistrationIntegrationTests(unittest.TestCase):
                 database=database,
             )
 
-        self.assertEqual(status, 400)
-        self.assertIn("1008", payload["error"])
-        service.submit_registration.assert_not_called()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["submitted"], 0)
+        service.submit_registration.assert_called_once_with(
+            count=84,
+            workers=3,
+            email_source="qan8_gmail_api",
+            qan8_aliases_per_source=12,
+        )
 
     @patch(
         "webui.app.svc.qan8_batch_status",

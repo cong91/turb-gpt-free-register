@@ -14,12 +14,22 @@ EMAIL_SOURCE 支持单个或多个来源：
     ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
 """
 import logging
+import re
 from collections.abc import Iterable
 
 from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
 
 logger = logging.getLogger(__name__)
 _BEFORE_CODE_UNSET = object()
+_PROVIDER_602_RE = re.compile(
+    r"(?:\bcode|\bstatus|\bhttp(?:\s+status)?|\berror)\s*[:=]?\s*602\b",
+    re.IGNORECASE,
+)
+
+
+def _is_provider_code_602(value: object) -> bool:
+    """Recognize provider 602 responses across API/error message formats."""
+    return bool(_PROVIDER_602_RE.search(str(value or "")))
 
 
 def _current_otp_job_id() -> int | None:
@@ -35,20 +45,87 @@ def _current_otp_job_id() -> int | None:
 
 def _get_code_url_account(email: str, source: str):
     """Resolve a Gmail API URL account for either URL-backed provider."""
-    if source == "gmail_api_url":
+    if source in {"gmail_api_url", "qan8_gmail_api"}:
         from core.gmail_api_url_client import (
             get_account_context,
             get_batch_account_context,
         )
 
-        account = get_account_context(email) or get_batch_account_context(email)
-    elif source == "qan8_gmail_api":
-        account = Qan8GmailApiAllocator().get_account_context(email)
+        job_id = _current_otp_job_id()
+        batch_account = (
+            get_batch_account_context(email, job_id=job_id)
+            if job_id is not None
+            else get_batch_account_context(email)
+        )
+        account = batch_account or get_account_context(email)
     else:
         return None
     if not account:
         raise ValueError(f"Gmail API URL account not found: {email}")
     return account
+
+
+def _gmail_api_url_runtime_path():
+    """Return the canonical Gmail batch database used by this process."""
+    try:
+        from core.gmail_api_url_client import _batch_store
+
+        path = getattr(_batch_store(), "path", None)
+        if path:
+            return path
+    except (AttributeError, ImportError, TypeError):
+        pass
+    from core.app_state_db import APP_STATE_DB_PATH
+
+    return APP_STATE_DB_PATH
+
+
+def _quarantine_code_url_after_provider_error(account, *, source: str, error: Exception) -> None:
+    """Persist a terminal provider URL failure before a driver releases its alias."""
+    if not _is_provider_code_602(error):
+        return
+    try:
+        from core import registration_service
+
+        registration_service.quarantine_provider_lane(
+            job_id=_current_otp_job_id(),
+            source=source,
+            code_url=str(getattr(account, "code_url", "") or ""),
+            provider_batch_id=getattr(account, "batch_id", None),
+            provider_lane_id=getattr(account, "lane_id", None),
+            reason=str(error),
+        )
+    except Exception:
+        logger.exception(
+            "[EmailProvider] Không thể quarantine provider source sau lỗi code=602: source=%s",
+            source,
+        )
+
+
+def _raise_if_code_url_is_quarantined(account) -> None:
+    """Prevent polling a Gmail root/alias that is disabled or retired."""
+    from core import db
+
+    code_url = str(getattr(account, "code_url", "") or "")
+    email = str(getattr(account, "email", "") or "")
+    runtime_path = _gmail_api_url_runtime_path()
+    url_quarantined = db.is_gmail_api_url_code_url_failed(
+        code_url,
+        sqlite_path=runtime_path,
+    )
+    if url_quarantined:
+        from core.gmail_api_url_client import GmailApiUrlError
+
+        raise GmailApiUrlError("Provider error code=602: Gmail API URL source is quarantined")
+    source_blocked = db.is_gmail_api_url_account_blocked(
+        email,
+        sqlite_path=runtime_path,
+    )
+    if not source_blocked:
+        return
+    from core.gmail_api_url_client import GmailApiUrlError
+
+    raise GmailApiUrlError("Gmail API URL source is disabled or terminally retired")
 
 
 def snapshot_verification_code(email: str, *, stage: str | None = None) -> str | None:
@@ -60,7 +137,12 @@ def snapshot_verification_code(email: str, *, stage: str | None = None) -> str |
     from core.gmail_api_url_client import snapshot_verification_code as snapshot_code
 
     account = _get_code_url_account(email, source)
-    code = snapshot_code(account)
+    try:
+        _raise_if_code_url_is_quarantined(account)
+        code = snapshot_code(account)
+    except Exception as exc:
+        _quarantine_code_url_after_provider_error(account, source=source, error=exc)
+        raise
     logger.info(
         "[EmailProvider][OTP] pre-request snapshot source=%s present=%s job=%s stage=%s",
         source,
@@ -133,6 +215,14 @@ def _normalize_explicit_email_source(value: str | None) -> str | None:
     return None
 
 
+def _canonicalize_runtime_source(source: str | None) -> str | None:
+    """Map QAN8 provenance to the single Gmail API runtime provider."""
+    normalized = _normalize_explicit_email_source(source)
+    if normalized == "qan8_gmail_api":
+        return "gmail_api_url"
+    return normalized
+
+
 def _registered_email_source(email: str) -> str | None:
     """读取已注册账号落库的邮箱来源。"""
     try:
@@ -140,7 +230,7 @@ def _registered_email_source(email: str) -> str | None:
         account = db.get_account_by_email(email)
     except Exception:  # noqa: BLE001
         return None
-    return _normalize_explicit_email_source((account or {}).get("email_source"))
+    return _canonicalize_runtime_source((account or {}).get("email_source"))
 
 
 def _active_job_email_source(email: str) -> str | None:
@@ -154,7 +244,7 @@ def _active_job_email_source(email: str) -> str | None:
         job = db.get_job(job_id) or {}
         job_email = str(job.get("email") or "").strip().casefold()
         if job_email and job_email == str(email or "").strip().casefold():
-            return _normalize_explicit_email_source(job.get("email_source"))
+            return _canonicalize_runtime_source(job.get("email_source"))
     except (AttributeError, TypeError, ValueError):
         return None
     return None
@@ -267,12 +357,19 @@ def _pick_from_source(
         from core.gmail_api_url_client import pick_account
         return pick_account().email
     if source == "qan8_gmail_api":
-        if not qan8_gmail_api_batch_id or qan8_gmail_api_lane_id is None:
-            raise ValueError("QAN8 Gmail API requires a batch_id and lane_id")
+        if (
+            not qan8_gmail_api_batch_id
+            or qan8_gmail_api_lane_id is None
+            or not gmail_api_url_batch_id
+        ):
+            raise ValueError(
+                "QAN8 Gmail API requires QAN8 batch/lane and canonical Gmail batch_id"
+            )
         from core.registration_service import check_stop_requested
 
-        return Qan8GmailApiAllocator().acquire_account(
+        return Qan8GmailApiAllocator().acquire_gmail_api_account(
             batch_id=qan8_gmail_api_batch_id,
+            gmail_batch_id=gmail_api_url_batch_id,
             job_id=job_id or "standalone",
             lane_id=int(qan8_gmail_api_lane_id),
             stop_check=check_stop_requested,
@@ -376,9 +473,15 @@ def resolve_email_source(email: str) -> str:
     active_job_source = _active_job_email_source(email)
     if active_job_source:
         return active_job_source
-    if Qan8GmailApiAllocator().get_account_context(email):
-        return "qan8_gmail_api"
-
+    # Canonical Gmail API inventory wins before the other provider contexts.
+    # QAN8 aliases are materialized here too, so no second runtime source can
+    # steal an alias that the Gmail ledger already owns.
+    from core import db
+    if db.get_gmail_api_url_email_by_email(email):
+        return "gmail_api_url"
+    from core.gmail_api_url_client import get_batch_account_context
+    if get_batch_account_context(email):
+        return "gmail_api_url"
     from core.gmail_123452026_client import get_account_context as get_gmail_cdk_context
     if get_gmail_cdk_context(email):
         return "gmail_123452026"
@@ -404,16 +507,8 @@ def resolve_email_source(email: str) -> str:
     if get_remail_context(email):
         return "remail"
 
-    from core import db
     if db.get_generic_api_email_by_email(email):
         return "generic_api"
-    if db.get_gmail_api_url_email_by_email(email):
-        return "gmail_api_url"
-    # Alias batch: alias (vd willjacob6442+xxx@gmail.com) không nằm trong pool,
-    # phải tra qua batch context để nhận ra là gmail_api_url.
-    from core.gmail_api_url_client import get_batch_account_context
-    if get_batch_account_context(email):
-        return "gmail_api_url"
     if db.get_outlook_by_email(email):
         return "outlook"
     if db._find_domain_email(db._load_domain_pool(), email):  # 内部轻量查询，仅本项目使用
@@ -479,27 +574,10 @@ def _wait_for_code_url_otp(
     if before_code is not _BEFORE_CODE_UNSET:
         poll_kwargs["before_code"] = before_code
     try:
+        _raise_if_code_url_is_quarantined(account)
         return poll_verification_code(normalized_account, **poll_kwargs)
     except GmailApiUrlError as exc:
-        if "code=602" in str(exc).lower():
-            try:
-                from core import registration_service
-
-                job_id = _current_otp_job_id()
-                if job_id is not None:
-                    registration_service.quarantine_provider_lane(
-                        job_id=job_id,
-                        source=source,
-                        code_url=normalized_account.code_url,
-                        provider_batch_id=getattr(account, "batch_id", None),
-                        provider_lane_id=getattr(account, "lane_id", None),
-                        reason=str(exc),
-                    )
-            except Exception as exc:
-                logger.exception(
-                    "[EmailProvider] Không thể quarantine lane sau lỗi code=602: email=%s",
-                    normalized_account.email,
-                )
+        _quarantine_code_url_after_provider_error(account, source=source, error=exc)
         raise
 
 
@@ -541,10 +619,11 @@ def wait_for_otp(
             job_id = None
         return wait_for_manual_otp(email, timeout=timeout, job_id=job_id)
 
-    source = (
-        _normalize_explicit_email_source(email_source)
-        or _registered_email_source(email)
-        or resolve_email_source(email)
+    # Resolve through the single provider resolver so registered-account,
+    # active-job, canonical Gmail inventory, and QAN8 provenance all follow
+    # the same precedence rules.
+    source = _canonicalize_runtime_source(email_source) or _canonicalize_runtime_source(
+        resolve_email_source(email)
     )
     extra_kwargs = {}
     if max_wait is not None or source == "paymesh":
@@ -588,17 +667,6 @@ def wait_for_otp(
             before_code=before_code,
             stage=stage,
         )
-    if source == "qan8_gmail_api":
-        account = _get_code_url_account(email, source)
-        return _wait_for_code_url_otp(
-            account,
-            source=source,
-            after_ts=after_ts,
-            max_wait=extra_kwargs.get("max_wait"),
-            poll_interval=extra_kwargs.get("poll_interval"),
-            before_code=before_code,
-            stage=stage,
-        )
     if source == "mailnest":
         from core.mailnest_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
@@ -614,7 +682,23 @@ def wait_for_otp(
 
 def release_email(email: str, status: str = "available", note: str | None = None) -> str:
     """按邮箱实际来源回收状态，返回来源名。"""
-    source = resolve_email_source(email)
+    resolved_source = resolve_email_source(email)
+    source = _canonicalize_runtime_source(resolved_source) or resolved_source
+    provider_failed = _is_provider_code_602(note)
+    if source == "gmail_api_url" and provider_failed:
+        try:
+            account = _get_code_url_account(email, source)
+            _quarantine_code_url_after_provider_error(
+                account,
+                source=source,
+                error=RuntimeError(str(note or "Provider error code=602")),
+            )
+        except Exception:
+            logger.exception(
+                "[EmailProvider] Không thể resolve Gmail API URL source khi release lỗi code=602"
+            )
+    if source == "gmail_api_url" and provider_failed:
+        status = "failed"
     if source == "gmail_123452026":
         from core.gmail_123452026_client import release_account
         release_account(email, status=status, note=note)
@@ -638,11 +722,11 @@ def release_email(email: str, status: str = "available", note: str | None = None
         release_account(email, status=status, note=note)
     elif source == "gmail_api_url":
         from core.gmail_api_url_client import release_account
-        release_account(email, status=status, note=note)
-    elif source == "qan8_gmail_api":
-        Qan8GmailApiAllocator().release_account(
-            email, status=status, reason=str(note or "")
-        )
+        release_kwargs = {"status": status, "note": note}
+        job_id = _current_otp_job_id()
+        if job_id is not None:
+            release_kwargs["job_id"] = job_id
+        release_account(email, **release_kwargs)
     elif source == "mailnest":
         from core.mailnest_client import release_account
         release_account(email, status=status, note=note)
@@ -668,7 +752,8 @@ def release_email_if_unconsumed(
     if not (email or "").strip():
         return False
 
-    source = resolve_email_source(email)
+    resolved_source = resolve_email_source(email)
+    source = _canonicalize_runtime_source(resolved_source) or resolved_source
     from core import db
 
     if source == "gmail_123452026":
@@ -684,36 +769,45 @@ def release_email_if_unconsumed(
     elif source == "gmail_api_url":
         from core.gmail_api_url_client import get_batch_account_context, release_account
 
-        batch_context = get_batch_account_context(email)
-        if discard_on_failure and batch_context:
-            changed = release_account(email, status="failed", note=note or "")
-            if changed:
+        job_id = _current_otp_job_id()
+        batch_context = (
+            get_batch_account_context(email, job_id=job_id)
+            if job_id is not None
+            else get_batch_account_context(email)
+        )
+        provider_failed = _is_provider_code_602(note)
+        if batch_context:
+            release_kwargs = {
+                "status": "failed" if discard_on_failure or provider_failed else "available",
+                "note": note or "",
+            }
+            if job_id is not None:
+                release_kwargs["job_id"] = job_id
+            changed = release_account(email, **release_kwargs)
+            if provider_failed:
+                _quarantine_code_url_after_provider_error(
+                    batch_context,
+                    source=source,
+                    error=RuntimeError(str(note or "Provider error code=602")),
+                )
+                changed = True
+            if (discard_on_failure or provider_failed) and changed:
                 logger.warning(
                     "[EmailProvider] Đã loại bỏ Gmail API alias sau lỗi đăng ký: %s",
                     email,
                 )
             return bool(changed)
 
-        provider_failed = "Provider error code=602" in str(note or "")
         if provider_failed:
             existing = db.get_gmail_api_url_email_by_email(email)
-            db.release_gmail_api_url_email(email, status="failed", note=note)
+            if existing is not None:
+                db.fail_gmail_api_url_sources_for_code_url(
+                    str(existing.get("code_url") or ""),
+                    note=note,
+                )
             changed = existing is not None
         else:
             changed = db.release_unconsumed_gmail_api_url_email(email, note=note)
-        if not changed and batch_context:
-            changed = release_account(
-                email,
-                status="failed" if provider_failed else "available",
-                note=note or "",
-            )
-    elif source == "qan8_gmail_api":
-        provider_failed = "code=602" in str(note or "").lower()
-        changed = Qan8GmailApiAllocator().release_account(
-            email,
-            status="failed" if discard_on_failure or provider_failed else "available",
-            reason=str(note or ""),
-        )
     elif source == "cloudflare_domain":
         changed = db.release_unconsumed_domain_email(email, note=note)
     else:
@@ -732,7 +826,8 @@ def mark_email_consumed(email: str) -> bool:
     """提交需要显式消费的 provider reservation；其他来源无需处理。"""
     if not (email or "").strip():
         return False
-    source = resolve_email_source(email)
+    resolved_source = resolve_email_source(email)
+    source = _canonicalize_runtime_source(resolved_source) or resolved_source
     if source == "gmail_123452026":
         from core.gmail_123452026_client import mark_account_consumed
         return mark_account_consumed(email)
@@ -741,9 +836,11 @@ def mark_email_consumed(email: str) -> bool:
         return mark_account_consumed(email)
     if source == "gmail_api_url":
         from core.gmail_api_url_client import release_account
-        return bool(release_account(email, status="used", note=""))
-    if source == "qan8_gmail_api":
-        return Qan8GmailApiAllocator().release_account(email, status="used", reason="")
+        job_id = _current_otp_job_id()
+        release_kwargs = {"status": "used", "note": ""}
+        if job_id is not None:
+            release_kwargs["job_id"] = job_id
+        return bool(release_account(email, **release_kwargs))
     if source == "tinyhost":
         from core.tinyhost_mail_client import mark_domain_supported
         return mark_domain_supported(email)
