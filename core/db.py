@@ -7,6 +7,7 @@ SQLite 持久化层。
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 import uuid
@@ -20,6 +21,7 @@ from core import app_state_db
 from core.gmail_aliases import (
     MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
     GmailAliasError,
+    canonical_gmail,
     generate_gmail_dual_domain_aliases,
 )
 from core.gmail_api_url_batch_store import (
@@ -29,6 +31,10 @@ from core.gmail_api_url_batch_store import (
 from core.openai_auth import account_unusable_message
 
 logger = logging.getLogger(__name__)
+_GMAIL_API_602_RE = re.compile(
+    r"(?:\bcode|\bstatus|\bhttp(?:\s+status)?|\berror)\s*[:=]?\s*602\b",
+    re.IGNORECASE,
+)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DATA_DIR = _PROJECT_ROOT
@@ -83,6 +89,29 @@ _CODEX_EXPORT_STATE = _LEGACY_CODEX_EXPORT_STATE
 _PERSONAL_INFO_CHANGE_STATE_KEY = "personal_info_change_batches"
 _MAX_PERSONAL_INFO_CHANGE_BATCHES = 32
 _REGISTRATION_JOB_SEQUENCE_KEY = "registration_job_next_id"
+
+
+def _is_gmail_api_url_quarantined_row(row: dict) -> bool:
+    """Return whether a raw Gmail source has a terminal provider quarantine."""
+    if bool(row.get("quarantined")):
+        return True
+    status = str(row.get("status") or "").strip().lower()
+    return status == "failed" and bool(_GMAIL_API_602_RE.search(str(row.get("note") or "")))
+
+
+def _is_gmail_api_602_note(value: object) -> bool:
+    """Recognize a provider-602 reason before persisting a release."""
+    return bool(_GMAIL_API_602_RE.search(str(value or "")))
+
+
+def _gmail_api_url_root_is_blocked(row: dict, blocked_roots: set[str]) -> bool:
+    """Return whether a raw row belongs to a terminal Gmail mailbox root."""
+    if not blocked_roots:
+        return False
+    try:
+        return canonical_gmail(str(row.get("email") or "").strip()) in blocked_roots
+    except GmailAliasError:
+        return True
 
 _LEGACY_SQLITE = _LEGACY_DATA_DIR / "registrations.db"
 _LEGACY_OUTLOOK_JSON = _LEGACY_DATA_DIR / "outlook_accounts.json"
@@ -1588,29 +1617,22 @@ def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
     result = [dict(row) for row in rows]
     from core.qan8_gmail_api_store import Qan8GmailApiStore
 
+    blocked_roots = gmail_api_url_blocked_canonical_roots()
     qan8_store = Qan8GmailApiStore(_SQLITE_PATH, initialize_schema=False)
     code_urls = {
         str(row.get("code_url") or "").strip()
         for row in result
         if str(row.get("code_url") or "").strip()
     }
-    usage_by_url = GmailApiUrlBatchStore(_SQLITE_PATH).alias_usage_for_code_urls(code_urls)
+    gmail_store = GmailApiUrlBatchStore(_SQLITE_PATH)
+    usage_by_url = gmail_store.alias_usage_for_code_urls(code_urls)
+    root_owners = gmail_store.alias_root_owners()
     empty_usage = {"allocated": set(), "consumed": set(), "failed": set(), "reserved": set()}
     for row in result:
         qan8_usage = qan8_store.alias_usage_for_source(
             str(row.get("email") or ""),
             str(row.get("code_url") or ""),
         )
-        if qan8_usage is not None:
-            row.update({
-                "alias_total": int(qan8_usage["total"]),
-                "alias_allocated": int(qan8_usage["total"]),
-                "alias_available": int(qan8_usage["available"]),
-                "alias_used": int(qan8_usage["used"]),
-                "alias_failed": int(qan8_usage["failed"]),
-                "alias_reserved": int(qan8_usage["reserved"]),
-            })
-            continue
         try:
             candidates = generate_gmail_dual_domain_aliases(
                 row.get("email"), limit=MAX_GMAIL_DUAL_DOMAIN_VARIANTS
@@ -1619,13 +1641,58 @@ def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
             candidates = []
         candidate_set = {str(alias).strip().casefold() for alias in candidates if alias}
         usage = usage_by_url.get(str(row.get("code_url") or "").strip(), empty_usage)
-        consumed = candidate_set & usage["consumed"]
-        failed = (candidate_set & usage["failed"]) - consumed
-        reserved = (candidate_set & usage["reserved"]) - consumed - failed
+        code_url = str(row.get("code_url") or "").strip()
+        cross_url_owned = set()
+        for alias in candidate_set:
+            try:
+                root = canonical_gmail(alias)
+            except GmailAliasError:
+                root = alias
+            if any(owner_url != code_url for owner_url in root_owners.get(root, set())):
+                cross_url_owned.add(alias)
+        q8_states = (
+            qan8_store.alias_state_sets_for_source(
+                str(row.get("email") or ""),
+                str(row.get("code_url") or ""),
+            )
+            if qan8_usage is not None
+            else None
+        )
+        if qan8_usage is not None and q8_states is None:
+            # Keep compatibility with providers/tests that expose only the
+            # aggregate QAN8 counters and have no alias-name detail.
+            row.update({
+                "alias_total": int(qan8_usage["total"]),
+                "alias_allocated": int(qan8_usage["total"]),
+                "alias_available": (
+                    0
+                    if _gmail_api_url_root_is_blocked(row, blocked_roots)
+                    else max(0, int(qan8_usage["available"]) - len(cross_url_owned))
+                ),
+                "alias_used": int(qan8_usage["used"]),
+                "alias_failed": int(qan8_usage["failed"]),
+                "alias_reserved": int(qan8_usage["reserved"]),
+            })
+            continue
+        q8_states = q8_states or {}
+        q8_consumed = candidate_set & q8_states.get("consumed", set())
+        q8_failed = candidate_set & q8_states.get("failed", set())
+        q8_reserved = candidate_set & q8_states.get("active", set())
+        consumed = q8_consumed | (candidate_set & usage["consumed"])
+        failed = (q8_failed | (candidate_set & usage["failed"])) - consumed
+        reserved = (q8_reserved | (candidate_set & usage["reserved"])) - consumed - failed
+        allocated_aliases = (
+            candidate_set & usage["allocated"]
+        ) | q8_consumed | q8_failed | q8_reserved | cross_url_owned
+        occupied = consumed | failed | reserved | cross_url_owned
         row.update({
             "alias_total": len(candidate_set),
-            "alias_allocated": len(candidate_set & usage["allocated"]),
-            "alias_available": max(0, len(candidate_set) - len(consumed) - len(failed) - len(reserved)),
+            "alias_allocated": len(allocated_aliases),
+            "alias_available": (
+                0
+                if _gmail_api_url_root_is_blocked(row, blocked_roots)
+                else max(0, len(candidate_set) - len(occupied))
+            ),
             "alias_used": len(consumed),
             "alias_failed": len(failed),
             "alias_reserved": len(reserved),
@@ -3607,12 +3674,27 @@ def record_gmail_api_url_email(
     *,
     status: str = "used",
     note: str | None = None,
+    sqlite_path: str | Path | None = None,
 ) -> bool:
-    """Persist one Gmail API URL source, preserving its current ownership state."""
+    """Persist one Gmail API URL source, preserving its current ownership state.
+
+    A caller using an isolated canonical ledger must not write the process-wide
+    raw JSON/TXT pool.  ``sqlite_path`` therefore scopes this compatibility
+    export to the same data directory used by the runtime ledger.
+    """
     normalized_email = str(email or "").strip().lower()
     normalized_url = str(code_url or "").strip()
     if not normalized_email or not normalized_url:
         raise ValueError("Gmail API URL email and code_url are required")
+
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return False
+        if raw_parent != db_parent:
+            return False
 
     state = str(status or "used").strip().lower()
     with _LOCK:
@@ -3621,9 +3703,28 @@ def record_gmail_api_url_email(
         if existing is not None:
             if str(existing.get("code_url") or "").strip() != normalized_url:
                 raise ValueError("Gmail API URL email already has a different code_url")
-            existing["status"] = state
-            existing["used_at"] = None if state == "available" else existing.get("used_at") or _now()
-            if note is not None:
+            existing_status = str(existing.get("status") or "").strip().lower()
+            # A manually disabled source, an exhausted source, and a provider
+            # failure are terminal ownership decisions.  A later QAN8
+            # purchase/import must not silently revive one of these rows.
+            quarantined = _is_gmail_api_url_quarantined_row(existing)
+            if quarantined:
+                existing["quarantined"] = True
+                existing["status"] = "failed"
+                existing_status = "failed"
+            terminal_failure = (
+                quarantined
+                or existing_status in {"failed", "disabled", "exhausted"}
+            ) and state != existing_status
+            if not terminal_failure:
+                existing["status"] = state
+            effective_state = existing_status if terminal_failure else state
+            existing["used_at"] = (
+                None
+                if effective_state == "available"
+                else existing.get("used_at") or _now()
+            )
+            if note is not None and not terminal_failure:
                 existing["note"] = str(note)
             existing["copy_line"] = _gmail_api_url_email_line(existing)
             _save_gmail_api_url_emails(rows)
@@ -3648,10 +3749,26 @@ def claim_next_gmail_api_url_email(
     *,
     include_used: bool = False,
     exclude_emails: set[str] | None = None,
+    sqlite_path: str | Path | None = None,
 ) -> dict | None:
-    """Claim a source mailbox, optionally reusing used rows with free aliases."""
+    """Claim a source mailbox, optionally reusing used rows with free aliases.
+
+    When a canonical ledger path is supplied, only a raw pool in the same
+    directory may be claimed.  Raw Gmail records are persisted in the JSON
+    export, so crossing that boundary would otherwise mutate one pool while
+    materializing into an unrelated SQLite ledger.
+    """
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return None
+        if raw_parent != db_parent:
+            return None
     with _LOCK:
         rows = sorted(_load_gmail_api_url_emails(), key=lambda x: int(x.get("id") or 0))
+        blocked_roots = gmail_api_url_blocked_canonical_roots(sqlite_path=sqlite_path)
         excluded = {
             str(email or "").strip().casefold()
             for email in (exclude_emails or set())
@@ -3661,6 +3778,8 @@ def claim_next_gmail_api_url_email(
             (
                 r for r in rows
                 if str(r.get("status") or "").strip().lower() == "available"
+                and not _is_gmail_api_url_quarantined_row(r)
+                and not _gmail_api_url_root_is_blocked(r, blocked_roots)
                 and str(r.get("email") or "").strip().casefold() not in excluded
             ),
             None,
@@ -3671,6 +3790,8 @@ def claim_next_gmail_api_url_email(
                 (
                     r for r in rows
                     if str(r.get("status") or "").strip().lower() == "used"
+                    and not _is_gmail_api_url_quarantined_row(r)
+                    and not _gmail_api_url_root_is_blocked(r, blocked_roots)
                     and str(r.get("email") or "").strip().casefold() not in excluded
                 ),
                 None,
@@ -3736,21 +3857,233 @@ def release_generic_api_email(email: str, status: str = "available", note: str |
         _mutate_email_pool_row("generic_api", email=email, mutator=mutate)
 
 
-def release_gmail_api_url_email(email: str, status: str = "available", note: str | None = None) -> None:
-    """把 Gmail API URL 邮箱状态改回 available，或标记为 failed/used。"""
+def release_gmail_api_url_email(
+    email: str,
+    status: str = "available",
+    note: str | None = None,
+    *,
+    sqlite_path: str | Path | None = None,
+) -> bool:
+    """Release a raw source without reviving a provider-602 quarantine."""
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return False
+        if raw_parent != db_parent:
+            return False
     with _LOCK:
         rows = _load_gmail_api_url_emails()
         row = _find_by_email(rows, email)
         if row is None:
-            return
+            return False
+        if _is_gmail_api_url_quarantined_row(row) or _is_gmail_api_602_note(note):
+            row["status"] = "failed"
+            row["quarantined"] = True
+            row["used_at"] = row.get("used_at") or _now()
+            if note is not None and not row.get("note"):
+                row["note"] = note
+            row["copy_line"] = _gmail_api_url_email_line(row)
+            _save_gmail_api_url_emails(rows)
+            return True
         row["status"] = status
         if status == "available":
             row["used_at"] = None
-        elif status in ("used", "failed", "disabled"):
+        elif status in ("used", "failed", "disabled", "exhausted"):
             row["used_at"] = row.get("used_at") or _now()
         if note is not None:
             row["note"] = note
         _save_gmail_api_url_emails(rows)
+        return True
+
+
+def fail_gmail_api_url_sources_for_code_url(
+    code_url: str,
+    note: str | None = None,
+    *,
+    sqlite_path: str | Path | None = None,
+) -> int:
+    """Mark every source sharing a terminal provider URL as failed.
+
+    ``sqlite_path`` scopes fixture/runtime calls to the data directory that
+    owns the canonical ledger.  This prevents a temporary store used by a
+    direct adapter call from mutating the live raw-pool export.
+    """
+    target = str(code_url or "").strip()
+    if not target:
+        return 0
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return 0
+        if raw_parent != db_parent:
+            return 0
+
+    with _LOCK:
+        rows = _load_gmail_api_url_emails()
+        matched = 0
+        for row in rows:
+            if str(row.get("code_url") or "").strip() != target:
+                continue
+            row["status"] = "failed"
+            row["quarantined"] = True
+            row["used_at"] = row.get("used_at") or _now()
+            if note is not None:
+                row["note"] = str(note)
+            matched += 1
+        if matched:
+            _save_gmail_api_url_emails(rows)
+        return matched
+
+
+def is_gmail_api_url_code_url_failed(
+    code_url: str,
+    *,
+    sqlite_path: str | Path | None = None,
+) -> bool:
+    """Return whether a provider URL has already been retired from the pool."""
+    target = str(code_url or "").strip()
+    if not target:
+        return False
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return False
+        if raw_parent != db_parent:
+            return False
+    with _LOCK:
+        return any(
+            str(row.get("code_url") or "").strip() == target
+            and (
+                str(row.get("status") or "").strip().lower() == "failed"
+                or _is_gmail_api_url_quarantined_row(row)
+            )
+            for row in _load_gmail_api_url_emails()
+        )
+
+
+def gmail_api_url_blocked_canonical_roots(
+    *,
+    sqlite_path: str | Path | None = None,
+) -> set[str]:
+    """Return canonical Gmail roots whose source rows cannot be claimed.
+
+    The raw Gmail pool remains the operator-facing source of truth for
+    ``available``/``used``/``disabled`` state.  Canonical batch rows contain
+    aliases rather than the source root, so claimers use this small snapshot
+    to prevent aliases of disabled, exhausted, or failed roots from being
+    allocated.  ``sqlite_path`` scopes the snapshot to the same data
+    directory; isolated test/fixture stores must not consult the live pool.
+    """
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return set()
+        if raw_parent != db_parent:
+            return set()
+
+    blocked_states = {"disabled", "failed", "exhausted"}
+    blocked: set[str] = set()
+    with _LOCK:
+        for row in _load_gmail_api_url_emails():
+            if (
+                str(row.get("status") or "available").strip().lower() not in blocked_states
+                and not _is_gmail_api_url_quarantined_row(row)
+            ):
+                continue
+            email = str(row.get("email") or "").strip()
+            if not email:
+                continue
+            try:
+                blocked.add(canonical_gmail(email))
+            except GmailAliasError:
+                # Invalid roots cannot generate canonical aliases and are
+                # already skipped by the raw-pool materializer.
+                continue
+    return blocked
+
+
+def is_gmail_api_url_source_blocked(
+    email: str,
+    *,
+    sqlite_path: str | Path | None = None,
+) -> bool:
+    """Return whether one raw Gmail source is disabled or terminally retired."""
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return False
+        if raw_parent != db_parent:
+            return False
+    target = str(email or "").strip()
+    if not target:
+        return True
+    with _LOCK:
+        row = _find_by_email(_load_gmail_api_url_emails(), target)
+    row = row or {}
+    return (
+        str(row.get("status") or "available").strip().lower()
+        in {"disabled", "failed", "exhausted"}
+        or _is_gmail_api_url_quarantined_row(row)
+    )
+
+
+def is_gmail_api_url_account_blocked(
+    email: str,
+    *,
+    sqlite_path: str | Path | None = None,
+) -> bool:
+    """Return whether a Gmail root or one of its aliases is terminally blocked."""
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return False
+        if raw_parent != db_parent:
+            return False
+
+    target = str(email or "").strip()
+    if not target:
+        return True
+    with _LOCK:
+        rows = _load_gmail_api_url_emails()
+        direct = _find_by_email(rows, target)
+        if direct and (
+            str(direct.get("status") or "available").strip().lower()
+            in {"disabled", "failed", "exhausted"}
+            or _is_gmail_api_url_quarantined_row(direct)
+        ):
+            return True
+        try:
+            canonical = canonical_gmail(target)
+        except GmailAliasError:
+            return False
+        for row in rows:
+            if (
+                str(row.get("status") or "available").strip().lower()
+                not in {"disabled", "failed", "exhausted"}
+                and not _is_gmail_api_url_quarantined_row(row)
+            ):
+                continue
+            source_email = str(row.get("email") or "").strip()
+            if not source_email:
+                continue
+            try:
+                if canonical_gmail(source_email) == canonical:
+                    return True
+            except GmailAliasError:
+                continue
+        return False
 
 
 def release_unconsumed_generic_api_email(email: str, note: str | None = None) -> bool:
@@ -3775,6 +4108,8 @@ def release_unconsumed_gmail_api_url_email(email: str, note: str | None = None) 
         rows = _load_gmail_api_url_emails()
         row = _find_by_email(rows, email)
         if row is None or row.get("status") != "used":
+            return False
+        if _is_gmail_api_url_quarantined_row(row):
             return False
         row["status"] = "available"
         row["used_at"] = None
@@ -3844,7 +4179,10 @@ def gmail_api_url_email_pool_summary() -> dict:
         alias_rows = _attach_gmail_api_url_alias_stats(rows)
         eligible_rows = [
             row for row in alias_rows
-            if str(row.get("status") or "").strip().lower() in {"available", "used"}
+            if (
+                str(row.get("status") or "").strip().lower() in {"available", "used"}
+                and not _is_gmail_api_url_quarantined_row(row)
+            )
         ]
         for key in ("alias_total", "alias_used", "alias_failed", "alias_reserved"):
             out[key] = sum(int(row.get(key) or 0) for row in alias_rows)
@@ -3861,7 +4199,19 @@ def get_generic_api_email_by_email(email: str) -> dict | None:
         return _decorate_generic_api_email(row) if row else None
 
 
-def get_gmail_api_url_email_by_email(email: str) -> dict | None:
+def get_gmail_api_url_email_by_email(
+    email: str,
+    *,
+    sqlite_path: str | Path | None = None,
+) -> dict | None:
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return None
+        if raw_parent != db_parent:
+            return None
     with _LOCK:
         row = _find_by_email(_load_gmail_api_url_emails(), email)
         return _decorate_gmail_api_url_email(row) if row else None
@@ -4006,8 +4356,13 @@ def list_codex_accounts(
     return [_codex_content_to_record(content) for content in rows]
 
 
-def upsert_codex_credential(content: dict, filename: str) -> str:
-    """把 Codex 凭证写入 SQLite，返回逻辑文件名（不创建本地文件）。"""
+def upsert_codex_credential(
+    content: dict,
+    filename: str,
+    *,
+    reset_export_state: bool = False,
+) -> str:
+    """把 Codex 凭证写入 SQLite；新 OAuth 结果可清除旧导出/归档状态。"""
     if not isinstance(content, dict) or not filename:
         raise ValueError("Codex 凭证或文件名无效")
     _ensure_sqlite()
@@ -4017,9 +4372,17 @@ def upsert_codex_credential(content: dict, filename: str) -> str:
         meta = dict(content)
         if old:
             previous = json.loads(old["payload"])
-            for key in ("_exported_at", "_exported_count", "_archived", "_archived_at"):
-                if key not in meta:
-                    meta[key] = previous.get(key)
+            if reset_export_state:
+                meta.update({
+                    "_exported_at": None,
+                    "_exported_count": 0,
+                    "_archived": False,
+                    "_archived_at": None,
+                })
+            else:
+                for key in ("_exported_at", "_exported_count", "_archived", "_archived_at"):
+                    if key not in meta:
+                        meta[key] = previous.get(key)
             created_at = old["created_at"] or now
             account_id = conn.execute("SELECT id FROM codex_accounts WHERE filename=?", (filename,)).fetchone()[0]
         else:
@@ -4099,6 +4462,80 @@ def mark_codex_exported(filename: str) -> dict:
             conn.execute("UPDATE codex_accounts SET updated_at=?, payload=? WHERE filename=?", (_now(), json.dumps(content, ensure_ascii=False), filename))
             conn.commit()
         return rec
+
+
+def mark_codex_exported_and_archived(
+    filenames: list[str],
+    *,
+    expected_payloads: dict[str, dict] | None = None,
+) -> list[dict]:
+    """原子地标记本地 Codex 凭证已导出并移入归档。"""
+    unique_filenames: list[str] = []
+    seen: set[str] = set()
+    for raw_filename in filenames:
+        filename = str(raw_filename or "")
+        if filename in seen:
+            continue
+        seen.add(filename)
+        if not filename.startswith("codex-") or not filename.endswith(".json"):
+            raise ValueError(f"非法文件名: {filename}")
+        if "/" in filename or "\\" in filename or ".." in filename:
+            raise ValueError(f"非法文件名: {filename}")
+        unique_filenames.append(filename)
+
+    if not unique_filenames:
+        return []
+
+    with _LOCK:
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = []
+                for filename in unique_filenames:
+                    row = conn.execute(
+                        "SELECT payload FROM codex_accounts WHERE filename=?", (filename,)
+                    ).fetchone()
+                    if not row:
+                        raise ValueError(f"文件不存在: {filename}")
+                    content = json.loads(row["payload"])
+                    if expected_payloads is not None:
+                        expected = expected_payloads.get(filename)
+                        if not isinstance(expected, dict):
+                            raise ValueError(f"缺少导出快照: {filename}")
+                        current_public = {
+                            key: value for key, value in content.items() if not key.startswith("_")
+                        }
+                        if current_public != expected:
+                            raise ValueError(f"凭证在导出期间已更新，请重新导出: {filename}")
+                    rows.append((filename, content))
+
+                now = _now()
+                updated = []
+                for filename, content in rows:
+                    exported_count = int(content.get("_exported_count", 0) or 0) + 1
+                    content.update({
+                        "_exported_count": exported_count,
+                        "_exported_at": now,
+                        "_archived": True,
+                        "_archived_at": now,
+                    })
+                    conn.execute(
+                        "UPDATE codex_accounts SET archived=1, updated_at=?, payload=? WHERE filename=?",
+                        (now, json.dumps(content, ensure_ascii=False), filename),
+                    )
+                    updated.append({
+                        "filename": filename,
+                        "exported_count": exported_count,
+                        "exported_at": now,
+                        "archived": True,
+                        "archived_at": now,
+                    })
+                conn.commit()
+                return updated
+            except Exception:
+                conn.rollback()
+                raise
 
 
 def reset_codex_exported(filename: str) -> None:
@@ -4310,6 +4747,7 @@ def update_job(
     completed_at: str | None = None,
     account_id: int | None = None,
     network_identity: dict | None = None,
+    provider_context: dict | None = None,
 ) -> None:
     with _LOCK:
         _ensure_sqlite()
@@ -4335,6 +4773,8 @@ def update_job(
                 row["account_id"] = account_id
             if network_identity is not None:
                 row["network_identity"] = dict(network_identity)
+            if provider_context is not None:
+                row["provider_context"] = dict(provider_context)
             now = _now()
             row["updated_at"] = now
             conn.execute(
