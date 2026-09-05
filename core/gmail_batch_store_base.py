@@ -93,6 +93,9 @@ class GmailBatchStoreBase(ABC):
             ).fetchone()
             if existing:
                 return self._assignment(existing)
+
+            if self._claim_is_blocked_by_provision(connection):
+                raise GmailBatchConflict("Gmail API source provisioning is busy")
             
             # Find available item
             row = connection.execute(
@@ -149,44 +152,58 @@ class GmailBatchStoreBase(ABC):
         if not value:
             raise GmailBatchError("Assignment ID cannot be empty")
         
-        prefix = self._table_prefix()
         with self._transaction() as connection:
-            row = connection.execute(
-                f"SELECT * FROM {prefix}_assignments WHERE assignment_id = ?",
-                (value,),
-            ).fetchone()
-            
-            if row is None:
-                return False
-            if row["state"] == target:
-                return True
-            if row["state"] != "active":
-                return False
-            
-            # Update assignment state
-            connection.execute(
-                f"UPDATE {prefix}_assignments SET state = ?, reason = ?, "
-                "updated_at = CURRENT_TIMESTAMP WHERE assignment_id = ?",
-                (target, str(reason or "")[:300], value),
+            return self._finish_in_connection(
+                connection,
+                value,
+                target,
+                reason=reason,
             )
-            
-            # Handle completed: increment counter and check exhaustion
-            if target == "completed":
-                connection.execute(
-                    f"UPDATE {prefix}_batch_items SET completed_count = completed_count + 1 "
-                    "WHERE batch_id = ? AND inventory_id = ?",
-                    (row["batch_id"], row["inventory_id"]),
-                )
-                connection.execute(
-                    f"UPDATE {prefix}_batch_items SET state = 'exhausted' "
-                    "WHERE batch_id = ? AND inventory_id = ? "
-                    f"AND completed_count >= (SELECT capacity FROM {prefix}_batches WHERE batch_id = ?)",
-                    (row["batch_id"], row["inventory_id"], row["batch_id"]),
-                )
-            # Handle failed: do NOT update item state, allow retry
-            # (item_state parameter is ignored for failed assignments)
-            
+
+    def _finish_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        assignment_id: str,
+        target: str,
+        *,
+        reason: str = "",
+    ) -> bool:
+        """Transition an assignment inside a caller-owned transaction.
+
+        Provider stores that coordinate a second ownership table can use this
+        primitive to commit both state transitions atomically.
+        """
+        value = str(assignment_id or "").strip()
+        prefix = self._table_prefix()
+        row = connection.execute(
+            f"SELECT * FROM {prefix}_assignments WHERE assignment_id = ?",
+            (value,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["state"] == target:
             return True
+        if row["state"] != "active":
+            return False
+
+        connection.execute(
+            f"UPDATE {prefix}_assignments SET state = ?, reason = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE assignment_id = ?",
+            (target, str(reason or "")[:300], value),
+        )
+        if target == "completed":
+            connection.execute(
+                f"UPDATE {prefix}_batch_items SET completed_count = completed_count + 1 "
+                "WHERE batch_id = ? AND inventory_id = ?",
+                (row["batch_id"], row["inventory_id"]),
+            )
+            connection.execute(
+                f"UPDATE {prefix}_batch_items SET state = 'exhausted' "
+                "WHERE batch_id = ? AND inventory_id = ? "
+                f"AND completed_count >= (SELECT capacity FROM {prefix}_batches WHERE batch_id = ?)",
+                (row["batch_id"], row["inventory_id"], row["batch_id"]),
+            )
+        return True
 
     def find_active_assignment(
         self, batch_id: str, job_id: str
@@ -197,6 +214,16 @@ class GmailBatchStoreBase(ABC):
                 f"SELECT * FROM {self._table_prefix()}_assignments "
                 "WHERE batch_id = ? AND job_id = ? AND state = 'active'",
                 (str(batch_id), str(job_id)),
+            ).fetchone()
+        return self._assignment(row) if row else None
+
+    def find_active_assignment_for_job(self, job_id: str) -> Assignment | None:
+        """Find an active assignment by job across every batch."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                f"SELECT * FROM {self._table_prefix()}_assignments "
+                "WHERE job_id = ? AND state = 'active' LIMIT 1",
+                (str(job_id),),
             ).fetchone()
         return self._assignment(row) if row else None
 
@@ -266,3 +293,7 @@ class GmailBatchStoreBase(ABC):
     def _transaction(self) -> _Transaction:
         """Create transaction context manager."""
         return self._Transaction(self)
+
+    def _claim_is_blocked_by_provision(self, connection: sqlite3.Connection) -> bool:
+        """Allow provider stores to guard direct claims during provisioning."""
+        return False

@@ -1,8 +1,13 @@
 """Gmail API URL 邮箱池 DB 层单元测试。"""
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from core import db
+from core.gmail_aliases import generate_gmail_dual_domain_aliases
+from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
+from core.qan8_gmail_api_store import Qan8GmailApiStore
 
 
 class GmailApiUrlPoolTests(unittest.TestCase):
@@ -44,6 +49,55 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         self.assertEqual(saved_rows[0]["code_url"], "https://example.com/otp")
         self.assertEqual(saved_rows[0]["status"], "used")
         self.assertEqual(saved_rows[0]["note"], "QAN8 purchased source")
+
+    @patch("core.db._load_gmail_api_url_emails")
+    @patch("core.db._save_gmail_api_url_emails")
+    def test_record_does_not_reactivate_a_failed_code_url(self, mock_save, mock_load):
+        mock_load.return_value = [
+            {
+                "id": 1,
+                "email": "failed@gmail.com",
+                "code_url": "https://example.com/otp",
+                "status": "failed",
+                "used_at": "2026-09-04T00:00:00+00:00",
+                "note": "code=602",
+            },
+        ]
+
+        db.record_gmail_api_url_email(
+            "failed@gmail.com",
+            "https://example.com/otp",
+            status="exhausted",
+            note="QAN8 source has no globally available Gmail aliases",
+        )
+
+        saved_row = mock_save.call_args.args[0][0]
+        self.assertEqual(saved_row["status"], "failed")
+        self.assertEqual(saved_row["used_at"], "2026-09-04T00:00:00+00:00")
+        self.assertEqual(saved_row["note"], "code=602")
+
+    @patch("core.db._load_gmail_api_url_emails")
+    @patch("core.db._save_gmail_api_url_emails")
+    def test_provider_602_quarantine_cannot_be_reenabled(self, mock_save, mock_load):
+        mock_load.return_value = [{
+            "id": 1,
+            "email": "quarantined@gmail.com",
+            "code_url": "https://example.com/otp",
+            "status": "failed",
+            "used_at": "2026-09-04T00:00:00+00:00",
+            "note": "Provider error code=602",
+        }]
+
+        db.release_gmail_api_url_email(
+            "quarantined@gmail.com",
+            status="available",
+            note="operator attempted to re-enable",
+        )
+
+        saved_row = mock_save.call_args.args[0][0]
+        self.assertEqual(saved_row["status"], "failed")
+        self.assertTrue(saved_row["quarantined"])
+        self.assertEqual(saved_row["note"], "Provider error code=602")
 
     @patch("core.db._load_gmail_api_url_emails")
     @patch("core.db._save_gmail_api_url_emails")
@@ -123,6 +177,69 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         self.assertEqual(saved_rows[0]["note"], "code=602 退款")
 
     @patch("core.db._load_gmail_api_url_emails")
+    @patch("core.db._save_gmail_api_url_emails")
+    def test_fail_code_url_marks_all_matching_sources_failed(self, mock_save, mock_load):
+        rows = [
+            {
+                "email": "first@example.com",
+                "code_url": "https://provider.example/code/shared",
+                "status": "available",
+                "used_at": "",
+                "note": "",
+            },
+            {
+                "email": "second@example.com",
+                "code_url": "https://provider.example/code/shared",
+                "status": "used",
+                "used_at": "2026-01-01T00:00:00+00:00",
+                "note": "old",
+            },
+            {
+                "email": "healthy@example.com",
+                "code_url": "https://provider.example/code/healthy",
+                "status": "available",
+                "used_at": "",
+                "note": "",
+            },
+        ]
+        mock_load.return_value = rows
+
+        failed = db.fail_gmail_api_url_sources_for_code_url(
+            "https://provider.example/code/shared",
+            "Gmail API error code=602",
+        )
+
+        self.assertEqual(failed, 2)
+        mock_save.assert_called_once_with(rows)
+        self.assertEqual([row["status"] for row in rows], ["failed", "failed", "available"])
+        self.assertTrue(rows[0]["quarantined"])
+        self.assertTrue(rows[1]["quarantined"])
+        self.assertEqual(rows[0]["note"], "Gmail API error code=602")
+        self.assertEqual(rows[1]["used_at"], "2026-01-01T00:00:00+00:00")
+
+    @patch("core.db._load_gmail_api_url_emails")
+    def test_failed_code_url_is_not_available_to_another_worker(self, mock_load):
+        mock_load.return_value = [
+            {
+                "email": "failed@example.com",
+                "code_url": "https://provider.example/code/failed",
+                "status": "failed",
+            },
+            {
+                "email": "healthy@example.com",
+                "code_url": "https://provider.example/code/healthy",
+                "status": "used",
+            },
+        ]
+
+        self.assertTrue(
+            db.is_gmail_api_url_code_url_failed("https://provider.example/code/failed")
+        )
+        self.assertFalse(
+            db.is_gmail_api_url_code_url_failed("https://provider.example/code/healthy")
+        )
+
+    @patch("core.db._load_gmail_api_url_emails")
     def test_list_filters_by_status_and_respects_limit(self, mock_load):
         """list 按状态过滤并遵守 limit。"""
         mock_load.return_value = [
@@ -137,10 +254,11 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         self.assertEqual(rows[0]["status"], "available")
 
     @patch("core.db._load_accounts", return_value=[])
+    @patch("core.db.GmailApiUrlBatchStore.alias_root_owners", return_value={})
     @patch("core.db.GmailApiUrlBatchStore.alias_usage_for_code_urls")
     @patch("core.db._load_gmail_api_url_emails")
     def test_list_exposes_alias_inventory_for_gmail_api_url(
-        self, mock_load, usage_for_urls, _accounts
+        self, mock_load, usage_for_urls, _root_owners, _accounts
     ):
         """Gmail API URL pool rows expose total/available/used alias counts."""
         mock_load.return_value = [{
@@ -165,6 +283,75 @@ class GmailApiUrlPoolTests(unittest.TestCase):
         self.assertEqual(row["alias_used"], 0)
         self.assertEqual(row["alias_reserved"], 0)
         usage_for_urls.assert_called_once_with({"http://example.com/otp"})
+
+    def test_alias_inventory_hides_root_owned_by_another_code_url(self):
+        """A dotted source cannot report capacity owned by another API URL."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            pool_json = root / "gmail-pool.json"
+            pool_txt = root / "gmail-pool.txt"
+            state = root / "turb.sqlite3"
+            with (
+                patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", pool_json),
+                patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", pool_txt),
+                patch.object(db, "_SQLITE_PATH", state),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", state),
+                patch.object(db, "_SQLITE_READY", False),
+            ):
+                db.import_gmail_api_url_emails([
+                    {
+                        "email": "s.ame@gmail.com",
+                        "code_url": "https://mail.example/source-b",
+                    }
+                ])
+                store = GmailApiUrlBatchStore(state)
+                store.create_batch_multi([
+                    {
+                        "source_email": "same@gmail.com",
+                        "code_url": "https://mail.example/source-a",
+                        "aliases": generate_gmail_dual_domain_aliases(
+                            "same@gmail.com", limit=12
+                        ),
+                    }
+                ])
+
+                row = db.list_gmail_api_url_email_pool()[0]
+
+                self.assertEqual(row["alias_total"], 12)
+                self.assertEqual(row["alias_available"], 0)
+                self.assertEqual(row["alias_allocated"], 12)
+    def test_alias_inventory_merges_gmail_and_qan8_ownership(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "state.sqlite3"
+            email = "source@gmail.com"
+            code_url = "https://provider.example/shared"
+            candidates = generate_gmail_dual_domain_aliases(email, limit=12)
+
+            gmail_store = GmailApiUrlBatchStore(path)
+            gmail_batch = gmail_store.create_batch_multi([
+                {"source_email": email, "code_url": code_url, "aliases": candidates},
+            ])
+            for index in range(2):
+                assignment = gmail_store.claim(gmail_batch, f"gmail-job-{index}")
+                self.assertTrue(gmail_store.complete(assignment.assignment_id))
+
+            qan8_store = Qan8GmailApiStore(path)
+            qan8_batch = qan8_store.create_batch(1, requested_workers=1, aliases_per_source=12)
+            qan8_store.create_source_group(
+                qan8_batch["batch_id"], 0, email, code_url, candidates,
+            )
+            assignment = qan8_store.claim_alias(qan8_batch["batch_id"], 0, "qan8-job")
+            self.assertIsNotNone(assignment)
+            self.assertTrue(qan8_store.complete_assignment("qan8-job"))
+
+            with patch.object(db, "_SQLITE_PATH", path):
+                rows = db._attach_gmail_api_url_alias_stats([
+                    {"email": email, "code_url": code_url},
+                ])
+
+            self.assertEqual(rows[0]["alias_total"], 12)
+            self.assertEqual(rows[0]["alias_used"], 3)
+            self.assertEqual(rows[0]["alias_available"], 9)
 
     @patch("core.db._load_gmail_api_url_emails")
     @patch("core.db._save_gmail_api_url_emails")
