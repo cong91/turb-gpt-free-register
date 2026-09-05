@@ -214,6 +214,49 @@ class BrowserTwofaRetryTests(unittest.TestCase):
         self.assertEqual(save_account.call_args.kwargs["auto_plan_check"], False)
         self.assertEqual(save_account.call_args.kwargs["extra"]["codex"], auto_result["codex"])
 
+    def test_retry_succeeds_when_post_auth_codex_fails(self):
+        driver = Mock()
+        profile = Mock(driver=driver, provider="cloak", timeout=90)
+        account = {
+            "id": 7,
+            "email": "user@example.com",
+            "registration_password": "password",
+            "access_token": "old-token",
+        }
+        auto_result = {
+            "plan": {"ok": True, "current_plan_type": "free", "plus_trial_eligible": False},
+            "codex": {
+                "ok": False,
+                "status": "failed",
+                "message": "phone verification failed",
+            },
+        }
+
+        with (
+            patch("core.browser_twofa_retry.open_browser_profile", return_value=profile),
+            patch(
+                "core.browser_twofa_retry._login_existing_account",
+                return_value={"accessToken": "new-token", "user": {}, "account": {}},
+            ),
+            patch("core.browser_twofa_retry.setup_2fa_in_page", return_value="SECRET"),
+            patch("core.browser_twofa_retry.save_account_data", return_value=8) as save_account,
+            patch("core.browser_twofa_retry.resolve_email_source", return_value="gmail_api_url"),
+            patch("core.registration_auto_codex.run_registration_auto_codex", return_value=auto_result),
+            patch("config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", True),
+            patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True),
+            patch("config.codex.ENABLE_CODEX_AUTO", False),
+        ):
+            result = browser_twofa_retry.run_twofa_retry(
+                account,
+                proxy="socks5://127.0.0.1:25000",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["codex"], auto_result["codex"])
+        self.assertEqual(save_account.call_args.kwargs["extra"]["twofa_status"], "active")
+        self.assertEqual(save_account.call_args.kwargs["extra"]["codex"], auto_result["codex"])
+
     def test_retry_passes_existing_cloud_session_to_codex_oauth(self):
         browser = Mock()
         context = Mock()

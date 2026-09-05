@@ -17,7 +17,9 @@ from core.browser_registration import (
     _has_access_token,
     _is_email_verification_page,
     _is_signup_password_page,
+    _is_transient_email_submission_error,
     _submit_email_and_wait_next,
+    _wait_email_submit_next_state,
     _wait_for_browser_challenge,
 )
 
@@ -39,6 +41,60 @@ class _StringStateDriver:
 
     def execute_async_script(self, _script):
         return {"ok": True, "reason": "navigation_after_script"}
+
+
+class _SessionStateDriver:
+    current_url = "https://chatgpt.com/"
+
+    def __init__(self):
+        self.session_timeouts = []
+
+    def get_chatgpt_auth_session(self, *, timeout_ms=None):
+        self.session_timeouts.append(timeout_ms)
+        return {"accessToken": "session-token"}
+
+    def execute_async_script(self, _script):
+        raise AssertionError("session checks must use the bounded request client")
+
+
+class _SessionTimeoutDriver:
+    current_url = "https://chatgpt.com/auth/login"
+
+    def __init__(self):
+        self.session_timeouts = []
+
+    def get_chatgpt_auth_session(self, *, timeout_ms=None):
+        self.session_timeouts.append(timeout_ms)
+        raise TimeoutError("session request timeout")
+
+
+class _BoundedStateDriver:
+    current_url = "https://chatgpt.com/auth/login"
+
+    def __init__(self):
+        self.session_timeouts = []
+        self.state_timeouts = []
+
+    def get_chatgpt_auth_session(self, *, timeout_ms=None):
+        self.session_timeouts.append(timeout_ms)
+
+    def read_auth_flow_state(self, *, timeout_ms):
+        self.state_timeouts.append(timeout_ms)
+        return {"state": "otp", "body_text": ""}
+
+    def execute_script(self, _script, *_args):
+        raise AssertionError("post-submit Cloak polling must not use synchronous JS probes")
+
+
+class _AsyncScriptCaptureDriver:
+    current_url = "https://chatgpt.com/auth/login"
+
+    def __init__(self):
+        self.script = ""
+
+    def execute_async_script(self, script):
+        self.script = script
+        return False
 
 
 class _ScriptCaptureDriver:
@@ -413,6 +469,64 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
         self.assertFalse(_is_signup_password_page(driver))
         self.assertFalse(_has_access_token(driver))
 
+    def test_access_token_probe_uses_bounded_session_request(self):
+        driver = _SessionStateDriver()
+
+        self.assertTrue(_has_access_token(driver))
+        self.assertEqual([5000], driver.session_timeouts)
+
+    def test_session_timeout_returns_control_to_email_state_poll(self):
+        driver = _SessionTimeoutDriver()
+
+        with (
+            patch("core.browser_registration.time.monotonic", side_effect=[0.0, 0.0, 0.0, 21.0]),
+            patch("core.browser_registration._raise_if_account_unusable"),
+            patch("core.browser_registration._browser_challenge_state", return_value={"is_challenge": False}),
+            patch("core.browser_registration._is_email_verification_page", return_value=False),
+            patch("core.browser_registration._is_signup_password_page", return_value=False),
+            patch("core.browser_registration._is_login_password_page", return_value=False),
+            patch("core.browser_registration._email_input_value_state", return_value={"inputs": []}),
+            patch("core.browser_registration.time.sleep"),
+        ):
+            result = _wait_email_submit_next_state(driver, "user@example.com", timeout=20)
+
+        self.assertEqual("unknown", result)
+        self.assertEqual([5000], driver.session_timeouts)
+
+    def test_bounded_adapter_state_reader_avoids_synchronous_page_scripts(self):
+        driver = _BoundedStateDriver()
+
+        result = _wait_email_submit_next_state(driver, "user@example.com", timeout=20)
+
+        self.assertEqual("otp", result)
+        self.assertEqual([], driver.session_timeouts)
+        self.assertEqual([400], driver.state_timeouts)
+
+    def test_access_token_fallback_has_abort_deadline(self):
+        driver = _AsyncScriptCaptureDriver()
+
+        self.assertFalse(_has_access_token(driver, timeout_ms=2300))
+        self.assertIn("const timeoutMs = 2300;", driver.script)
+        self.assertIn("AbortController", driver.script)
+
+    def test_email_submit_challenge_wait_uses_remaining_attempt_budget(self):
+        driver = _StringStateDriver()
+
+        with (
+            patch("core.browser_registration.time.monotonic", side_effect=[0.0, 0.0, 0.0, 21.0]),
+            patch("core.browser_registration._raise_if_account_unusable"),
+            patch(
+                "core.browser_registration._browser_challenge_state",
+                return_value={"is_challenge": True},
+            ),
+            patch("core.browser_registration._wait_for_browser_challenge") as wait_for_challenge,
+            patch("core.browser_registration.time.sleep"),
+        ):
+            result = _wait_email_submit_next_state(driver, "user@example.com", timeout=20)
+
+        self.assertEqual("unknown", result)
+        self.assertEqual(20.0, wait_for_challenge.call_args.kwargs["timeout"])
+
     def test_transient_state_reader_error_reloads_login_and_retries_email(self):
         driver = Mock()
         email = "user@example.com"
@@ -443,6 +557,35 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
         self.assertEqual(submit_email.call_count, 2)
         driver.get.assert_called_once_with("https://chatgpt.com/auth/login")
         maybe_accept.assert_called_once_with(driver)
+
+    def test_playwright_timeout_reloads_login_and_retries_email(self):
+        driver = Mock()
+        email = "user@example.com"
+
+        with (
+            patch(
+                "core.browser_registration._wait_for_browser_challenge",
+                return_value={"is_challenge": False},
+            ),
+            patch("core.browser_registration._type_email_address"),
+            patch(
+                "core.browser_registration._email_input_value_state",
+                return_value={"inputs": [{"value": email}]},
+            ),
+            patch("core.browser_registration._submit_email_step"),
+            patch(
+                "core.browser_registration._wait_email_submit_next_state",
+                side_effect=[TimeoutError("Page.wait_for_function: Timeout 20000ms exceeded"), "otp"],
+            ),
+            patch("core.browser_registration._maybe_accept"),
+            patch("core.browser_registration._assert_not_external_idp"),
+            patch("core.browser_registration.human_delay"),
+        ):
+            result = _submit_email_and_wait_next(driver, email, attempts=2)
+
+        self.assertTrue(_is_transient_email_submission_error(TimeoutError("probe timeout")))
+        self.assertEqual("otp", result)
+        driver.get.assert_called_once_with("https://chatgpt.com/auth/login")
 
 
 class TurnstileResponseInspectionTests(unittest.TestCase):

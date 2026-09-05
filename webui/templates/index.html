@@ -2793,7 +2793,7 @@
       </div>
       <div class="jobs-toolbar-v2" id="codexToolbarV2">
         <button type="button" class="jobs-tb-btn" id="showArchivedCodexV2" aria-pressed="false" title="默认只显示未归档凭证；开启后单独查看归档凭证">查看归档</button>
-        <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCodexDownloadBulkV2" disabled title="把选中的多个本地凭证打包成一个 JSON 文件下载（备份/迁移用，CPA 不能直接读，需先解包）">下载本地</button>
+        <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCodexDownloadBulkV2" disabled title="将选中的本地凭证与账号（用户名 | 密码 | 2FA）打包为 ZIP；下载后自动归档">下载本地</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnCodexDownloadBulkCpaV2" disabled title="从 CPA auth-files 下载选中账号的真实 Codex JSON，并打包成 ZIP（可直接解压放入 CPA auth-dir）">从CPA下载</button>
         <button type="button" class="jobs-tb-btn" id="btnCodexArchiveBulkV2" disabled title="归档选中的 Codex 授权凭证；默认列表不再显示">归档选中</button>
         <button type="button" class="jobs-tb-btn jobs-tb-btn--danger" id="btnCodexDeleteBulkV2" disabled title="删除选中的本地 Codex JSON 凭证文件">删除选中</button>
@@ -6717,9 +6717,11 @@ function applyCodexArchivedFilter(on) {
 async function codexDownloadBulkLocal() {
   if (CODEX_SELECTED.size === 0) return;
   const filenames = Array.from(CODEX_SELECTED);
-  const note = `选中 ${filenames.length} 个凭证，打包到一个 JSON 文件下载。\n\n` +
-               `⚠ 这个聚合格式 CPA 不能直接读，主要用于备份/迁移。\n` +
-               `要给 CPA 用请用每行的"下载 JSON"单个下载。\n\n继续？`;
+  const note = `选中 ${filenames.length} 个本地凭证，将下载一个 ZIP。\n\n` +
+               `ZIP 内含：\n` +
+               `  1. 当前聚合 Codex JSON\n` +
+               `  2. 账号用户名 | 密码 | 2FA 列表\n\n` +
+               `导出成功后，这些 Codex 凭证会立即移入归档。\n\n继续？`;
   if (!confirm(note)) return;
   const btn = $('#btnCodexDownloadBulkV2');
   if (btn) btn.disabled = true;
@@ -6735,14 +6737,22 @@ async function codexDownloadBulkLocal() {
     }
     const cd = resp.headers.get('Content-Disposition') || '';
     const m = cd.match(/filename="([^"]+)"/);
-    const dlname = m ? m[1] : `codex-bulk-${Date.now()}.json`;
+    const dlname = m ? m[1] : `codex-local-bulk-${Date.now()}.zip`;
     const blob = await resp.blob();
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url; a.download = dlname;
     document.body.appendChild(a); a.click();
     setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 800);
-    showToast(`已打包下载 ${filenames.length} 个`);
+    const exportedCount = Number(resp.headers.get('X-Codex-Exported-Count') || filenames.length);
+    const skippedCount = Number(resp.headers.get('X-Codex-Skipped-Count') || 0);
+    const accountLineSkippedCount = Number(resp.headers.get('X-Codex-Account-Line-Skipped-Count') || 0);
+    const summary = skippedCount
+      ? `已下载并归档 ${exportedCount} 个，跳过 ${skippedCount} 个`
+      : `已下载并归档 ${exportedCount} 个`;
+    showToast(accountLineSkippedCount
+      ? `${summary}；账号列表缺少 ${accountLineSkippedCount} 行`
+      : summary);
     CODEX_SELECTED.clear();
     setTimeout(loadCodex, 600);
   } catch(err) {

@@ -68,10 +68,17 @@ class AccountFilterTests(unittest.TestCase):
                 failed_rows = db.list_accounts(twofa_filter="failed")
                 active_rows = db.list_accounts(twofa_filter="active")
                 disabled_rows = db.list_accounts(twofa_filter="disabled")
+                failed_page = db.list_accounts_page(limit=20, twofa_filter="failed")
+                failed_snapshot = db.list_account_plan_check_statuses(
+                    limit=20,
+                    twofa_filter="failed",
+                )
 
         self.assertEqual([row["email"] for row in failed_rows], ["failed@example.com"])
         self.assertEqual([row["email"] for row in active_rows], ["active@example.com"])
         self.assertEqual([row["email"] for row in disabled_rows], ["disabled@example.com"])
+        self.assertEqual([row["email"] for row in failed_page["items"]], ["failed@example.com"])
+        self.assertEqual([row["email"] for row in failed_snapshot["items"]], ["failed@example.com"])
 
     def test_account_email_domain_filter_normalizes_case_and_groups_unknown_accounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -161,6 +168,20 @@ class AccountFilterTests(unittest.TestCase):
         self.assertEqual(list_accounts_page.call_args.kwargs["plan_filter"], "pro")
         self.assertEqual(list_accounts_page.call_args.kwargs["twofa_filter"], "failed")
 
+    @patch("webui.app.db.list_accounts_page")
+    def test_accounts_api_does_not_alias_twofa_filter_to_legacy_totp_filter(self, list_accounts_page):
+        list_accounts_page.return_value = {"items": [], "total": 0, "offset": 0, "limit": 50, "revision": "0"}
+        client = create_app(auth_code="test-auth").test_client()
+
+        response = client.get(
+            "/api/accounts?paged=1&page=1&page_size=50&twofa_status=failed",
+            headers={"X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list_accounts_page.call_args.kwargs["twofa_filter"], "failed")
+        self.assertEqual(list_accounts_page.call_args.kwargs["totp_filter"], "")
+
     @patch("webui.app.db.list_accounts")
     def test_filtered_account_ids_api_uses_all_account_filters(self, list_accounts):
         list_accounts.return_value = [{"id": 7}, {"id": 9}]
@@ -241,6 +262,20 @@ class AccountFilterTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(list_statuses.call_args.kwargs["totp_filter"], "enabled")
+
+    @patch("webui.app.db.list_account_plan_check_statuses")
+    def test_plan_status_api_does_not_alias_twofa_filter_to_legacy_totp_filter(self, list_statuses):
+        list_statuses.return_value = {"items": [], "total": 0, "offset": 0, "limit": 50, "revision": "0"}
+        client = create_app(auth_code="test-auth").test_client()
+
+        response = client.get(
+            "/api/accounts/plan-check-status?page=1&page_size=50&twofa_status=failed",
+            headers={"X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list_statuses.call_args.kwargs["twofa_filter"], "failed")
+        self.assertEqual(list_statuses.call_args.kwargs["totp_filter"], "")
 
     def test_plan_status_snapshot_with_empty_filters_uses_sql_path(self):
         expected = {"items": [], "total": 0, "offset": 0, "limit": 20, "revision": "0"}

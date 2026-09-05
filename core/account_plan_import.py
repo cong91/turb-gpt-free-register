@@ -70,10 +70,6 @@ def _login_and_save_account(
     """Login with imported credentials, then persist the resulting access token."""
     from core.account_security import TwofaChangeInput, _login_and_get_access_token
     from core.browser_profile import open_browser_profile
-    from core.openai_auth import (
-        account_unusable_message,
-        detect_account_unusable_text,
-    )
 
     profile = None
     try:
@@ -92,7 +88,9 @@ def _login_and_save_account(
                 raise RuntimeError("无法把登录后的 accessToken 写入账号")
             return {"ok": True, "network_mode": resolved_mode}
     except Exception as exc:  # noqa: BLE001 - one failed login must not stop the batch.
-        error_code = detect_account_unusable_text(str(exc))
+        error_code = str(getattr(exc, "error_code", "") or "").strip().lower()
+        if not error_code:
+            error_code = detect_account_unusable_text(str(exc))
         if error_code:
             return {
                 "ok": False,
@@ -183,7 +181,9 @@ def _run_login_then_plan_check(
             _mark_login_failed(account_id, queued.get("error") or "账号无法进入套餐检查队列", stage="plan")
     except Exception as exc:  # noqa: BLE001 - isolate one account from the batch.
         error_text = str(exc)
-        error_code = detect_account_unusable_text(error_text)
+        error_code = str(getattr(exc, "error_code", "") or "").strip().lower()
+        if not error_code:
+            error_code = detect_account_unusable_text(error_text)
         _mark_login_failed(
             account_id,
             account_unusable_message(error_code) if error_code else f"{type(exc).__name__}: {error_text[:180]}",
@@ -256,7 +256,7 @@ def queue_imported_plan_checks(
         raise ValueError(f"Mỗi lần chỉ được nhập tối đa {max_records} tài khoản")
 
     login_network_error: str | None = None
-    if credentials and preflight_login_network is not None:
+    if (credentials or force_login_keys) and preflight_login_network is not None:
         try:
             preflight_login_network(login_network_mode)
         except Exception as exc:  # noqa: BLE001 - report route failure per account.
@@ -302,7 +302,7 @@ def queue_imported_plan_checks(
                 continue
             account = {"id": account_id, "email": email, "access_token": ""}
 
-        if str(account.get("live_check_status") or "").strip().lower() == "deactivated":
+        if _is_deactivated_account(account):
             skipped.append({
                 "id": account.get("id"),
                 "email": str(account.get("email") or email),

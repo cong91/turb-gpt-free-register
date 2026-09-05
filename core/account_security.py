@@ -136,6 +136,7 @@ def _mfa_request_headers(transport: BrowserPageTransport, access_token: str, pat
 def _login_and_get_access_token(driver, item: TwofaChangeInput) -> str:
     """Login again once when the browser session does not expose a token."""
     from core.email_change import _login_chatgpt_with_credentials
+    from core.openai_auth import AccountUnusableError
 
     last_error: Exception | None = None
     for attempt in range(1, _LOGIN_ATTEMPTS + 1):
@@ -146,8 +147,10 @@ def _login_and_get_access_token(driver, item: TwofaChangeInput) -> str:
             if access_token:
                 return access_token
             raise RuntimeError("ChatGPT login completed without accessToken")
-        except Exception as exc:  # noqa: BLE001 - retry the complete login boundary once.
+        except Exception as exc:
             last_error = exc
+            if isinstance(exc, AccountUnusableError):
+                raise
             if attempt < _LOGIN_ATTEMPTS:
                 logger.warning(
                     "[2FA] login/session did not provide accessToken; retrying login (%s/%s)",

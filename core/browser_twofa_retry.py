@@ -229,9 +229,8 @@ def run_twofa_retry(
                         },
                         auto_plan_check=False,
                     )
-                    codex_ok = bool(codex_result.get("ok")) or codex_result.get("status") == "skipped"
                     return {
-                        "ok": codex_ok,
+                        "ok": True,
                         "status": "success",
                         "email": email,
                         "account_id": saved_id,

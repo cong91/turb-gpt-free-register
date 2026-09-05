@@ -414,7 +414,6 @@ def create_app(auth_code: str | None = None) -> Flask:
         totp_filter = str(
             request.args.get("totp_status")
             or request.args.get("totp_filter")
-            or request.args.get("twofa_status")
             or ""
         ).strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
@@ -533,7 +532,6 @@ def create_app(auth_code: str | None = None) -> Flask:
         totp_filter = str(
             request.args.get("totp_status")
             or request.args.get("totp_filter")
-            or request.args.get("twofa_status")
             or ""
         ).strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
@@ -2310,21 +2308,16 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.post("/api/codex/download-bulk")
     def api_codex_download_bulk():
         """
-        批量下载选中的 codex 凭证，打包到一个 JSON 文件里。
+        批量下载选中的本地 Codex 凭证。
 
         Body: {"filenames": ["codex-xxx.json", ...]}
-        响应：聚合 JSON（attachment 触发浏览器下载），结构：
-            {
-              "exported_at": "...",
-              "count": N,
-              "credentials": [{"filename": "...", "data": {...原始凭证内容...}}, ...],
-              "errors": [...]   // 仅当部分失败时出现
-            }
-        注意：聚合格式**不能直接被 CPA 读**，CPA 是按单文件加载 auths/ 目录的。
-              本接口主要用途是备份 / 跨机迁移 / 二次处理。
-        每个成功的凭证会自动标记 mark_exported（计数+1）。
+        响应：一个 ZIP，恰好包含聚合 JSON 和账号 ``邮箱 | 密码 | 2FA`` TXT。
+        可读取的本地 JSON 保持原有导出范围；缺少完整账号资料时仅跳过 TXT
+        对应行并在聚合 JSON 中记录，已写入 JSON 的凭证会标记为已导出并归档。
         """
+        import io
         import json as _json
+        import zipfile
         from datetime import datetime as _dt
 
         data = request.get_json(silent=True) or {}
@@ -2335,18 +2328,46 @@ def create_app(auth_code: str | None = None) -> Flask:
             return jsonify({"ok": False, "error": "单次最多 1000 个"}), 400
 
         bundle = []
+        account_lines = []
         errors = []
+        account_line_errors = []
+        seen_filenames = set()
+        duplicate_count = 0
         for fname in filenames:
             if not isinstance(fname, str):
                 errors.append({"filename": str(fname), "error": "非字符串"})
                 continue
+            if fname in seen_filenames:
+                duplicate_count += 1
+                continue
+            seen_filenames.add(fname)
             try:
                 content, real_fname = db.read_codex_credential(fname)
                 parsed = _json.loads(content)
+                if not isinstance(parsed, dict):
+                    raise ValueError("Codex 凭证内容不是对象")
                 bundle.append({"filename": real_fname, "data": parsed})
-                db.mark_codex_exported(real_fname)
+                try:
+                    email = str(parsed.get("email") or "").strip()
+                    account = db.get_account_by_email(email) if email else None
+                    if not account:
+                        raise ValueError("未找到对应账号，无法导出用户名 | 密码 | 2FA")
+                    account_line = db.account_line(account, "modern")
+                    parts = [part.strip() for part in account_line.split("|", 2)]
+                    if len(parts) != 3 or not all(parts):
+                        raise ValueError("对应账号缺少用户名、密码或 2FA，无法导出")
+                    account_lines.append(account_line)
+                except Exception as exc:  # noqa: BLE001
+                    account_line_errors.append({
+                        "filename": real_fname,
+                        "email": str(parsed.get("email") or "").strip(),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    })
             except Exception as exc:  # noqa: BLE001
                 errors.append({"filename": fname, "error": f"{type(exc).__name__}: {exc}"})
+
+        if not bundle:
+            return jsonify({"ok": False, "error": "没有可读取的本地 Codex 凭证", "errors": errors}), 404
 
         now = _dt.now(tz=timezone.utc).astimezone().replace(tzinfo=None)
         result = {
@@ -2356,12 +2377,50 @@ def create_app(auth_code: str | None = None) -> Flask:
         }
         if errors:
             result["errors"] = errors
+        if account_line_errors:
+            result["account_line_errors"] = account_line_errors
 
-        dl_name = f"codex-bulk-{now.strftime('%Y%m%d-%H%M%S')}.json"
+        timestamp = now.strftime("%Y%m%d-%H%M%S")
+        json_name = f"codex-bulk-{timestamp}.json"
+        accounts_name = f"accounts-{timestamp}.txt"
+        buf = io.BytesIO()
+        try:
+            with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr(json_name, _json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+                account_text = "\n".join(account_lines)
+                zf.writestr(accounts_name, account_text + ("\n" if account_text else ""))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Codex] 构建本地导出 ZIP 失败")
+            return jsonify({"ok": False, "error": f"构建导出 ZIP 失败: {type(exc).__name__}: {exc}"}), 500
+
+        try:
+            db.mark_codex_exported_and_archived(
+                [item["filename"] for item in bundle],
+                expected_payloads={item["filename"]: item["data"] for item in bundle},
+            )
+        except ValueError as exc:
+            logger.warning("[Codex] 本地导出状态冲突: %s", exc)
+            return jsonify({"ok": False, "error": str(exc)}), 409
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("[Codex] 更新本地导出归档状态失败")
+            return jsonify({"ok": False, "error": f"更新导出归档状态失败: {type(exc).__name__}: {exc}"}), 500
+
+        dl_name = f"codex-local-bulk-{timestamp}.zip"
+        zip_bytes = buf.getvalue()
         return Response(
-            _json.dumps(result, ensure_ascii=False, indent=2),
-            mimetype="application/json",
-            headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+            zip_bytes,
+            mimetype="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{dl_name}"',
+                "Content-Length": str(len(zip_bytes)),
+                "Cache-Control": "no-store, max-age=0",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "X-Download-Options": "noopen",
+                "X-Codex-Exported-Count": str(len(bundle)),
+                "X-Codex-Skipped-Count": str(len(errors) + duplicate_count),
+                "X-Codex-Account-Line-Skipped-Count": str(len(account_line_errors)),
+            },
         )
 
     @app.post("/api/codex/reset-export")
