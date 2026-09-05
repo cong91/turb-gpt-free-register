@@ -1,6 +1,9 @@
 """Gmail API URL 取码客户端单元测试（全程 mock HTTP 请求）。"""
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from core import registration_service
@@ -10,6 +13,7 @@ from core.gmail_api_url_client import (
     GmailApiUrlAccount,
     GmailApiUrlBatchError,
     GmailApiUrlError,
+    _fetch_code_once,
     _reconcile_batch_queue,
     acknowledge_verification_code,
     create_registration_batch,
@@ -95,7 +99,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
             return dict(source)
 
         mock_claim.side_effect = claim_source
-        mock_store_factory.return_value.list_aliases_for_code_url.return_value = set()
+        mock_store_factory.return_value.list_unavailable_aliases_for_code_url.return_value = set()
         mock_store_factory.return_value.create_batch_multi.return_value = "batch-used-source"
 
         batch_id = create_registration_batch(1, aliases_per_email=1)
@@ -114,7 +118,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
         }
         mock_claim.return_value = source
         store = mock_store_factory.return_value
-        store.list_aliases_for_code_url.return_value = ["s.ource@gmail.com"]
+        store.list_allocated_aliases_for_code_url.return_value = {"s.ource@gmail.com"}
         store.create_batch_multi.return_value = "batch-next"
 
         batch_id = create_registration_batch(1, aliases_per_email=1)
@@ -122,7 +126,84 @@ class GmailApiUrlClientTests(unittest.TestCase):
         self.assertEqual(batch_id, "batch-next")
         groups = store.create_batch_multi.call_args.args[0]
         self.assertEqual(groups[0]["aliases"], ["so.urce@gmail.com"])
-        store.list_aliases_for_code_url.assert_called_once_with(source["code_url"])
+        store.list_allocated_aliases_for_code_url.assert_called_once_with(source["code_url"])
+
+    def test_create_registration_batch_skips_root_collision_and_uses_later_source(self):
+        """A dotted/plus variant owned by another URL must not abort selection."""
+        from core import db
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw_json = root / "gmail-pool.json"
+            raw_txt = root / "gmail-pool.txt"
+            state = root / "turb.sqlite3"
+            first_source = "same@gmail.com"
+            second_source = "s.ame@gmail.com"
+            third_source = "different@gmail.com"
+            first_url = "https://api.example/first"
+            second_url = "https://api.example/second"
+            third_url = "https://api.example/third"
+            with (
+                patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", raw_json),
+                patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", raw_txt),
+                patch.object(db, "_SQLITE_PATH", state),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", state),
+                patch.object(db, "_SQLITE_READY", False),
+            ):
+                db.import_gmail_api_url_emails([
+                    {"email": first_source, "code_url": first_url},
+                    {"email": second_source, "code_url": second_url},
+                    {"email": third_source, "code_url": third_url},
+                ])
+                store = GmailApiUrlBatchStore(state)
+                existing = generate_gmail_dual_domain_aliases(first_source, limit=1)[0]
+                store.create_batch_multi([{
+                    "source_email": first_source,
+                    "code_url": first_url,
+                    "aliases": [existing],
+                }])
+
+                with patch("core.gmail_api_url_client._batch_store", return_value=store):
+                    batch_id = create_registration_batch(3, aliases_per_email=2)
+
+                with closing(sqlite3.connect(state)) as connection:
+                    rows = connection.execute(
+                        "SELECT code_url, email FROM gmail_api_url_batch_items "
+                        "WHERE batch_id = ? ORDER BY position",
+                        (batch_id,),
+                    ).fetchall()
+                items = [{"code_url": row[0], "email": row[1]} for row in rows]
+                self.assertEqual(len(items), 3)
+                self.assertEqual(sum(item["code_url"] == first_url for item in items), 2)
+                self.assertEqual(sum(item["code_url"] == third_url for item in items), 1)
+                self.assertNotIn(second_url, {item["code_url"] for item in items})
+
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.claim_next_gmail_api_url_email")
+    def test_create_registration_batch_skips_alias_owned_by_another_code_url(
+        self, mock_claim, mock_store_factory
+    ):
+        source = {
+            "email": "source@gmail.com",
+            "code_url": "https://api.example/source",
+        }
+        mock_claim.return_value = source
+        store = mock_store_factory.return_value
+        store.list_allocated_aliases_for_code_url.return_value = set()
+        store.list_globally_unavailable_aliases.return_value = set()
+        store.has_alias_for_other_code_url.side_effect = (
+            lambda alias, code_url: alias == "so.urce@gmail.com"
+        )
+        store.create_batch_multi.return_value = "batch-next"
+
+        batch_id = create_registration_batch(1, aliases_per_email=1)
+
+        self.assertEqual(batch_id, "batch-next")
+        groups = store.create_batch_multi.call_args.args[0]
+        self.assertEqual(groups[0]["aliases"], ["source+41cf6@gmail.com"])
+        store.has_alias_for_other_code_url.assert_any_call(
+            "so.urce@gmail.com", source["code_url"]
+        )
 
     @patch("core.gmail_api_url_client._batch_store")
     @patch("core.db.release_gmail_api_url_email")
@@ -136,7 +217,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
         }
         mock_claim.side_effect = [source, None]
         store = mock_store_factory.return_value
-        store.list_aliases_for_code_url.return_value = set(
+        store.list_allocated_aliases_for_code_url.return_value = set(
             generate_gmail_dual_domain_aliases(source["email"])
         )
 
@@ -145,28 +226,102 @@ class GmailApiUrlClientTests(unittest.TestCase):
 
         mock_release.assert_called_once_with(
             source["email"],
-            "used",
+            "exhausted",
             "Record đã dùng hết alias Gmail khả dụng",
         )
 
-    def test_list_aliases_for_code_url_is_scoped_to_source_record(self):
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.release_gmail_api_url_email")
+    @patch("core.db.claim_next_gmail_api_url_email")
+    def test_pending_alias_does_not_terminalize_raw_source(
+        self, mock_claim, mock_release, mock_store_factory
+    ):
+        source = {
+            "email": "source@gmail.com",
+            "code_url": "https://api.example/source",
+            "_claimed_from_available": True,
+        }
+        mock_claim.side_effect = [source, None]
+        store = mock_store_factory.return_value
+        store.list_allocated_aliases_for_code_url.return_value = set(
+            generate_gmail_dual_domain_aliases(source["email"])
+        )
+        store.list_globally_unavailable_aliases.return_value = set()
+        store.has_pending_alias_for_code_url.return_value = True
+
+        with self.assertRaises(GmailApiUrlBatchError):
+            create_registration_batch(1, aliases_per_email=1)
+
+        mock_release.assert_not_called()
+        store.has_pending_alias_for_code_url.assert_called_once_with(source["code_url"])
+
+    def test_active_last_alias_does_not_mark_raw_source_exhausted(self):
+        """A temporarily owned final alias must remain usable after the lock drains."""
+        from core import db
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw_json = root / "gmail-pool.json"
+            raw_txt = root / "gmail-pool.txt"
+            state = root / "gmail-state.sqlite3"
+            source_email = "activesource123@gmail.com"
+            code_url = "https://api.example/active-source"
+            aliases = generate_gmail_dual_domain_aliases(source_email)
+            with (
+                patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", raw_json),
+                patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", raw_txt),
+                patch.object(db, "_SQLITE_PATH", state),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", state),
+                patch.object(db, "_SQLITE_READY", False),
+            ):
+                db.import_gmail_api_url_emails([
+                    {"email": source_email, "code_url": code_url},
+                ])
+                store = GmailApiUrlBatchStore(state)
+                batch_id = store.create_batch_multi([
+                    {
+                        "source_email": source_email,
+                        "code_url": code_url,
+                        "aliases": aliases,
+                    },
+                ])
+                for index in range(len(aliases) - 1):
+                    assignment = store.claim(batch_id, f"completed-{index}")
+                    self.assertTrue(store.complete(assignment.assignment_id))
+                active = store.claim(batch_id, "active-last")
+                self.assertIsNotNone(active)
+
+                with patch(
+                    "core.gmail_api_url_client._batch_store",
+                    return_value=store,
+                ), self.assertRaises(GmailApiUrlBatchError):
+                    create_registration_batch(1, aliases_per_email=1)
+
+                raw_row = db.get_gmail_api_url_email_by_email(source_email)
+                self.assertEqual(raw_row["status"], "used")
+                self.assertFalse(db.is_gmail_api_url_source_blocked(source_email))
+
+    def test_unavailable_aliases_for_code_url_are_scoped_to_source_record(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = GmailApiUrlBatchStore(f"{temp_dir}/batch.db")
-            store.create_batch_multi([
+            batch_id = store.create_batch_multi([
                 {
                     "source_email": "source-a@gmail.com",
                     "code_url": "https://api.example/source-a",
                     "aliases": ["a.one@gmail.com"],
                 },
+            ])
+            store.create_batch_multi([
                 {
                     "source_email": "source-b@gmail.com",
                     "code_url": "https://api.example/source-b",
                     "aliases": ["b.one@gmail.com"],
                 },
             ])
+            store.claim(batch_id, "job")
 
             self.assertEqual(
-                store.list_aliases_for_code_url("https://api.example/source-a"),
+                store.list_unavailable_aliases_for_code_url("https://api.example/source-a"),
                 {"a.one@gmail.com"},
             )
 
@@ -349,6 +504,25 @@ class GmailApiUrlClientTests(unittest.TestCase):
         self.assertEqual(code, "123456")
         self.assertEqual(mock_get.call_count, 1)
 
+    @patch("core.gmail_api_url_client.requests.get")
+    @patch("core.db.is_gmail_api_url_account_blocked", return_value=True)
+    @patch("core.db.is_gmail_api_url_code_url_failed", return_value=False)
+    @patch("core.gmail_api_url_client._batch_store")
+    def test_poll_rejects_blocked_source_before_provider_request(
+        self,
+        mock_batch_store,
+        _mock_failed_url,
+        _mock_account_blocked,
+        mock_get,
+    ):
+        mock_batch_store.return_value.path = "runtime/turb.sqlite3"
+        account = GmailApiUrlAccount("blocked+alias@gmail.com", "https://api.example/blocked")
+
+        with self.assertRaisesRegex(GmailApiUrlError, "disabled or terminally retired"):
+            poll_verification_code(account, max_wait=5, poll_interval=0)
+
+        mock_get.assert_not_called()
+
     @patch("core.gmail_api_url_client.time.time", side_effect=[0.0, 0.0, 2.0])
     @patch("core.gmail_api_url_client.time.sleep", return_value=None)
     @patch("core.gmail_api_url_client.requests.get")
@@ -461,6 +635,76 @@ class GmailApiUrlClientTests(unittest.TestCase):
             poll_verification_code(account, max_wait=5, poll_interval=1)
 
         self.assertEqual(mock_get.call_count, 1)
+
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_poll_602_quarantines_raw_and_canonical_siblings(self, mock_get):
+        """A terminal provider response retires every owner of the URL."""
+        from core import db
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw_json = root / "gmail-pool.json"
+            raw_txt = root / "gmail-pool.txt"
+            store = GmailApiUrlBatchStore(root / "gmail-state.sqlite3")
+            code_url = "https://api.example/terminal"
+
+            with (
+                patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", raw_json),
+                patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", raw_txt),
+            ):
+                self.assertEqual(
+                    db.import_gmail_api_url_emails([
+                        {"email": "source-one@gmail.com", "code_url": code_url},
+                        {"email": "source-two@gmail.com", "code_url": code_url},
+                    ]),
+                    (2, 0),
+                )
+                batch_id = store.create_batch_multi([
+                    {
+                        "source_email": "source-one@gmail.com",
+                        "code_url": code_url,
+                        "aliases": ["alias-one@gmail.com", "alias-two@gmail.com"],
+                    },
+                ])
+                assignment = store.claim(batch_id, "job-terminal")
+                mock_get.return_value = _Response({"code": 602, "message": "expired"})
+
+                with self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"):
+                    poll_verification_code(
+                        GmailApiUrlAccount("alias-one@gmail.com", code_url),
+                        max_wait=5,
+                        poll_interval=0,
+                        sqlite_path=store.path,
+                    )
+
+                rows = db.list_gmail_api_url_email_pool(limit=10)
+                self.assertEqual({row["status"] for row in rows}, {"failed"})
+                self.assertEqual(store.get_assignment(assignment.assignment_id).state, "failed")
+                self.assertEqual(store.batch_status(batch_id)["pending"], 0)
+
+                mock_get.reset_mock()
+                with self.assertRaisesRegex(GmailApiUrlError, r"code=602.*quarantined"):
+                    poll_verification_code(
+                        GmailApiUrlAccount("alias-two@gmail.com", code_url),
+                        max_wait=5,
+                        poll_interval=0,
+                        sqlite_path=store.path,
+                    )
+                mock_get.assert_not_called()
+
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_string_provider_code_602_is_terminal(self, mock_get):
+        mock_get.return_value = _Response({"code": "602", "message": "expired"})
+
+        with self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"):
+            _fetch_code_once("https://api.example/code")
+
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_http_status_602_is_terminal(self, mock_get):
+        mock_get.return_value = _Response({}, status_code=602)
+
+        with self.assertRaisesRegex(GmailApiUrlError, r"code=602"):
+            _fetch_code_once("https://api.example/code")
 
     @patch("core.gmail_api_url_client.requests.get")
     @patch("core.gmail_api_url_client.time.sleep", return_value=None)

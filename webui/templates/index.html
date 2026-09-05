@@ -7928,10 +7928,7 @@ function readGmailApiUrlAliasCount(root = document) {
 
 function gmailApiUrlAvailableCount(aliasCount = 1) {
   const aliases = Math.max(1, Number(aliasCount || 1));
-  if (aliases > 1) {
-    return Math.floor(gmailApiUrlAliasAvailableCount() / aliases);
-  }
-  return Math.max(0, Number(window.GMAIL_API_URL_POOL_AVAILABLE || 0));
+  return Math.floor(gmailApiUrlAliasAvailableCount() / aliases);
 }
 
 function gmailApiUrlAliasAvailableCount() {
@@ -7973,7 +7970,7 @@ function syncGmailApiUrlCountLabel(providerEl) {
     const first = field.childNodes[0];
     if (first && first.nodeType === Node.TEXT_NODE) {
       first.textContent = isGmailApiUrl
-        ? (aliasCount > 1 ? 'Số nhóm email gốc còn khả dụng' : 'Số bản ghi chưa dùng')
+        ? (aliasCount > 1 ? 'Số nhóm email gốc còn khả dụng' : 'Số alias còn khả dụng')
         : '注册数量';
     }
   }

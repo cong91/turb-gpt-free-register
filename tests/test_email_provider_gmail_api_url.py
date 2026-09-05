@@ -73,6 +73,128 @@ class GmailApiUrlProviderTests(unittest.TestCase):
         call_args = mock_poll.call_args
         self.assertEqual(call_args[0][0].email, "test@gmail.com")
 
+    @patch("core.email_provider._get_code_url_account")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.is_gmail_api_url_account_blocked", return_value=True)
+    @patch("core.db.is_gmail_api_url_code_url_failed", return_value=False)
+    @patch("core.gmail_api_url_client.poll_verification_code", return_value="654321")
+    def test_wait_for_otp_rejects_blocked_raw_root_before_provider(
+        self,
+        mock_poll,
+        mock_failed_url,
+        mock_account_blocked,
+        mock_batch_store,
+        _mock_source,
+        mock_account,
+    ):
+        from pathlib import Path
+
+        from core.gmail_api_url_client import GmailApiUrlError
+
+        mock_batch_store.return_value.path = Path("runtime") / "turb.sqlite3"
+        mock_account.return_value = type(
+            "Account",
+            (),
+            {
+                "email": "disabled.root+alias@gmail.com",
+                "code_url": "http://example.com/otp",
+            },
+        )()
+
+        with self.assertRaisesRegex(GmailApiUrlError, "source is disabled"):
+            email_provider.wait_for_otp("disabled.root+alias@gmail.com", after_ts=123.0)
+
+        mock_account_blocked.assert_called_once_with(
+            "disabled.root+alias@gmail.com",
+            sqlite_path=Path("runtime") / "turb.sqlite3",
+        )
+        mock_failed_url.assert_called_once_with(
+            "http://example.com/otp",
+            sqlite_path=Path("runtime") / "turb.sqlite3",
+        )
+        mock_poll.assert_not_called()
+
+    @patch("core.email_provider._quarantine_code_url_after_provider_error")
+    @patch("core.email_provider._get_code_url_account")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.is_gmail_api_url_account_blocked", return_value=True)
+    @patch("core.db.is_gmail_api_url_code_url_failed", return_value=True)
+    @patch("core.gmail_api_url_client.poll_verification_code")
+    def test_wait_for_otp_preserves_602_for_quarantined_url(
+        self,
+        mock_poll,
+        mock_url_failed,
+        _mock_account_blocked,
+        mock_batch_store,
+        _mock_source,
+        mock_account,
+        quarantine,
+    ):
+        from pathlib import Path
+
+        from core.gmail_api_url_client import GmailApiUrlError
+
+        mock_batch_store.return_value.path = Path("runtime") / "turb.sqlite3"
+        mock_account.return_value = type(
+            "Account",
+            (),
+            {"email": "failed.root+alias@gmail.com", "code_url": "http://example.com/otp"},
+        )()
+
+        with self.assertRaisesRegex(GmailApiUrlError, "code=602"):
+            email_provider.wait_for_otp("failed.root+alias@gmail.com", after_ts=123.0)
+
+        mock_url_failed.assert_called_once_with(
+            "http://example.com/otp",
+            sqlite_path=Path("runtime") / "turb.sqlite3",
+        )
+        mock_poll.assert_not_called()
+        quarantine.assert_called_once()
+
+    @patch("core.email_provider._get_code_url_account")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.is_gmail_api_url_account_blocked", return_value=True)
+    @patch("core.db.is_gmail_api_url_code_url_failed", return_value=False)
+    @patch("core.gmail_api_url_client.snapshot_verification_code", return_value="654321")
+    def test_snapshot_rejects_blocked_raw_root_before_provider(
+        self,
+        mock_snapshot,
+        mock_failed_url,
+        mock_account_blocked,
+        mock_batch_store,
+        _mock_source,
+        mock_account,
+    ):
+        from pathlib import Path
+
+        from core.gmail_api_url_client import GmailApiUrlError
+
+        mock_batch_store.return_value.path = Path("runtime") / "turb.sqlite3"
+        mock_account.return_value = type(
+            "Account",
+            (),
+            {
+                "email": "exhaustedroot+alias@gmail.com",
+                "code_url": "http://example.com/otp",
+            },
+        )()
+
+        with self.assertRaisesRegex(GmailApiUrlError, "source is disabled"):
+            email_provider.snapshot_verification_code("exhaustedroot+alias@gmail.com")
+
+        mock_account_blocked.assert_called_once_with(
+            "exhaustedroot+alias@gmail.com",
+            sqlite_path=Path("runtime") / "turb.sqlite3",
+        )
+        mock_failed_url.assert_called_once_with(
+            "http://example.com/otp",
+            sqlite_path=Path("runtime") / "turb.sqlite3",
+        )
+        mock_snapshot.assert_not_called()
+
     @patch("core.db.get_gmail_api_url_email_by_email")
     @patch("core.gmail_api_url_client.poll_verification_code", return_value="222222")
     def test_wait_for_otp_forwards_previous_code_as_stale_guard(self, mock_poll, mock_get):
@@ -183,8 +305,11 @@ class GmailApiUrlProviderTests(unittest.TestCase):
         )
 
     @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
-    @patch("core.db.get_gmail_api_url_email_by_email", return_value={"email": "test@gmail.com"})
-    @patch("core.db.release_gmail_api_url_email")
+    @patch(
+        "core.db.get_gmail_api_url_email_by_email",
+        return_value={"email": "test@gmail.com", "code_url": "https://mail.example/broken"},
+    )
+    @patch("core.db.fail_gmail_api_url_sources_for_code_url")
     def test_provider_error_marks_gmail_api_url_email_failed(
         self, mock_release, _mock_get, _mock_source
     ):
@@ -195,9 +320,116 @@ class GmailApiUrlProviderTests(unittest.TestCase):
 
         self.assertTrue(result)
         mock_release.assert_called_once_with(
-            "test@gmail.com",
-            status="failed",
+            "https://mail.example/broken",
             note="GmailApiUrlError: Provider error code=602: refund required",
+        )
+
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch(
+        "core.db.get_gmail_api_url_email_by_email",
+        return_value={"email": "test@gmail.com", "code_url": "https://mail.example/broken"},
+    )
+    @patch("core.db.fail_gmail_api_url_sources_for_code_url")
+    def test_lowercase_provider_602_marks_gmail_api_url_email_failed(
+        self, mock_release, _mock_get, _mock_source
+    ):
+        result = email_provider.release_email_if_unconsumed(
+            "test@gmail.com",
+            note="gmail api error: provider error code=602",
+        )
+
+        self.assertTrue(result)
+        mock_release.assert_called_once_with(
+            "https://mail.example/broken",
+            note="gmail api error: provider error code=602",
+        )
+
+    @patch("core.email_provider._quarantine_code_url_after_provider_error")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.db.release_unconsumed_gmail_api_url_email", return_value=False)
+    @patch("core.gmail_api_url_client.get_batch_account_context")
+    @patch("core.gmail_api_url_client.release_account", return_value=True)
+    def test_batch_602_cleanup_quarantines_code_url_before_discard(
+        self,
+        mock_release,
+        mock_context,
+        _mock_db_release,
+        _mock_source,
+        quarantine,
+    ):
+        account = type(
+            "Account", (), {"email": "alias@gmail.com", "code_url": "https://mail.example/broken"}
+        )()
+        mock_context.return_value = account
+
+        result = email_provider.release_email_if_unconsumed(
+            "alias@gmail.com",
+            note="Provider error code=602",
+            discard_on_failure=True,
+        )
+
+        self.assertTrue(result)
+        quarantine.assert_called_once()
+        self.assertEqual(quarantine.call_args.args[0], account)
+        self.assertEqual(quarantine.call_args.kwargs["source"], "gmail_api_url")
+        mock_release.assert_called_once_with(
+            "alias@gmail.com",
+            status="failed",
+            note="Provider error code=602",
+        )
+
+    @patch("core.email_provider._quarantine_code_url_after_provider_error")
+    @patch("core.email_provider._get_code_url_account")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.gmail_api_url_client.release_account")
+    def test_direct_release_keeps_gmail_api_url_602_terminal(
+        self, mock_release, _mock_source, mock_account, quarantine
+    ):
+        account = type(
+            "Account", (), {"email": "alias@gmail.com", "code_url": "https://mail.example/broken"}
+        )()
+        mock_account.return_value = account
+
+        email_provider.release_email(
+            "alias@gmail.com",
+            status="available",
+            note="Provider error code=602",
+        )
+
+        quarantine.assert_called_once()
+        self.assertEqual(quarantine.call_args.args[0], account)
+        self.assertEqual(quarantine.call_args.kwargs["source"], "gmail_api_url")
+        mock_release.assert_called_once_with(
+            "alias@gmail.com",
+            status="failed",
+            note="Provider error code=602",
+        )
+
+    @patch("core.email_provider._quarantine_code_url_after_provider_error")
+    @patch("core.email_provider._get_code_url_account")
+    @patch("core.email_provider.resolve_email_source", return_value="qan8_gmail_api")
+    @patch("core.gmail_api_url_client.release_account")
+    def test_qan8_provenance_release_uses_canonical_gmail_api(
+        self, mock_release, _mock_source, mock_account, quarantine
+    ):
+        account = type(
+            "Account", (), {"email": "alias@gmail.com", "code_url": "https://mail.example/broken"}
+        )()
+        mock_account.return_value = account
+
+        email_provider.release_email(
+            "alias@gmail.com",
+            status="available",
+            note="Provider error code=602",
+        )
+
+        quarantine.assert_called_once()
+        self.assertEqual(quarantine.call_args.args[0], account)
+        self.assertEqual(quarantine.call_args.kwargs["source"], "gmail_api_url")
+        mock_release.assert_called_once_with(
+            "alias@gmail.com",
+            status="failed",
+            note="Provider error code=602",
         )
 
     @patch("core.db.get_gmail_api_url_email_by_email")

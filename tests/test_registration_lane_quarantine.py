@@ -54,6 +54,12 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
             patch.object(registration_service.db, "get_job", return_value=jobs[0]),
             patch.object(registration_service.db, "list_jobs", return_value=jobs),
             patch.object(registration_service.db, "update_job") as update_job,
+            patch.object(
+                registration_service.db,
+                "fail_gmail_api_url_sources_for_code_url",
+                create=True,
+                return_value=1,
+            ) as fail_source,
             patch(
                 "core.gmail_api_url_client.quarantine_code_url",
                 return_value=2,
@@ -67,16 +73,19 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
             )
 
         quarantine_url.assert_called_once_with(
-            "batch-1",
             "https://mail.example/broken",
             reason="Provider error code=602",
+        )
+        fail_source.assert_called_once_with(
+            "https://mail.example/broken",
+            note="Provider error code=602",
         )
         self.assertFalse(registration_service._STOP_EVENTS[10].is_set())
         self.assertEqual(result["cancelled"], 0)
         self.assertEqual(result["stopping"], 0)
         update_job.assert_not_called()
 
-    def test_qan8_602_quarantines_provider_lane_and_cancels_its_jobs(self):
+    def test_qan8_602_retires_shared_source_and_keeps_pending_jobs(self):
         jobs = [
             {
                 "id": 20,
@@ -104,10 +113,16 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
             patch.object(registration_service.db, "get_job", return_value=jobs[0]),
             patch.object(registration_service.db, "list_jobs", return_value=jobs),
             patch.object(registration_service.db, "update_job") as update_job,
-            patch(
-                "core.qan8_gmail_api_allocator.Qan8GmailApiAllocator.quarantine_lane",
+            patch.object(
+                registration_service.db,
+                "fail_gmail_api_url_sources_for_code_url",
+                create=True,
                 return_value=1,
-            ) as quarantine_lane,
+            ) as fail_source,
+            patch(
+                "core.gmail_api_url_client.quarantine_code_url",
+                return_value=1,
+            ) as quarantine_code_url,
         ):
             result = registration_service.quarantine_provider_lane(
                 job_id=20,
@@ -118,12 +133,17 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
                 reason="Provider error code=602",
             )
 
-        quarantine_lane.assert_called_once_with(
-            "batch-2", 1, reason="Provider error code=602"
+        quarantine_code_url.assert_called_once_with(
+            "https://mail.example/broken", reason="Provider error code=602"
         )
-        self.assertEqual(result["cancelled"], 1)
-        self.assertEqual(result["stopping"], 1)
-        self.assertEqual({call.args[0] for call in update_job.call_args_list}, {20, 21})
+        fail_source.assert_called_once_with(
+            "https://mail.example/broken",
+            note="Provider error code=602",
+        )
+        self.assertFalse(registration_service._STOP_EVENTS[20].is_set())
+        self.assertEqual(result["cancelled"], 0)
+        self.assertEqual(result["stopping"], 0)
+        update_job.assert_not_called()
 
     def test_gmail_api_url_without_batch_does_not_cancel_same_proxy_lane(self):
         jobs = [
@@ -147,6 +167,16 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
             patch.object(registration_service.db, "get_job", return_value=jobs[0]),
             patch.object(registration_service.db, "list_jobs", return_value=jobs),
             patch.object(registration_service.db, "update_job") as update_job,
+            patch.object(
+                registration_service.db,
+                "fail_gmail_api_url_sources_for_code_url",
+                create=True,
+                return_value=1,
+            ) as fail_source,
+            patch(
+                "core.gmail_api_url_client.quarantine_code_url",
+                return_value=0,
+            ) as quarantine_url,
         ):
             result = registration_service.quarantine_provider_lane(
                 job_id=30,
@@ -157,7 +187,47 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
 
         self.assertEqual(result["cancelled"], 0)
         self.assertEqual(result["stopping"], 0)
+        quarantine_url.assert_called_once_with(
+            "https://mail.example/broken",
+            reason="Provider error code=602",
+        )
+        fail_source.assert_called_once_with(
+            "https://mail.example/broken",
+            note="Provider error code=602",
+        )
         update_job.assert_not_called()
+
+    def test_snapshot_code_602_quarantines_the_provider_source(self):
+        account = SimpleNamespace(
+            email="alias@gmail.com",
+            code_url="https://mail.example/broken",
+            batch_id="batch-qan8",
+            lane_id=2,
+        )
+        with (
+            patch.object(email_provider, "resolve_email_source", return_value="qan8_gmail_api"),
+            patch.object(email_provider, "_get_code_url_account", return_value=account),
+            patch(
+                "core.gmail_api_url_client.snapshot_verification_code",
+                side_effect=GmailApiUrlError("Provider error code=602"),
+            ),
+            patch.object(registration_service, "quarantine_provider_lane") as quarantine,
+            patch.object(registration_service._THREAD_CTX, "job_id", 77, create=True),
+            self.assertRaisesRegex(GmailApiUrlError, "code=602"),
+        ):
+            email_provider.snapshot_verification_code(
+                "alias@gmail.com",
+                stage="registration_email_request",
+            )
+
+        quarantine.assert_called_once_with(
+            job_id=77,
+            source="qan8_gmail_api",
+            code_url="https://mail.example/broken",
+            provider_batch_id="batch-qan8",
+            provider_lane_id=2,
+            reason="Provider error code=602",
+        )
 
     def test_both_url_providers_quarantine_on_code_602(self):
         cases = (
