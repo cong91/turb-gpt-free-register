@@ -52,7 +52,10 @@ PLAN_CHECK_JITTER = 0.3
 # Proxy xoay proxy.vn: lease chỉ tồn tại khi worker đang chạy. Khi hoàn tất,
 # key được trả ngay; proxy còn TTL được cache để workflow kế tiếp tái dùng.
 # Key mới chỉ được mua khi số worker đồng thời vượt số key nhàn rỗi.
+# Khi bật one-account-per-IP, registration được serialize; mỗi job force-refresh
+# ở boundary, còn retry/browser reopen trong cùng job giữ proxy hiện tại.
 ROTATING_PROXY_ENABLED = False
+ROTATING_PROXY_ONE_ACCOUNT_PER_IP = False
 ROTATING_PROXY_API_BASE = "https://proxy.vn/proxyxoay"
 ROTATING_PROXY_PROXY_API_BASE = "https://proxyxoay.shop/api"
 ROTATING_PROXY_API_KEY = ""
@@ -153,6 +156,7 @@ apply_env_overrides(globals(), {
     'PLAN_CHECK_MIN_INTERVAL': 'float',
     'PLAN_CHECK_JITTER': 'float',
     'ROTATING_PROXY_ENABLED': 'bool',
+    'ROTATING_PROXY_ONE_ACCOUNT_PER_IP': 'bool',
     'ROTATING_PROXY_API_BASE': 'str',
     'ROTATING_PROXY_PROXY_API_BASE': 'str',
     'ROTATING_PROXY_API_KEY': 'str',

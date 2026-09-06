@@ -1,1399 +1,852 @@
-#!/usr/bin/env python3
-"""Standalone ChatGPT checkout short-link extractor.
-
-Author: Simon
-
-Default flow:
-
-* checkout billing: PH / PHP
-* checkout proxy country: US
-* promotion update proxy country: TR
-* payment locale: English
-* proxy provider: Cliproxy-compatible username routing
-* output: https://chatgpt.com/checkout/<processor_entity>/<oaics_id>
-
-The script creates the checkout without a promotion, applies the promotion to
-the same checkout through ``checkout/update``, and verifies the payable amount.
-An explicit non-zero amount is rejected. If neither the update response nor the
-checkout page exposes an amount, the result is returned as ``pending`` so a
-payment client can verify it before payment.
-
-Only ``curl_cffi`` is required::
-
-    python -m pip install "curl_cffi>=0.15.0"
-
-Recommended usage keeps credentials out of the process list::
-
-    export CLIPROXY_HOST=proxy.example:8080
-    export CLIPROXY_USERNAME=your-user
-    export CLIPROXY_PASSWORD=your-password
-    python checkout_link_extractor_standalone.py --credential-file session.json --pretty
-
-Use ``--credential-file -`` to read a token or session JSON from stdin.
-"""
-
+"""Direct PAY.153 provider checkout workflow for local link extraction."""
 from __future__ import annotations
 
-import argparse
-try:
-    import fcntl
-except ImportError:  # Windows does not expose POSIX file locking.
-    fcntl = None  # type: ignore[assignment]
-import getpass
+import base64
 import json
-import os
-import random
 import re
-import sys
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
-from html import unescape as html_unescape
-from pathlib import Path
-from typing import Any, Callable
-from urllib.parse import quote, unquote, urlsplit, urlunsplit
+from collections.abc import Callable
+from typing import Any
 
-try:
-    from curl_cffi.requests import Session as CurlSession
-except ImportError:  # pragma: no cover - exercised by the CLI error path
-    CurlSession = None  # type: ignore[assignment]
-
-
-VERSION = "1.0.0"
-CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
-UPDATE_PATH = "/backend-api/payments/checkout/update"
-TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
-    "Gecko/20100101 Firefox/144.0"
+from core import pay153_provider_checkout as provider_checkout
+from core import pay153_stripe_checkout as stripe_checkout
+from core.pay153_checkout_extractor import checkout_amount_minor, checkout_currency
+from core.pay153_provider_policy import (
+    PROVIDER_POLICIES,
+    provider_policy,
+    public_provider_config,
 )
-DEFAULT_CLIENT_VERSION = "prod-db390ebea64862bf1899c420a4c736e0cf639747"
-DEFAULT_CLIENT_BUILD = "7904904"
-PAYMENT_COOKIE_NAMES = frozenset(
-    {
-        "oai-did",
-        "oai-hlib",
-        "oai-sc",
-        "oaicom-stable-id",
-        "_account",
-        "_account_is_fedramp",
-        "__Secure-oai-is",
-        "__Secure-next-auth.session-token",
-        "__cf_bm",
-        "__cflb",
-        "_cfuvid",
-        "__oailb",
-        "cf_clearance",
-    }
-)
-RETRYABLE_STATUSES = frozenset({403, 429, 500, 502, 503, 504})
+
+PAY153_LOCAL_LINK_TYPES = frozenset(PROVIDER_POLICIES)
+_LOCAL_METHOD_STRATEGIES = {
+    "pix": ("standalone", "late_promo", "inline"),
+    "momo": ("late_promo", "inline", "standalone"),
+}
+_PROVIDER_LABELS = {
+    "hosted": "Official Checkout",
+    "ph_short": "Philippines short checkout",
+    "paypal": "PayPal",
+    "ideal": "iDEAL",
+    "twint": "TWINT",
+    "upi": "UPI",
+    "pix": "PIX",
+    "momo": "MoMo",
+    "gcash": "GCash",
+    "kakao": "Kakao Pay",
+}
+_OPENAI_CHECKOUT_CURRENCIES = {
+    "USD", "AUD", "CAD", "GBP", "EUR", "CLP", "JPY", "INR", "IDR", "PKR",
+    "THB", "MYR", "TWD", "VND", "PHP", "NGN", "ZAR", "KZT", "TZS", "EGP",
+    "BRL", "SEK", "CZK", "PLN", "DKK", "NOK", "KRW", "COP", "MXN", "PEN",
+    "HUF", "QAR", "RON", "ILS", "AED", "SGD", "NZD", "CHF", "SAR",
+}
 
 
-class ExtractorError(RuntimeError):
-    """Base error safe to expose in the CLI JSON response."""
+def _upi_enabled() -> bool:
+    from core.pay153_upi_go_runner import available
+
+    return available()
 
 
-class UpstreamError(ExtractorError):
-    def __init__(
-        self,
-        status_code: int,
-        message: str,
-        *,
-        retryable: bool = False,
-        cloudflare: bool = False,
-    ) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-        self.retryable = retryable
-        self.cloudflare = cloudflare
-
-
-class InvalidPromotionError(ExtractorError):
-    pass
-
-
-class CustomerSessionMissingError(ExtractorError):
-    pass
-
-
-class NonZeroAmountError(ExtractorError):
-    pass
-
-
-@dataclass(frozen=True)
-class Credentials:
-    access_token: str
-    session_cookie: str = ""
-
-
-@dataclass(frozen=True)
-class ExtractorConfig:
-    billing_country: str = "PH"
-    currency: str = "PHP"
-    payment_locale: str = "en"
-    checkout_proxy_country: str = "US"
-    update_proxy_country: str = "TR"
-    cliproxy_host: str = "127.0.0.1:19010"
-    cliproxy_username: str = ""
-    cliproxy_password: str = ""
-    checkout_proxy: str = ""
-    update_proxy: str = ""
-    plan_name: str = "chatgptplusplan"
-    promo_campaign_id: str = "plus-1-month-free"
-    apply_promo: bool = True
-    checkout_ui_mode: str = "custom"
-    timeout: float = 45.0
-    checkout_attempts: int = 10
-    update_attempts: int = 15
-    full_attempts: int = 3
-    cf_same_identity_attempts: int = 5
-    cf_retry_delay: float = 3.0
-    verify_proxy_country: bool = True
-    allow_missing_customer_session: bool = False
-    user_agent: str = DEFAULT_USER_AGENT
-
-    def validate(self) -> None:
-        if not re.fullmatch(r"[A-Z]{2}", self.billing_country):
-            raise ExtractorError("billing country must be a two-letter code")
-        if not re.fullmatch(r"[A-Z]{3}", self.currency):
-            raise ExtractorError("currency must be a three-letter code")
-        for field_name, value in (
-            ("checkout proxy country", self.checkout_proxy_country),
-            ("update proxy country", self.update_proxy_country),
-        ):
-            if not re.fullmatch(r"[A-Z]{2}", value):
-                raise ExtractorError(f"{field_name} must be a two-letter code")
-        for field_name, value in (
-            ("checkout attempts", self.checkout_attempts),
-            ("update attempts", self.update_attempts),
-            ("full attempts", self.full_attempts),
-            ("CF same-identity attempts", self.cf_same_identity_attempts),
-        ):
-            if value < 1:
-                raise ExtractorError(f"{field_name} must be at least 1")
-
-
-@dataclass(frozen=True)
-class CheckoutResult:
-    ok: bool
-    long_url: str
-    cs_id: str
-    processor_entity: str
-    billing_country: str
-    currency: str
-    payment_locale: str
-    amount_verification: str
-    amount_minor: int | None
-    amount_currency: str
-    device_id: str
-    chatgpt_session_id: str
-    user_agent: str
-    publishable_key: str
-
-
-def find_value(payload: Any, keys: tuple[str, ...]) -> str:
-    if isinstance(payload, dict):
-        for key in keys:
-            value = payload.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        for value in payload.values():
-            found = find_value(value, keys)
-            if found:
-                return found
-    elif isinstance(payload, list):
-        for value in payload:
-            found = find_value(value, keys)
-            if found:
-                return found
-    return ""
-
-
-def persist_private_checkout_context(
-    session: Any,
-    checkout: dict[str, Any],
-    checkout_proxy: str,
-    device_id: str,
-    chatgpt_session_id: str,
-    user_agent: str,
-) -> None:
-    session_id = str(checkout.get("cs_id") or "").strip()
-    if not session_id:
-        return
-    cookies: dict[str, str] = {}
-    jar = getattr(session, "cookies", None)
-    if jar is not None:
-        try:
-            for item in jar.jar:
-                name = str(getattr(item, "name", "") or "")
-                value = str(getattr(item, "value", "") or "")
-                if name and value:
-                    cookies[name] = value
-        except Exception:
-            try:
-                cookies.update({str(k): str(v) for k, v in jar.items() if str(k) and str(v)})
-            except Exception:
-                pass
-    cookies.setdefault("oai-did", str(device_id or ""))
-    payload = {
-        "checkout_session_id": session_id,
-        "checkout_url": checkout_short_url(
-            session_id,
-            str(checkout.get("billing_country") or "PH"),
-            str(checkout.get("processor_entity") or ""),
-        ),
-        "processor_entity": processor_entity_for_country(
-            str(checkout.get("billing_country") or "PH"),
-            str(checkout.get("processor_entity") or ""),
-        ),
-        "checkout_proxy": str(checkout_proxy or ""),
-        "checkout_device_id": str(device_id or ""),
-        "checkout_chatgpt_session_id": str(chatgpt_session_id or ""),
-        "checkout_user_agent": str(user_agent or ""),
-        "session_cookies": cookies,
-        "created_at": time.time(),
-        "source": "pay153_ph_short_extractor",
-    }
-    target = Path(os.getenv("TURB_PAY153_CONTEXT_PATH", str(Path(__file__).resolve().parent.parent / "data" / "pay153_checkout_contexts.jsonl")))
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8", newline="\n") as handle:
-        try:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        except Exception:
-            pass
-        handle.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-        handle.flush()
-        try:
-            if fcntl is not None:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        except Exception:
-            pass
-
-
-def parse_credentials(raw: str, explicit_session_cookie: str = "") -> Credentials:
-    raw = str(raw or "").strip()
-    if not raw:
-        raise ExtractorError("access token or session JSON is required")
-    payload: Any = None
-    if raw.startswith(("{", "[")):
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ExtractorError(f"credential JSON is invalid: {exc.msg}") from exc
-        access_token = find_value(payload, ("accessToken", "access_token", "token"))
-    else:
-        access_token = raw
-    if not access_token:
-        raise ExtractorError("credential payload does not contain an access token")
-    session_cookie = str(explicit_session_cookie or "").strip()
-    if not session_cookie and payload is not None:
-        session_cookie = find_value(
-            payload,
-            (
-                "chatgpt_session_cookie",
-                "chatgptSessionCookie",
-                "session_cookie",
-                "sessionCookie",
-                "sessionToken",
-                "__Secure-next-auth.session-token",
-            ),
-        )
-    return Credentials(access_token=access_token, session_cookie=session_cookie)
-
-
-def cookie_header_value(cookie_header: str, name: str) -> str:
-    for item in str(cookie_header or "").split(";"):
-        key, separator, value = item.strip().partition("=")
-        if separator and key == name:
-            return value.strip()
-    return ""
-
-
-def filter_payment_cookie_header(cookie_header: str) -> str:
-    values: dict[str, str] = {}
-    for item in str(cookie_header or "").split(";"):
-        name, separator, value = item.strip().partition("=")
-        if separator and name in PAYMENT_COOKIE_NAMES:
-            values[name] = value
-    return "; ".join(f"{name}={value}" for name, value in values.items())
-
-
-def replace_cookie_value(cookie_header: str, name: str, value: str) -> str:
-    values: list[str] = []
-    replaced = False
-    for item in str(cookie_header or "").split(";"):
-        key, separator, _ = item.strip().partition("=")
-        if not separator:
+def payment_method_catalog() -> list[dict[str, Any]]:
+    """Return the PAY.153 provider catalog for the WebUI selector."""
+    providers = public_provider_config(upi_enabled=_upi_enabled())
+    methods = []
+    for method_id in (
+        "hosted", "ph_short", "paypal", "ideal", "twint", "upi", "pix", "momo", "gcash", "kakao",
+    ):
+        item = providers[method_id]
+        if not item["api_enabled"] or not item["ui_visible"]:
             continue
-        if key == name:
-            if not replaced:
-                values.append(f"{name}={value}")
-                replaced = True
-        else:
-            values.append(item.strip())
-    if not replaced:
-        values.insert(0, f"{name}={value}")
-    return "; ".join(values)
+        methods.append({
+            "id": method_id,
+            "label": _PROVIDER_LABELS[method_id],
+            "country": item["country"],
+            "currency": item["currency"],
+            "route_shape": item["route_shape"],
+            "recommendation": item["recommendation"],
+        })
+    return methods
 
 
-def initial_cookie_header(session_cookie: str, device_id: str) -> str:
-    raw_cookie = str(session_cookie or "").strip()
-    if raw_cookie and "=" not in raw_cookie.split(";", 1)[0]:
-        return f"oai-did={device_id}; __Secure-next-auth.session-token={raw_cookie}"
-    filtered = filter_payment_cookie_header(raw_cookie)
-    if not filtered:
-        return f"oai-did={device_id}"
-    return replace_cookie_value(filtered, "oai-did", device_id)
+def validate_provider(value: str) -> str:
+    """Validate a local PAY.153 provider identifier without UI aliases."""
+    provider = str(value or "").strip().lower()
+    if provider not in PAY153_LOCAL_LINK_TYPES:
+        raise ValueError("Unsupported PAY.153 payment method")
+    if provider == "upi" and not _upi_enabled():
+        raise ValueError("UPI checkout binary is not available")
+    return provider
 
 
-def merged_cookie_header(cookie_header: str, cookies: Any) -> str:
-    values: dict[str, str] = {}
-    for item in str(cookie_header or "").split(";"):
-        name, separator, value = item.strip().partition("=")
-        if separator and name:
-            values[name] = value
+def local_method_strategy(provider_name: str, attempt: int) -> str:
+    """Select the PAY.153 local-method submission shape for one fresh checkout."""
+    provider = validate_provider(provider_name)
+    strategies = _LOCAL_METHOD_STRATEGIES.get(provider)
+    if not strategies:
+        return "standalone"
+    index = max(0, int(attempt) - 1) % len(strategies)
+    return strategies[index]
+
+
+def _decode_jwt(token: str) -> dict[str, Any]:
     try:
-        for name, value in cookies.items():
-            if name:
-                values[str(name)] = str(value)
-    except Exception:
-        pass
-    return "; ".join(f"{name}={value}" for name, value in values.items())
-
-
-def refresh_cookie_header(session: Any, fallback: str = "") -> None:
-    headers = getattr(session, "headers", None)
-    if headers is None:
-        return
-    cookie_header = filter_payment_cookie_header(
-        merged_cookie_header(
-            fallback or str(headers.get("Cookie") or ""),
-            getattr(session, "cookies", None),
-        )
-    )
-    if cookie_header:
-        headers["Cookie"] = cookie_header
-
-
-def sync_cookies(target: Any, source: Any) -> None:
-    if target is source:
-        refresh_cookie_header(target)
-        return
-    try:
-        target.cookies.update(source.cookies)
-    except Exception:
-        pass
-    refresh_cookie_header(target, str(getattr(source, "headers", {}).get("Cookie") or ""))
-
-
-def normalize_proxy_url(proxy: str) -> str:
-    proxy = str(proxy or "").strip()
-    if not proxy:
-        return ""
-    if "://" in proxy:
-        return proxy
-    parts = proxy.split(":", 3)
-    if len(parts) == 4 and parts[1].isdigit() and "@" not in proxy:
-        host, port, username, password = parts
-        return (
-            f"http://{quote(username, safe='-._~')}:"
-            f"{quote(password, safe='-._~')}@{host}:{port}"
-        )
-    return f"http://{proxy}"
-
-
-def new_proxy_session_id() -> str:
-    return str(random.randint(10_000_000, 99_999_999))
-
-
-def cliproxy_proxy_url(
-    host: str,
-    username: str,
-    password: str,
-    country: str,
-    session_id: str = "",
-) -> str:
-    host = re.sub(r"^https?://", "", str(host or "").strip()).strip("/")
-    username = str(username or "").strip()
-    password = str(password or "").strip()
-    country = str(country or "").strip().upper()
-    if not host or not username or not password:
-        raise ExtractorError(
-            "Cliproxy host, username and password are required unless both stage proxies are supplied"
-        )
-    if not re.fullmatch(r"[A-Z]{2}", country):
-        raise ExtractorError("Cliproxy country must be a two-letter code")
-    username_base = re.split(r"-region-[A-Za-z]{2}", username, maxsplit=1)[0]
-    routed_username = (
-        f"{username_base}-region-{country}-sid-{session_id or new_proxy_session_id()}"
-    )
-    return (
-        f"http://{quote(routed_username, safe='-._~')}:"
-        f"{quote(password, safe='-._~')}@{host}"
-    )
-
-
-def rotate_proxy_session(proxy: str, country: str) -> str:
-    proxy = normalize_proxy_url(proxy)
-    if not proxy:
-        return proxy
-    parsed = urlsplit(proxy)
-    username = unquote(parsed.username or "")
-    password = unquote(parsed.password or "")
-    hostname = parsed.hostname or ""
-    if not username or not password or not hostname:
-        return proxy
-    rotated_username = re.sub(
-        r"region-[A-Za-z]{2}", f"region-{country.upper()}", username
-    )
-    if re.search(r"sid-[A-Za-z0-9]+", rotated_username):
-        rotated_username = re.sub(
-            r"sid-[A-Za-z0-9]+", f"sid-{new_proxy_session_id()}", rotated_username
-        )
-    elif re.search(r"region-[A-Za-z]{2}", rotated_username):
-        rotated_username += f"-sid-{new_proxy_session_id()}"
-    else:
-        return proxy
-    host = f"[{hostname}]" if ":" in hostname and not hostname.startswith("[") else hostname
-    if parsed.port:
-        host = f"{host}:{parsed.port}"
-    netloc = (
-        f"{quote(rotated_username, safe='-._~')}:"
-        f"{quote(password, safe='-._~')}@{host}"
-    )
-    return urlunsplit((parsed.scheme or "http", netloc, parsed.path, parsed.query, parsed.fragment))
-
-
-def set_proxy(session: Any, proxy: str) -> None:
-    proxy = normalize_proxy_url(proxy)
-    session.proxies = {"http": proxy, "https": proxy} if proxy else {}
-
-
-def safe_close(session: Any) -> None:
-    if session is None:
-        return
-    try:
-        session.close()
-    except Exception:
-        pass
-
-
-def money_minor_units(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, dict):
-        for key in ("minorUnitsAmount", "minor_units_amount", "amount"):
-            if value.get(key) is not None:
-                return money_minor_units(value.get(key))
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
-        return int(value.strip())
-    return None
-
-
-def nested_value(payload: Any, path: tuple[str, ...]) -> Any:
-    current = payload
-    for key in path:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
-
-
-def checkout_amount_minor(data: Any) -> int | None:
-    wrapper_keys = (
-        "checkout_session",
-        "checkoutSession",
-        "session",
-        "checkout",
-        "data",
-        "result",
-        "payload",
-        "response",
-        "checkout_state",
-        "checkoutState",
-        "checkout_snapshot",
-        "checkoutSnapshot",
-    )
-    amount_paths = (
-        ("checkout_amount_minor",),
-        ("total_summary", "due"),
-        ("totalSummary", "due"),
-        ("invoice", "amount_due"),
-        ("invoice", "amountDue"),
-        ("amount_due",),
-        ("amountDue",),
-        ("amount_total",),
-        ("amountTotal",),
-        ("total", "total"),
-        ("total", "due"),
-        ("total", "taxInclusive"),
-        ("total", "taxInclusiveAmount"),
-    )
-    visited: set[int] = set()
-
-    def find(payload: Any) -> int | None:
-        if not isinstance(payload, dict) or id(payload) in visited:
-            return None
-        visited.add(id(payload))
-        for path in amount_paths:
-            amount = money_minor_units(nested_value(payload, path))
-            if amount is not None:
-                return amount
-        line_items = payload.get("lineItems") or payload.get("line_items")
-        if isinstance(line_items, list):
-            total = 0
-            found = False
-            for item in line_items:
-                if not isinstance(item, dict):
-                    continue
-                for key in ("total", "subtotal", "unitAmount", "unit_amount"):
-                    amount = money_minor_units(item.get(key))
-                    if amount is not None:
-                        total += amount
-                        found = True
-                        break
-            if found:
-                return total
-        for key in wrapper_keys:
-            amount = find(payload.get(key))
-            if amount is not None:
-                return amount
-        return None
-
-    return find(data)
-
-
-def checkout_currency(data: Any) -> str:
-    visited: set[int] = set()
-
-    def find(payload: Any) -> str:
-        if not isinstance(payload, dict) or id(payload) in visited:
-            return ""
-        visited.add(id(payload))
-        for key in ("currency", "currency_code", "currencyCode"):
-            value = payload.get(key)
-            if isinstance(value, str) and re.fullmatch(r"[A-Za-z]{3}", value.strip()):
-                return value.strip().upper()
-        for key in (
-            "checkout_state",
-            "checkoutState",
-            "checkout_snapshot",
-            "checkoutSnapshot",
-            "checkout_session",
-            "checkoutSession",
-            "session",
-            "checkout",
-            "data",
-            "result",
-            "payload",
-            "response",
-            "total",
-            "total_summary",
-            "totalSummary",
-        ):
-            value = find(payload.get(key))
-            if value:
-                return value
-        return ""
-
-    return find(data)
-
-
-def decode_react_router_payload(payload: Any) -> Any:
-    if not isinstance(payload, list):
-        return None
-    resolved: dict[int, Any] = {}
-
-    def resolve(reference: Any, depth: int = 0) -> Any:
-        if depth > 256:
-            return None
-        if not isinstance(reference, int):
-            return reference
-        if reference < 0 or reference >= len(payload):
-            return None
-        if reference in resolved:
-            return resolved[reference]
-        value = payload[reference]
-        if isinstance(value, dict):
-            output: dict[str, Any] = {}
-            resolved[reference] = output
-            for encoded_key, encoded_value in value.items():
-                key_text = str(encoded_key)
-                if not key_text.startswith("_") or not key_text[1:].isdigit():
-                    continue
-                key = resolve(int(key_text[1:]), depth + 1)
-                if key is not None:
-                    output[str(key)] = resolve(encoded_value, depth + 1)
-            return output
-        if isinstance(value, list):
-            output_list: list[Any] = []
-            resolved[reference] = output_list
-            output_list.extend(resolve(item, depth + 1) for item in value)
-            return output_list
-        resolved[reference] = value
-        return value
-
-    return resolve(0)
-
-
-def checkout_state_from_html(html: str) -> dict[str, Any]:
-    visited: set[int] = set()
-
-    def find_state(payload: Any, depth: int = 0) -> dict[str, Any]:
-        if depth > 256:
-            return {}
-        if isinstance(payload, (dict, list)):
-            identity = id(payload)
-            if identity in visited:
-                return {}
-            visited.add(identity)
-        if isinstance(payload, dict):
-            for key in ("checkout_state", "checkoutState"):
-                state = payload.get(key)
-                if isinstance(state, dict):
-                    return state
-            for value in payload.values():
-                state = find_state(value, depth + 1)
-                if state:
-                    return state
-            if checkout_amount_minor(payload) is not None and any(
-                key in payload
-                for key in ("total", "total_summary", "totalSummary", "lineItems", "line_items")
-            ):
-                return payload
-        elif isinstance(payload, list):
-            for value in payload:
-                state = find_state(value, depth + 1)
-                if state:
-                    return state
+        part = token.split(".")[1]
+        part += "=" * ((4 - len(part) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(part.encode("ascii")).decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
         return {}
 
-    def state_from_serialized(serialized: str) -> dict[str, Any]:
+
+def extract_access_token(raw: str) -> tuple[str, dict[str, Any]]:
+    """Parse the stored account token exactly as PAY.153 accepts it."""
+    source = str(raw or "").strip()
+    if not source:
+        raise ValueError("Access token is empty")
+    token = ""
+    metadata: dict[str, Any] = {}
+    if source.startswith("{"):
         try:
-            decoded: Any = json.loads(serialized)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return {}
-        if isinstance(decoded, list):
-            state = find_state(decode_react_router_payload(decoded))
-            if state:
-                return state
-        return find_state(decoded)
-
-    enqueue_pattern = re.compile(
-        r'window\.__reactRouterContext\.streamController\.enqueue\(("(?:\\.|[^"\\])*")\)',
-        re.DOTALL,
-    )
-    chunks: list[str] = []
-    for match in enqueue_pattern.finditer(str(html or "")):
+            payload = json.loads(source)
+        except json.JSONDecodeError as exc:
+            raise ValueError("Access token JSON is invalid") from exc
+        if isinstance(payload, dict):
+            token = str(payload.get("accessToken") or payload.get("access_token") or "")
+            account = payload.get("account")
+            if isinstance(account, dict):
+                metadata.update(account)
+    if not token:
+        match = re.search(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", source)
+        token = match.group(0) if match else source.splitlines()[0].strip()
+    if token.count(".") < 2:
+        raise ValueError("Access token format is not recognized")
+    claims = _decode_jwt(token)
+    metadata.update({
+        "email": claims.get("email") or metadata.get("email") or "",
+        "exp": claims.get("exp"),
+        "account_id": (claims.get("https://api.openai.com/auth") or {}).get("chatgpt_account_id")
+        or metadata.get("id") or "",
+    })
+    expiry = metadata.get("exp")
+    if expiry:
         try:
-            raw_payload = json.loads(match.group(1))
-        except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-        if not isinstance(raw_payload, str):
-            continue
-        chunks.append(raw_payload)
-        state = state_from_serialized(raw_payload)
-        if state:
-            return state
-    if len(chunks) > 1:
-        state = state_from_serialized("".join(chunks))
-        if state:
-            return state
-    application_json_pattern = re.compile(
-        r"<script\b[^>]*\btype=(['\"])application/json\1[^>]*>(.*?)</script>",
-        re.IGNORECASE | re.DOTALL,
-    )
-    for match in application_json_pattern.finditer(str(html or "")):
-        state = state_from_serialized(html_unescape(match.group(2)).strip())
-        if state:
-            return state
-    return {}
+            expired = int(expiry) <= int(time.time())
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Access token expiry is invalid") from exc
+        if expired:
+            raise ValueError("Access token has expired")
+    return token, metadata
 
 
-def payload_has_invalid_promotion(
-    payload: Any, visited: set[int] | None = None, depth: int = 0
-) -> bool:
-    if depth > 256:
-        return False
-    if visited is None:
-        visited = set()
-    if isinstance(payload, (dict, list)):
-        identity = id(payload)
-        if identity in visited:
-            return False
-        visited.add(identity)
-    if isinstance(payload, dict):
-        return any(
-            payload_has_invalid_promotion(value, visited, depth + 1)
-            for value in payload.values()
+def _checkout_currency(country: str, requested_currency: str) -> str:
+    value = str(requested_currency or "").upper()
+    if value in _OPENAI_CHECKOUT_CURRENCIES:
+        return value
+    fallback = stripe_checkout.currency_for_country(country)
+    return fallback if fallback in _OPENAI_CHECKOUT_CURRENCIES else "USD"
+
+
+def _sentinel_headers(proxy: str | None, flow: str, device_id: str, did: str) -> dict[str, str]:
+    """Use Turb's Sentinel runner with PAY.153's checkout request sequence."""
+    from core.sentinel import build_sentinel_request_body, generate_requirements_token
+    from core.sentinel_runner import generate_sentinel_token
+
+    sentinel_sid = str(uuid.uuid4())
+    http = stripe_checkout.build_http(proxy)
+    try:
+        response = http.post(
+            "https://sentinel.openai.com/backend-api/sentinel/req",
+            data=build_sentinel_request_body(generate_requirements_token(sentinel_sid), device_id, flow),
+            headers={
+                "Content-Type": "text/plain;charset=UTF-8",
+                "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+                "User-Agent": stripe_checkout.CHROME_UA,
+            },
+            timeout=45,
         )
-    if isinstance(payload, list):
-        return any(
-            payload_has_invalid_promotion(value, visited, depth + 1)
-            for value in payload
-        )
-    return isinstance(payload, str) and payload.strip().lower() == "invalid_promotion"
-
-
-def extract_processor_entity(
-    payload: Any, visited: set[int] | None = None, depth: int = 0
-) -> str:
-    if depth > 128:
-        return ""
-    if not isinstance(payload, dict):
-        return ""
-    if visited is None:
-        visited = set()
-    identity = id(payload)
-    if identity in visited:
-        return ""
-    visited.add(identity)
-    direct = payload.get("processor_entity") or payload.get("processorEntity")
-    if direct:
-        return str(direct).strip()
-    for key in ("checkout_session", "checkoutSession", "session", "checkout", "data"):
-        found = extract_processor_entity(payload.get(key), visited, depth + 1)
-        if found:
-            return found
-    return ""
-
-
-def processor_entity_for_country(country: str, processor_entity: str = "") -> str:
-    if str(processor_entity or "").strip():
-        return str(processor_entity).strip()
-    return "openai_llc" if str(country or "").upper() == "US" else "openai_ie"
-
-
-def checkout_short_url(cs_id: str, country: str, processor_entity: str = "") -> str:
-    entity = processor_entity_for_country(country, processor_entity)
-    return f"https://chatgpt.com/checkout/{entity}/{cs_id}"
-
-
-def is_retryable_network_error(exc: Exception) -> bool:
-    retryable_names = {"ReadTimeout", "ConnectTimeout", "ConnectionError", "Timeout", "SSLError"}
-    if any(item.__name__ in retryable_names for item in type(exc).mro()):
-        return True
-    text = str(exc).lower()
-    return any(
-        marker in text
-        for marker in (
-            "read timed out",
-            "connect timed out",
-            "connection aborted",
-            "proxy connect aborted",
-            "curl: (56)",
-            "unexpected_eof",
-            "eof occurred in violation of protocol",
-            "max retries exceeded",
-        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Sentinel request HTTP {response.status_code}")
+        challenge = response.json()
+        if not isinstance(challenge, dict):
+            raise TypeError("Sentinel returned an invalid challenge")
+    finally:
+        try:
+            http.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
+    token_text = generate_sentinel_token(
+        challenge=challenge,
+        flow=flow,
+        device_id=device_id,
+        user_agent=stripe_checkout.CHROME_UA,
+        page_url="https://chatgpt.com/",
+        sentinel_sid=sentinel_sid,
+        cookie=f"oai-did={did}",
     )
+    headers = {"OpenAI-Sentinel-Token": token_text}
+    try:
+        token_payload = json.loads(token_text)
+        so_value = token_payload.get("so") if isinstance(token_payload, dict) else ""
+        if so_value:
+            headers["OpenAI-Sentinel-SO-Token"] = json.dumps({
+                "so": so_value,
+                "c": token_payload.get("c") or challenge.get("token") or "",
+                "id": device_id,
+                "flow": flow,
+            }, separators=(",", ":"))
+    except (TypeError, ValueError):
+        pass
+    return headers
 
 
-def response_error(response: Any, prefix: str) -> UpstreamError:
-    status = int(getattr(response, "status_code", 0) or 0)
-    headers = getattr(response, "headers", {}) or {}
-    content_type = str(headers.get("content-type") or "")
-    server = str(headers.get("server") or "")
-    body = str(getattr(response, "text", "") or "")
-    lowered = body[:4000].lower()
-    is_html = "html" in content_type.lower() or body.lstrip().lower().startswith(("<!doctype", "<html"))
-    cloudflare = status == 403 and (
-        "challenge-platform" in lowered
-        or "__cf$cv$params" in lowered
-        or "cloudflare" in server.lower()
-        or is_html
-    )
-    if is_html:
-        title_match = re.search(r"<title[^>]*>(.*?)</title>", body, re.IGNORECASE | re.DOTALL)
-        detail = re.sub(r"\s+", " ", title_match.group(1)).strip() if title_match else "HTML verification page"
+def _checkout_payload(provider: str, country: str, currency: str, campaign_id: str) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "entry_point": "all_plans_pricing_modal",
+        "plan_name": "chatgptplusplan",
+        "billing_details": {"country": country, "currency": currency},
+        "cancel_url": "https://chatgpt.com/",
+        "checkout_ui_mode": "redirect" if provider == "hosted" else "custom",
+        "check_card_proxy": True,
+    }
+    if provider not in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"}:
+        payload["promo_campaign"] = {
+            "promo_campaign_id": campaign_id,
+            "is_coupon_from_query_param": False,
+        }
+    return payload
+
+
+def _create_checkout(
+    token: str,
+    payload: dict[str, Any],
+    proxy: str | None,
+    device_id: str,
+    did: str,
+    log: Callable[[str], None],
+) -> tuple[dict[str, Any], Any]:
+    http = stripe_checkout.build_http(proxy)
+    try:
+        http.cookies.set("oai-did", did, domain="chatgpt.com")
+        http.get(
+            "https://chatgpt.com/api/auth/csrf",
+            headers={"User-Agent": stripe_checkout.CHROME_UA, "Accept": "application/json,text/plain,*/*"},
+            timeout=20,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"Checkout warmup note: {type(exc).__name__}")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://chatgpt.com",
+        "Referer": "https://chatgpt.com/",
+        "User-Agent": stripe_checkout.CHROME_UA,
+        "OAI-Language": "en-US",
+        "OAI-Device-Id": device_id,
+        **_sentinel_headers(proxy, "chatgpt_checkout", device_id, did),
+    }
+    response = http.post(stripe_checkout.OPENAI_CHECKOUT_URL, json=payload, headers=headers, timeout=60)
+    text = response.text or ""
+    if response.status_code != 200:
+        raise RuntimeError(f"OpenAI Checkout HTTP {response.status_code}: {text[:300]}")
+    try:
+        data = response.json()
+    except Exception as exc:
+        raise RuntimeError("OpenAI Checkout returned non-JSON") from exc
+    if not isinstance(data, dict):
+        raise TypeError("OpenAI Checkout returned an invalid payload")
+    raw_session_id = "\n".join((str(data.get("checkout_session_id") or ""), str(data.get("url") or ""), text))
+    direct_session_id = str(data.get("checkout_session_id") or "").strip()
+    direct_match = re.fullmatch(r"(?:oaics_[A-Za-z0-9_-]+|cs_(?:live|test)_[A-Za-z0-9_-]+)", direct_session_id)
+    stripe_match = re.search(r"cs_(?:live|test)_[A-Za-z0-9_-]+", raw_session_id)
+    custom_match = re.search(r"oaics_[A-Za-z0-9_-]+", raw_session_id)
+    session_ids: dict[str, str] = {}
+    if stripe_match:
+        session_ids["stripe"] = stripe_match.group(0)
+    if custom_match:
+        session_ids["custom"] = custom_match.group(0)
+    if session_ids:
+        data["checkout_session_ids"] = session_ids
+        if "stripe" in session_ids:
+            data["stripe_checkout_session_id"] = session_ids["stripe"]
+        if "custom" in session_ids:
+            data["custom_checkout_session_id"] = session_ids["custom"]
+    prefer_custom = str(payload.get("checkout_ui_mode") or "").strip().lower() == "custom"
+    if direct_match:
+        session_id = direct_match.group(0)
+    elif prefer_custom and custom_match:
+        session_id = custom_match.group(0)
+    elif stripe_match:
+        session_id = stripe_match.group(0)
+    elif custom_match:
+        session_id = custom_match.group(0)
     else:
-        detail = re.sub(r"\s+", " ", body).strip()[:300] or "empty response"
-    return UpstreamError(
-        status,
-        f"{prefix}: HTTP {status}; {detail}",
-        retryable=status in RETRYABLE_STATUSES,
-        cloudflare=cloudflare,
-    )
+        session_id = ""
+
+    if session_id.startswith("cs_"):
+        data["checkout_session_id"] = session_id
+        data["checkout_url"] = _normalize_hosted_url(str(data.get("url") or ""), session_id)
+    elif session_id.startswith("oaics_"):
+        processor = str(data.get("processor_entity") or "openai_ie").strip() or "openai_ie"
+        data.update({
+            "checkout_session_id": session_id,
+            "processor_entity": processor,
+            "is_custom_checkout": True,
+            "checkout_url": f"https://chatgpt.com/checkout/{processor}/{session_id}",
+        })
+    else:
+        raise RuntimeError("Checkout did not return a session ID")
+    return data, http
 
 
-class CheckoutExtractor:
-    def __init__(
-        self,
-        credentials: Credentials,
-        config: ExtractorConfig | None = None,
-        *,
-        session_factory: Callable[[], Any] | None = None,
-        sleeper: Callable[[float], None] = time.sleep,
-        logger: Callable[[str], None] | None = None,
-    ) -> None:
-        self.credentials = credentials
-        self.config = config or ExtractorConfig()
-        self.config.validate()
-        if session_factory is None:
-            if CurlSession is None:
-                raise ExtractorError(
-                    'curl_cffi is required; install it with: python -m pip install "curl_cffi>=0.15.0"'
-                )
-            session_factory = lambda: CurlSession(impersonate="firefox144")
-        self.session_factory = session_factory
-        self.sleep = sleeper
-        self.log = logger or (lambda message: print(message, file=sys.stderr, flush=True))
-        self.device_id = cookie_header_value(credentials.session_cookie, "oai-did") or str(uuid.uuid4())
-        self.chatgpt_session_id = str(uuid.uuid4())
+def _normalize_hosted_url(url: str, session_id: str) -> str:
+    value = str(url or "").strip() or f"https://pay.openai.com/c/pay/{session_id}"
+    if value.startswith("https://checkout.stripe.com/c/pay/"):
+        return "https://pay.openai.com" + value[len("https://checkout.stripe.com"):]
+    return value
 
-    def _new_identity_session(self, proxy: str) -> Any:
-        session = self.session_factory()
-        if hasattr(session, "trust_env"):
-            session.trust_env = False
-        session.headers.update(
-            {
-                "User-Agent": self.config.user_agent,
-                "Accept": "*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Authorization": f"Bearer {self.credentials.access_token}",
+
+def _preflight_campaign(
+    token: str,
+    account_id: str,
+    proxy: str | None,
+    device_id: str,
+    did: str,
+    log: Callable[[str], None],
+) -> str:
+    if not account_id:
+        return ""
+    http = stripe_checkout.build_http(proxy)
+    try:
+        http.cookies.set("oai-did", did, domain="chatgpt.com")
+        response = http.get(
+            "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
                 "Origin": "https://chatgpt.com",
                 "Referer": "https://chatgpt.com/",
-                "Content-Type": "application/json",
-                "oai-device-id": self.device_id,
-                "oai-language": "en-US",
-                "oai-session-id": self.chatgpt_session_id,
-                "oai-client-version": DEFAULT_CLIENT_VERSION,
-                "oai-client-build-number": DEFAULT_CLIENT_BUILD,
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-                "Cookie": initial_cookie_header(self.credentials.session_cookie, self.device_id),
-            }
+                "OAI-Device-Id": device_id,
+                "ChatGPT-Account-ID": account_id,
+            },
+            timeout=35,
         )
-        set_proxy(session, proxy)
-        return session
-
-    def _clone_session(self, source: Any, proxy: str) -> Any:
-        session = self.session_factory()
-        if hasattr(session, "trust_env"):
-            session.trust_env = False
-        session.headers.update(dict(getattr(source, "headers", {})))
+        if response.status_code != 200:
+            log(f"Promotion catalog HTTP {response.status_code}")
+            return ""
+        payload = response.json()
+        accounts = payload.get("accounts") if isinstance(payload, dict) else {}
+        account = accounts.get(account_id) or accounts.get("default") or {}
+        campaign = ((account.get("eligible_promo_campaigns") or {}).get("plus") or {})
+        campaign_id = str(campaign.get("id") or campaign.get("campaign_id") or "").strip()
+        if campaign_id:
+            log("Account promotion catalog matched a Plus campaign")
+        return campaign_id
+    except Exception as exc:  # noqa: BLE001
+        log(f"Promotion catalog note: {type(exc).__name__}")
+        return ""
+    finally:
         try:
-            session.cookies.update(source.cookies)
-        except Exception:
+            http.close()
+        except Exception:  # noqa: BLE001, S110
             pass
-        refresh_cookie_header(session, str(getattr(source, "headers", {}).get("Cookie") or ""))
-        set_proxy(session, proxy)
-        return session
 
-    def _stage_proxies(self) -> tuple[str, str]:
-        checkout_proxy = normalize_proxy_url(self.config.checkout_proxy)
-        update_proxy = normalize_proxy_url(self.config.update_proxy)
-        if not checkout_proxy and not update_proxy and not (
-            str(self.config.cliproxy_host or "").strip()
-            and str(self.config.cliproxy_username or "").strip()
-            and str(self.config.cliproxy_password or "").strip()
-        ):
-            return "", ""
-        if not checkout_proxy:
-            checkout_proxy = cliproxy_proxy_url(
-                self.config.cliproxy_host,
-                self.config.cliproxy_username,
-                self.config.cliproxy_password,
-                self.config.checkout_proxy_country,
-            )
-        if not update_proxy:
-            update_proxy = cliproxy_proxy_url(
-                self.config.cliproxy_host,
-                self.config.cliproxy_username,
-                self.config.cliproxy_password,
-                self.config.update_proxy_country,
-            )
-        return checkout_proxy, update_proxy
 
-    def _probe_country(self, proxy: str, expected_country: str) -> None:
-        session = self.session_factory()
-        try:
-            set_proxy(session, proxy)
-            response = session.get(TRACE_URL, timeout=min(self.config.timeout, 12.0))
-            if int(getattr(response, "status_code", 0) or 0) >= 400:
-                raise response_error(response, "proxy country probe")
-            fields = dict(
-                line.split("=", 1)
-                for line in str(getattr(response, "text", "") or "").splitlines()
-                if "=" in line
-            )
-            observed = str(fields.get("loc") or "").upper()
-            if observed != expected_country:
-                raise ExtractorError(
-                    f"proxy country mismatch: expected {expected_country}, observed {observed or 'unknown'}"
-                )
-        finally:
-            safe_close(session)
-
-    def _preflight(self, checkout_proxy: str, update_proxy: str) -> None:
-        if not self.config.verify_proxy_country:
-            return
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            checkout_future = executor.submit(
-                self._probe_country, checkout_proxy, self.config.checkout_proxy_country
-            )
-            update_future = executor.submit(
-                self._probe_country, update_proxy, self.config.update_proxy_country
-            )
-            checkout_future.result()
-            update_future.result()
-        self.log(
-            f"Proxy check passed: checkout={self.config.checkout_proxy_country}, "
-            f"update={self.config.update_proxy_country}."
-        )
-
-    def _create_checkout(self, session: Any) -> dict[str, Any]:
-        refresh_cookie_header(session)
-        body = {
-            "entry_point": "all_plans_pricing_modal",
-            "plan_name": self.config.plan_name,
-            "billing_details": {
-                "country": self.config.billing_country,
-                "currency": self.config.currency,
-            },
-            "checkout_ui_mode": self.config.checkout_ui_mode,
-        }
-        response = session.post(
-            CHECKOUT_URL,
-            json=body,
-            headers={
-                "Referer": "https://chatgpt.com/",
-                "x-openai-target-path": "/backend-api/payments/checkout",
-                "x-openai-target-route": "/backend-api/payments/checkout",
-            },
-            timeout=self.config.timeout,
-        )
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
-            try:
-                error_payload = response.json() or {}
-            except Exception:
-                error_payload = {}
-            if str(error_payload.get("detail") or "") == "User is already paid":
-                raise UpstreamError(400, "the account is already paid and cannot create a Plus checkout")
-            raise response_error(response, "checkout create failed")
-        try:
-            payload = response.json() or {}
-        except Exception as exc:
-            raise UpstreamError(502, "checkout create returned invalid JSON", retryable=True) from exc
-        cs_id = payload.get("checkout_session_id") or payload.get("session_id") or payload.get("id")
-        cs_id = str(cs_id or "").strip()
-        if not cs_id.startswith(("oaics_", "cs_")):
-            raise UpstreamError(502, "checkout response did not contain a supported session id")
-        return {
-            "cs_id": cs_id,
-            "processor_entity": extract_processor_entity(payload),
-            "billing_country": self.config.billing_country,
-            "currency": self.config.currency,
-            "checkout_amount_minor": checkout_amount_minor(payload),
-            "customer_session_client_secret": str(payload.get("customer_session_client_secret") or ""),
-            "publishable_key": str(payload.get("publishable_key") or ""),
-        }
-
-    def _create_checkout_with_retry(self, checkout_proxy: str) -> tuple[Any, dict[str, Any]]:
-        session = self._new_identity_session(checkout_proxy)
-        current_proxy = checkout_proxy
-        cloudflare_failures = 0
-        exit_rotated = False
-        last_error: Exception | None = None
-        for attempt in range(1, self.config.checkout_attempts + 1):
-            self.log(f"Checkout attempt {attempt}/{self.config.checkout_attempts}.")
-            try:
-                return session, self._create_checkout(session)
-            except UpstreamError as exc:
-                last_error = exc
-                if not exc.retryable or attempt >= self.config.checkout_attempts:
-                    safe_close(session)
-                    raise
-                if exc.cloudflare:
-                    cloudflare_failures += 1
-                    if cloudflare_failures >= self.config.cf_same_identity_attempts and not exit_rotated:
-                        rotated = rotate_proxy_session(current_proxy, self.config.checkout_proxy_country)
-                        if rotated != current_proxy:
-                            current_proxy = rotated
-                            set_proxy(session, current_proxy)
-                            cloudflare_failures = 0
-                            exit_rotated = True
-                            self.log("Checkout CF retries exhausted; rotated the proxy exit once.")
-                    if self.config.cf_retry_delay > 0:
-                        self.sleep(self.config.cf_retry_delay)
-            except Exception as exc:
-                last_error = exc
-                if not is_retryable_network_error(exc) or attempt >= self.config.checkout_attempts:
-                    safe_close(session)
-                    raise ExtractorError(f"checkout network error: {exc}") from exc
-        safe_close(session)
-        raise ExtractorError(f"checkout retries exhausted: {last_error}")
-
-    def _update_promotion(
-        self,
-        checkout_session: Any,
-        checkout: dict[str, Any],
-        checkout_proxy: str,
-        update_proxy: str,
-    ) -> dict[str, Any]:
-        processor_entity = processor_entity_for_country(
-            checkout["billing_country"], checkout.get("processor_entity", "")
-        )
-        body = {
-            "checkout_session_id": checkout["cs_id"],
-            "processor_entity": processor_entity,
-            "plan_name": self.config.plan_name,
+def _update_promotion(
+    http: Any,
+    token: str,
+    session_id: str,
+    processor: str,
+    campaign_id: str,
+    device_id: str,
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    response = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/update",
+        json={
+            "checkout_session_id": session_id,
+            "processor_entity": processor,
+            "plan_name": "chatgptplusplan",
             "price_interval": "month",
             "seat_quantity": 1,
+            "discount_code": None,
             "promo_campaign": {
-                "promo_campaign_id": self.config.promo_campaign_id,
+                "promo_campaign_id": campaign_id,
                 "is_coupon_from_query_param": False,
             },
-        }
-        headers = {
-            "Referer": checkout_short_url(
-                checkout["cs_id"], checkout["billing_country"], processor_entity
-            ),
-            "x-openai-target-path": UPDATE_PATH,
-            "x-openai-target-route": UPDATE_PATH,
-        }
-        same_session = normalize_proxy_url(checkout_proxy) == normalize_proxy_url(update_proxy)
-        session = checkout_session if same_session else self._clone_session(checkout_session, update_proxy)
-        owns_session = not same_session
-        current_proxy = update_proxy
-        cloudflare_failures = 0
-        exit_rotated = False
-        try:
-            for attempt in range(1, self.config.update_attempts + 1):
-                self.log(f"Promotion update attempt {attempt}/{self.config.update_attempts}.")
-                try:
-                    refresh_cookie_header(session)
-                    response = session.post(
-                        f"https://chatgpt.com{UPDATE_PATH}",
-                        json=body,
-                        headers=headers,
-                        timeout=self.config.timeout,
-                    )
-                except Exception as exc:
-                    if not is_retryable_network_error(exc) or attempt >= self.config.update_attempts:
-                        raise ExtractorError(f"promotion update network error: {exc}") from exc
-                    current_proxy = rotate_proxy_session(
-                        current_proxy, self.config.update_proxy_country
-                    )
-                    if owns_session:
-                        safe_close(session)
-                    session = self._clone_session(checkout_session, current_proxy)
-                    owns_session = True
-                    continue
-                if int(getattr(response, "status_code", 0) or 0) >= 400:
-                    error = response_error(response, "checkout/update failed")
-                    if not error.retryable or attempt >= self.config.update_attempts:
-                        raise error
-                    if error.cloudflare:
-                        cloudflare_failures += 1
-                        if cloudflare_failures >= self.config.cf_same_identity_attempts and not exit_rotated:
-                            rotated = rotate_proxy_session(
-                                current_proxy, self.config.update_proxy_country
-                            )
-                            if rotated != current_proxy:
-                                current_proxy = rotated
-                                set_proxy(session, current_proxy)
-                                cloudflare_failures = 0
-                                exit_rotated = True
-                                self.log("Update CF retries exhausted; rotated the proxy exit once.")
-                        if self.config.cf_retry_delay > 0:
-                            self.sleep(self.config.cf_retry_delay)
-                    else:
-                        current_proxy = rotate_proxy_session(
-                            current_proxy, self.config.update_proxy_country
-                        )
-                        if owns_session:
-                            safe_close(session)
-                        session = self._clone_session(checkout_session, current_proxy)
-                        owns_session = True
-                    continue
-                try:
-                    payload = response.json() or {}
-                except Exception as exc:
-                    raise UpstreamError(502, "checkout/update returned invalid JSON") from exc
-                if payload_has_invalid_promotion(payload):
-                    raise InvalidPromotionError("checkout/update returned invalid_promotion")
-                if payload.get("success") is False:
-                    raise UpstreamError(502, "checkout/update explicitly rejected the promotion")
-                sync_cookies(checkout_session, session)
-                return payload
-            raise ExtractorError("promotion update retries exhausted")
-        finally:
-            if owns_session:
-                safe_close(session)
-
-    def _page_amount(self, session: Any, checkout: dict[str, Any]) -> tuple[int | None, str]:
-        refresh_cookie_header(session)
-        response = session.get(
-            checkout_short_url(
-                checkout["cs_id"],
-                checkout["billing_country"],
-                checkout.get("processor_entity", ""),
-            ),
-            headers={"Referer": "https://chatgpt.com/"},
-            timeout=self.config.timeout,
-        )
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
-            raise response_error(response, "checkout page amount query failed")
-        state = checkout_state_from_html(str(getattr(response, "text", "") or ""))
-        return checkout_amount_minor(state), checkout_currency(state) or self.config.currency
-
-    def _require_customer_session(
-        self,
-        checkout_session: Any,
-        checkout: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Require a CustomerSession so the checkout can redisplay saved cards."""
-        initial_secret = str(checkout.get("customer_session_client_secret") or "")
-        if initial_secret.startswith("cuss_secret_"):
-            self.log("Checkout initial response includes CustomerSession for saved-card display.")
-            return checkout
-        processor = processor_entity_for_country(
-            checkout["billing_country"], checkout.get("processor_entity", "")
-        )
-        session_id = checkout["cs_id"]
-        path = f"/backend-api/payments/checkout/{processor}/{session_id}"
-        refresh_cookie_header(checkout_session)
-        response = checkout_session.get(
-            f"https://chatgpt.com{path}",
-            headers={
-                "Referer": checkout_short_url(
-                    session_id, checkout["billing_country"], processor
-                ),
-                "x-openai-target-path": path,
-                "x-openai-target-route": path,
-            },
-            timeout=self.config.timeout,
-        )
-        if int(getattr(response, "status_code", 0) or 0) >= 400:
-            raise response_error(response, "checkout CustomerSession query failed")
-        try:
-            state = response.json() or {}
-        except Exception as exc:
-            raise CustomerSessionMissingError(
-                "Checkout did not return a readable CustomerSession"
-            ) from exc
-        customer_secret = str(state.get("customer_session_client_secret") or "")
-        if not customer_secret.startswith("cuss_secret_"):
-            country = str(checkout.get("billing_country") or "").upper()
-            if country in {"US", "GB"} or self.config.allow_missing_customer_session:
-                self.log("Checkout created without CustomerSession; returning the first cs_live link without rebuilding.")
-                checkout["saved_card_ready"] = False
-                return state
-            raise CustomerSessionMissingError(
-                f"Checkout {session_id[:12]} has no CustomerSession; rebuilding for saved-card display"
-            )
-        checkout["saved_card_ready"] = True
-        self.log("Checkout CustomerSession is ready for saved-card display.")
-        return state
-
-    def _verify_amount(
-        self,
-        checkout_session: Any,
-        checkout: dict[str, Any],
-        update_payload: dict[str, Any],
-    ) -> tuple[str, int | None, str]:
-        amount = checkout_amount_minor(update_payload)
-        currency = checkout_currency(update_payload) or self.config.currency
-        if amount is None:
-            try:
-                amount, currency = self._page_amount(checkout_session, checkout)
-            except UpstreamError as exc:
-                self.log(f"Amount page probe was unavailable ({exc.status_code}); returning pending.")
-                amount = None
-        if amount is None:
-            return "pending", None, currency
-        if not self.config.apply_promo:
-            return ("verified_zero" if amount == 0 else "verified_nonzero"), amount, currency
-        if amount != 0:
-            raise NonZeroAmountError(
-                f"promotion did not produce a zero checkout: amount_minor={amount} {currency}"
-            )
-        return "verified_zero", 0, currency
-
-    def extract(self) -> CheckoutResult:
-        last_promotion_error: InvalidPromotionError | None = None
-        for full_attempt in range(1, self.config.full_attempts + 1):
-            checkout_session = None
-            checkout_proxy, update_proxy = self._stage_proxies()
-            try:
-                self.log(f"Full checkout flow {full_attempt}/{self.config.full_attempts}.")
-                self._preflight(checkout_proxy, update_proxy)
-                checkout_session, checkout = self._create_checkout_with_retry(checkout_proxy)
-                self.log(f"Checkout created: {checkout['cs_id'][:12]}...")
-                if self.config.apply_promo:
-                    update_payload = self._update_promotion(
-                        checkout_session, checkout, checkout_proxy, update_proxy
-                    )
-                else:
-                    self.log("Promotion update skipped by request; preserving the original Checkout amount.")
-                    update_payload = checkout
-                verification, amount, amount_currency = self._verify_amount(
-                    checkout_session, checkout, update_payload
-                )
-                self._require_customer_session(checkout_session, checkout)
-                if str(os.getenv("TURB_PAY153_PERSIST_CONTEXT", "")).strip().lower() in {
-                    "1", "true", "yes", "on",
-                }:
-                    persist_private_checkout_context(
-                        checkout_session, checkout, checkout_proxy,
-                        self.device_id, self.chatgpt_session_id, self.config.user_agent,
-                    )
-                return CheckoutResult(
-                    ok=True,
-                    long_url=checkout_short_url(
-                        checkout["cs_id"],
-                        checkout["billing_country"],
-                        checkout.get("processor_entity", ""),
-                    ),
-                    cs_id=checkout["cs_id"],
-                    processor_entity=processor_entity_for_country(
-                        checkout["billing_country"], checkout.get("processor_entity", "")
-                    ),
-                    billing_country=self.config.billing_country,
-                    currency=self.config.currency,
-                    payment_locale=self.config.payment_locale,
-                    amount_verification=verification,
-                    amount_minor=amount,
-                    amount_currency=amount_currency,
-                    device_id=self.device_id,
-                    chatgpt_session_id=self.chatgpt_session_id,
-                    user_agent=self.config.user_agent,
-                    publishable_key=(
-                        str(checkout.get("publishable_key") or "").strip()
-                        or find_value(update_payload, ("publishable_key", "public_key", "stripe_publishable_key"))
-                    ),
-                )
-            except (InvalidPromotionError, CustomerSessionMissingError) as exc:
-                last_promotion_error = exc
-                if full_attempt >= self.config.full_attempts:
-                    raise
-                if isinstance(exc, CustomerSessionMissingError):
-                    self.log("Checkout has no CustomerSession; discarding it and rebuilding the full flow.")
-                else:
-                    self.log("Promotion was invalid; discarding this checkout and rebuilding the full flow.")
-            finally:
-                safe_close(checkout_session)
-        raise last_promotion_error or ExtractorError("checkout flow did not return a result")
-
-
-def read_credential_input(args: argparse.Namespace) -> str:
-    if args.credential:
-        return str(args.credential)
-    if args.credential_file:
-        if args.credential_file == "-":
-            if sys.stdin.isatty():
-                return getpass.getpass("Access token or session JSON: ")
-            return sys.stdin.read()
-        try:
-            return Path(args.credential_file).expanduser().read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ExtractorError(f"cannot read credential file: {exc}") from exc
-    if not sys.stdin.isatty():
-        return sys.stdin.read()
-    return getpass.getpass("Access token or session JSON: ")
-
-
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Create a PH/PHP ChatGPT checkout short link through US checkout and TR update proxies."
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
+            "User-Agent": stripe_checkout.CHROME_UA,
+            "OAI-Device-Id": device_id,
+            "x-openai-target-path": "/backend-api/payments/checkout/update",
+            "x-openai-target-route": "/backend-api/payments/checkout/update",
+        },
+        timeout=45,
     )
-    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    parser.add_argument("--credential-file", default="", help="token/session JSON file, or '-' for stdin")
-    parser.add_argument(
-        "--credential",
-        default="",
-        help="raw token/session JSON (less secure than --credential-file)",
-    )
-    parser.add_argument("--session-cookie", default="", help="optional ChatGPT payment cookie header")
-    parser.add_argument(
-        "--cliproxy-host",
-        default=os.getenv("CLIPROXY_HOST", os.getenv("OPENAI_PAY_CLIPROXY_HOST", "127.0.0.1:19010")),
-    )
-    parser.add_argument("--cliproxy-username", default=os.getenv("CLIPROXY_USERNAME", ""))
-    parser.add_argument("--cliproxy-password", default=os.getenv("CLIPROXY_PASSWORD", ""))
-    parser.add_argument("--checkout-proxy", default="", help="explicit proxy; overrides Cliproxy for checkout")
-    parser.add_argument("--update-proxy", default="", help="explicit proxy; overrides Cliproxy for update")
-    parser.add_argument("--billing-country", default="PH")
-    parser.add_argument("--currency", default="PHP")
-    parser.add_argument("--checkout-proxy-country", default="US")
-    parser.add_argument("--update-proxy-country", default="TR")
-    parser.add_argument("--payment-locale", default="en")
-    parser.add_argument("--plan-name", default="chatgptplusplan")
-    parser.add_argument("--promo-campaign-id", default="plus-1-month-free")
-    parser.add_argument("--timeout", type=float, default=45.0)
-    parser.add_argument("--checkout-attempts", type=int, default=10)
-    parser.add_argument("--update-attempts", type=int, default=15)
-    parser.add_argument("--full-attempts", type=int, default=3)
-    parser.add_argument("--cf-same-identity-attempts", type=int, default=5)
-    parser.add_argument("--cf-retry-delay", type=float, default=3.0)
-    parser.add_argument("--skip-proxy-check", action="store_true")
-    parser.add_argument("--pretty", action="store_true", help="pretty-print JSON output")
-    return parser
-
-
-def config_from_args(args: argparse.Namespace) -> ExtractorConfig:
-    return ExtractorConfig(
-        billing_country=str(args.billing_country).upper(),
-        currency=str(args.currency).upper(),
-        payment_locale=str(args.payment_locale),
-        checkout_proxy_country=str(args.checkout_proxy_country).upper(),
-        update_proxy_country=str(args.update_proxy_country).upper(),
-        cliproxy_host=str(args.cliproxy_host),
-        cliproxy_username=str(args.cliproxy_username),
-        cliproxy_password=str(args.cliproxy_password),
-        checkout_proxy=str(args.checkout_proxy),
-        update_proxy=str(args.update_proxy),
-        plan_name=str(args.plan_name),
-        promo_campaign_id=str(args.promo_campaign_id),
-        timeout=float(args.timeout),
-        checkout_attempts=int(args.checkout_attempts),
-        update_attempts=int(args.update_attempts),
-        full_attempts=int(args.full_attempts),
-        cf_same_identity_attempts=int(args.cf_same_identity_attempts),
-        cf_retry_delay=max(0.0, float(args.cf_retry_delay)),
-        verify_proxy_country=not bool(args.skip_proxy_check),
-    )
-
-
-def print_json(payload: dict[str, Any], pretty: bool) -> None:
-    print(
-        json.dumps(
-            payload,
-            ensure_ascii=False,
-            indent=2 if pretty else None,
-            separators=None if pretty else (",", ":"),
-        )
-    )
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = build_argument_parser()
-    args = parser.parse_args(argv)
+    text = response.text or ""
+    log(f"Promotion update: HTTP {response.status_code}")
+    if response.status_code != 200:
+        raise RuntimeError(f"Promotion update HTTP {response.status_code}: {text[:300]}")
     try:
-        credentials = parse_credentials(read_credential_input(args), args.session_cookie)
-        result = CheckoutExtractor(credentials, config_from_args(args)).extract()
-        print_json(asdict(result), args.pretty)
-        return 0
-    except (ExtractorError, UpstreamError) as exc:
-        print_json(
-            {
-                "ok": False,
-                "error_type": type(exc).__name__,
-                "error": str(exc),
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _approve_checkout(
+    token: str,
+    session_id: str,
+    processor: str,
+    proxy: str | None,
+    device_id: str,
+    did: str,
+    http: Any,
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    response = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/approve",
+        json={"checkout_session_id": session_id, "processor_entity": processor},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
+            "OAI-Device-Id": device_id,
+            "User-Agent": stripe_checkout.CHROME_UA,
+            "x-openai-target-path": "/backend-api/payments/checkout/approve",
+            "x-openai-target-route": "/backend-api/payments/checkout/approve",
+            **_sentinel_headers(proxy, "checkout_session_approval", device_id, did),
+        },
+        timeout=45,
+    )
+    text = response.text or ""
+    log(f"Checkout approval: HTTP {response.status_code}")
+    if response.status_code != 200:
+        raise RuntimeError(f"Checkout approval HTTP {response.status_code}: {text[:300]}")
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if isinstance(payload, dict) and str(payload.get("result") or "").lower() not in {"", "approved"}:
+        raise RuntimeError("Checkout approval was not accepted")
+    return payload if isinstance(payload, dict) else {}
+
+
+def _custom_checkout_state(http: Any, token: str, session_id: str, processor: str, device_id: str) -> dict[str, Any]:
+    response = http.get(
+        f"https://chatgpt.com/backend-api/payments/checkout/{processor}/{session_id}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
+            "User-Agent": stripe_checkout.CHROME_UA,
+            "OAI-Device-Id": device_id,
+        },
+        timeout=45,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Custom checkout read HTTP {response.status_code}: {(response.text or '')[:300]}")
+    payload = response.json()
+    return payload if isinstance(payload, dict) else {}
+
+
+def _custom_checkout_taxes(
+    http: Any,
+    token: str,
+    session_id: str,
+    processor: str,
+    billing: dict[str, Any],
+    currency: str,
+    device_id: str,
+) -> dict[str, Any]:
+    address = dict(billing.get("address") or {})
+    response = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/taxes",
+        json={
+            "checkout_session_id": session_id,
+            "checkout_email": str(billing.get("email") or ""),
+            "billing_country": str(address.get("country") or "PH").upper(),
+            "billing_name": str(billing.get("name") or ""),
+            "currency": str(currency or "PHP").upper(),
+            "tax_id": str(billing.get("tax_id") or "") or None,
+            "processor_entity": processor,
+            "billing_address": {
+                "country": str(address.get("country") or "PH").upper(),
+                "line1": str(address.get("line1") or ""),
+                "line2": str(address.get("line2") or ""),
+                "city": str(address.get("city") or ""),
+                "state": str(address.get("state") or ""),
+                "postal_code": str(address.get("postal_code") or ""),
             },
-            args.pretty,
+        },
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
+            "User-Agent": stripe_checkout.CHROME_UA,
+            "OAI-Device-Id": device_id,
+            "x-openai-target-path": "/backend-api/payments/checkout/taxes",
+            "x-openai-target-route": "/backend-api/payments/checkout/taxes",
+        },
+        timeout=50,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Custom checkout tax update HTTP {response.status_code}: {(response.text or '')[:300]}")
+    payload = response.json()
+    checkout = payload.get("checkout_session") if isinstance(payload, dict) else {}
+    return checkout if isinstance(checkout, dict) else {}
+
+
+def _custom_confirm_and_start(
+    http: Any,
+    token: str,
+    session_id: str,
+    processor: str,
+    method_id: str,
+    proxy: str | None,
+    device_id: str,
+    did: str,
+) -> dict[str, Any]:
+    confirm = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/confirm",
+        json={"checkout_session_id": session_id, "selected_payment_method_type": method_id},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
+            "User-Agent": stripe_checkout.CHROME_UA,
+            "OAI-Device-Id": device_id,
+            "x-openai-target-path": "/backend-api/payments/checkout/confirm",
+            "x-openai-target-route": "/backend-api/payments/checkout/confirm",
+            **_sentinel_headers(proxy, "checkout_session_approval", device_id, did),
+        },
+        timeout=50,
+    )
+    if confirm.status_code != 200:
+        raise RuntimeError(f"Custom checkout confirm HTTP {confirm.status_code}: {(confirm.text or '')[:300]}")
+    confirmed = confirm.json()
+    if not isinstance(confirmed, dict) or str(confirmed.get("status") or "").lower() != "success":
+        raise RuntimeError("Custom checkout payment method was not accepted")
+    start = http.post(
+        "https://chatgpt.com/backend-api/payments/checkout/custom_payment_method/start",
+        json={"checkout_session_id": session_id, "custom_payment_method_type_id": method_id},
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Origin": "https://chatgpt.com",
+            "Referer": f"https://chatgpt.com/checkout/{processor}/{session_id}",
+            "User-Agent": stripe_checkout.CHROME_UA,
+            "OAI-Device-Id": device_id,
+            "x-openai-target-path": "/backend-api/payments/checkout/custom_payment_method/start",
+            "x-openai-target-route": "/backend-api/payments/checkout/custom_payment_method/start",
+        },
+        timeout=60,
+    )
+    if start.status_code != 200:
+        raise RuntimeError(f"Custom checkout start HTTP {start.status_code}: {(start.text or '')[:300]}")
+    payload = start.json()
+    action = payload.get("next_action") if isinstance(payload, dict) else {}
+    if str(payload.get("status") or "").lower() != "requires_action" or not isinstance(action, dict):
+        raise RuntimeError("Custom checkout did not return a payment action")
+    return {"confirmed": confirmed, "started": payload}
+
+
+def _custom_momo_methods(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the MoMo custom method without selecting another local rail."""
+    methods = [
+        item
+        for item in state.get("custom_payment_methods") or []
+        if isinstance(item, dict) and str(item.get("id") or "").startswith("cpmt_")
+    ]
+    matched = [item for item in methods if "momo" in json.dumps(item).lower()]
+    if matched:
+        return matched
+    return methods if len(methods) == 1 else []
+
+
+def _custom_action_material(action: dict[str, Any], provider: str) -> dict[str, Any]:
+    """Normalize a custom-checkout action using the existing provider parser."""
+    material = provider_checkout.extract_provider_result({"next_action": action}, provider)
+    direct_url = str(action.get("url") or action.get("redirect_url") or "").strip()
+    if direct_url and not material.get("provider_redirect_url"):
+        material["provider_redirect_url"] = direct_url
+    return material
+
+
+def _run_custom_provider(
+    provider: str,
+    token: str,
+    session_id: str,
+    processor: str,
+    country: str,
+    currency: str,
+    proxy: str | None,
+    device_id: str,
+    did: str,
+    http: Any,
+    promo_http: Any,
+    campaign_id: str,
+    email: str,
+) -> dict[str, Any]:
+    if provider not in {"gcash", "paypal", "momo"}:
+        raise RuntimeError(f"CUSTOM_CHECKOUT_REBUILD_REQUIRED: received {session_id}; {provider} requires a Stripe cs_* checkout")
+    state = _custom_checkout_state(http, token, session_id, processor, device_id)
+    amount = checkout_amount_minor(state)
+    actual_currency = checkout_currency(state) or currency
+    if amount not in {None, 0}:
+        _update_promotion(promo_http, token, session_id, processor, campaign_id, device_id, lambda _message: None)
+        state = _custom_checkout_state(http, token, session_id, processor, device_id)
+        amount = checkout_amount_minor(state)
+        actual_currency = checkout_currency(state) or actual_currency
+    billing_country = "PH" if provider == "gcash" else country
+    billing = provider_checkout.default_billing(
+        billing_country,
+        email,
+        real_random=provider in {"paypal", "gcash"},
+    )
+    taxed = _custom_checkout_taxes(http, token, session_id, processor, billing, actual_currency, device_id)
+    if taxed:
+        state = taxed
+        amount = checkout_amount_minor(state)
+        actual_currency = checkout_currency(state) or actual_currency
+    methods = [item for item in state.get("custom_payment_methods") or [] if isinstance(item, dict)]
+    if provider == "paypal":
+        methods.sort(key=lambda item: 0 if "paypal" in json.dumps(item).lower() else 1)
+    methods = [item for item in methods if str(item.get("id") or "").startswith("cpmt_")]
+    if provider == "momo":
+        methods = _custom_momo_methods(state)
+        for method_poll in range(1, 4):
+            if methods:
+                break
+            time.sleep(0.8 * method_poll)
+            state = _custom_checkout_state(http, token, session_id, processor, device_id)
+            methods = _custom_momo_methods(state)
+    if not methods:
+        raise RuntimeError(f"{provider.upper()} custom payment method is not available")
+    selected_method = methods[0]
+    custom: dict[str, Any] = {}
+    action: dict[str, Any] = {}
+    redirect = ""
+    payment_material: dict[str, Any] = {}
+    for method in methods:
+        custom = _custom_confirm_and_start(http, token, session_id, processor, str(method["id"]), proxy, device_id, did)
+        action = custom["started"].get("next_action") or {}
+        payment_material = _custom_action_material(action, provider)
+        candidate = str(payment_material.get("provider_redirect_url") or "")
+        action_type = str(action.get("paymentMethodType") or "").lower()
+        has_qr = any(payment_material.get(key) for key in ("qr_data", "qr_image_png", "qr_image_svg"))
+        if provider == "momo" and not (candidate or has_qr):
+            continue
+        if provider != "paypal" or "paypal" in candidate.lower() or "paypal" in action_type:
+            selected_method = method
+            redirect = candidate
+            break
+    if provider == "momo" and not (redirect or any(payment_material.get(key) for key in ("qr_data", "qr_image_png", "qr_image_svg"))):
+        raise RuntimeError("MOMO custom checkout returned no redirect or QR payment material")
+    if provider != "momo" and not redirect:
+        raise RuntimeError(f"{provider.upper()} custom checkout returned no redirect")
+    if amount not in {None, 0}:
+        raise RuntimeError(f"{provider.upper()} promotion is not applied: amount={amount} {actual_currency}")
+    result = {
+        "provider": provider,
+        "provider_redirect_url": redirect,
+        "checkout_url": redirect,
+        "short_link": redirect,
+        "custom_payment_method_id": str(selected_method["id"]),
+        "payment_method_type": str(action.get("paymentMethodType") or provider),
+        "checkout_amount": amount,
+        "checkout_currency": actual_currency,
+        "amount_verification": "verified_zero" if amount == 0 else "pending",
+        "promo_applied": amount == 0 if amount is not None else None,
+        "expires_at": payment_material.get("expires_at") or int(time.time()) + 1800,
+    }
+    for key in ("qr_data", "qr_image_png", "qr_image_svg"):
+        if payment_material.get(key):
+            result[key] = payment_material[key]
+    return result
+
+
+def _run_hosted_checkout(
+    token: str,
+    checkout: dict[str, Any],
+    http: Any,
+    proxy: str | None,
+    device_id: str,
+    country: str,
+    currency: str,
+    campaign_id: str,
+    email: str,
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    session_id = str(checkout.get("checkout_session_id") or "")
+    processor = str(checkout.get("processor_entity") or "openai_llc")
+    if checkout.get("is_custom_checkout"):
+        update = _update_promotion(http, token, session_id, processor, campaign_id, device_id, log)
+        amount = checkout_amount_minor(update)
+        return {
+            "checkout_url": str(checkout.get("checkout_url") or ""),
+            "short_link": str(checkout.get("checkout_url") or ""),
+            "checkout_amount": amount,
+            "checkout_currency": checkout_currency(update) or currency,
+            "amount_verification": "verified_zero" if amount == 0 else "pending",
+            "promo_applied": amount == 0 if amount is not None else None,
+        }
+    profile = stripe_checkout._profile(country)
+    hosted_http = stripe_checkout.build_http(proxy)
+    publishable_key = str(checkout.get("publishable_key") or "") or stripe_checkout.verify_pk(hosted_http, session_id, log)
+    _, version, context = stripe_checkout.init_checkout(hosted_http, session_id, publishable_key, profile, log)
+    amount = context.get("checkout_amount")
+    if amount not in {0, "0", "0.0", "0.00"}:
+        _update_promotion(http, token, session_id, processor, campaign_id, device_id, log)
+        _, version, context = stripe_checkout.init_checkout(hosted_http, session_id, publishable_key, profile, log)
+        amount = context.get("checkout_amount")
+    billing = provider_checkout.default_billing(country, email)
+    stripe_checkout.update_tax_region(hosted_http, session_id, publishable_key, version, context, billing, profile, log)
+    amount = context.get("checkout_amount")
+    if amount not in {0, "0", "0.0", "0.00"}:
+        raise RuntimeError(f"Hosted Checkout promotion is not applied: amount={amount}")
+    hosted_url = _normalize_hosted_url(str(context.get("stripe_hosted_url") or checkout.get("checkout_url") or ""), session_id)
+    return {
+        "checkout_url": hosted_url,
+        "short_link": hosted_url,
+        "checkout_amount": amount,
+        "checkout_currency": str(context.get("currency") or currency).upper(),
+        "payment_method_types": context.get("payment_method_types") or [],
+        "processor_entity": processor,
+        "stripe_publishable_key": publishable_key,
+        "amount_verification": "verified_zero",
+        "promo_applied": True,
+    }
+
+
+def run_provider_checkout(
+    raw_token: str,
+    provider_name: str,
+    *,
+    entry_proxy: str | None,
+    payment_proxy: str | None,
+    promotion_proxy: str | None,
+    local_method_strategy: str = "standalone",
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    """Run PAY.153's direct provider flow and return its normalized result."""
+    provider = validate_provider(provider_name)
+    token, metadata = extract_access_token(raw_token)
+    policy = provider_policy(provider)
+    country = policy.country
+    currency = _checkout_currency(country, policy.currency)
+    device_id = str(uuid.uuid4())
+    did = str(uuid.uuid4())
+    campaign_id = _preflight_campaign(token, str(metadata.get("account_id") or ""), promotion_proxy or entry_proxy, device_id, did, log)
+    campaign_id = campaign_id or "plus-1-month-free"
+    checkout_proxy = payment_proxy if provider in {"paypal", "upi", "ideal", "twint"} else entry_proxy
+    checkout, chatgpt_http = _create_checkout(
+        token,
+        _checkout_payload(provider, country, currency, campaign_id),
+        checkout_proxy,
+        device_id,
+        did,
+        log,
+    )
+    session_id = str(checkout.get("checkout_session_id") or "")
+    processor = str(checkout.get("processor_entity") or "openai_llc")
+    result: dict[str, Any] = {
+        "plan": "plus",
+        "link_type": provider,
+        "checkout_session_id": session_id,
+        "stripe_checkout_session_id": checkout.get("stripe_checkout_session_id"),
+        "custom_checkout_session_id": checkout.get("custom_checkout_session_id"),
+        "checkout_session_ids": checkout.get("checkout_session_ids") or {},
+        "checkout_url": str(checkout.get("checkout_url") or ""),
+        "processor_entity": processor,
+        "account_email": str(metadata.get("email") or ""),
+        "account_id": str(metadata.get("account_id") or ""),
+        "country": country,
+        "currency": currency,
+        "checkout_country": country,
+        "checkout_currency": currency,
+        "proxy_mode": policy.route_shape,
+        "promo_requested": True,
+        "promo_campaign_used": campaign_id,
+    }
+    try:
+        if provider == "hosted":
+            result.update(_run_hosted_checkout(token, checkout, chatgpt_http, entry_proxy, device_id, country, currency, campaign_id, str(metadata.get("email") or ""), log))
+            return result
+        if session_id.startswith("oaics_"):
+            promo_http = stripe_checkout.build_http(promotion_proxy or entry_proxy)
+            result.update(_run_custom_provider(provider, token, session_id, processor, country, currency, checkout_proxy, device_id, did, chatgpt_http, promo_http, campaign_id, str(metadata.get("email") or "")))
+            return result
+        if provider == "upi":
+            from core.pay153_upi_go_runner import run_upi
+
+            go_result = run_upi(
+                token=token,
+                proxy=payment_proxy or entry_proxy or "",
+                provider_proxy=payment_proxy or "",
+                promotion_proxy=promotion_proxy or entry_proxy or "",
+                billing=provider_checkout.default_billing("IN", str(metadata.get("email") or "")),
+                log=log,
+            )
+            result.update(go_result)
+            return result
+        promo_http = chatgpt_http if provider in {"pix", "momo"} else stripe_checkout.build_http(promotion_proxy or entry_proxy)
+        provider_http = stripe_checkout.build_http(payment_proxy or entry_proxy)
+
+        def apply_promo(active_processor: str) -> dict[str, Any]:
+            return _update_promotion(promo_http, token, session_id, active_processor, campaign_id, device_id, log)
+
+        def approve(active_processor: str) -> dict[str, Any]:
+            return _approve_checkout(token, session_id, active_processor, checkout_proxy, device_id, did, chatgpt_http, log)
+
+        billing = provider_checkout.default_billing(
+            country,
+            str(metadata.get("email") or ""),
+            real_random=provider in {"paypal", "gcash"},
         )
-        return 1
-    except KeyboardInterrupt:
-        print_json({"ok": False, "error_type": "Cancelled", "error": "cancelled"}, args.pretty)
-        return 130
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+        provider_result = provider_checkout.stripe_to_provider(
+            provider_http,
+            session_id,
+            provider,
+            billing=billing,
+            country=country,
+            chatgpt_http=chatgpt_http,
+            access_token=token,
+            stage1=checkout,
+            approve_callback=None if provider == "paypal" else approve,
+            # PAY.153 carries Kakao's Plus campaign on Checkout creation;
+            # its original workflow does not issue a second checkout/update.
+            apply_promo_callback=(
+                apply_promo
+                if provider in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"}
+                else None
+            ),
+            require_zero_due=True,
+            local_method_strategy=local_method_strategy,
+            log=log,
+        )
+        result.update(provider_result)
+        if provider_result.get("checkout_currency"):
+            result["currency"] = str(provider_result["checkout_currency"]).upper()
+            result["checkout_currency"] = result["currency"]
+        return result
+    finally:
+        try:
+            chatgpt_http.close()
+        except Exception:  # noqa: BLE001, S110
+            pass

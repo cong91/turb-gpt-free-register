@@ -234,7 +234,7 @@ curl http://localhost:5000/api/gmail-api-url/summary
 **Client Behavior:**
 - `code=0` → Return OTP immediately
 - `code=601` → Continue polling (up to timeout)
-- `code=602` → Mark email as `failed`, throw exception
+- `code=602` → Mark email as `failed`; only if this is the first response of a purchased QAN8 source (no earlier `601`, other code, or OTP), request after-sales, then throw exception
 - Other codes → Treat as error
 
 ---
@@ -289,7 +289,7 @@ curl http://localhost:5000/api/gmail-api-url/pool?status=failed
 |----------|----------|--------------|
 | Pool empty | Exception: "No gmail_api_url email available" | N/A |
 | Poll timeout (60s) | Exception: "Verification timeout" | Auto-released → `available` |
-| Provider error (602) | Exception: "Provider error, refund required" | `failed` |
+| Provider error (602) | Exception: "Provider error, refund required"; QAN8 purchase UID is sent to after-sales only when the first code-URL response is 602 and no prior response/OTP was observed | `failed` |
 | HTTP error | Exception with error details | Auto-released → `available` |
 | User abandons | Auto-released after session | `available` |
 

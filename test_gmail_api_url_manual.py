@@ -5,12 +5,39 @@ Kiểm tra thủ công toàn bộ luồng: import → claim → poll OTP → rel
 """
 import json
 import sys
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 # Thêm project root vào path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from core import db, email_provider, gmail_api_url_client
+from core import (
+    db,
+    email_provider,
+    gmail_api_url_batch_coordinator,
+    gmail_api_url_client,
+)
+
+
+@contextmanager
+def isolated_runtime():
+    """Keep this manual fixture out of the project-wide runtime store."""
+    with tempfile.TemporaryDirectory(prefix="turb-gmail-api-manual-") as temp_dir:
+        root = Path(temp_dir)
+        sqlite_path = root / "turb.sqlite3"
+        with (
+            patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", root / "gmail-pool.json"),
+            patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", root / "gmail-pool.txt"),
+            patch.object(db, "_SQLITE_PATH", sqlite_path),
+            patch.object(db, "_DEFAULT_SQLITE_PATH", sqlite_path),
+            patch.object(db, "_SQLITE_READY", False),
+            patch.object(db, "_SQLITE_READY_PATH", None),
+            patch.object(gmail_api_url_batch_coordinator, "_BATCH_STORE_PATH", sqlite_path),
+            patch.object(gmail_api_url_batch_coordinator, "_batch_store_instance", None),
+        ):
+            yield
 
 
 def print_section(title: str):
@@ -231,7 +258,7 @@ def test_11_cleanup():
     return True
 
 
-def main():
+def _main_impl():
     """Chạy toàn bộ test suite"""
     print("\n" + "🚀 " * 30)
     print("   GMAIL API URL EMAIL PROVIDER - MANUAL INTEGRATION TEST")
@@ -287,6 +314,11 @@ def main():
     print(f"{'='*60}\n")
     
     return passed == total
+
+
+def main():
+    with isolated_runtime():
+        return _main_impl()
 
 
 if __name__ == "__main__":

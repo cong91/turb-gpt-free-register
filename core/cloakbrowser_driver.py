@@ -399,19 +399,71 @@ class BrowserSeleniumDriver:
     def execute_async_script(self, script: str, *args: Any) -> Any:
         return self._evaluate(script, args=args, async_mode=True)
 
-    def get_chatgpt_auth_session(self) -> dict | None:
+    def get_chatgpt_auth_session(self, *, timeout_ms: int | None = None) -> dict | None:
         """Read the session through Playwright's cookie-sharing request client."""
         request = getattr(self.context, "request", None)
         if request is None:
             return None
+        try:
+            request_timeout_ms = (
+                max(1, int(timeout_ms)) if timeout_ms is not None else self._script_timeout_ms
+            )
+        except (TypeError, ValueError):
+            request_timeout_ms = self._script_timeout_ms
         response = request.get(
             "https://chatgpt.com/api/auth/session",
-            timeout=self._script_timeout_ms,
+            timeout=request_timeout_ms,
         )
         if int(getattr(response, "status", 0) or 0) != 200:
             return None
         payload = response.json()
         return payload if isinstance(payload, dict) else None
+
+    def read_auth_flow_state(self, *, timeout_ms: int = 400) -> dict:
+        """Observe auth selectors and body text without returning a JS handle."""
+        wait_timeout = max(1, int(timeout_ms))
+        deadline = time.monotonic() + wait_timeout / 1000
+        body_text = ""
+        try:
+            body_timeout = max(1, min(wait_timeout, 100))
+            body_text = str(self.page.locator("body").inner_text(timeout=body_timeout) or "")
+        except Exception as exc:
+            message = str(exc or "").lower()
+            if "timeout" not in message and not _is_navigation_context_error(exc):
+                raise
+        selectors = (
+            (
+                "otp",
+                (
+                    "input[name='code'],input[name='otp'],input[autocomplete='one-time-code'],"
+                    "input[inputmode='numeric'],input[type='tel'],input[maxlength='1'],"
+                    "input[data-index],input[aria-label*='code' i],input[placeholder*='code' i]"
+                ),
+            ),
+            (
+                "password",
+                "input[type='password'],input[name*='password' i],input[autocomplete='new-password']",
+            ),
+        )
+        for state, selector in selectors:
+            remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            try:
+                handle = self.page.wait_for_selector(
+                    selector,
+                    state="visible",
+                    timeout=min(wait_timeout, remaining_ms),
+                )
+            except Exception as exc:
+                message = str(exc or "").lower()
+                if "timeout" in message or _is_navigation_context_error(exc):
+                    continue
+                raise
+            try:
+                handle.dispose()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[Cloak] auth selector handle cleanup skipped: %s", type(exc).__name__)
+            return {"state": state, "body_text": body_text}
+        return {"state": None, "body_text": body_text}
 
     def execute_cdp_cmd(self, cmd: str, params: dict | None = None) -> Any:
         params = params or {}
@@ -485,10 +537,10 @@ class BrowserSeleniumDriver:
     def _evaluate(self, script: str, args: tuple[Any, ...], async_mode: bool) -> Any:
         first_el, serial_args = self._serialize_args(args)
         if async_mode:
-            wrapper = """async ({script, args}) => {
+            wrapper = """async ({script, args, timeoutMs}) => {
               return await new Promise((resolve) => {
                 const fn = new Function(...args.map((_, i) => 'a' + i), '__cloak_done', script);
-                const timer = setTimeout(() => resolve({__cloak_timeout:true}), 120000);
+                const timer = setTimeout(() => resolve({__cloak_timeout:true}), timeoutMs);
                 const __cloak_done = (v) => { clearTimeout(timer); resolve(v); };
                 try { fn(...args, __cloak_done); } catch (e) { clearTimeout(timer); resolve({ok:false, error:String(e)}); }
               });
@@ -497,16 +549,21 @@ class BrowserSeleniumDriver:
               const args = [el, ...payload.args];
               return await new Promise((resolve) => {
                 const fn = new Function(...args.map((_, i) => 'a' + i), '__cloak_done', payload.script);
-                const timer = setTimeout(() => resolve({__cloak_timeout:true}), 120000);
+                const timer = setTimeout(() => resolve({__cloak_timeout:true}), payload.timeoutMs);
                 const __cloak_done = (v) => { clearTimeout(timer); resolve(v); };
                 try { fn(...args, __cloak_done); } catch (e) { clearTimeout(timer); resolve({ok:false, error:String(e)}); }
               });
             }"""
+            payload = {
+                "script": script,
+                "args": serial_args,
+                "timeoutMs": max(1, int(self._script_timeout_ms)),
+            }
             try:
                 if first_el is not None:
-                    result = first_el._eval(element_wrapper, {"script": script, "args": serial_args})
+                    result = first_el._eval(element_wrapper, payload)
                 else:
-                    result = self.page.evaluate(wrapper, {"script": script, "args": serial_args})
+                    result = self.page.evaluate(wrapper, payload)
             except Exception as exc:
                 if _is_navigation_context_error(exc):
                     logger.info("[Cloak] 异步 JS 执行期间页面发生跳转，忽略本次临时结果")

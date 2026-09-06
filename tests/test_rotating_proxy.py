@@ -229,6 +229,35 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertEqual(second.proxy_url, first.proxy_url)
         self.assertEqual(client.get_calls, ["key-1"])
 
+    def test_force_refresh_skips_cached_proxy_for_one_account_registration(self):
+        client = _FakeRotatingProxyClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        first = manager.acquire(0)
+        manager.retire(0, proxy_url=first.proxy_url)
+        second = manager.acquire(0, force_refresh=True)
+
+        self.assertNotEqual(first.proxy_url, second.proxy_url)
+        self.assertEqual(client.get_calls, ["key-1", "key-1"])
+
+    def test_force_refresh_waits_for_provider_cooldown_instead_of_reusing_previous_proxy(self):
+        client = _CooldownAfterHealthFailureClient(
+            [{"key": "key-1", "expires_at": 1000.0}]
+        )
+        manager = self._manager(client)
+
+        with patch("core.rotating_proxy_manager.time.sleep") as sleep:
+            first = manager.acquire(0)
+            manager.retire(0, proxy_url=first.proxy_url)
+            second = manager.acquire(0, force_refresh=True)
+
+        self.assertNotEqual(first.proxy_url, second.proxy_url)
+        sleep.assert_called_once_with(23)
+        self.assertEqual(
+            client.get_calls,
+            ["purchased-1", "purchased-1", "purchased-1", "purchased-1"],
+        )
+
     def test_provider_cooldown_waits_and_reuses_key_without_purchase(self):
         client = _CooldownAfterHealthFailureClient(
             [{"key": "key-1", "expires_at": 1000.0}]
@@ -729,6 +758,7 @@ class RotatingProxyConfigTests(unittest.TestCase):
 
         for key in (
             "ROTATING_PROXY_ENABLED",
+            "ROTATING_PROXY_ONE_ACCOUNT_PER_IP",
             "ROTATING_PROXY_API_KEY",
             "ROTATING_PROXY_PROTOCOL",
             "ROTATING_PROXY_NHAMANG",
@@ -770,6 +800,112 @@ class RotatingProxyConfigTests(unittest.TestCase):
             lane_id=3,
             proxy_url=lease.proxy_url,
         )
+
+    def test_one_account_registration_mode_retires_proxy_and_forces_single_worker(self):
+        import main
+        from core import registration_service
+
+        lease = Mock(proxy_url="http://203.0.113.21:8080", lane_id=0, proxy_expires_at=200.0)
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+            proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True
+        ), patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", "roxy"), patch(
+            "core.rotating_proxy_manager.get_rotating_proxy_manager"
+        ) as get_manager, patch(
+            "core.roxy_registration.run_roxy_registration",
+            return_value={"success": True},
+        ) as run_roxy, patch(
+            "core.rotating_proxy_runtime.retire_rotating_proxy",
+        ) as retire_proxy:
+            get_manager.return_value.acquire.return_value = lease
+            result = main.run_registration(
+                "user@example.com",
+                "Test User",
+                "1990-01-01",
+                proxy_lane_id=0,
+            )
+
+        self.assertTrue(result["success"])
+        get_manager.return_value.acquire.assert_called_once_with(0, force_refresh=True)
+        self.assertEqual(run_roxy.call_args.kwargs["proxy"], lease.proxy_url)
+        retire_proxy.assert_called_once_with(
+            scope="registration",
+            lane_id=0,
+            proxy_url=lease.proxy_url,
+        )
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+            proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True
+        ), patch.object(registration_service, "_normalize_workers", return_value=8):
+            self.assertEqual(registration_service.effective_registration_workers(8), 1)
+
+    def test_one_account_registration_failure_releases_proxy_for_retry(self):
+        import main
+
+        lease = Mock(proxy_url="http://203.0.113.22:8080", lane_id=0, proxy_expires_at=200.0)
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+            proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True
+        ), patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", "roxy"), patch(
+            "core.rotating_proxy_manager.get_rotating_proxy_manager"
+        ) as get_manager, patch(
+            "core.roxy_registration.run_roxy_registration",
+            return_value={"success": False, "error": "temporary registration failure"},
+        ), patch(
+            "core.rotating_proxy_runtime.release_rotating_proxy",
+        ) as release_proxy, patch(
+            "core.rotating_proxy_runtime.retire_rotating_proxy",
+        ) as retire_proxy:
+            get_manager.return_value.acquire.return_value = lease
+            result = main.run_registration(
+                "user@example.com",
+                "Test User",
+                "1990-01-01",
+                proxy_lane_id=0,
+            )
+
+        self.assertFalse(result["success"])
+        get_manager.return_value.acquire.assert_called_once_with(0, force_refresh=True)
+        release_proxy.assert_called_once_with(
+            scope="registration",
+            lane_id=0,
+            proxy_url=lease.proxy_url,
+        )
+        retire_proxy.assert_not_called()
+
+    def test_one_account_registration_explicit_proxy_override_reuses_proxy(self):
+        import main
+
+        lease = Mock(proxy_url="http://203.0.113.23:8080", lane_id=0, proxy_expires_at=200.0)
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+            proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True
+        ), patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", "roxy"), patch(
+            "core.rotating_proxy_manager.get_rotating_proxy_manager"
+        ) as get_manager, patch(
+            "core.roxy_registration.run_roxy_registration",
+            return_value={"success": True},
+        ):
+            get_manager.return_value.acquire.return_value = lease
+            result = main.run_registration(
+                "user@example.com",
+                "Test User",
+                "1990-01-01",
+                proxy_lane_id=0,
+                force_refresh_proxy=False,
+            )
+
+        self.assertTrue(result["success"])
+        get_manager.return_value.acquire.assert_called_once_with(0)
+
+    def test_parallel_batch_serializes_when_one_account_mode_is_enabled(self):
+        import main
+
+        with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
+            proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True
+        ), patch.object(
+            main, "run_serial_batch", return_value=[{"success": True}]
+        ) as run_serial:
+            result = main.run_parallel_batch(1, 4, 0, True)
+
+        self.assertEqual(result, [{"success": True}])
+        run_serial.assert_called_once_with(1, 0, True, None)
 
     def test_cli_batch_assigns_a_stable_lane_id_to_each_worker_slot(self):
         import main

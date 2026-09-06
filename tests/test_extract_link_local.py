@@ -106,6 +106,7 @@ class LocalExtractLinkTests(unittest.TestCase):
             entry_proxy="http://127.0.0.1:8000",
             payment_proxy="http://127.0.0.1:8001",
             promotion_proxy="http://127.0.0.1:8002",
+            local_method_strategy="standalone",
             log=workflow.call_args.kwargs["log"],
         )
         self.assertEqual(result["link_type"], "upi")
@@ -189,9 +190,194 @@ class LocalExtractLinkTests(unittest.TestCase):
             proxy=leases["extract_link_promotion"],
             payment_proxy=leases["extract_link_payment"],
             promotion_proxy=leases["extract_link_promotion"],
+            local_method_strategy="standalone",
             log=local_checkout.call_args.kwargs["log"],
         )
         self.assertEqual(release.call_count, 2)
+
+    def test_momo_card_only_checkout_retries_with_fresh_proxy_and_strategy(self):
+        with (
+            patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
+            patch.object(extract_link_service, "_mode", return_value="local"),
+            patch.object(extract_link_service, "_local_provider_attempts", return_value=3),
+            patch.object(
+                extract_link_service,
+                "resolve_rotating_proxy",
+                side_effect=["http://proxy.one:8080", "http://proxy.two:8080"],
+            ) as resolve,
+            patch.object(
+                extract_link_service,
+                "_run_local_checkout",
+                side_effect=[
+                    RuntimeError("当前 checkout 未开放 momo，可用方式：card"),
+                    {"ok": True, "status": "success", "result": {"copy_paste": "momo-qr"}},
+                ],
+            ) as checkout,
+            patch.object(extract_link_service, "release_rotating_proxy") as release,
+            patch.object(extract_link_service.db, "update_account_extract"),
+            patch.object(extract_link_service.time, "sleep") as sleep,
+            patch.object(extract_link_service._QUEUE_SLOTS, "release"),
+        ):
+            result = extract_link_service._run_extract(
+                account_id=8,
+                email="user@example.com",
+                access_token="token",
+                link_type="momo",
+                cdk="",
+                trigger="manual",
+                proxy_lane_id=7,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(resolve.call_count, 2)
+        self.assertEqual(checkout.call_args_list[0].kwargs["local_method_strategy"], "late_promo")
+        self.assertEqual(checkout.call_args_list[1].kwargs["local_method_strategy"], "inline")
+        self.assertEqual(checkout.call_args_list[0].kwargs["proxy"], "http://proxy.one:8080")
+        self.assertEqual(checkout.call_args_list[1].kwargs["proxy"], "http://proxy.two:8080")
+        self.assertEqual(release.call_args_list[0].kwargs["retire"], True)
+        self.assertNotIn("retire", release.call_args_list[1].kwargs)
+        sleep.assert_called_once_with(1.35)
+
+    def test_pay153_high_variance_rails_default_to_ten_attempts(self):
+        with patch.object(
+            extract_link_service,
+            "_runtime_setting",
+            side_effect=lambda name, default=None: default,
+        ):
+            self.assertEqual(extract_link_service._local_provider_attempts("momo"), 10)
+            self.assertEqual(extract_link_service._local_provider_attempts("pix"), 10)
+            self.assertEqual(extract_link_service._local_provider_attempts("gcash"), 10)
+            self.assertEqual(extract_link_service._local_provider_attempts("kakao"), 3)
+
+    def test_provider_method_unavailable_is_retryable_for_each_local_rail(self):
+        for provider in ("pix", "momo", "gcash"):
+            with self.subTest(provider=provider):
+                error = RuntimeError(f"当前 checkout 未开放 {provider}，可用方式：card")
+                self.assertTrue(extract_link_service._retryable_local_checkout_error(provider, error))
+
+    def test_fixed_proxy_retry_does_not_claim_that_proxy_changed(self):
+        with (
+            patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
+            patch.object(extract_link_service, "_mode", return_value="local"),
+            patch.object(extract_link_service, "_local_provider_attempts", return_value=2),
+            patch.object(
+                extract_link_service,
+                "_run_local_checkout",
+                side_effect=[
+                    RuntimeError("当前 checkout 未开放 momo，可用方式：card"),
+                    {"ok": True, "status": "success", "result": {"copy_paste": "momo-qr"}},
+                ],
+            ),
+            patch.object(extract_link_service.db, "update_account_extract") as update,
+            patch.object(extract_link_service.time, "sleep"),
+            patch.object(extract_link_service._QUEUE_SLOTS, "release"),
+        ):
+            result = extract_link_service._run_extract(
+                account_id=8,
+                email="user@example.com",
+                access_token="token",
+                link_type="momo",
+                cdk="",
+                trigger="manual",
+                proxy="http://proxy.fixed:8080",
+            )
+
+        self.assertTrue(result["ok"])
+        retry_messages = [
+            call.args[1].get("message", "")
+            for call in update.call_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict)
+        ]
+        self.assertIn("MOMO attempt 1/2 chỉ có card; tạo Checkout mới", retry_messages)
+        self.assertNotIn("đổi proxy", retry_messages[-1])
+
+    def test_proxy_cooldown_is_retryable_and_waits_for_provider_window(self):
+        with (
+            patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
+            patch.object(extract_link_service, "_mode", return_value="local"),
+            patch.object(extract_link_service, "_local_provider_attempts", return_value=2),
+            patch.object(
+                extract_link_service,
+                "resolve_rotating_proxy",
+                side_effect=[
+                    RuntimeError("RotatingProxyError: proxy.vn API status=101: Con 12s moi co the doi proxy"),
+                    "http://proxy.after-cooldown:8080",
+                ],
+            ),
+            patch.object(
+                extract_link_service,
+                "_run_local_checkout",
+                return_value={"ok": True, "status": "success", "result": {"copy_paste": "momo-qr"}},
+            ) as checkout,
+            patch.object(extract_link_service.db, "update_account_extract"),
+            patch.object(extract_link_service.time, "sleep") as sleep,
+            patch.object(extract_link_service._QUEUE_SLOTS, "release"),
+        ):
+            result = extract_link_service._run_extract(
+                account_id=8,
+                email="user@example.com",
+                access_token="token",
+                link_type="momo",
+                cdk="",
+                trigger="manual",
+                proxy_lane_id=7,
+            )
+
+        self.assertTrue(result["ok"])
+        checkout.assert_called_once_with(
+            token="token",
+            link_type="momo",
+            proxy="http://proxy.after-cooldown:8080",
+            payment_proxy="http://proxy.after-cooldown:8080",
+            promotion_proxy="http://proxy.after-cooldown:8080",
+            local_method_strategy="inline",
+            log=checkout.call_args.kwargs["log"],
+        )
+        sleep.assert_called_once_with(13)
+
+    def test_tls_error_retries_local_checkout_with_a_fresh_rotating_proxy(self):
+        tls_error = type("SSLError", (RuntimeError,), {})(
+            "Failed to perform, curl: (35) TLS connect error"
+        )
+        with (
+            patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
+            patch.object(extract_link_service, "_mode", return_value="local"),
+            patch.object(extract_link_service, "_local_provider_attempts", return_value=3),
+            patch.object(
+                extract_link_service,
+                "resolve_rotating_proxy",
+                side_effect=["http://proxy.one:8080", "http://proxy.two:8080"],
+            ) as resolve,
+            patch.object(
+                extract_link_service,
+                "_run_local_checkout",
+                side_effect=[
+                    tls_error,
+                    {"ok": True, "status": "success", "result": {"copy_paste": "momo-qr"}},
+                ],
+            ) as checkout,
+            patch.object(extract_link_service, "release_rotating_proxy") as release,
+            patch.object(extract_link_service.db, "update_account_extract"),
+            patch.object(extract_link_service.time, "sleep") as sleep,
+            patch.object(extract_link_service._QUEUE_SLOTS, "release"),
+        ):
+            result = extract_link_service._run_extract(
+                account_id=8,
+                email="user@example.com",
+                access_token="token",
+                link_type="momo",
+                cdk="",
+                trigger="manual",
+                proxy_lane_id=7,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(resolve.call_count, 2)
+        self.assertEqual(checkout.call_args_list[0].kwargs["proxy"], "http://proxy.one:8080")
+        self.assertEqual(checkout.call_args_list[1].kwargs["proxy"], "http://proxy.two:8080")
+        self.assertEqual(release.call_args_list[0].kwargs["retire"], True)
+        self.assertNotIn("retire", release.call_args_list[1].kwargs)
+        sleep.assert_called_once_with(1.35)
 
     def test_provider_proxy_roles_follow_pay153_route_stages(self):
         self.assertEqual(extract_link_service._proxy_roles("momo"), ("extract_link",))

@@ -19,6 +19,10 @@ from core.pay153_provider_policy import (
 )
 
 PAY153_LOCAL_LINK_TYPES = frozenset(PROVIDER_POLICIES)
+_LOCAL_METHOD_STRATEGIES = {
+    "pix": ("standalone", "late_promo", "inline"),
+    "momo": ("late_promo", "inline", "standalone"),
+}
 _PROVIDER_LABELS = {
     "hosted": "Official Checkout",
     "ph_short": "Philippines short checkout",
@@ -74,6 +78,16 @@ def validate_provider(value: str) -> str:
     if provider == "upi" and not _upi_enabled():
         raise ValueError("UPI checkout binary is not available")
     return provider
+
+
+def local_method_strategy(provider_name: str, attempt: int) -> str:
+    """Select the PAY.153 local-method submission shape for one fresh checkout."""
+    provider = validate_provider(provider_name)
+    strategies = _LOCAL_METHOD_STRATEGIES.get(provider)
+    if not strategies:
+        return "standalone"
+    index = max(0, int(attempt) - 1) % len(strategies)
+    return strategies[index]
 
 
 def _decode_jwt(token: str) -> dict[str, Any]:
@@ -245,14 +259,37 @@ def _create_checkout(
     if not isinstance(data, dict):
         raise TypeError("OpenAI Checkout returned an invalid payload")
     raw_session_id = "\n".join((str(data.get("checkout_session_id") or ""), str(data.get("url") or ""), text))
-    stripe_match = re.search(r"cs_(?:live|test)_[A-Za-z0-9]+", raw_session_id)
-    custom_match = re.search(r"oaics_[A-Za-z0-9]+", raw_session_id)
+    direct_session_id = str(data.get("checkout_session_id") or "").strip()
+    direct_match = re.fullmatch(r"(?:oaics_[A-Za-z0-9_-]+|cs_(?:live|test)_[A-Za-z0-9_-]+)", direct_session_id)
+    stripe_match = re.search(r"cs_(?:live|test)_[A-Za-z0-9_-]+", raw_session_id)
+    custom_match = re.search(r"oaics_[A-Za-z0-9_-]+", raw_session_id)
+    session_ids: dict[str, str] = {}
     if stripe_match:
+        session_ids["stripe"] = stripe_match.group(0)
+    if custom_match:
+        session_ids["custom"] = custom_match.group(0)
+    if session_ids:
+        data["checkout_session_ids"] = session_ids
+        if "stripe" in session_ids:
+            data["stripe_checkout_session_id"] = session_ids["stripe"]
+        if "custom" in session_ids:
+            data["custom_checkout_session_id"] = session_ids["custom"]
+    prefer_custom = str(payload.get("checkout_ui_mode") or "").strip().lower() == "custom"
+    if direct_match:
+        session_id = direct_match.group(0)
+    elif prefer_custom and custom_match:
+        session_id = custom_match.group(0)
+    elif stripe_match:
         session_id = stripe_match.group(0)
-        data["checkout_session_id"] = session_id
-        data["checkout_url"] = _normalize_hosted_url(str(data.get("url") or ""), session_id)
     elif custom_match:
         session_id = custom_match.group(0)
+    else:
+        session_id = ""
+
+    if session_id.startswith("cs_"):
+        data["checkout_session_id"] = session_id
+        data["checkout_url"] = _normalize_hosted_url(str(data.get("url") or ""), session_id)
+    elif session_id.startswith("oaics_"):
         processor = str(data.get("processor_entity") or "openai_ie").strip() or "openai_ie"
         data.update({
             "checkout_session_id": session_id,
@@ -704,6 +741,7 @@ def run_provider_checkout(
     entry_proxy: str | None,
     payment_proxy: str | None,
     promotion_proxy: str | None,
+    local_method_strategy: str = "standalone",
     log: Callable[[str], None],
 ) -> dict[str, Any]:
     """Run PAY.153's direct provider flow and return its normalized result."""
@@ -731,6 +769,9 @@ def run_provider_checkout(
         "plan": "plus",
         "link_type": provider,
         "checkout_session_id": session_id,
+        "stripe_checkout_session_id": checkout.get("stripe_checkout_session_id"),
+        "custom_checkout_session_id": checkout.get("custom_checkout_session_id"),
+        "checkout_session_ids": checkout.get("checkout_session_ids") or {},
         "checkout_url": str(checkout.get("checkout_url") or ""),
         "processor_entity": processor,
         "account_email": str(metadata.get("email") or ""),
@@ -796,7 +837,7 @@ def run_provider_checkout(
                 else None
             ),
             require_zero_due=True,
-            local_method_strategy="standalone",
+            local_method_strategy=local_method_strategy,
             log=log,
         )
         result.update(provider_result)

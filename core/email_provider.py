@@ -17,8 +17,6 @@ import logging
 import re
 from collections.abc import Iterable
 
-from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
-
 logger = logging.getLogger(__name__)
 _BEFORE_CODE_UNSET = object()
 _PROVIDER_602_RE = re.compile(
@@ -43,19 +41,38 @@ def _current_otp_job_id() -> int | None:
         return None
 
 
+def _current_gmail_api_url_batch_id() -> str | None:
+    """Return the canonical Gmail batch carried by the active job context."""
+    job_id = _current_otp_job_id()
+    if job_id is None:
+        return None
+    try:
+        from core import db
+
+        job = db.get_job(job_id) or {}
+        provider_context = job.get("provider_context")
+        if not isinstance(provider_context, dict):
+            return None
+        batch_id = str(provider_context.get("gmail_api_url_batch_id") or "").strip()
+        return batch_id or None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 def _get_code_url_account(email: str, source: str):
     """Resolve a Gmail API URL account for either URL-backed provider."""
-    if source in {"gmail_api_url", "qan8_gmail_api"}:
+    source = _canonicalize_runtime_source(source)
+    if source == "gmail_api_url":
         from core.gmail_api_url_client import (
             get_account_context,
             get_batch_account_context,
         )
 
         job_id = _current_otp_job_id()
-        batch_account = (
-            get_batch_account_context(email, job_id=job_id)
-            if job_id is not None
-            else get_batch_account_context(email)
+        batch_account = get_batch_account_context(
+            email,
+            job_id=job_id,
+            batch_id=_current_gmail_api_url_batch_id(),
         )
         account = batch_account or get_account_context(email)
     else:
@@ -130,8 +147,8 @@ def _raise_if_code_url_is_quarantined(account) -> None:
 
 def snapshot_verification_code(email: str, *, stage: str | None = None) -> str | None:
     """Capture a URL provider's current code before triggering a new OTP."""
-    source = resolve_email_source(email)
-    if source not in {"gmail_api_url", "qan8_gmail_api"}:
+    source = _canonicalize_runtime_source(resolve_email_source(email))
+    if source != "gmail_api_url":
         return None
 
     from core.gmail_api_url_client import snapshot_verification_code as snapshot_code
@@ -160,8 +177,8 @@ def acknowledge_verification_code(
     stage: str | None = None,
 ) -> None:
     """Persist a URL provider OTP only after its remote validation succeeds."""
-    source = resolve_email_source(email)
-    if source not in {"gmail_api_url", "qan8_gmail_api"}:
+    source = _canonicalize_runtime_source(resolve_email_source(email))
+    if source != "gmail_api_url":
         return
 
     from core.gmail_api_url_client import (
@@ -179,25 +196,28 @@ def acknowledge_verification_code(
 
 _VALID_SOURCES = (
     "outlook", "generic_api", "gmail_api_url", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "tinyhost",
-    "gmail_123452026", "paymesh", "qan8_gmail_api", "remail",
+    "gmail_123452026", "paymesh", "remail",
 )
 
 _SOURCE_ALIASES = {
+    "qan8_gmail_api": "gmail_api_url",
     "sms_paymesh": "paymesh",
     "sms.paymesh": "paymesh",
     "sms.paymesh.cn": "paymesh",
     "paymesh.cn": "paymesh",
     "mail": "paymesh",
 }
+_OBSOLETE_RUNTIME_SOURCES = frozenset({"qan8_gmail_api"})
 
 
 def normalize_email_source(value: str) -> str:
-    source = str(value or "").strip().strip('"\'')
+    source = str(value or "").strip().strip('"\'').lower()
     return _SOURCE_ALIASES.get(source, source)
 
 
 def is_valid_email_source(value: str) -> bool:
-    return normalize_email_source(value) in _VALID_SOURCES
+    raw = str(value or "").strip().strip('"\'').lower()
+    return raw not in _OBSOLETE_RUNTIME_SOURCES and normalize_email_source(raw) in _VALID_SOURCES
 
 
 def _normalize_explicit_email_source(value: str | None) -> str | None:
@@ -209,6 +229,8 @@ def _normalize_explicit_email_source(value: str | None) -> str | None:
         return None
     for item in raw.replace(";", ",").replace("|", ",").split(","):
         source = str(item or "").strip().strip("\"'").lower()
+        if source in _OBSOLETE_RUNTIME_SOURCES:
+            continue
         source = normalize_email_source(source)
         if source in _VALID_SOURCES:
             return source
@@ -216,11 +238,11 @@ def _normalize_explicit_email_source(value: str | None) -> str | None:
 
 
 def _canonicalize_runtime_source(source: str | None) -> str | None:
-    """Map QAN8 provenance to the single Gmail API runtime provider."""
-    normalized = _normalize_explicit_email_source(source)
-    if normalized == "qan8_gmail_api":
+    """Map historical QAN8 provenance to the single Gmail runtime provider."""
+    raw = str(source or "").strip().strip('"\'').lower()
+    if raw in _OBSOLETE_RUNTIME_SOURCES:
         return "gmail_api_url"
-    return normalized
+    return _normalize_explicit_email_source(raw)
 
 
 def _registered_email_source(email: str) -> str | None:
@@ -264,7 +286,14 @@ def parse_email_sources(value=None) -> list[str]:
 
     out: list[str] = []
     for item in raw:
-        s = normalize_email_source(str(item or ""))
+        raw_source = str(item or "").strip().strip('"\'').lower()
+        if raw_source in _OBSOLETE_RUNTIME_SOURCES:
+            logger.warning(
+                "[EmailProvider] obsolete email source %r is no longer a runtime provider",
+                raw_source,
+            )
+            continue
+        s = normalize_email_source(raw_source)
         if not s:
             continue
         if s not in _VALID_SOURCES:
@@ -287,9 +316,9 @@ def _pick_from_source(
     paymesh_inventory_ids: list[str] | None = None,
     paymesh_routed_domains: list[str] | None = None,
     gmail_api_url_batch_id: str | None = None,
-    qan8_gmail_api_batch_id: str | None = None,
-    qan8_gmail_api_lane_id: int | None = None,
+    gmail_api_url_aliases_per_source: int = 12,
 ) -> str:
+    source = _canonicalize_runtime_source(source) or str(source or "").strip().lower()
     if source == "gmail_123452026":
         if gmail_batch_id:
             from core.gmail_123452026_client import pick_account_by_batch
@@ -353,27 +382,10 @@ def _pick_from_source(
             return get_email_from_batch(
                 batch_id=gmail_api_url_batch_id,
                 job_id=str(job_id or "standalone"),
+                aliases_per_source=gmail_api_url_aliases_per_source,
             ).email
         from core.gmail_api_url_client import pick_account
         return pick_account().email
-    if source == "qan8_gmail_api":
-        if (
-            not qan8_gmail_api_batch_id
-            or qan8_gmail_api_lane_id is None
-            or not gmail_api_url_batch_id
-        ):
-            raise ValueError(
-                "QAN8 Gmail API requires QAN8 batch/lane and canonical Gmail batch_id"
-            )
-        from core.registration_service import check_stop_requested
-
-        return Qan8GmailApiAllocator().acquire_gmail_api_account(
-            batch_id=qan8_gmail_api_batch_id,
-            gmail_batch_id=gmail_api_url_batch_id,
-            job_id=job_id or "standalone",
-            lane_id=int(qan8_gmail_api_lane_id),
-            stop_check=check_stop_requested,
-        ).email
     if source == "mailnest":
         from core.mailnest_client import pick_account
         return pick_account().email
@@ -399,17 +411,17 @@ def acquire_email(
     paymesh_inventory_ids: list[str] | None = None,
     paymesh_routed_domains: list[str] | None = None,
     gmail_api_url_batch_id: str | None = None,
-    qan8_gmail_api_batch_id: str | None = None,
-    qan8_gmail_api_lane_id: int | None = None,
+    gmail_api_url_aliases_per_source: int = 12,
 ) -> str:
     """领取注册邮箱；显式 source 仅使用该 provider，否则按全局配置兜底。
 
     Supports both raw CDK lists (backward-compatible) and managed inventory IDs.
     """
     if email_source is not None:
-        source = normalize_email_source(str(email_source or ""))
-        if not is_valid_email_source(source):
-            raise ValueError(f"未知邮箱来源: {source}")
+        raw_source = str(email_source or "").strip().strip('"\'').lower()
+        if not is_valid_email_source(raw_source):
+            raise ValueError(f"未知邮箱来源: {raw_source}")
+        source = normalize_email_source(raw_source)
         sources = [source]
     else:
         sources = parse_email_sources()
@@ -432,8 +444,7 @@ def acquire_email(
                 paymesh_inventory_ids=paymesh_inventory_ids,
                 paymesh_routed_domains=paymesh_routed_domains,
                 gmail_api_url_batch_id=gmail_api_url_batch_id,
-                qan8_gmail_api_batch_id=qan8_gmail_api_batch_id,
-                qan8_gmail_api_lane_id=qan8_gmail_api_lane_id,
+                gmail_api_url_aliases_per_source=gmail_api_url_aliases_per_source,
             )
             logger.info(f"[EmailProvider] 使用邮箱来源: {source}, email={email}")
             return email
@@ -474,8 +485,7 @@ def resolve_email_source(email: str) -> str:
     if active_job_source:
         return active_job_source
     # Canonical Gmail API inventory wins before the other provider contexts.
-    # QAN8 aliases are materialized here too, so no second runtime source can
-    # steal an alias that the Gmail ledger already owns.
+    # Purchased sources are materialized into this same ledger.
     from core import db
     if db.get_gmail_api_url_email_by_email(email):
         return "gmail_api_url"
@@ -547,10 +557,9 @@ def _wait_for_code_url_otp(
 ) -> str:
     """Poll one mailbox code URL with the shared Gmail API stale guard.
 
-    QAN8 aliases and imported Gmail API URL records are different allocation
-    records, but both resolve to the same ``email----code_url`` mailbox
-    contract. Normalize both account types before polling so OTP persistence
-    is always keyed by the original mailbox URL, never by an alias.
+    Imported and purchased Gmail API URL records resolve to the same
+    ``email----code_url`` mailbox contract. OTP persistence is always keyed by
+    the original mailbox URL, never by an alias.
     """
     from config import email as _email_cfg
     from core.gmail_api_url_client import (
@@ -593,9 +602,8 @@ def wait_for_otp(
 ) -> str:
     """等待并返回该邮箱最新的 ChatGPT OTP（6 位数字字符串）。
 
-    ``before_code`` 用于重发后的 stale guard；Gmail API URL 与 QAN8
-    provider 都按共享的原始 mailbox ``code_url`` 处理，其他 provider
-    保持原有参数行为。
+    ``before_code`` 用于重发后的 stale guard；Gmail API URL 按共享的原始
+    mailbox ``code_url`` 处理，其他 provider 保持原有参数行为。
     ``stage`` 仅用于关联并发任务的 OTP 日志。
 
     USE_EMAIL_SERVICE=False 时走手动验证码通道（WebUI 提交 / CLI 输入），
@@ -620,11 +628,12 @@ def wait_for_otp(
         return wait_for_manual_otp(email, timeout=timeout, job_id=job_id)
 
     # Resolve through the single provider resolver so registered-account,
-    # active-job, canonical Gmail inventory, and QAN8 provenance all follow
-    # the same precedence rules.
-    source = _canonicalize_runtime_source(email_source) or _canonicalize_runtime_source(
-        resolve_email_source(email)
-    )
+    # active-job, and canonical Gmail inventory all follow the same precedence.
+    source = _canonicalize_runtime_source(email_source)
+    if not source:
+        source = _registered_email_source(email)
+    if not source:
+        source = _canonicalize_runtime_source(resolve_email_source(email))
     extra_kwargs = {}
     if max_wait is not None or source == "paymesh":
         extra_kwargs["max_wait"] = otp_max_wait_for_source(source, max_wait)
@@ -748,7 +757,7 @@ def release_email_if_unconsumed(
     *,
     discard_on_failure: bool = False,
 ) -> bool:
-    """回收未消耗的任务邮箱；注册失败时废弃 Gmail API/QAN8 alias。"""
+    """回收未消耗的任务邮箱；注册失败时废弃 Gmail API alias。"""
     if not (email or "").strip():
         return False
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 from config import email as email_config
 from config import register as register_config
 from core.email_provider import (
@@ -102,20 +104,17 @@ def _pool_warning(
     sources: list[str],
     count: int,
     *,
-    gmail_api_url_aliases_per_email: int = 1,
+    gmail_api_url_aliases_per_email: int = 12,
 ) -> str:
     if any(source in sources for source in (
         "gptmail", "mailnest", "cloudmail", "tinyhost", "cloudflare", "gmail_123452026", "paymesh", "remail",
-        "qan8_gmail_api",
     )):
         return ""
     if sources == ["gmail_api_url"]:
-        summary = database.gmail_api_url_email_pool_summary()
-        available = summary.get("alias_available", 0)
-        return (
-            f"Kho Gmail API URL còn {available} alias, ít hơn số alias yêu cầu {count}，alias thiếu sẽ thất bại"
-            if available < count else ""
-        )
+        # Gmail API URL replenishes through the purchase adapter when the
+        # imported canonical aliases are exhausted. A local shortage is not a
+        # warning; it is only an error when the purchase adapter is unconfigured.
+        return ""
     if "cloudflare_domain" in sources:
         pool = database.domain_email_pool_summary()
         if sources == ["cloudflare_domain"] and pool.get("available", 0) < count:
@@ -133,6 +132,19 @@ def _pool_warning(
         return f"多个邮箱池合计仅 {available} 个可用，少于任务数 {count}，不足的会失败" if available < count else ""
     available = database.outlook_pool_summary().get("available", 0)
     return f"可用邮箱仅 {available} 个，少于任务数 {count}，不足的会失败" if available < count else ""
+
+
+def _qan8_purchase_config_error() -> str | None:
+    """Validate the internal Gmail source purchase adapter when it is needed."""
+    api_base = str(getattr(email_config, "QAN8_API_BASE", "") or "").strip()
+    parsed = urlparse(api_base)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return "Kho Gmail API URL không đủ alias và địa chỉ shop.qan8.com chưa hợp lệ."
+    if not str(getattr(email_config, "QAN8_API_KEY", "") or "").strip():
+        return "Kho Gmail API URL không đủ alias, hãy cấu hình QAN8 API Key để mua bổ sung."
+    if not str(getattr(email_config, "QAN8_GMAIL_SKU_ID", "") or "").strip():
+        return "Kho Gmail API URL không đủ alias, hãy cấu hình SKU Gmail của shop.qan8.com để mua bổ sung."
+    return None
 
 
 def create_registration_jobs(
@@ -161,7 +173,8 @@ def create_registration_jobs(
         paymesh_routed_domains = list(normalize_paymesh_routed_domains(raw_paymesh_routed))
     except PaymeshAliasError as exc:
         return {"ok": False, "error": str(exc)}, 400
-    requested_source = normalize_email_source(str(data.get("email_source") or "")) or None
+    raw_requested_source = str(data.get("email_source") or "").strip().strip('"\'').lower()
+    requested_source = normalize_email_source(raw_requested_source) or None
     try:
         count = int(data.get("count", 1))
     except (TypeError, ValueError):
@@ -172,7 +185,7 @@ def create_registration_jobs(
         workers = max(1, min(16, int(data.get("workers", 3))))
     except (TypeError, ValueError):
         return {"ok": False, "error": "workers 非法"}, 400
-    if requested_source is not None and not is_valid_email_source(requested_source):
+    if raw_requested_source and not is_valid_email_source(raw_requested_source):
         return {"ok": False, "error": "邮箱来源不支持"}, 400
 
     if not bool(getattr(email_config, "USE_EMAIL_SERVICE", True)):
@@ -207,8 +220,8 @@ def create_registration_jobs(
 
     submit_kwargs = {"count": count, "workers": workers}
     # Automation callers already provide the number of account jobs required
-    # by Sub2API. The manual WebUI form may instead enter source Gmail count
-    # and expand it into aliases, so keep that legacy UI behavior scoped there.
+    # by Sub2API. The manual WebUI form enters source-group count and expands
+    # each source to the fixed twelve-alias registration capacity.
     automation_registration = (
         isinstance(automation_context, dict)
         and automation_context.get("sub2api_automation_kind") == "registration"
@@ -224,62 +237,36 @@ def create_registration_jobs(
         if paymesh_routed_domains:
             submit_kwargs["paymesh_routed_domains"] = paymesh_routed_domains
     if "gmail_api_url" in sources:
-        # Số alias mỗi email gốc (1..12): 6 gmail.com + 6 googlemail.com,
-        # tất cả share code_url của email gốc.
-        try:
-            aliases_per_email = int(data.get("gmail_api_url_alias_count", 1) or 1)
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "gmail_api_url_alias_count 非法"}, 400
-        aliases_per_email = max(1, min(12, aliases_per_email))
+        # Manual WebUI count is the number of source purchases/groups. Each
+        # source contributes up to 12 aliases, so the service receives the
+        # expanded registration-job count. Automation already sends account
+        # count and must never be multiplied here.
+        aliases_per_email = 12
+        requested_job_count = (
+            count if automation_registration else count * aliases_per_email
+        )
+        if requested_job_count > MAX_REGISTRATION_TASKS:
+            return {
+                "ok": False,
+                "error": (
+                    f"Gmail API URL: {count} source × {aliases_per_email} alias = "
+                    f"{requested_job_count} task, vượt {MAX_REGISTRATION_TASKS}"
+                ),
+            }, 400
         summary = database.gmail_api_url_email_pool_summary()
         alias_available = int(summary.get("alias_available", 0) or 0)
-        if alias_available < 1:
-            return {"ok": False, "error": "Kho Gmail API URL không còn alias khả dụng"}, 400
-        if aliases_per_email > 1 and not automation_registration:
-            max_sources = alias_available // aliases_per_email
-            if max_sources < 1:
-                return {
-                    "ok": False,
-                    "error": (
-                        f"Kho Gmail API URL chỉ còn {alias_available} alias khả dụng, "
-                        f"chưa đủ 1 nhóm {aliases_per_email} alias"
-                    ),
-                }, 400
-            count = min(count, max_sources)
-        else:
-            count = min(count, alias_available)
-        submit_kwargs["count"] = count
-        if aliases_per_email > 1 and not automation_registration:
-            # count = số email gốc; mỗi email gốc sinh aliases_per_email tài khoản.
-            job_count = count * aliases_per_email
-            if job_count > MAX_REGISTRATION_TASKS:
-                return {
-                    "ok": False,
-                    "error": (
-                        f"Gmail API URL: {count} email × {aliases_per_email} alias = "
-                        f"{job_count} task, vượt {MAX_REGISTRATION_TASKS}"
-                    ),
-                }, 400
-            submit_kwargs["count"] = job_count
-            submit_kwargs["gmail_api_url_aliases_per_email"] = aliases_per_email
-    if "qan8_gmail_api" in sources:
-        try:
-            aliases_per_source = int(
-                data.get(
-                    "qan8_alias_count",
-                    getattr(email_config, "QAN8_ALIASES_PER_SOURCE", 12),
-                )
-                or 12
-            )
-        except (TypeError, ValueError):
-            return {"ok": False, "error": "qan8_alias_count 非法"}, 400
-        if not 1 <= aliases_per_source <= 12:
-            return {"ok": False, "error": "qan8_alias_count 需在 1~12 之间"}, 400
-        submit_kwargs["qan8_aliases_per_source"] = aliases_per_source
-        # QAN8 alias capacity is a reuse limit for each purchased source, not
-        # a multiplier for the requested registration count.  The service
-        # creates exactly ``count`` jobs and lets ``workers`` claim that many
-        # aliases concurrently before lanes reuse or replenish a source.
+        submit_kwargs["count"] = requested_job_count
+        submit_kwargs["gmail_api_url_aliases_per_email"] = aliases_per_email
+        purchase_error = (
+            _qan8_purchase_config_error()
+            if alias_available < requested_job_count
+            else None
+        )
+        if purchase_error:
+            return {
+                "ok": False,
+                "error": purchase_error,
+            }, 400
     if automation_context:
         submit_kwargs["automation_context"] = automation_context
     try:
@@ -301,18 +288,4 @@ def create_registration_jobs(
         ),
         "workers": effective_workers,
     }, 200
-    if "qan8_gmail_api" in sources:
-        context = (jobs[0].get("provider_context") if jobs else {}) or {}
-        qan8_aliases = int(submit_kwargs.get("qan8_aliases_per_source", 12))
-        qan8_source_count = (count + qan8_aliases - 1) // qan8_aliases
-        qan8_effective_workers = min(effective_workers, qan8_source_count)
-        response[0]["qan8"] = {
-            "batch_id": context.get("qan8_gmail_api_batch_id"),
-            "target_count": count,
-            "effective_workers": qan8_effective_workers,
-            "aliases_per_source": qan8_aliases,
-            "active_sources": 0,
-            "orders_placed": 0,
-            "lifetime_sources_purchased": 0,
-        }
     return response

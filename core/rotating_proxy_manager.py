@@ -321,12 +321,32 @@ class RotatingProxyManager:
                 if key in available
             ]
 
-    def acquire(self, lane_id: int, *, scope: str = "registration") -> RotatingProxyLease:
+    def acquire(
+        self,
+        lane_id: int,
+        *,
+        scope: str = "registration",
+        force_refresh: bool = False,
+    ) -> RotatingProxyLease:
+        """Acquire a lease, optionally requiring a fresh provider IP."""
         lane = self._lane_id(lane_id)
         lane_scope = self._scope(scope)
         with self._lock:
             now = self.clock()
-            previous = self.store.get_lease(lane, scope=lane_scope)
+            if force_refresh:
+                stale = self.store.get_lease(lane, scope=lane_scope)
+                if stale is not None:
+                    self.store.delete_cached_proxy(
+                        str(stale.get("rotating_key") or ""),
+                        proxy_url=str(stale.get("proxy_url") or "") or None,
+                    )
+                    self.store.delete_lease(
+                        lane,
+                        scope=lane_scope,
+                        rotating_key=str(stale.get("rotating_key") or "") or None,
+                        proxy_url=str(stale.get("proxy_url") or "") or None,
+                    )
+            previous = None if force_refresh else self.store.get_lease(lane, scope=lane_scope)
             previous_key = str(previous.get("rotating_key") or "").strip() if previous else ""
             previous_key_info = self.store.get_key(previous_key) if previous_key else None
             fallback = None
@@ -341,7 +361,7 @@ class RotatingProxyManager:
 
             self.store.delete_expired_leases(now)
             self.store.delete_expired_cached_proxies(now)
-            existing = self.store.get_lease(lane, scope=lane_scope)
+            existing = None if force_refresh else self.store.get_lease(lane, scope=lane_scope)
             existing_key = str(existing.get("rotating_key") or "").strip() if existing else ""
             key_info = self.store.get_key(existing_key) if existing_key else None
             if (
@@ -390,7 +410,11 @@ class RotatingProxyManager:
                 key = str(key_info.get("rotating_key") or "").strip()
                 if not key:
                     raise RotatingProxyError("Không xác định được keyxoay cho lane")
-                cached = self._cached_proxy(key, key_info=key_info, now=now)
+                cached = (
+                    None
+                    if force_refresh
+                    else self._cached_proxy(key, key_info=key_info, now=now)
+                )
                 if cached is not None:
                     proxy_url = str(cached["proxy_url"])
                     proxy_expires_at = float(cached["proxy_expires_at"])
@@ -462,7 +486,7 @@ class RotatingProxyManager:
                         alternative = self._choose_available_key(
                             used_keys | excluded_keys | {key}
                         )
-                        if alternative is not None:
+                        if alternative is not None and not force_refresh:
                             excluded_keys.add(key)
                             existing = None
                             logger.warning(

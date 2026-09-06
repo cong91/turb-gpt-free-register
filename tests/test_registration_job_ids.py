@@ -1,4 +1,3 @@
-import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,36 +21,16 @@ class RegistrationJobIdTests(unittest.TestCase):
             self.addCleanup(one.stop)
 
     def test_deleted_job_id_is_not_reused(self):
-        first = db.create_job(email_source="qan8_gmail_api")
+        first = db.create_job(email_source="gmail_api_url")
         self.assertTrue(db.delete_job(first["id"]))
 
-        second = db.create_job(email_source="qan8_gmail_api")
+        second = db.create_job(email_source="gmail_api_url")
 
         self.assertEqual(second["id"], first["id"] + 1)
 
-    def test_new_job_id_skips_numeric_qan8_assignment_history(self):
-        first = db.create_job(email_source="qan8_gmail_api")
-        database = db._active_sqlite_path()
-        connection = sqlite3.connect(database)
-        try:
-            connection.execute(
-                "CREATE TABLE qan8_assignments (job_id TEXT NOT NULL UNIQUE)"
-            )
-            connection.execute(
-                "INSERT INTO qan8_assignments(job_id) VALUES (?)", ("827",)
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
-        self.assertTrue(db.delete_job(first["id"]))
-        next_job = db.create_job(email_source="qan8_gmail_api")
-
-        self.assertEqual(next_job["id"], 828)
-
     def test_update_job_writes_only_the_target_row(self):
-        first = db.create_job(email_source="qan8_gmail_api")
-        second = db.create_job(email_source="qan8_gmail_api")
+        first = db.create_job(email_source="gmail_api_url")
+        second = db.create_job(email_source="gmail_api_url")
 
         with (
             patch.object(db, "_load_jobs", side_effect=AssertionError("loaded all jobs")),
@@ -74,12 +53,12 @@ class RegistrationJobIdTests(unittest.TestCase):
         with patch.object(db, "_load_jobs", side_effect=AssertionError("loaded all jobs")), patch.object(
             db, "_save_jobs", side_effect=AssertionError("rewrote all jobs")
         ):
-            created = db.create_job(email_source="qan8_gmail_api")
+            created = db.create_job(email_source="gmail_api_url")
 
-        self.assertEqual(db.get_job(created["id"])["email_source"], "qan8_gmail_api")
+        self.assertEqual(db.get_job(created["id"])["email_source"], "gmail_api_url")
 
     def test_create_retry_job_does_not_rewrite_existing_jobs(self):
-        source = db.create_job(email_source="qan8_gmail_api")
+        source = db.create_job(email_source="gmail_api_url")
         db.update_job(source["id"], status="failed")
 
         with patch.object(db, "_load_jobs", side_effect=AssertionError("loaded all jobs")), patch.object(
@@ -88,7 +67,7 @@ class RegistrationJobIdTests(unittest.TestCase):
             retry, created = db.create_retry_job(
                 source["id"],
                 job_type="registration",
-                email_source="qan8_gmail_api",
+                email_source="gmail_api_url",
             )
 
         self.assertTrue(created)

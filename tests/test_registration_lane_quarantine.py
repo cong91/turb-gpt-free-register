@@ -85,66 +85,6 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
         self.assertEqual(result["stopping"], 0)
         update_job.assert_not_called()
 
-    def test_qan8_602_retires_shared_source_and_keeps_pending_jobs(self):
-        jobs = [
-            {
-                "id": 20,
-                "status": "running",
-                "email_source": "qan8_gmail_api",
-                "provider_context": {
-                    "qan8_gmail_api_batch_id": "batch-2",
-                    "qan8_gmail_api_lane_id": 1,
-                },
-            },
-            {
-                "id": 21,
-                "status": "pending",
-                "email_source": "qan8_gmail_api",
-                "provider_context": {
-                    "qan8_gmail_api_batch_id": "batch-2",
-                    "qan8_gmail_api_lane_id": 1,
-                },
-            },
-        ]
-        registration_service._ACTIVE_JOBS.add(20)
-        registration_service._STOP_EVENTS[20] = threading.Event()
-
-        with (
-            patch.object(registration_service.db, "get_job", return_value=jobs[0]),
-            patch.object(registration_service.db, "list_jobs", return_value=jobs),
-            patch.object(registration_service.db, "update_job") as update_job,
-            patch.object(
-                registration_service.db,
-                "fail_gmail_api_url_sources_for_code_url",
-                create=True,
-                return_value=1,
-            ) as fail_source,
-            patch(
-                "core.gmail_api_url_client.quarantine_code_url",
-                return_value=1,
-            ) as quarantine_code_url,
-        ):
-            result = registration_service.quarantine_provider_lane(
-                job_id=20,
-                source="qan8_gmail_api",
-                code_url="https://mail.example/broken",
-                provider_batch_id="batch-2",
-                provider_lane_id=1,
-                reason="Provider error code=602",
-            )
-
-        quarantine_code_url.assert_called_once_with(
-            "https://mail.example/broken", reason="Provider error code=602"
-        )
-        fail_source.assert_called_once_with(
-            "https://mail.example/broken",
-            note="Provider error code=602",
-        )
-        self.assertFalse(registration_service._STOP_EVENTS[20].is_set())
-        self.assertEqual(result["cancelled"], 0)
-        self.assertEqual(result["stopping"], 0)
-        update_job.assert_not_called()
-
     def test_gmail_api_url_without_batch_does_not_cancel_same_proxy_lane(self):
         jobs = [
             {
@@ -201,11 +141,11 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
         account = SimpleNamespace(
             email="alias@gmail.com",
             code_url="https://mail.example/broken",
-            batch_id="batch-qan8",
+            batch_id="batch-gmail",
             lane_id=2,
         )
         with (
-            patch.object(email_provider, "resolve_email_source", return_value="qan8_gmail_api"),
+            patch.object(email_provider, "resolve_email_source", return_value="gmail_api_url"),
             patch.object(email_provider, "_get_code_url_account", return_value=account),
             patch(
                 "core.gmail_api_url_client.snapshot_verification_code",
@@ -222,59 +162,37 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
 
         quarantine.assert_called_once_with(
             job_id=77,
-            source="qan8_gmail_api",
+            source="gmail_api_url",
             code_url="https://mail.example/broken",
-            provider_batch_id="batch-qan8",
+            provider_batch_id="batch-gmail",
             provider_lane_id=2,
             reason="Provider error code=602",
         )
 
-    def test_both_url_providers_quarantine_on_code_602(self):
-        cases = (
-            (
-                "gmail_api_url",
-                SimpleNamespace(email="alias@gmail.com", code_url="https://mail.example/gmail"),
-                {},
+    def test_gmail_api_url_quarantines_on_code_602(self):
+        account = SimpleNamespace(email="alias@gmail.com", code_url="https://mail.example/gmail")
+        with (
+            patch.object(email_config, "USE_EMAIL_SERVICE", True),
+            patch.object(email_provider, "resolve_email_source", return_value="gmail_api_url"),
+            patch.object(email_provider, "_get_code_url_account", return_value=account),
+            patch(
+                "core.gmail_api_url_client.poll_verification_code",
+                side_effect=GmailApiUrlError("Provider error code=602: expired"),
             ),
-            (
-                "qan8_gmail_api",
-                SimpleNamespace(
-                    email="alias@gmail.com",
-                    code_url="https://mail.example/qan8",
-                    batch_id="batch-qan8",
-                    lane_id=2,
-                ),
-                {"provider_batch_id": "batch-qan8", "provider_lane_id": 2},
-            ),
+            patch.object(registration_service, "quarantine_provider_lane") as quarantine,
+            patch.object(registration_service._THREAD_CTX, "job_id", 77, create=True),
+            self.assertRaises(GmailApiUrlError),
+        ):
+            email_provider.wait_for_otp("alias@gmail.com", after_ts=1.0)
+
+        quarantine.assert_called_once_with(
+            job_id=77,
+            source="gmail_api_url",
+            code_url=account.code_url,
+            provider_batch_id=None,
+            provider_lane_id=None,
+            reason="Provider error code=602: expired",
         )
-
-        for source, account, provider_ids in cases:
-            with (
-                self.subTest(source=source),
-                patch.object(email_config, "USE_EMAIL_SERVICE", True),
-                patch.object(email_provider, "resolve_email_source", return_value=source),
-                patch.object(email_provider, "_get_code_url_account", return_value=account),
-                patch(
-                    "core.gmail_api_url_client.poll_verification_code",
-                    side_effect=GmailApiUrlError("Provider error code=602: expired"),
-                ),
-                patch.object(
-                    registration_service,
-                    "quarantine_provider_lane",
-                ) as quarantine,
-                patch.object(registration_service._THREAD_CTX, "job_id", 77, create=True),
-                self.assertRaises(GmailApiUrlError),
-            ):
-                email_provider.wait_for_otp("alias@gmail.com", after_ts=1.0)
-
-                quarantine.assert_called_once_with(
-                    job_id=77,
-                    source=source,
-                    code_url=account.code_url,
-                    provider_batch_id=provider_ids.get("provider_batch_id"),
-                    provider_lane_id=provider_ids.get("provider_lane_id"),
-                    reason="Provider error code=602: expired",
-                )
 
     def test_timeout_does_not_quarantine_url_lane(self):
         account = SimpleNamespace(email="alias@gmail.com", code_url="https://mail.example/code")
