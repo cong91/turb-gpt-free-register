@@ -7,7 +7,6 @@ from unittest.mock import patch
 from core import db
 from core.gmail_aliases import generate_gmail_dual_domain_aliases
 from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
-from core.qan8_gmail_api_store import Qan8GmailApiStore
 
 
 class GmailApiUrlPoolTests(unittest.TestCase):
@@ -297,6 +296,7 @@ class GmailApiUrlPoolTests(unittest.TestCase):
                 patch.object(db, "_SQLITE_PATH", state),
                 patch.object(db, "_DEFAULT_SQLITE_PATH", state),
                 patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
             ):
                 db.import_gmail_api_url_emails([
                     {
@@ -320,7 +320,7 @@ class GmailApiUrlPoolTests(unittest.TestCase):
                 self.assertEqual(row["alias_total"], 12)
                 self.assertEqual(row["alias_available"], 0)
                 self.assertEqual(row["alias_allocated"], 12)
-    def test_alias_inventory_merges_gmail_and_qan8_ownership(self):
+    def test_alias_inventory_reports_canonical_ownership(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "state.sqlite3"
             email = "source@gmail.com"
@@ -335,23 +335,14 @@ class GmailApiUrlPoolTests(unittest.TestCase):
                 assignment = gmail_store.claim(gmail_batch, f"gmail-job-{index}")
                 self.assertTrue(gmail_store.complete(assignment.assignment_id))
 
-            qan8_store = Qan8GmailApiStore(path)
-            qan8_batch = qan8_store.create_batch(1, requested_workers=1, aliases_per_source=12)
-            qan8_store.create_source_group(
-                qan8_batch["batch_id"], 0, email, code_url, candidates,
-            )
-            assignment = qan8_store.claim_alias(qan8_batch["batch_id"], 0, "qan8-job")
-            self.assertIsNotNone(assignment)
-            self.assertTrue(qan8_store.complete_assignment("qan8-job"))
-
             with patch.object(db, "_SQLITE_PATH", path):
                 rows = db._attach_gmail_api_url_alias_stats([
                     {"email": email, "code_url": code_url},
                 ])
 
             self.assertEqual(rows[0]["alias_total"], 12)
-            self.assertEqual(rows[0]["alias_used"], 3)
-            self.assertEqual(rows[0]["alias_available"], 9)
+            self.assertEqual(rows[0]["alias_used"], 2)
+            self.assertEqual(rows[0]["alias_available"], 10)
 
     @patch("core.db._load_gmail_api_url_emails")
     @patch("core.db._save_gmail_api_url_emails")

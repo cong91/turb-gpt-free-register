@@ -168,21 +168,34 @@ def run_registration(
     proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
     on_email_acquired: Callable[[str], None] | None = None,
+    force_refresh_proxy: bool | None = None,
 ):
-    """Run registration while retaining its rotating-proxy lane until TTL expiry."""
+    """Run registration with the configured rotating-proxy lifecycle."""
     from core.rotating_proxy_runtime import (
         REGISTRATION_PROXY_SCOPE,
         release_rotating_proxy,
+        retire_rotating_proxy,
         resolve_rotating_proxy,
     )
+    from config import proxy as proxy_config
 
+    one_account_per_ip = bool(
+        getattr(proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False)
+    )
+    should_force_refresh = (
+        one_account_per_ip
+        if force_refresh_proxy is None
+        else bool(force_refresh_proxy)
+    )
     active_proxy = resolve_rotating_proxy(
         proxy,
         scope=REGISTRATION_PROXY_SCOPE,
         lane_id=proxy_lane_id,
+        force_refresh=should_force_refresh,
     )
+    result = None
     try:
-        return _run_registration_impl(
+        result = _run_registration_impl(
             email,
             name,
             birthday=birthday,
@@ -193,13 +206,34 @@ def run_registration(
             lease_owner_id=lease_owner_id,
             on_email_acquired=on_email_acquired,
         )
+        return result
     finally:
         if proxy is None and active_proxy is not None:
-            release_rotating_proxy(
+            account_ready = _registration_account_ready_for_proxy_retire(result)
+            cleanup = retire_rotating_proxy if one_account_per_ip and account_ready else release_rotating_proxy
+            cleaned = cleanup(
                 scope=REGISTRATION_PROXY_SCOPE,
                 lane_id=proxy_lane_id,
                 proxy_url=active_proxy,
             )
+            if cleanup is retire_rotating_proxy and cleaned is False:
+                logger.warning(
+                    "[RotatingProxy] không thể retire registration proxy sau khi hoàn tất; "
+                    "lượt kế tiếp sẽ force-refresh lease trước khi chạy"
+                )
+
+
+def _registration_account_ready_for_proxy_retire(result: object) -> bool:
+    """Retire a one-account proxy only after registration setup is complete."""
+    if not isinstance(result, dict):
+        return False
+    if bool(result.get("success")):
+        return True
+    # Codex may fail after the OpenAI account and its configured 2FA state are
+    # persisted; that account no longer needs a registration retry on this IP.
+    return bool(result.get("account_id")) and str(
+        result.get("twofa_status") or ""
+    ).strip().lower() in {"active", "disabled"}
 
 
 def _run_registration_impl(
@@ -732,7 +766,6 @@ def _run_registration_impl(
             from core.email_provider import resolve_email_source
 
             source = resolve_email_source(email) if email else ""
-            alias_provider = source == "qan8_gmail_api"
             if source == "gmail_api_url":
                 from core.gmail_api_url_client import get_batch_account_context
 
@@ -899,6 +932,15 @@ def run_parallel_batch(
     batch_dir=None,
 ) -> list[dict]:
     """使用线程池并发执行批量注册。"""
+    from config import proxy as proxy_config
+
+    if (
+        bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False))
+        and bool(getattr(proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False))
+    ):
+        logger.info("[批量] Proxy.vn one-account-per-IP 已启用，改用串行注册以保证一号一 IP")
+        return run_serial_batch(count, delay, continue_on_fail, batch_dir)
+
     logger.info(f"[批量] 启用多线程注册：目标 {count}，并发 {workers}")
     from core.rotating_proxy_runtime import (
         REGISTRATION_PROXY_SCOPE,

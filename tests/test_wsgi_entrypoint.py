@@ -9,8 +9,8 @@ class WsgiEntrypointTests(unittest.TestCase):
         app = object()
         recovery = {
             "stopped_jobs": 5,
-            "failed_qan8_assignments": 1,
-            "completed_qan8_assignments": 0,
+            "failed_gmail_assignments": 1,
+            "completed_gmail_assignments": 0,
         }
         sys.modules.pop("wsgi", None)
         with patch("webui.app.create_app", return_value=app), patch(

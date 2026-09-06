@@ -2,16 +2,24 @@
 Test THẬT với email/URL do user cung cấp.
 KHÔNG chạy full registration - chỉ test phần Gmail API URL polling.
 """
+import os
 import sys
+import tempfile
 import warnings
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 warnings.filterwarnings("ignore")  # bỏ SSL warning
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import requests
 
-from core import db, email_provider
+from core import (
+    db,
+    email_provider,
+    gmail_api_url_batch_coordinator,
+)
 from core.gmail_api_url_client import (
     GmailApiUrlAccount,
     GmailApiUrlError,
@@ -20,8 +28,27 @@ from core.gmail_api_url_client import (
     release_account,
 )
 
-EMAIL    = "willjacob6442@gmail.com"
-CODE_URL = "https://gapi.mailsapi.com/api/get-code?uid=sdceb05c12ab70e6bcd"
+EMAIL = os.environ.get("TURB_TEST_GMAIL_EMAIL", "").strip()
+CODE_URL = os.environ.get("TURB_TEST_GMAIL_CODE_URL", "").strip()
+
+
+@contextmanager
+def isolated_runtime():
+    """Keep the real provider probe out of the project-wide runtime store."""
+    with tempfile.TemporaryDirectory(prefix="turb-gmail-api-real-") as temp_dir:
+        root = Path(temp_dir)
+        sqlite_path = root / "turb.sqlite3"
+        with (
+            patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", root / "gmail-pool.json"),
+            patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", root / "gmail-pool.txt"),
+            patch.object(db, "_SQLITE_PATH", sqlite_path),
+            patch.object(db, "_DEFAULT_SQLITE_PATH", sqlite_path),
+            patch.object(db, "_SQLITE_READY", False),
+            patch.object(db, "_SQLITE_READY_PATH", None),
+            patch.object(gmail_api_url_batch_coordinator, "_BATCH_STORE_PATH", sqlite_path),
+            patch.object(gmail_api_url_batch_coordinator, "_batch_store_instance", None),
+        ):
+            yield
 
 
 def sep(title: str):
@@ -199,7 +226,11 @@ def step_7_cleanup():
 # ──────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────
-def main():
+def _main_impl():
+    if not EMAIL or not CODE_URL:
+        raise SystemExit(
+            "Set TURB_TEST_GMAIL_EMAIL and TURB_TEST_GMAIL_CODE_URL for this live provider probe"
+        )
     print("\n" + "=" * 60)
     print("  REAL GMAIL API URL — END-TO-END POLL TEST")
     print("  (KHÔNG chạy registration — chỉ test polling layer)")
@@ -266,6 +297,11 @@ def main():
         print("   (OTP này dùng cho email đã được gửi từ trước, không phải từ bước đăng ký mới)")
 
     return passed == len(results)
+
+
+def main():
+    with isolated_runtime():
+        return _main_impl()
 
 
 if __name__ == "__main__":

@@ -395,6 +395,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             "gmail_api_url_available": gmail_api_url_pool.get("available", 0),
             "gmail_api_url_alias_total": gmail_api_url_pool.get("alias_total", 0),
             "gmail_api_url_alias_available": gmail_api_url_pool.get("alias_available", 0),
+            "gmail_api_url_alias_source_available": gmail_api_url_pool.get("alias_source_available", 0),
             "domain_total": domain_pool.get("total", 0),
             "domain_available": domain_pool.get("available", 0),
             "domain_used": domain_pool.get("used", 0),
@@ -2823,17 +2824,6 @@ def create_app(auth_code: str | None = None) -> Flask:
             database=db,
         )
         return jsonify(payload), status_code
-
-    @app.get("/api/qan8/batches/<batch_id>")
-    def api_qan8_batch_status(batch_id: str):
-        """Return QAN8 lane/source counters without credentials or code URLs."""
-        try:
-            status = svc.qan8_batch_status(batch_id)
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"ok": False, "error": f"{type(exc).__name__}: {exc}"}), 400
-        if not status.get("target_count"):
-            return jsonify({"ok": False, "error": "QAN8 batch không tồn tại"}), 404
-        return jsonify({"ok": True, **status})
 
     @app.get("/api/manual-otp/waiting")
     def api_manual_otp_waiting():

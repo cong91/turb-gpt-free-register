@@ -43,6 +43,15 @@ CREATE TABLE IF NOT EXISTS gmail_api_url_batches (
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS gmail_api_url_batch_meta (
+    batch_id TEXT PRIMARY KEY,
+    target_count INTEGER,
+    aliases_per_source INTEGER NOT NULL DEFAULT 12,
+    desired_sources INTEGER,
+    created_at REAL NOT NULL,
+    FOREIGN KEY (batch_id) REFERENCES gmail_api_url_batches(batch_id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS gmail_api_url_batch_items (
     batch_id TEXT NOT NULL,
     inventory_id TEXT NOT NULL,
@@ -99,9 +108,45 @@ CREATE TABLE IF NOT EXISTS gmail_api_url_provision_leases (
     expires_at REAL NOT NULL,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS gmail_api_url_purchase_orders (
+    purchase_id TEXT PRIMARY KEY,
+    batch_id TEXT NOT NULL,
+    out_order_no TEXT NOT NULL UNIQUE,
+    sku_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    delivery_summary TEXT NOT NULL DEFAULT '',
+    message TEXT NOT NULL DEFAULT '',
+    source_email TEXT NOT NULL DEFAULT '',
+    code_url TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    FOREIGN KEY (batch_id) REFERENCES gmail_api_url_batches(batch_id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_gmail_api_url_purchase_orders_batch_status
+    ON gmail_api_url_purchase_orders(batch_id, status, created_at);
+
+CREATE TABLE IF NOT EXISTS gmail_api_url_after_sales_observations (
+    code_url TEXT PRIMARY KEY,
+    first_code INTEGER NOT NULL,
+    otp_received INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gmail_api_url_after_sales_claims (
+    uid TEXT PRIMARY KEY,
+    code_url TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    message TEXT NOT NULL DEFAULT '',
+    attempts INTEGER NOT NULL DEFAULT 1,
+    created_at REAL NOT NULL
+);
 """
 
 _WAITER_STALE_SECONDS = 300
+_AFTER_SALES_PENDING_TIMEOUT = 300
 _PROVISION_LEASE_KEY = "canonical_purchase"
 _PROVISION_LEASE_SECONDS = 300
 
@@ -120,6 +165,15 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         from . import db
 
         return db.gmail_api_url_blocked_canonical_roots(sqlite_path=self.path)
+
+    def _source_provenance_keys_in_connection(
+        self,
+        connection: sqlite3.Connection,
+    ) -> set[tuple[str, str]]:
+        """Return source identities backed by the canonical raw Gmail pool."""
+        from . import db
+
+        return set(db.gmail_api_url_source_keys(sqlite_path=self.path))
 
     @staticmethod
     def _runtime_alias_keys(alias: object) -> set[str]:
@@ -171,16 +225,23 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         with db._LOCK, self._transaction() as connection:
             yield connection
 
+    @staticmethod
+    def _provision_lease_key(batch_id: str | None = None) -> str:
+        batch = str(batch_id or "").strip()
+        return f"{_PROVISION_LEASE_KEY}:{batch}" if batch else _PROVISION_LEASE_KEY
+
     def acquire_provision_lease(
         self,
         owner: str,
         *,
+        batch_id: str | None = None,
         lease_seconds: int = _PROVISION_LEASE_SECONDS,
     ) -> bool:
         """Reserve the canonical ledger while deciding whether to buy a source."""
         value = str(owner or "").strip()
         if not value:
             raise ValueError("Gmail API provision lease owner is required")
+        lease_key = self._provision_lease_key(batch_id)
         now = time.time()
         expires_at = now + max(1, int(lease_seconds))
         with self._transaction() as connection:
@@ -190,7 +251,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             )
             row = connection.execute(
                 "SELECT owner FROM gmail_api_url_provision_leases WHERE lease_key = ?",
-                (_PROVISION_LEASE_KEY,),
+                (lease_key,),
             ).fetchone()
             if row is not None and str(row["owner"]) != value:
                 return False
@@ -199,39 +260,283 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 "(lease_key, owner, expires_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(lease_key) DO UPDATE SET owner = excluded.owner, "
                 "expires_at = excluded.expires_at, updated_at = CURRENT_TIMESTAMP",
-                (_PROVISION_LEASE_KEY, value, expires_at),
+                (lease_key, value, expires_at),
             )
         return True
 
-    def release_provision_lease(self, owner: str) -> bool:
+    def release_provision_lease(
+        self,
+        owner: str,
+        *,
+        batch_id: str | None = None,
+    ) -> bool:
         value = str(owner or "").strip()
         if not value:
             return False
+        lease_key = self._provision_lease_key(batch_id)
         with self._transaction() as connection:
             result = connection.execute(
                 "DELETE FROM gmail_api_url_provision_leases "
                 "WHERE lease_key = ? AND owner = ?",
-                (_PROVISION_LEASE_KEY, value),
+                (lease_key, value),
             )
         return result.rowcount > 0
+
+    def list_purchase_orders(self, batch_id: str) -> list[dict[str, object]]:
+        """Return purchase intents persisted for one canonical Gmail batch."""
+        batch = str(batch_id or "").strip()
+        if not batch:
+            return []
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            rows = connection.execute(
+                "SELECT * FROM gmail_api_url_purchase_orders "
+                "WHERE batch_id = ? ORDER BY created_at, purchase_id",
+                (batch,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def has_purchase_order_for_code_url(self, code_url: str) -> bool:
+        """Return whether a code URL was delivered by a QAN8 purchase order."""
+        value = str(code_url or "").strip()
+        if not value:
+            return False
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            row = connection.execute(
+                "SELECT 1 FROM gmail_api_url_purchase_orders "
+                "WHERE code_url = ? AND lower(status) = 'completed' LIMIT 1",
+                (value,),
+            ).fetchone()
+        return row is not None
+
+    def record_qan8_after_sales_observation(
+        self,
+        code_url: str,
+        response_code: int,
+        *,
+        otp_received: bool = False,
+    ) -> None:
+        """Record the first QAN8 response and whether the source ever returned OTP."""
+        url = str(code_url or "").strip()
+        if not url:
+            return
+        try:
+            code = int(response_code)
+        except (TypeError, ValueError):
+            return
+        now = time.time()
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO gmail_api_url_after_sales_observations "
+                "(code_url, first_code, otp_received, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(code_url) DO UPDATE SET "
+                "otp_received = MAX(otp_received, excluded.otp_received), "
+                "updated_at = excluded.updated_at",
+                (url, code, int(bool(otp_received)), now, now),
+            )
+
+    def is_qan8_after_sales_eligible(self, code_url: str) -> bool:
+        """Require the first QAN8 response to be 602 and no prior OTP delivery."""
+        url = str(code_url or "").strip()
+        if not url:
+            return False
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            row = connection.execute(
+                "SELECT first_code, otp_received "
+                "FROM gmail_api_url_after_sales_observations WHERE code_url = ?",
+                (url,),
+            ).fetchone()
+        return bool(
+            row is not None
+            and int(row["first_code"]) == 602
+            and not bool(row["otp_received"])
+        )
+
+    def claim_after_sales_uid(self, uid: str, code_url: str) -> bool:
+        """Atomically claim one QAN8 UID for an after-sales request."""
+        uid_value = str(uid or "").strip()
+        url_value = str(code_url or "").strip()
+        if not uid_value or not url_value:
+            return False
+        with self._transaction() as connection:
+            self._ensure_after_sales_claim_schema(connection)
+            row = connection.execute(
+                "SELECT status, created_at FROM gmail_api_url_after_sales_claims WHERE uid = ?",
+                (uid_value,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO gmail_api_url_after_sales_claims "
+                    "(uid, code_url, created_at) VALUES (?, ?, ?)",
+                    (uid_value, url_value, time.time()),
+                )
+                return True
+            if str(row["status"] or "").lower() == "completed":
+                return False
+            status = str(row["status"] or "").lower()
+            if status == "pending" and (
+                time.time() - float(row["created_at"] or 0) < _AFTER_SALES_PENDING_TIMEOUT
+            ):
+                return False
+            connection.execute(
+                "UPDATE gmail_api_url_after_sales_claims SET status='pending', "
+                "code_url=?, attempts=attempts+1, message='', created_at=? WHERE uid=?",
+                (url_value, time.time(), uid_value),
+            )
+            return True
+
+    def finish_after_sales_uid(self, uid: str, *, success: bool, message: str = "") -> None:
+        """Persist the outcome so failed after-sales attempts remain retryable."""
+        value = str(uid or "").strip()
+        if not value:
+            return
+        with self._transaction() as connection:
+            self._ensure_after_sales_claim_schema(connection)
+            connection.execute(
+                "UPDATE gmail_api_url_after_sales_claims SET status=?, message=? WHERE uid=?",
+                ("completed" if success else "failed", str(message or "")[:500], value),
+            )
+
+    @staticmethod
+    def _ensure_after_sales_claim_schema(connection: sqlite3.Connection) -> None:
+        """Upgrade the claim table created by an earlier version in place."""
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(gmail_api_url_after_sales_claims)"
+            ).fetchall()
+        }
+        if "status" not in columns:
+            connection.execute(
+                "ALTER TABLE gmail_api_url_after_sales_claims "
+                "ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            )
+        if "message" not in columns:
+            connection.execute(
+                "ALTER TABLE gmail_api_url_after_sales_claims "
+                "ADD COLUMN message TEXT NOT NULL DEFAULT ''"
+            )
+        if "attempts" not in columns:
+            connection.execute(
+                "ALTER TABLE gmail_api_url_after_sales_claims "
+                "ADD COLUMN attempts INTEGER NOT NULL DEFAULT 1"
+            )
+
+    def get_purchase_order(
+        self,
+        batch_id: str,
+        out_order_no: str,
+    ) -> dict[str, object] | None:
+        batch, order_no = self._required(batch_id, out_order_no)
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            row = connection.execute(
+                "SELECT * FROM gmail_api_url_purchase_orders "
+                "WHERE batch_id = ? AND out_order_no = ?",
+                (batch, order_no),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def create_purchase_order(
+        self,
+        batch_id: str,
+        out_order_no: str,
+        sku_id: int | str,
+    ) -> dict[str, object]:
+        """Persist one idempotent quantity-one purchase intent."""
+        batch, order_no = self._required(batch_id, out_order_no)
+        sku = str(sku_id or "").strip()
+        if not sku:
+            raise GmailBatchError("Gmail API purchase order requires sku_id")
+        now = time.time()
+        purchase_id = uuid.uuid4().hex
+        with self._transaction() as connection:
+            connection.execute(
+                "INSERT INTO gmail_api_url_purchase_orders "
+                "(purchase_id, batch_id, out_order_no, sku_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(out_order_no) DO NOTHING",
+                (purchase_id, batch, order_no, sku, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM gmail_api_url_purchase_orders "
+                "WHERE batch_id = ? AND out_order_no = ?",
+                (batch, order_no),
+            ).fetchone()
+        if row is None:
+            raise GmailBatchError("Gmail API purchase order was not persisted")
+        return dict(row)
+
+    def update_purchase_order(
+        self,
+        batch_id: str,
+        out_order_no: str,
+        *,
+        status: str | None = None,
+        message: str | None = None,
+        delivery_summary: str | None = None,
+        source_email: str | None = None,
+        code_url: str | None = None,
+    ) -> dict[str, object] | None:
+        """Update provider state without storing credentials or delivery text."""
+        batch, order_no = self._required(batch_id, out_order_no)
+        assignments: list[str] = []
+        params: list[object] = []
+        for column, value in (
+            ("status", status),
+            ("message", message),
+            ("delivery_summary", delivery_summary),
+            ("source_email", source_email),
+            ("code_url", code_url),
+        ):
+            if value is None:
+                continue
+            assignments.append(f"{column} = ?")
+            params.append(str(value)[:500])
+        if not assignments:
+            return self.get_purchase_order(batch, order_no)
+        assignments.append("updated_at = ?")
+        params.append(time.time())
+        params.extend((batch, order_no))
+        with self._transaction() as connection:
+            connection.execute(
+                "UPDATE gmail_api_url_purchase_orders SET "
+                + ", ".join(assignments)
+                + " WHERE batch_id = ? AND out_order_no = ?",
+                tuple(params),
+            )
+            row = connection.execute(
+                "SELECT * FROM gmail_api_url_purchase_orders "
+                "WHERE batch_id = ? AND out_order_no = ?",
+                (batch, order_no),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     @staticmethod
     def _provision_claim_allowed(
         connection: sqlite3.Connection,
         provision_owner: str | None,
+        batch_id: str | None = None,
     ) -> bool:
-        """Block new claims while another worker is buying a shared source."""
+        """Block claims while the same batch is materializing a source."""
         row = connection.execute(
             "SELECT owner, expires_at FROM gmail_api_url_provision_leases "
             "WHERE lease_key = ?",
-            (_PROVISION_LEASE_KEY,),
+            (GmailApiUrlBatchStore._provision_lease_key(batch_id),),
         ).fetchone()
         if row is None or float(row["expires_at"] or 0) <= time.time():
             return True
         return bool(provision_owner and str(row["owner"]) == str(provision_owner))
 
-    def _claim_is_blocked_by_provision(self, connection: sqlite3.Connection) -> bool:
-        return not self._provision_claim_allowed(connection, None)
+    def _claim_is_blocked_by_provision(
+        self,
+        connection: sqlite3.Connection,
+        batch_id: str | None = None,
+    ) -> bool:
+        return not self._provision_claim_allowed(connection, None, batch_id)
 
     @staticmethod
     def _alias_is_runtime_blocked(alias: str, blocked_roots: set[str]) -> bool:
@@ -251,6 +556,21 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         suffix = value.rsplit("::", 1)[-1] if "::" in value else ""
         return bool(suffix.isdigit())
 
+    @staticmethod
+    def _source_provenance_key(row: sqlite3.Row) -> tuple[str, str] | None:
+        """Normalize a canonical alias row for provenance matching."""
+        from .gmail_aliases import GmailAliasError, canonical_gmail
+
+        email = str(row["email"] or "").strip()
+        code_url = str(row["code_url"] or "").strip()
+        if not email or not code_url:
+            return None
+        try:
+            root = canonical_gmail(email)
+        except GmailAliasError:
+            return None
+        return root, code_url
+
     def _first_runtime_eligible_row(
         self,
         rows: list[sqlite3.Row],
@@ -258,6 +578,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         unavailable_aliases: set[str] | None = None,
         shadow_items: set[tuple[str, str]] | None = None,
         connection: sqlite3.Connection | None = None,
+        source_provenance_keys: set[tuple[str, str]] | None = None,
     ) -> sqlite3.Row | None:
         unavailable = unavailable_aliases or set()
         shadows = shadow_items or set()
@@ -267,6 +588,10 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 if not self._runtime_alias_is_unavailable(row["email"], unavailable)
                 and (str(row["batch_id"]), str(row["inventory_id"])) not in shadows
                 and not self._alias_is_runtime_blocked(str(row["email"] or ""), blocked_roots)
+                and (
+                    source_provenance_keys is None
+                    or self._source_provenance_key(row) in source_provenance_keys
+                )
             ),
             None,
         )
@@ -339,25 +664,21 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
     def _globally_terminal_aliases_in_connection(
         connection: sqlite3.Connection,
     ) -> set[str]:
-        """Return aliases consumed or failed anywhere in the shared ledger."""
-        aliases: set[str] = set()
-        q8_tables = {
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('qan8_aliases', 'qan8_sources')"
-            ).fetchall()
+        """Return terminal aliases, excluding reusable legacy capacity slots."""
+        rows = connection.execute(
+            "SELECT DISTINCT lower(email) AS alias, inventory_id "
+            "FROM gmail_api_url_batch_items "
+            "WHERE state = 'failed' OR state = 'exhausted' "
+            "OR completed_count > 0"
+        ).fetchall()
+        return {
+            str(row["alias"] or "").strip().casefold()
+            for row in rows
+            if str(row["alias"] or "").strip()
+            and not GmailApiUrlBatchStore._is_legacy_capacity_slot(
+                row["inventory_id"]
+            )
         }
-        if q8_tables == {"qan8_aliases", "qan8_sources"}:
-            rows = connection.execute(
-                "SELECT DISTINCT lower(x.alias) AS alias FROM qan8_aliases x "
-                "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                "WHERE x.state IN ('consumed', 'failed')"
-            ).fetchall()
-            for row in rows:
-                if str(row["alias"] or "").strip():
-                    aliases.add(str(row["alias"] or "").strip().casefold())
-        return aliases
 
     @classmethod
     def _globally_unavailable_aliases_in_connection(
@@ -366,21 +687,18 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
     ) -> set[str]:
         """Return terminal aliases plus aliases currently owned by a job."""
         aliases = cls._globally_terminal_aliases_in_connection(connection)
-        q8_tables = {
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name = 'qan8_aliases'"
-            ).fetchall()
-        }
-        if q8_tables:
-            rows = connection.execute(
-                "SELECT DISTINCT lower(alias) AS alias FROM qan8_aliases "
-                "WHERE state IN ('consumed', 'failed', 'active')"
-            ).fetchall()
-            for row in rows:
-                if str(row["alias"] or "").strip():
-                    aliases.add(str(row["alias"] or "").strip().casefold())
+        rows = connection.execute(
+            "SELECT DISTINCT lower(i.email) AS alias "
+            "FROM gmail_api_url_batch_items i "
+            "JOIN gmail_api_url_assignments a ON a.batch_id = i.batch_id "
+            "AND a.inventory_id = i.inventory_id "
+            "WHERE a.state = 'active'"
+        ).fetchall()
+        aliases.update(
+            str(row["alias"] or "").strip().casefold()
+            for row in rows
+            if str(row["alias"] or "").strip()
+        )
         return aliases
 
     def claim(
@@ -415,7 +733,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             if existing:
                 return self._assignment(existing)
 
-            if not self._provision_claim_allowed(connection, provision_owner):
+            if not self._provision_claim_allowed(connection, provision_owner, batch):
                 raise GmailBatchConflict("Gmail API URL provision is busy")
             
             # Find available item with exclusive code_url constraint
@@ -469,6 +787,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         job_id: str,
         *,
         provision_owner: str | None = None,
+        require_source_provenance: bool = False,
     ) -> Assignment | None:
         """Claim through the durable FIFO queue, returning None while waiting.
 
@@ -484,6 +803,11 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             blocked_roots = self.runtime_blocked_canonical_roots()
             unavailable_aliases = self._globally_unavailable_aliases_in_connection(connection)
             shadow_items = self._shadow_aliases_in_connection(connection)
+            source_provenance_keys = (
+                self._source_provenance_keys_in_connection(connection)
+                if require_source_provenance
+                else None
+            )
             existing = connection.execute(
                 f"SELECT * FROM {prefix}_assignments "
                 "WHERE batch_id = ? AND job_id = ? AND state = 'active'",
@@ -497,7 +821,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 )
                 return self._assignment(existing)
 
-            if not self._provision_claim_allowed(connection, provision_owner):
+            if not self._provision_claim_allowed(connection, provision_owner, batch):
                 return None
 
             connection.execute(
@@ -556,6 +880,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 unavailable_aliases,
                 shadow_items,
                 connection,
+                source_provenance_keys,
             )
             if row is None:
                 connection.execute(
@@ -596,13 +921,12 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         *,
         exclude_batch_id: str | None = None,
         provision_owner: str | None = None,
+        require_source_provenance: bool = False,
     ) -> Assignment | None:
         """Claim one available alias from the shared Gmail ledger.
 
-        QAN8 jobs own an empty target batch until a purchase is required.  This
-        method lets those jobs consume aliases already materialized by another
-        Gmail/QAN8 batch while keeping the same code-url exclusivity and one
-        assignment owner used by the normal batch queue.
+        This method lets callers consume aliases already materialized by
+        another canonical Gmail batch while keeping one assignment owner.
         """
         owner = str(job_id or "").strip()
         if not owner:
@@ -612,6 +936,11 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             blocked_roots = self.runtime_blocked_canonical_roots()
             unavailable_aliases = self._globally_unavailable_aliases_in_connection(connection)
             shadow_items = self._shadow_aliases_in_connection(connection)
+            source_provenance_keys = (
+                self._source_provenance_keys_in_connection(connection)
+                if require_source_provenance
+                else None
+            )
             existing = connection.execute(
                 "SELECT * FROM gmail_api_url_assignments "
                 "WHERE job_id = ? AND state = 'active' LIMIT 1",
@@ -649,6 +978,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 unavailable_aliases,
                 shadow_items,
                 connection,
+                source_provenance_keys,
             )
             if row is None:
                 return None
@@ -665,7 +995,12 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             ).fetchone()
             return self._assignment(created)
 
-    def has_available_item(self, *, exclude_batch_id: str | None = None) -> bool:
+    def has_available_item(
+        self,
+        *,
+        exclude_batch_id: str | None = None,
+        require_source_provenance: bool = False,
+    ) -> bool:
         """Return whether any unassigned active alias remains in the ledger."""
         excluded = str(exclude_batch_id or "").strip()
         blocked_roots = self.runtime_blocked_canonical_roots()
@@ -673,6 +1008,11 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             connection.executescript(self._get_schema_sql())
             unavailable_aliases = self._globally_unavailable_aliases_in_connection(connection)
             shadow_items = self._shadow_aliases_in_connection(connection)
+            source_provenance_keys = (
+                self._source_provenance_keys_in_connection(connection)
+                if require_source_provenance
+                else None
+            )
             clauses = [
                 "i.state = 'active'",
                 "i.completed_count < b.capacity",
@@ -694,20 +1034,22 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 f"WHERE {' AND '.join(clauses)}",
                 tuple(params),
             ).fetchall()
-            row = next(
-                (
-                    item for item in rows
-                    if not self._runtime_alias_is_unavailable(
-                        item["email"], unavailable_aliases
-                    )
-                    and (str(item["batch_id"]), str(item["inventory_id"])) not in shadow_items
-                    if not self._alias_is_runtime_blocked(str(item["email"] or ""), blocked_roots)
-                ),
-                None,
+            row = self._first_runtime_eligible_row(
+                rows,
+                blocked_roots,
+                unavailable_aliases,
+                shadow_items,
+                connection,
+                source_provenance_keys,
             )
         return row is not None
 
-    def has_pending_item(self, *, exclude_batch_id: str | None = None) -> bool:
+    def has_pending_item(
+        self,
+        *,
+        exclude_batch_id: str | None = None,
+        require_source_provenance: bool = False,
+    ) -> bool:
         """Return whether any active alias still has capacity, even if locked.
 
         A code URL is deliberately exclusive while one job is polling it.  The
@@ -720,6 +1062,11 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             connection.executescript(self._get_schema_sql())
             terminal_aliases = self._globally_terminal_aliases_in_connection(connection)
             shadow_items = self._shadow_aliases_in_connection(connection)
+            source_provenance_keys = (
+                self._source_provenance_keys_in_connection(connection)
+                if require_source_provenance
+                else None
+            )
             clauses = [
                 "i.state = 'active'",
                 "i.completed_count < b.capacity",
@@ -734,16 +1081,13 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 f"WHERE {' AND '.join(clauses)}",
                 tuple(params),
             ).fetchall()
-            row = next(
-                (
-                    item for item in rows
-                    if not self._runtime_alias_is_unavailable(
-                        item["email"], terminal_aliases
-                    )
-                    and (str(item["batch_id"]), str(item["inventory_id"])) not in shadow_items
-                    if not self._alias_is_runtime_blocked(str(item["email"] or ""), blocked_roots)
-                ),
-                None,
+            row = self._first_runtime_eligible_row(
+                rows,
+                blocked_roots,
+                terminal_aliases,
+                shadow_items,
+                connection,
+                source_provenance_keys,
             )
         return row is not None
 
@@ -834,31 +1178,6 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 result[alias] = (str(row["batch_id"]), str(row["inventory_id"]))
                 continue
 
-            q8_tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources')"
-                ).fetchall()
-            }
-            if q8_tables == {"qan8_aliases", "qan8_sources"}:
-                q8_rows = connection.execute(
-                    "SELECT s.code_url FROM qan8_aliases x "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE lower(x.alias) = ?",
-                    (alias,),
-                ).fetchall()
-                q8_conflicting = next(
-                    (
-                        row for row in q8_rows
-                        if str(row["code_url"] or "").strip() != url
-                    ),
-                    None,
-                )
-                if q8_conflicting is not None:
-                    raise GmailBatchConflict(
-                        f"Gmail API alias {alias} is already linked to another code_url"
-                    )
             missing.append(alias)
 
         if missing:
@@ -956,7 +1275,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             ):
                 return self._assignment(existing)
             return None
-        if not self._provision_claim_allowed(connection, None):
+        if not self._provision_claim_allowed(connection, None, batch):
             return None
         row = connection.execute(
             "SELECT i.*, b.capacity FROM gmail_api_url_batch_items i "
@@ -1069,56 +1388,11 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
 
         message = str(reason or "")[:300]
         with self._transaction() as connection:
-            item_count = self.quarantine_code_url_in_connection(
+            return self.quarantine_code_url_in_connection(
                 connection,
                 url,
                 reason=message,
             )
-            q8_tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources', 'qan8_assignments', 'qan8_lanes')"
-                ).fetchall()
-            }
-            q8_item_count = 0
-            if q8_tables == {
-                "qan8_aliases",
-                "qan8_sources",
-                "qan8_assignments",
-                "qan8_lanes",
-            }:
-                q8_item_count = connection.execute(
-                    "SELECT COUNT(*) FROM qan8_aliases x "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE s.code_url = ? AND x.state IN ('available', 'active')",
-                    (url,),
-                ).fetchone()[0]
-                connection.execute(
-                    "UPDATE qan8_assignments SET state = 'failed', reason = ?, updated_at = ? "
-                    "WHERE state = 'active' AND alias_id IN ("
-                    "SELECT x.alias_id FROM qan8_aliases x "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE s.code_url = ?)",
-                    (message, time.time(), url),
-                )
-                connection.execute(
-                    "UPDATE qan8_aliases SET state = 'failed' WHERE state IN ('available', 'active') "
-                    "AND source_group_id IN (SELECT source_group_id FROM qan8_sources WHERE code_url = ?)",
-                    (url,),
-                )
-                connection.execute(
-                    "UPDATE qan8_sources SET state = 'retired', retired_at = ? "
-                    "WHERE code_url = ? AND state = 'active'",
-                    (time.time(), url),
-                )
-                connection.execute(
-                    "UPDATE qan8_lanes SET current_source_group_id = NULL, active_job_id = NULL, "
-                    "failure_reason = ? WHERE current_source_group_id IN ("
-                    "SELECT source_group_id FROM qan8_sources WHERE code_url = ?)",
-                    (message, url),
-                )
-        return max(int(item_count or 0), int(q8_item_count or 0))
 
     def poll_otp(
         self,
@@ -1206,14 +1480,27 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         
         return batch_id
 
-    def create_empty_batch(self, *, routed_domains=()) -> str:
+    def create_empty_batch(
+        self,
+        *,
+        routed_domains=(),
+        target_count: int | None = None,
+        aliases_per_source: int = 12,
+        desired_sources: int | None = None,
+    ) -> str:
         """Create an empty canonical batch that can be filled lazily.
 
-        QAN8 registration creates the canonical Gmail batch before it knows
-        whether a purchase is required.  Keeping the batch row without
-        inventory lets existing Gmail API aliases and later purchased aliases
-        share one queue and one assignment ledger.
+        Keeping the batch row without inventory lets imported Gmail aliases
+        and lazily purchased Gmail API sources share one queue and assignment
+        ledger.
         """
+        if target_count is not None and int(target_count) < 1:
+            raise GmailBatchError("Gmail API batch target_count must be positive")
+        limit = max(1, min(12, int(aliases_per_source or 12)))
+        if desired_sources is None and target_count is not None:
+            desired_sources = (int(target_count) + limit - 1) // limit
+        if desired_sources is not None and int(desired_sources) < 1:
+            raise GmailBatchError("Gmail API batch desired_sources must be positive")
         batch_id = uuid.uuid4().hex
         domains = list(routed_domains or ())
         with self._transaction() as connection:
@@ -1222,7 +1509,73 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 "VALUES (?, 1, ?)",
                 (batch_id, json.dumps(domains, ensure_ascii=False)),
             )
+            connection.execute(
+                "INSERT INTO gmail_api_url_batch_meta "
+                "(batch_id, target_count, aliases_per_source, desired_sources, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    int(target_count) if target_count is not None else None,
+                    limit,
+                    int(desired_sources) if desired_sources is not None else None,
+                    time.time(),
+                ),
+            )
         return batch_id
+
+    def batch_provision_plan(self, batch_id: str) -> dict[str, int | None]:
+        """Return the lazy source target recorded for one canonical batch."""
+        batch = str(batch_id or "").strip()
+        if not batch:
+            return {
+                "target_count": None,
+                "aliases_per_source": 12,
+                "desired_sources": None,
+            }
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            row = connection.execute(
+                "SELECT target_count, aliases_per_source, desired_sources "
+                "FROM gmail_api_url_batch_meta WHERE batch_id = ?",
+                (batch,),
+            ).fetchone()
+            if row is None:
+                item_count = connection.execute(
+                    "SELECT COUNT(*) FROM gmail_api_url_batch_items WHERE batch_id = ?",
+                    (batch,),
+                ).fetchone()[0]
+                return {
+                    "target_count": int(item_count or 0) or None,
+                    "aliases_per_source": 12,
+                    "desired_sources": None,
+                }
+        return {
+            "target_count": (
+                int(row["target_count"])
+                if row["target_count"] is not None
+                else None
+            ),
+            "aliases_per_source": int(row["aliases_per_source"] or 12),
+            "desired_sources": (
+                int(row["desired_sources"])
+                if row["desired_sources"] is not None
+                else None
+            ),
+        }
+
+    def count_source_groups(self, batch_id: str) -> int:
+        """Count distinct canonical provider URLs in one batch."""
+        batch = str(batch_id or "").strip()
+        if not batch:
+            return 0
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            row = connection.execute(
+                "SELECT COUNT(DISTINCT code_url) FROM gmail_api_url_batch_items "
+                "WHERE batch_id = ? AND state != 'failed'",
+                (batch,),
+            ).fetchone()
+        return int(row[0] or 0)
 
     def append_source_group(
         self,
@@ -1230,6 +1583,8 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         source_email: str,
         code_url: str,
         aliases: list[str],
+        *,
+        exclusive_code_url: bool = False,
     ) -> dict[str, tuple[str, str]]:
         """Append one purchased source group to an existing canonical batch.
 
@@ -1248,6 +1603,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 source_email,
                 code_url,
                 aliases,
+                exclusive_code_url=exclusive_code_url,
             )
 
     def append_source_group_in_connection(
@@ -1257,6 +1613,8 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         source_email: str,
         code_url: str,
         aliases: list[str],
+        *,
+        exclusive_code_url: bool = False,
     ) -> dict[str, tuple[str, str]]:
         """Append a source group inside a caller-owned SQLite transaction."""
         batch, url = self._required(batch_id, code_url)
@@ -1281,6 +1639,17 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
         ).fetchone()
         if target is None:
             raise GmailBatchError(f"Gmail API batch does not exist: {batch}")
+
+        if exclusive_code_url:
+            owner = connection.execute(
+                "SELECT 1 FROM gmail_api_url_batch_items "
+                "WHERE code_url = ? AND batch_id != ? LIMIT 1",
+                (url, batch),
+            ).fetchone()
+            if owner is not None:
+                raise GmailBatchConflict(
+                    f"Gmail API code_url is already owned by another batch: {url}"
+                )
 
         # Read all rows for each alias before inserting anything.  The caller's
         # immediate transaction makes this check and the following inserts
@@ -1317,38 +1686,6 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                     f"Gmail API alias {alias} is already allocated in another batch"
                 )
 
-            # QAN8 keeps purchase provenance in a second set of tables.  Check
-            # it in this same transaction too, otherwise a concurrent/legacy
-            # QAN8 row could bypass canonical alias ownership.
-            q8_tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources')"
-                ).fetchall()
-            }
-            if q8_tables == {"qan8_aliases", "qan8_sources"}:
-                q8_rows = connection.execute(
-                    "SELECT s.code_url FROM qan8_aliases x "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE lower(x.alias) = ?",
-                    (alias,),
-                ).fetchall()
-                if q8_rows:
-                    q8_conflicting = next(
-                        (
-                            row for row in q8_rows
-                            if str(row["code_url"] or "").strip() != url
-                        ),
-                        None,
-                    )
-                    if q8_conflicting is not None:
-                        raise GmailBatchConflict(
-                            f"Gmail API alias {alias} is already linked to another code_url"
-                        )
-                    raise GmailBatchConflict(
-                        f"Gmail API alias {alias} is already registered in QAN8"
-                    )
             missing.append(alias)
 
         if missing:
@@ -1462,16 +1799,40 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             return None
 
     def find_item_by_alias_for_job(self, alias: str, job_id: str) -> tuple[str, str] | None:
-        """Resolve the mailbox URL through the active assignment owner first."""
+        """Resolve the mailbox URL owned by this job, including post-claim use."""
         with closing(self._connect()) as connection:
             connection.executescript(self._get_schema_sql())
             row = connection.execute(
                 "SELECT i.email, i.code_url FROM gmail_api_url_assignments a "
                 "JOIN gmail_api_url_batch_items i ON i.batch_id = a.batch_id "
                 "AND i.inventory_id = a.inventory_id "
-                "WHERE a.job_id = ? AND a.state = 'active' "
-                "AND lower(i.email) = lower(?) LIMIT 1",
+                "WHERE a.job_id = ? AND a.state IN ('active', 'completed') "
+                "AND lower(i.email) = lower(?) "
+                "ORDER BY CASE WHEN a.state = 'active' THEN 0 ELSE 1 END, "
+                "a.updated_at DESC LIMIT 1",
                 (str(job_id), str(alias or "").strip()),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["email"]), str(row["code_url"])
+
+    def find_item_by_alias_for_batch(
+        self,
+        alias: str,
+        batch_id: str,
+    ) -> tuple[str, str] | None:
+        """Resolve an alias mailbox from its durable canonical batch."""
+        batch = str(batch_id or "").strip()
+        email = str(alias or "").strip()
+        if not batch or not email:
+            return None
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            row = connection.execute(
+                "SELECT email, code_url FROM gmail_api_url_batch_items "
+                "WHERE batch_id = ? AND lower(email) = lower(?) "
+                "ORDER BY created_at, position LIMIT 1",
+                (batch, email),
             ).fetchone()
         if row is None:
             return None
@@ -1482,9 +1843,7 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
 
         Historical batch rows are an audit trail, not a permanent reservation.
         An alias only remains unavailable after it was consumed, explicitly
-        failed, or is still owned by an active assignment. QAN8 uses a second
-        set of tables in the same database, so its terminal/live aliases are
-        part of the same mailbox ownership check.
+        failed, or is still owned by an active assignment.
         """
         value = str(code_url or "").strip()
         if not value:
@@ -1503,28 +1862,10 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 ")",
                 (value,),
             ).fetchall()
-            q8_tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources')"
-                ).fetchall()
-            }
-            q8_rows = []
-            if q8_tables == {'qan8_aliases', 'qan8_sources'}:
-                q8_rows = connection.execute(
-                    "SELECT DISTINCT x.alias FROM qan8_aliases x "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE s.code_url = ? AND x.state IN ('consumed', 'failed', 'active')",
-                    (value,),
-                ).fetchall()
         aliases: set[str] = set()
         for row in rows:
             if str(row["email"] or "").strip():
                 aliases.add(str(row["email"] or "").strip().casefold())
-        for row in q8_rows:
-            if str(row["alias"] or "").strip():
-                aliases.add(str(row["alias"] or "").strip().casefold())
         return aliases
 
     def list_globally_unavailable_aliases(self) -> set[str]:
@@ -1556,34 +1897,14 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 for row in rows
                 if str(row["email"] or "").strip()
             }
-            q8_tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources')"
-                ).fetchall()
-            }
-            if q8_tables == {"qan8_aliases", "qan8_sources"}:
-                rows = connection.execute(
-                    "SELECT DISTINCT lower(x.alias) AS alias FROM qan8_aliases x "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE s.code_url = ?",
-                    (value,),
-                ).fetchall()
-                aliases.update(
-                    str(row["alias"] or "").strip().casefold()
-                    for row in rows
-                    if str(row["alias"] or "").strip()
-                )
         return aliases
 
     def has_pending_alias_for_code_url(self, code_url: str) -> bool:
         """Return whether an alias for one URL is still reusable or queued.
 
-        A raw source may already be represented by another canonical batch (or
-        by QAN8 provenance) while its aliases are waiting for a worker.  That
-        is temporary/pending capacity, not source exhaustion; callers must not
-        mark the raw root terminal in that state.
+        A raw source may already be represented by another canonical batch
+        while its aliases are waiting for a worker.  That is temporary/pending
+        capacity, not source exhaustion.
         """
         value = str(code_url or "").strip()
         if not value:
@@ -1599,21 +1920,6 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             ).fetchone()
             if row is not None:
                 return True
-            q8_tables = {
-                str(item[0])
-                for item in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources')"
-                ).fetchall()
-            }
-            if q8_tables == {"qan8_aliases", "qan8_sources"}:
-                row = connection.execute(
-                    "SELECT 1 FROM qan8_aliases x "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE s.code_url = ? AND s.state = 'active' "
-                    "AND x.state IN ('available', 'active') LIMIT 1",
-                    (value,),
-                ).fetchone()
         return row is not None
 
     def has_active_code_url_assignment(self, code_url: str) -> bool:
@@ -1632,22 +1938,25 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             ).fetchone()
             if row is not None:
                 return True
-            q8_tables = {
-                str(item[0])
-                for item in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources', 'qan8_assignments')"
-                ).fetchall()
-            }
-            if q8_tables == {"qan8_aliases", "qan8_sources", "qan8_assignments"}:
-                row = connection.execute(
-                    "SELECT 1 FROM qan8_assignments a "
-                    "JOIN qan8_aliases x ON x.alias_id = a.alias_id "
-                    "JOIN qan8_sources s ON s.source_group_id = x.source_group_id "
-                    "WHERE s.code_url = ? AND a.state = 'active' LIMIT 1",
-                    (value,),
-                ).fetchone()
         return row is not None
+
+    def active_code_urls(self) -> set[str]:
+        """Return provider URLs currently owned by a live Gmail job."""
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            rows = connection.execute(
+                "SELECT DISTINCT i.code_url "
+                "FROM gmail_api_url_assignments a "
+                "JOIN gmail_api_url_batch_items i ON i.batch_id = a.batch_id "
+                "AND i.inventory_id = a.inventory_id "
+                "WHERE a.state = 'active'"
+            ).fetchall()
+            urls = {
+                str(row["code_url"] or "").strip()
+                for row in rows
+                if str(row["code_url"] or "").strip()
+            }
+        return urls
 
     def has_alias_for_other_code_url(self, alias: str, code_url: str) -> bool:
         """Return whether an alias mailbox root is tied to another URL."""
@@ -1695,32 +2004,6 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 except GmailAliasError:
                     continue
 
-        q8_tables = {
-            str(item[0])
-            for item in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table' "
-                "AND name IN ('qan8_aliases', 'qan8_sources')"
-            ).fetchall()
-        }
-        if q8_tables != {"qan8_aliases", "qan8_sources"}:
-            return False
-        rows = connection.execute(
-            "SELECT x.alias, s.code_url FROM qan8_aliases x "
-            "JOIN qan8_sources s ON s.source_group_id = x.source_group_id"
-        ).fetchall()
-        for row in rows:
-            owner_url = str(row["code_url"] or "").strip()
-            if owner_url == url:
-                continue
-            owner_email = str(row["alias"] or "").strip().casefold()
-            if owner_email == email:
-                return True
-            if canonical:
-                try:
-                    if canonical_gmail(owner_email) == canonical:
-                        return True
-                except GmailAliasError:
-                    continue
         return False
 
     def list_batch_ids_for_code_urls(self, code_urls: set[str]) -> list[str]:
@@ -1824,22 +2107,6 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             rows = connection.execute(
                 "SELECT email, code_url FROM gmail_api_url_batch_items"
             ).fetchall()
-            q8_tables = {
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table' "
-                    "AND name IN ('qan8_aliases', 'qan8_sources')"
-                ).fetchall()
-            }
-            if q8_tables == {"qan8_aliases", "qan8_sources"}:
-                rows.extend(
-                    connection.execute(
-                        "SELECT x.alias AS email, s.code_url "
-                        "FROM qan8_aliases x "
-                        "JOIN qan8_sources s ON s.source_group_id = x.source_group_id"
-                    ).fetchall()
-                )
-
         owners: dict[str, set[str]] = {}
         for row in rows:
             email = str(row["email"] or "").strip().casefold()

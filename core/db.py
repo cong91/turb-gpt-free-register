@@ -660,15 +660,7 @@ def _next_registration_job_id(rows: list[dict]) -> int:
             except (TypeError, ValueError):
                 stored_next = 1
 
-            qan8_max = 0
-            if _table_exists(conn, "qan8_assignments"):
-                for item in conn.execute("SELECT job_id FROM qan8_assignments"):
-                    try:
-                        qan8_max = max(qan8_max, int(str(item["job_id"])))
-                    except (TypeError, ValueError):
-                        continue
-
-            next_id = max(stored_next, current_max + 1, qan8_max + 1, 1)
+            next_id = max(stored_next, current_max + 1, 1)
             conn.execute(
                 "INSERT INTO storage_meta(key, value) VALUES(?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -1615,10 +1607,7 @@ def _decorate_gmail_api_url_email(row: dict, account_by_email: dict[str, dict] |
 def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
     """Attach alias inventory counts without exposing the source code URL."""
     result = [dict(row) for row in rows]
-    from core.qan8_gmail_api_store import Qan8GmailApiStore
-
     blocked_roots = gmail_api_url_blocked_canonical_roots()
-    qan8_store = Qan8GmailApiStore(_SQLITE_PATH, initialize_schema=False)
     code_urls = {
         str(row.get("code_url") or "").strip()
         for row in result
@@ -1629,10 +1618,6 @@ def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
     root_owners = gmail_store.alias_root_owners()
     empty_usage = {"allocated": set(), "consumed": set(), "failed": set(), "reserved": set()}
     for row in result:
-        qan8_usage = qan8_store.alias_usage_for_source(
-            str(row.get("email") or ""),
-            str(row.get("code_url") or ""),
-        )
         try:
             candidates = generate_gmail_dual_domain_aliases(
                 row.get("email"), limit=MAX_GMAIL_DUAL_DOMAIN_VARIANTS
@@ -1650,40 +1635,10 @@ def _attach_gmail_api_url_alias_stats(rows: list[dict]) -> list[dict]:
                 root = alias
             if any(owner_url != code_url for owner_url in root_owners.get(root, set())):
                 cross_url_owned.add(alias)
-        q8_states = (
-            qan8_store.alias_state_sets_for_source(
-                str(row.get("email") or ""),
-                str(row.get("code_url") or ""),
-            )
-            if qan8_usage is not None
-            else None
-        )
-        if qan8_usage is not None and q8_states is None:
-            # Keep compatibility with providers/tests that expose only the
-            # aggregate QAN8 counters and have no alias-name detail.
-            row.update({
-                "alias_total": int(qan8_usage["total"]),
-                "alias_allocated": int(qan8_usage["total"]),
-                "alias_available": (
-                    0
-                    if _gmail_api_url_root_is_blocked(row, blocked_roots)
-                    else max(0, int(qan8_usage["available"]) - len(cross_url_owned))
-                ),
-                "alias_used": int(qan8_usage["used"]),
-                "alias_failed": int(qan8_usage["failed"]),
-                "alias_reserved": int(qan8_usage["reserved"]),
-            })
-            continue
-        q8_states = q8_states or {}
-        q8_consumed = candidate_set & q8_states.get("consumed", set())
-        q8_failed = candidate_set & q8_states.get("failed", set())
-        q8_reserved = candidate_set & q8_states.get("active", set())
-        consumed = q8_consumed | (candidate_set & usage["consumed"])
-        failed = (q8_failed | (candidate_set & usage["failed"])) - consumed
-        reserved = (q8_reserved | (candidate_set & usage["reserved"])) - consumed - failed
-        allocated_aliases = (
-            candidate_set & usage["allocated"]
-        ) | q8_consumed | q8_failed | q8_reserved | cross_url_owned
+        consumed = candidate_set & usage["consumed"]
+        failed = (candidate_set & usage["failed"]) - consumed
+        reserved = (candidate_set & usage["reserved"]) - consumed - failed
+        allocated_aliases = (candidate_set & usage["allocated"]) | cross_url_owned
         occupied = consumed | failed | reserved | cross_url_owned
         row.update({
             "alias_total": len(candidate_set),
@@ -3705,7 +3660,7 @@ def record_gmail_api_url_email(
                 raise ValueError("Gmail API URL email already has a different code_url")
             existing_status = str(existing.get("status") or "").strip().lower()
             # A manually disabled source, an exhausted source, and a provider
-            # failure are terminal ownership decisions.  A later QAN8
+            # failure are terminal ownership decisions.  A later source
             # purchase/import must not silently revive one of these rows.
             quarantined = _is_gmail_api_url_quarantined_row(existing)
             if quarantined:
@@ -4008,6 +3963,41 @@ def gmail_api_url_blocked_canonical_roots(
                 # already skipped by the raw-pool materializer.
                 continue
     return blocked
+
+
+def gmail_api_url_source_keys(
+    *,
+    sqlite_path: str | Path | None = None,
+) -> set[tuple[str, str]]:
+    """Return canonical source identities known to the raw Gmail pool.
+
+    Canonical batch rows contain aliases only, so a cross-batch consumer needs
+    a separate provenance snapshot before it can trust a row as a real Gmail
+    API source.  The optional SQLite path keeps isolated test ledgers from
+    consulting the process-wide runtime pool.
+    """
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return set()
+        if raw_parent != db_parent:
+            return set()
+
+    keys: set[tuple[str, str]] = set()
+    with _LOCK:
+        for row in _load_gmail_api_url_emails():
+            email = str(row.get("email") or "").strip()
+            code_url = str(row.get("code_url") or "").strip()
+            if not email or not code_url:
+                continue
+            try:
+                root = canonical_gmail(email)
+            except GmailAliasError:
+                continue
+            keys.add((root, code_url))
+    return keys
 
 
 def is_gmail_api_url_source_blocked(

@@ -350,6 +350,83 @@ class BrowserTwofaRetryTests(unittest.TestCase):
         self.assertEqual(login.call_count, 2)
         driver.get.assert_called_once_with("https://chatgpt.com/auth/login")
 
+    def test_retry_restarts_browser_after_in_profile_attempts_are_exhausted(self):
+        profiles = [
+            Mock(driver=Mock(), provider="cloak", timeout=90),
+            Mock(driver=Mock(), provider="cloak", timeout=90),
+            Mock(driver=Mock(), provider="cloak", timeout=90),
+        ]
+        account = {
+            "id": 7,
+            "email": "user@example.com",
+            "registration_password": "password",
+        }
+
+        with (
+            patch("core.browser_twofa_retry.open_browser_profile", side_effect=profiles) as open_profile,
+            patch(
+                "core.browser_twofa_retry._login_existing_account",
+                return_value={"accessToken": "token"},
+            ) as login,
+            patch(
+                "core.browser_twofa_retry.setup_2fa_in_page",
+                side_effect=RuntimeError("re-auth retry exhausted"),
+            ),
+            patch("core.browser_twofa_retry.db.update_account_2fa"),
+            patch("core.browser_twofa_retry.human_delay"),
+            patch("core.account_network.resolve_rotating_proxy", return_value=None),
+            patch("config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", False),
+            patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False),
+            patch("config.codex.ENABLE_CODEX_AUTO", False),
+        ):
+            result = browser_twofa_retry.run_twofa_retry(account, proxy="http://proxy")
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(open_profile.call_count, 3)
+        self.assertEqual(login.call_count, 9)
+        self.assertEqual(
+            [call.kwargs["proxy"] for call in open_profile.call_args_list],
+            ["http://proxy", "http://proxy", "http://proxy"],
+        )
+        for profile in profiles:
+            profile.close.assert_called_once_with()
+            profile.cleanup.assert_called_once_with()
+
+    def test_retry_forces_browser_close_when_profile_is_configured_to_keep_open(self):
+        drivers = [Mock(), Mock(), Mock()]
+        profiles = [
+            Mock(driver=driver, provider="cloak", timeout=90, keep_open=True)
+            for driver in drivers
+        ]
+        account = {
+            "id": 7,
+            "email": "user@example.com",
+            "registration_password": "password",
+        }
+
+        with (
+            patch("core.browser_twofa_retry.open_browser_profile", side_effect=profiles),
+            patch(
+                "core.browser_twofa_retry._login_existing_account",
+                return_value={"accessToken": "token"},
+            ),
+            patch(
+                "core.browser_twofa_retry.setup_2fa_in_page",
+                side_effect=RuntimeError("re-auth retry exhausted"),
+            ),
+            patch("core.browser_twofa_retry.db.update_account_2fa"),
+            patch("core.browser_twofa_retry.human_delay"),
+            patch("core.account_network.resolve_rotating_proxy", return_value=None),
+            patch("config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", False),
+            patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False),
+            patch("config.codex.ENABLE_CODEX_AUTO", False),
+        ):
+            result = browser_twofa_retry.run_twofa_retry(account)
+
+        self.assertFalse(result["ok"])
+        for driver in drivers:
+            driver.quit.assert_called_once_with()
+
 
 @contextmanager
 def _null_proxy_context():

@@ -283,6 +283,72 @@ class ForcePasswordFlowTests(unittest.TestCase):
         release_email.assert_called_once()
         self.assertEqual(release_email.call_args.kwargs["status"], "disabled")
 
+    def test_cloak_twofa_failure_restarts_browser_and_reauthenticates(self):
+        driver = Mock()
+        opened = SimpleNamespace(profile_id="cloak-test", raw={})
+        recovery = {
+            "ok": True,
+            "email": "user@example.com",
+            "account_id": 7,
+            "access_token": "re-auth-token",
+            "totp_secret": "TOTPSECRET",
+            "codex": {"ok": True, "status": "skipped"},
+        }
+
+        with ExitStack() as stack:
+            stack.enter_context(patch("core.cloakbrowser_registration.build_cloak_driver", return_value=(driver, opened)))
+            stack.enter_context(patch("core.cloakbrowser_registration._twofa_cfg.ENABLE_2FA", True))
+            stack.enter_context(patch("core.cloakbrowser_registration._safe_get"))
+            stack.enter_context(patch("core.cloakbrowser_registration._maybe_accept"))
+            stack.enter_context(patch("core.cloakbrowser_registration._check_manual_stop"))
+            stack.enter_context(patch("core.cloakbrowser_registration._submit_email_and_wait_next", return_value="password"))
+            stack.enter_context(patch("core.cloakbrowser_registration._fill_password_page_if_present", return_value="Secret123!"))
+            stack.enter_context(patch("core.cloakbrowser_registration._complete_profile_page", return_value=True))
+            stack.enter_context(
+                patch(
+                    "core.cloakbrowser_registration._fetch_chatgpt_session",
+                    return_value={"accessToken": "tok", "user": {}, "account": {}},
+                )
+            )
+            stack.enter_context(patch("core.cloakbrowser_registration.wait_for_otp", return_value="123456"))
+            stack.enter_context(patch("core.cloakbrowser_registration._clear_otp_inputs"))
+            stack.enter_context(patch("core.cloakbrowser_registration._type_otp"))
+            stack.enter_context(patch("core.cloakbrowser_registration._click_continue"))
+            stack.enter_context(patch("core.cloakbrowser_registration._wait_after_email_otp_submit", return_value="accepted"))
+            stack.enter_context(patch("core.cloakbrowser_registration.checkpoint_account_data", return_value=7))
+            stack.enter_context(
+                patch(
+                    "core.account_export.setup_2fa_for_registration",
+                    side_effect=RuntimeError("re-auth retry exhausted"),
+                )
+            )
+            stack.enter_context(patch("core.cloakbrowser_registration.db.update_account_2fa"))
+            run_retry = stack.enter_context(
+                patch("core.browser_twofa_retry.run_twofa_retry", return_value=recovery)
+            )
+            stack.enter_context(patch("core.cloakbrowser_registration.resolve_email_source", return_value="gmail_api_url"))
+            stack.enter_context(patch("core.cloakbrowser_registration.human_delay"))
+            stack.enter_context(patch("core.cloakbrowser_registration.post_register_dwell"))
+            result = cloakbrowser_registration.run_cloak_registration(
+                email="user@example.com", name="Test", birthday="1990-01-01",
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["twofa_status"], "active")
+        driver.quit.assert_called_once_with()
+        run_retry.assert_called_once_with(
+            {
+                "id": 7,
+                "email": "user@example.com",
+                "registration_password": "Secret123!",
+                "access_token": "tok",
+                "proxy_used": None,
+            },
+            max_attempts=3,
+            browser_restart_attempts=3,
+            proxy=None,
+        )
+
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", False)
     @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")
     @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")

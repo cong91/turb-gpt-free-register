@@ -64,24 +64,26 @@ def _set_job_email_inputs(
     paymesh_inventory_id: str | None = None,
     paymesh_routed_domains: list[str] | None = None,
     gmail_api_url_batch_id: str | None = None,
-    qan8_gmail_api_batch_id: str | None = None,
-    qan8_gmail_api_lane_id: int | None = None,
+    gmail_api_url_aliases_per_source: int = 12,
 ) -> None:
+    from core.email_provider import normalize_email_source
+
+    inputs = {
+        "email_source": str(email_source).strip() if email_source else None,
+        "gmail_cdks": list(gmail_cdks or []),
+        "gmail_routed_domains": list(gmail_routed_domains or []),
+        "gmail_batch_id": str(gmail_batch_id or "").strip() or None,
+        "gmail_api_url_batch_id": str(gmail_api_url_batch_id or "").strip() or None,
+        "paymesh_cdks": list(paymesh_cdks or []),
+        "paymesh_inventory_id": str(paymesh_inventory_id or "").strip() or None,
+        "paymesh_routed_domains": list(paymesh_routed_domains or []),
+    }
+    if normalize_email_source(email_source or "") == "gmail_api_url":
+        inputs["gmail_api_url_aliases_per_source"] = max(
+            1, min(12, int(gmail_api_url_aliases_per_source or 12))
+        )
     with _JOB_EMAIL_INPUTS_LOCK:
-        _JOB_EMAIL_INPUTS[int(job_id)] = {
-            "email_source": str(email_source).strip() if email_source else None,
-            "gmail_cdks": list(gmail_cdks or []),
-            "gmail_routed_domains": list(gmail_routed_domains or []),
-            "gmail_batch_id": str(gmail_batch_id or "").strip() or None,
-            "gmail_api_url_batch_id": str(gmail_api_url_batch_id or "").strip() or None,
-            "qan8_gmail_api_batch_id": str(qan8_gmail_api_batch_id or "").strip() or None,
-            "qan8_gmail_api_lane_id": (
-                int(qan8_gmail_api_lane_id) if qan8_gmail_api_lane_id is not None else None
-            ),
-            "paymesh_cdks": list(paymesh_cdks or []),
-            "paymesh_inventory_id": str(paymesh_inventory_id or "").strip() or None,
-            "paymesh_routed_domains": list(paymesh_routed_domains or []),
-        }
+        _JOB_EMAIL_INPUTS[int(job_id)] = inputs
 
 
 def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
@@ -91,8 +93,6 @@ def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
         "gmail_routed_domains": [],
         "gmail_batch_id": None,
         "gmail_api_url_batch_id": None,
-        "qan8_gmail_api_batch_id": None,
-        "qan8_gmail_api_lane_id": None,
         "paymesh_cdks": [],
         "paymesh_routed_domains": [],
     }
@@ -110,11 +110,12 @@ def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
                 "paymesh_cdks": list(context.get("paymesh_cdks") or []),
                 "paymesh_routed_domains": list(context.get("paymesh_routed_domains") or []),
             }
-            if context.get("qan8_gmail_api_batch_id"):
-                result["qan8_gmail_api_batch_id"] = context["qan8_gmail_api_batch_id"]
-                result["qan8_gmail_api_lane_id"] = context.get("qan8_gmail_api_lane_id")
             if context.get("paymesh_inventory_id"):
                 result["paymesh_inventory_id"] = context["paymesh_inventory_id"]
+            if "gmail_api_url_aliases_per_source" in context:
+                result["gmail_api_url_aliases_per_source"] = int(
+                    context.get("gmail_api_url_aliases_per_source") or 12
+                )
             return result
     job = db.get_job(int(job_id))
     persisted = job.get("provider_context") if job else {}
@@ -129,13 +130,18 @@ def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
         "paymesh_cdks": [],
         "paymesh_routed_domains": list(persisted.get("paymesh_routed_domains") or []),
     }
-    qan8_batch_id = str(persisted.get("qan8_gmail_api_batch_id") or "").strip()
-    if qan8_batch_id:
-        result["qan8_gmail_api_batch_id"] = qan8_batch_id
-        result["qan8_gmail_api_lane_id"] = persisted.get("qan8_gmail_api_lane_id")
     paymesh_inventory_id = str(persisted.get("paymesh_inventory_id") or "").strip()
     if paymesh_inventory_id:
         result["paymesh_inventory_id"] = paymesh_inventory_id
+    from core.email_provider import normalize_email_source
+
+    if (
+        normalize_email_source(result["email_source"] or "") == "gmail_api_url"
+        or "gmail_api_url_aliases_per_source" in persisted
+    ):
+        result["gmail_api_url_aliases_per_source"] = int(
+            persisted.get("gmail_api_url_aliases_per_source") or 12
+        )
     return result
 
 
@@ -274,89 +280,25 @@ def _random_display_name() -> str:
     return random_display_name()
 
 
-def _refresh_exhausted_gmail_api_url_batch(
-    job_id: int | None,
-    batch_id: str | None,
-) -> str | None:
-    """为已耗尽的持久化 Gmail API URL batch 创建一个新的 alias。"""
-    normalized_batch_id = str(batch_id or "").strip()
-    if not normalized_batch_id:
-        return None
-
-    from core.gmail_api_url_client import create_registration_batch
-
-    refreshed_batch_id = str(
-        create_registration_batch(1, aliases_per_email=1) or ""
-    ).strip()
-    if not refreshed_batch_id:
-        raise RuntimeError("Gmail API URL batch refresh returned an empty batch ID")
-
-    if job_id is not None:
-        job = db.get_job(int(job_id))
-        if job is None:
-            raise RuntimeError(f"任务 #{job_id} 不存在，无法持久化 Gmail API URL batch")
-        provider_context = job.get("provider_context")
-        if not isinstance(provider_context, dict):
-            provider_context = {}
-        provider_context = dict(provider_context)
-        provider_context["gmail_api_url_batch_id"] = refreshed_batch_id
-        db.update_job(int(job_id), provider_context=provider_context)
-        with _JOB_EMAIL_INPUTS_LOCK:
-            current = _JOB_EMAIL_INPUTS.get(int(job_id))
-            if current is not None:
-                current["gmail_api_url_batch_id"] = refreshed_batch_id
-
-    logger.info(
-        "Gmail API URL batch %s exhausted; refreshed with one-alias batch %s for job %s",
-        normalized_batch_id,
-        refreshed_batch_id,
-        job_id if job_id is not None else "-",
-    )
-    return refreshed_batch_id
-
-
-def _is_gmail_api_url_batch_exhausted_error(error: BaseException) -> bool:
-    """识别邮箱来源包装后的 batch 耗尽错误，不把忙碌队列当成耗尽。"""
-    return "No available Gmail account in batch" in str(error)
-
-
-def _ensure_qan8_canonical_batch(job_id: int | None, current_batch_id: str | None) -> str:
-    """Give legacy QAN8 jobs an empty canonical destination before claiming."""
-    normalized = str(current_batch_id or "").strip()
-    if normalized:
-        return normalized
-    from core.app_state_db import APP_STATE_DB_PATH
-    from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
-
-    batch_id = GmailApiUrlBatchStore(APP_STATE_DB_PATH).create_empty_batch()
-    if job_id is not None:
-        job = db.get_job(int(job_id))
-        if job is not None:
-            provider_context = job.get("provider_context")
-            if not isinstance(provider_context, dict):
-                provider_context = {}
-            provider_context = dict(provider_context)
-            provider_context["gmail_api_url_batch_id"] = batch_id
-            db.update_job(int(job_id), provider_context=provider_context)
-        with _JOB_EMAIL_INPUTS_LOCK:
-            current = _JOB_EMAIL_INPUTS.get(int(job_id))
-            if current is not None:
-                current["gmail_api_url_batch_id"] = batch_id
-    return batch_id
-
-
 def _ensure_gmail_api_url_canonical_batch(
     job_id: int | None,
     current_batch_id: str | None,
+    aliases_per_source: int = 12,
 ) -> str:
-    """Give legacy Gmail API jobs a canonical alias batch before claiming."""
+    """Give a Gmail API URL job one lazy canonical batch before claiming."""
     normalized = str(current_batch_id or "").strip()
     if normalized:
         return normalized
 
-    from core.gmail_api_url_client import create_registration_batch
+    from core.app_state_db import APP_STATE_DB_PATH
+    from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 
-    batch_id = str(create_registration_batch(1, aliases_per_email=1) or "").strip()
+    limit = max(1, min(12, int(aliases_per_source or 12)))
+    batch_id = GmailApiUrlBatchStore(APP_STATE_DB_PATH).create_empty_batch(
+        target_count=1,
+        aliases_per_source=limit,
+        desired_sources=1,
+    )
     if not batch_id:
         raise RuntimeError("Gmail API URL batch creation returned an empty batch ID")
     if job_id is not None:
@@ -380,7 +322,7 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
     # 用模块属性读，支持 WebUI 热加载
     from config import email as _e
     from config import register as _r
-    from core.email_provider import acquire_email
+    from core.email_provider import acquire_email, normalize_email_source
     from core.profile_utils import generate_random_birthday
 
     email = str(getattr(_r, "REGISTER_EMAIL", "") or "").strip()
@@ -400,7 +342,7 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
         if _e.USE_EMAIL_SERVICE:
             email_inputs = _get_job_email_inputs(job_id)
             acquire_kwargs = {"job_id": job_id}
-            source = email_inputs["email_source"]
+            source = normalize_email_source(email_inputs["email_source"] or "") or None
             if source == "gmail_123452026":
                 if email_inputs["gmail_batch_id"]:
                     acquire_kwargs["gmail_batch_id"] = email_inputs["gmail_batch_id"]
@@ -413,14 +355,11 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
                 acquire_kwargs["gmail_api_url_batch_id"] = _ensure_gmail_api_url_canonical_batch(
                     job_id,
                     email_inputs.get("gmail_api_url_batch_id"),
+                    int(email_inputs.get("gmail_api_url_aliases_per_source") or 12),
                 )
-            elif source == "qan8_gmail_api":
-                acquire_kwargs["gmail_api_url_batch_id"] = _ensure_qan8_canonical_batch(
-                    job_id,
-                    email_inputs.get("gmail_api_url_batch_id"),
+                acquire_kwargs["gmail_api_url_aliases_per_source"] = int(
+                    email_inputs.get("gmail_api_url_aliases_per_source") or 12
                 )
-                acquire_kwargs["qan8_gmail_api_batch_id"] = email_inputs["qan8_gmail_api_batch_id"]
-                acquire_kwargs["qan8_gmail_api_lane_id"] = email_inputs["qan8_gmail_api_lane_id"]
             elif source == "paymesh":
                 if email_inputs.get("paymesh_inventory_id"):
                     acquire_kwargs["paymesh_inventory_id"] = email_inputs["paymesh_inventory_id"]
@@ -441,26 +380,7 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
                     acquire_kwargs["paymesh_cdks"] = email_inputs["paymesh_cdks"]
             if source is not None:
                 acquire_kwargs["email_source"] = source
-            try:
-                email = acquire_email(**acquire_kwargs)
-            except RuntimeError as exc:
-                stale_batch_id = str(
-                    acquire_kwargs.get("gmail_api_url_batch_id") or ""
-                ).strip() or None
-                if (
-                    source != "gmail_api_url"
-                    or not stale_batch_id
-                    or not _is_gmail_api_url_batch_exhausted_error(exc)
-                ):
-                    raise
-                refreshed_batch_id = _refresh_exhausted_gmail_api_url_batch(
-                    job_id,
-                    stale_batch_id,
-                )
-                if not refreshed_batch_id or refreshed_batch_id == stale_batch_id:
-                    raise
-                acquire_kwargs["gmail_api_url_batch_id"] = refreshed_batch_id
-                email = acquire_email(**acquire_kwargs)
+            email = acquire_email(**acquire_kwargs)
         else:
             raise RuntimeError(
                 "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
@@ -476,7 +396,7 @@ def _release_unconsumed_job_email(
     *,
     discard_on_failure: bool = False,
 ) -> bool:
-    """任务结束时回收邮箱；真正注册失败时废弃 Gmail API/QAN8 alias。"""
+    """任务结束时回收邮箱；真正注册失败时废弃 Gmail API alias。"""
     if not email:
         return False
     try:
@@ -508,24 +428,15 @@ def quarantine_provider_lane(
     if not isinstance(context, dict):
         context = {}
 
-    normalized_source = str(source or "").strip().lower()
-    if normalized_source == "qan8_gmail_api":
-        normalized_source = "gmail_api_url"
+    from core.email_provider import normalize_email_source
+
+    normalized_source = normalize_email_source(source or "")
     batch_id = str(
-        provider_batch_id
-        or context.get(
-            "gmail_api_url_batch_id"
-            if normalized_source == "gmail_api_url"
-            else "qan8_gmail_api_batch_id"
-        )
-        or ""
+        provider_batch_id or context.get("gmail_api_url_batch_id") or ""
     ).strip()
-    if normalized_source == "gmail_api_url":
+    lane_value = provider_lane_id
+    if lane_value is None:
         lane_value = context.get("proxy_lane_id")
-    else:
-        lane_value = provider_lane_id
-        if lane_value is None:
-            lane_value = context.get("qan8_gmail_api_lane_id")
     try:
         lane_id = int(lane_value) if lane_value is not None else None
     except (TypeError, ValueError):
@@ -534,24 +445,13 @@ def quarantine_provider_lane(
     normalized_code_url = str(code_url or "").strip()
     provider_items = 0
     if (
-        normalized_source in {"gmail_api_url", "qan8_gmail_api"}
+        normalized_source == "gmail_api_url"
         and normalized_code_url
     ):
         from core.gmail_api_url_client import _runtime_store_path, quarantine_code_url
 
         provider_items = int(
             quarantine_code_url(normalized_code_url, reason=str(reason or ""))
-            or 0
-        )
-    elif normalized_source == "qan8_gmail_api" and batch_id and lane_id is not None:
-        from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
-
-        provider_items = int(
-            Qan8GmailApiAllocator().quarantine_lane(
-                batch_id,
-                lane_id,
-                reason=str(reason or ""),
-            )
             or 0
         )
     else:
@@ -564,7 +464,7 @@ def quarantine_provider_lane(
         )
 
     failed_sources = 0
-    if normalized_source in {"gmail_api_url", "qan8_gmail_api"} and normalized_code_url:
+    if normalized_source == "gmail_api_url" and normalized_code_url:
         runtime_path = _runtime_store_path()
         scope_kwargs = {}
         if runtime_path != getattr(db, "_DEFAULT_SQLITE_PATH", runtime_path):
@@ -604,7 +504,7 @@ def _consume_recoverable_twofa_assignment(email: str | None, reason: str) -> boo
         from core.email_provider import mark_email_consumed, resolve_email_source
 
         source = resolve_email_source(email)
-        if source not in {"qan8_gmail_api", "gmail_api_url"}:
+        if source != "gmail_api_url":
             return False
         changed = bool(mark_email_consumed(email))
         if changed:
@@ -697,8 +597,21 @@ def _normalize_workers(max_workers: int | None) -> int:
 
 
 def effective_registration_workers(max_workers: int | None) -> int:
-    """Serialize registration when system-wide NordVPN rotation is enabled."""
+    """Serialize registration when the active network rotates system-wide."""
     requested = _normalize_workers(max_workers)
+    from config import proxy as _proxy_cfg
+
+    if (
+        bool(getattr(_proxy_cfg, "ROTATING_PROXY_ENABLED", False))
+        and bool(getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False))
+    ):
+        if requested != 1:
+            logger.info(
+                "[Service] Proxy.vn one-account-per-IP 使用单一 registration lane，workers 从 %s 调整为 1",
+                requested,
+            )
+        return 1
+
     from config import nordvpn as _nordvpn_cfg
 
     try:
@@ -724,13 +637,6 @@ def effective_registration_workers(max_workers: int | None) -> int:
             )
         return 1
     return requested
-
-
-def qan8_batch_status(batch_id: str) -> dict:
-    """Return non-secret operational counters for a QAN8 registration batch."""
-    from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
-
-    return Qan8GmailApiAllocator().status(str(batch_id or "").strip())
 
 
 def get_executor(max_workers: int | None = None) -> ThreadPoolExecutor:
@@ -787,35 +693,26 @@ def reconcile_interrupted_registration_jobs() -> dict[str, int]:
     if _ACTIVE_JOBS:
         return {
             "stopped_jobs": 0,
-            "failed_qan8_assignments": 0,
-            "completed_qan8_assignments": 0,
+            "failed_gmail_assignments": 0,
+            "completed_gmail_assignments": 0,
         }
 
     from core.app_state_db import APP_STATE_DB_PATH
     from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
-    from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
 
     result = {
         "stopped_jobs": 0,
-        "failed_qan8_assignments": 0,
-        "completed_qan8_assignments": 0,
+        "failed_gmail_assignments": 0,
+        "completed_gmail_assignments": 0,
     }
     now_iso = _local_now().isoformat(timespec="seconds")
     jobs = db.list_jobs(limit=10_000)
-    allocator = Qan8GmailApiAllocator()
     gmail_store = GmailApiUrlBatchStore(APP_STATE_DB_PATH)
     for job in jobs:
         job_id = int(job["id"])
         status = str(job.get("status") or "")
         canonical_assignment = gmail_store.find_active_assignment_for_job(str(job_id))
-        # Legacy QAN8 assignments are inspected only to finish a pre-migration
-        # process.  New workers never create or depend on this row.
-        legacy_assignment = allocator.store.get_assignment(job_id)
-        legacy_active = (
-            legacy_assignment is not None
-            and str(legacy_assignment.get("state") or "") == "active"
-        )
-        active_assignment = canonical_assignment is not None or legacy_active
+        active_assignment = canonical_assignment is not None
         account = _account_for_job(job) if status in {"running", "stopping"} or active_assignment else None
         if status in {"running", "stopping"}:
             db.update_job(
@@ -830,8 +727,8 @@ def reconcile_interrupted_registration_jobs() -> dict[str, int]:
             if (
                 status in {"running", "stopping"}
                 and account is None
-                and str(job.get("email_source") or "")
-                in {"gmail_api_url", "qan8_gmail_api", "outlook", "generic_api", "cloudflare_domain"}
+                and str(job.get("email_source") or "").strip().lower()
+                in {"gmail_api_url", "outlook", "generic_api", "cloudflare_domain"}
             ):
                 _release_unconsumed_job_email(
                     str(job.get("email") or "").strip() or None,
@@ -839,28 +736,16 @@ def reconcile_interrupted_registration_jobs() -> dict[str, int]:
                 )
             continue
         if account is not None:
-            if canonical_assignment is not None:
-                changed = gmail_store.complete(canonical_assignment.assignment_id)
-            else:
-                changed = allocator.complete_account(
-                    str(legacy_assignment["batch_id"]),
-                    job_id,
-                )
+            changed = gmail_store.complete(canonical_assignment.assignment_id)
             if changed:
-                result["completed_qan8_assignments"] += 1
+                result["completed_gmail_assignments"] += 1
         elif canonical_assignment is not None:
             changed = gmail_store.discard(
                 canonical_assignment.assignment_id,
                 reason="WebUI restarted before registration completed",
             )
             if changed:
-                result["failed_qan8_assignments"] += 1
-        elif allocator.fail_account(
-            str(legacy_assignment["batch_id"]),
-            job_id,
-            reason="WebUI restarted before registration completed",
-        ):
-            result["failed_qan8_assignments"] += 1
+                result["failed_gmail_assignments"] += 1
     return result
 
 
@@ -1008,7 +893,7 @@ def _registration_cleanup_allows_retry(job_id: int, cleanup_succeeded: bool) -> 
         return True
     source = db.get_job(job_id) or {}
     email_source = str(source.get("email_source") or "").strip().lower()
-    if email_source in {"gmail_api_url", "qan8_gmail_api"}:
+    if email_source == "gmail_api_url":
         try:
             from core.gmail_api_url_client import has_active_batch_assignment
 
@@ -1065,12 +950,18 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             check_stop_requested()
             provider_context = current.get("provider_context") or {}
             proxy_lane_id = provider_context.get("proxy_lane_id")
+            from config import proxy as _proxy_cfg
+
             result = run_registration(
                 email=email,
                 name=name,
                 birthday=birthday,
                 proxy_lane_id=proxy_lane_id,
                 lease_owner_id=f"registration-job:{job_id}",
+                force_refresh_proxy=bool(
+                    getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False)
+                    and int(current.get("retry_attempt") or 0) > 0
+                ),
             )
             if is_stop_requested(job_id):
                 result_dict = result if isinstance(result, dict) else {}
@@ -1102,13 +993,10 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                         resolve_email_source,
                     )
 
-                    if resolve_email_source(email or "") in {
-                        "gmail_api_url",
-                        "qan8_gmail_api",
-                    }:
+                    if resolve_email_source(email or "") == "gmail_api_url":
                         mark_email_consumed(email or "")
                 except Exception:
-                    logger.exception("[Job %s] consume QAN8 alias after success failed", job_id)
+                    logger.exception("[Job %s] consume Gmail API alias after success failed", job_id)
                 db.update_job(
                     job_id,
                     status="success",
@@ -1238,6 +1126,41 @@ def _run_one_job(job_id: int, log_file: str) -> None:
     finally:
         _deactivate_job(job_id)
         _notify_sub2api_automation_job(job_id)
+
+
+def _plan_gmail_api_url_lanes(
+    job_count: int,
+    lane_count: int,
+    aliases_per_source: int,
+) -> tuple[list[list[int]], list[int]]:
+    """Group registration positions into source lanes without splitting a source."""
+    total = int(job_count)
+    lanes = int(lane_count)
+    capacity = max(1, min(12, int(aliases_per_source or 12)))
+    if total < 1 or lanes < 1:
+        raise ValueError("Gmail API URL lane plan requires positive counts")
+
+    source_count = (total + capacity - 1) // capacity
+    positions_by_lane = [[] for _ in range(lanes)]
+    sources_by_lane = [0 for _ in range(lanes)]
+    next_position = 0
+    remaining = total
+    for source_index in range(source_count):
+        lane_id = source_index % lanes
+        source_jobs = min(capacity, remaining)
+        positions_by_lane[lane_id].extend(
+            range(next_position, next_position + source_jobs)
+        )
+        sources_by_lane[lane_id] += 1
+        next_position += source_jobs
+        remaining -= source_jobs
+    return positions_by_lane, sources_by_lane
+
+
+def _run_gmail_api_url_lane(lane_jobs: list[tuple[int, str]]) -> None:
+    """Run one Gmail source lane in order so aliases never overlap in a lane."""
+    for job_id, log_file in lane_jobs:
+        _run_one_job(int(job_id), str(log_file))
 
 
 def _notify_sub2api_automation_job(job_id: int) -> None:
@@ -1533,12 +1456,12 @@ def submit_registration(
     gmail_batch_id: str | None = None,
     paymesh_routed_domains: list[str] | None = None,
     gmail_api_url_aliases_per_email: int | None = None,
-    qan8_aliases_per_source: int | None = None,
     automation_context: dict | None = None,
 ) -> list[dict]:
     """
     创建 N 个注册任务并提交到线程池。
-    email_source 仅记录到 DB；实际邮箱来源固定为 Outlook 账号池。
+    Gmail API URL 任务按 12 alias source group 分配到独立的 canonical lane
+    batch；source 只在对应 lane 需要时从本地池或 shop.qan8.com 物化。
 
     Returns:
         N 个新创建的 job dict
@@ -1546,6 +1469,11 @@ def submit_registration(
     if email_source is None:
         from config import email as _email_cfg
         email_source = _email_cfg.EMAIL_SOURCE
+    from core.email_provider import normalize_email_source
+
+    normalized_source = normalize_email_source(str(email_source or ""))
+    if normalized_source == "gmail_api_url":
+        email_source = normalized_source
     if gmail_cdks and not gmail_batch_id:
         from core.gmail_123452026_client import create_registration_batch
 
@@ -1554,23 +1482,12 @@ def submit_registration(
             routed_domains=gmail_routed_domains or [],
         )
 
-    # Every Gmail API URL job uses the canonical alias ledger, including
-    # aliases_per_email=1.  Raw source rows describe provenance only; a used
-    # source can still have claimable aliases and must not be skipped.
-    gmail_api_url_batch_id: str | None = None
-    aliases_per_email = int(gmail_api_url_aliases_per_email or 1)
+    aliases_per_email = max(1, min(12, int(gmail_api_url_aliases_per_email or 12)))
+    gmail_api_url_source_count = 0
     if email_source == "gmail_api_url":
-        from core.gmail_api_url_client import (
-            create_registration_batch as create_gmail_api_url_batch,
-        )
-
-        gmail_api_url_batch_id = create_gmail_api_url_batch(
-            count, aliases_per_email=aliases_per_email
-        )
-        logger.info(
-            "Đã tạo Gmail API URL batch %s: %d alias, mỗi email ≤%d",
-            gmail_api_url_batch_id, count, aliases_per_email,
-        )
+        gmail_api_url_source_count = (
+            count + aliases_per_email - 1
+        ) // aliases_per_email
     paymesh_assignments: list[str] = []
     if paymesh_cdks:
         from config import email as _email_cfg
@@ -1589,8 +1506,10 @@ def submit_registration(
             "gmail_batch_id": gmail_batch_id,
             "gmail_routed_domains": list(gmail_routed_domains or []),
         }
-    if gmail_api_url_batch_id:
-        provider_context["gmail_api_url_batch_id"] = gmail_api_url_batch_id
+    if email_source == "gmail_api_url":
+        provider_context["gmail_api_url_aliases_per_source"] = aliases_per_email
+        provider_context["gmail_api_url_target_count"] = int(count)
+        provider_context["gmail_api_url_source_count"] = int(gmail_api_url_source_count)
     if paymesh_routed_domains:
         provider_context["paymesh_routed_domains"] = list(paymesh_routed_domains)
     if isinstance(automation_context, dict):
@@ -1610,69 +1529,75 @@ def submit_registration(
     )
 
     effective_workers = effective_registration_workers(workers)
-    if rotating_proxy_enabled:
-        from core.rotating_proxy_runtime import (
-            REGISTRATION_PROXY_SCOPE,
-            prepare_rotating_proxy_lanes,
-        )
-
-        prepare_rotating_proxy_lanes(
-            min(effective_workers, count),
-            scope=REGISTRATION_PROXY_SCOPE,
-        )
     # 创建/切换线程池和提交本批任务必须整体串行化：否则另一请求在本批提交中途
     # 切换 workers 并 shutdown 旧池，会导致后续 submit 报 cannot schedule new futures after shutdown。
     with _executor_lock:
         executor = get_executor(max_workers=effective_workers)
         effective_workers = get_executor_workers()
-        qan8_batch_id: str | None = None
-        qan8_lane_workers = effective_workers
-        from config import email as _email_cfg
-        qan8_aliases = int(
-            qan8_aliases_per_source
-            if qan8_aliases_per_source is not None
-            else getattr(_email_cfg, "QAN8_ALIASES_PER_SOURCE", 12)
-        )
-        if email_source == "qan8_gmail_api":
-            if not 1 <= qan8_aliases <= 12:
-                raise ValueError("qan8_aliases_per_source must be between 1 and 12")
-            from core.qan8_gmail_api_allocator import Qan8GmailApiAllocator
-
-            # ``count`` is the number of registrations.  A source contributes
-            # ``qan8_aliases`` canonical aliases, so provider lanes are sized
-            # by the number of source groups actually needed, not by the raw
-            # job count or executor width.  Physical workers may still wait on
-            # the same source while its aliases are being consumed.
-            qan8_source_count = (count + qan8_aliases - 1) // qan8_aliases
-            qan8_workers = min(effective_workers, qan8_source_count)
-            qan8_lane_workers = qan8_workers
-            qan8_batch = Qan8GmailApiAllocator().create_batch(
-                count,
-                requested_workers=qan8_workers,
-                aliases_per_source=qan8_aliases,
+        gmail_api_url_lane_count = min(
+            effective_workers,
+            gmail_api_url_source_count,
+        ) if gmail_api_url_source_count else 0
+        if gmail_api_url_lane_count:
+            provider_context["gmail_api_url_lane_count"] = int(gmail_api_url_lane_count)
+        if rotating_proxy_enabled:
+            from core.rotating_proxy_runtime import (
+                REGISTRATION_PROXY_SCOPE,
+                prepare_rotating_proxy_lanes,
             )
-            qan8_batch_id = str(qan8_batch["batch_id"])
+
+            prepare_rotating_proxy_lanes(
+                gmail_api_url_lane_count or min(effective_workers, count),
+                scope=REGISTRATION_PROXY_SCOPE,
+            )
+
+        gmail_lane_positions: list[list[int]] = []
+        gmail_lane_source_counts: list[int] = []
+        gmail_lane_batch_ids: list[str] = []
+        if gmail_api_url_lane_count:
             from core.app_state_db import APP_STATE_DB_PATH
             from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 
-            # QAN8 is a lazy purchaser only.  Workers claim existing aliases
-            # from every canonical Gmail batch first; this empty target batch
-            # is where a quantity=1 purchase is appended when the ledger has
-            # no claimable alias left.
-            gmail_api_url_batch_id = GmailApiUrlBatchStore(APP_STATE_DB_PATH).create_empty_batch()
-            provider_context["qan8_gmail_api_batch_id"] = qan8_batch_id
-            provider_context["gmail_api_url_batch_id"] = gmail_api_url_batch_id
-            provider_context["qan8_aliases_per_source"] = qan8_aliases
-            qan8_lane_workers = int(qan8_batch.get("effective_workers") or qan8_workers)
+            gmail_lane_positions, gmail_lane_source_counts = _plan_gmail_api_url_lanes(
+                count,
+                gmail_api_url_lane_count,
+                aliases_per_email,
+            )
+            gmail_store = GmailApiUrlBatchStore(APP_STATE_DB_PATH)
+            for lane_id, lane_positions in enumerate(gmail_lane_positions):
+                lane_batch_id = gmail_store.create_empty_batch(
+                    target_count=len(lane_positions),
+                    aliases_per_source=aliases_per_email,
+                    desired_sources=gmail_lane_source_counts[lane_id],
+                )
+                gmail_lane_batch_ids.append(lane_batch_id)
+                logger.info(
+                    "Đã tạo Gmail API URL lane %d batch %s: %d job, %d source, mỗi source ≤%d alias",
+                    lane_id,
+                    lane_batch_id,
+                    len(lane_positions),
+                    gmail_lane_source_counts[lane_id],
+                    aliases_per_email,
+                )
+
+        job_lane_ids = [0] * count
+        for lane_id, lane_positions in enumerate(gmail_lane_positions):
+            for position in lane_positions:
+                job_lane_ids[position] = lane_id
+        lane_jobs: list[list[tuple[int, str]]] = [
+            [] for _ in range(gmail_api_url_lane_count)
+        ]
         jobs = []
         for index in range(count):
             job_provider_context = dict(provider_context)
-            if rotating_proxy_enabled:
+            if gmail_api_url_lane_count:
+                lane_id = job_lane_ids[index]
+                job_provider_context["gmail_api_url_lane_id"] = lane_id
+                job_provider_context["gmail_api_url_batch_id"] = gmail_lane_batch_ids[lane_id]
+                if rotating_proxy_enabled:
+                    job_provider_context["proxy_lane_id"] = lane_id
+            elif rotating_proxy_enabled:
                 job_provider_context["proxy_lane_id"] = index % effective_workers
-            qan8_lane_id = None
-            if qan8_batch_id:
-                qan8_lane_id = index % qan8_lane_workers
-                job_provider_context["qan8_gmail_api_lane_id"] = qan8_lane_id
             paymesh_inventory_id = (
                 paymesh_assignments[index] if paymesh_assignments else None
             )
@@ -1688,25 +1613,50 @@ def submit_registration(
                 paymesh_cdks=(None if paymesh_inventory_id else paymesh_cdks),
                 gmail_routed_domains=gmail_routed_domains,
                 gmail_batch_id=gmail_batch_id,
-                gmail_api_url_batch_id=gmail_api_url_batch_id,
-                qan8_gmail_api_batch_id=qan8_batch_id,
-                qan8_gmail_api_lane_id=qan8_lane_id,
+                gmail_api_url_batch_id=(
+                    gmail_lane_batch_ids[job_lane_ids[index]]
+                    if gmail_api_url_lane_count
+                    else None
+                ),
+                gmail_api_url_aliases_per_source=aliases_per_email,
                 email_source=email_source,
                 paymesh_inventory_id=paymesh_inventory_id,
                 paymesh_routed_domains=paymesh_routed_domains,
             )
-            try:
-                executor.submit(_run_one_job, job["id"], job["log_file"])
-            except Exception as exc:
-                _clear_job_email_inputs(int(job["id"]))
-                db.update_job(
-                    int(job["id"]),
-                    status="failed",
-                    error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
-                    completed_at=_local_now().isoformat(timespec="seconds"),
+            if gmail_api_url_lane_count:
+                lane_jobs[job_lane_ids[index]].append(
+                    (int(job["id"]), str(job["log_file"]))
                 )
-                logger.exception("[Service] 注册任务 #%s 提交线程池失败", job["id"])
+            else:
+                try:
+                    executor.submit(_run_one_job, job["id"], job["log_file"])
+                except Exception as exc:
+                    _clear_job_email_inputs(int(job["id"]))
+                    db.update_job(
+                        int(job["id"]),
+                        status="failed",
+                        error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
+                        completed_at=_local_now().isoformat(timespec="seconds"),
+                    )
+                    logger.exception("[Service] 注册任务 #%s 提交线程池失败", job["id"])
             jobs.append(db.get_job(int(job["id"])) or job)
+        if gmail_api_url_lane_count:
+            for lane_id, lane_job_list in enumerate(lane_jobs):
+                try:
+                    executor.submit(_run_gmail_api_url_lane, lane_job_list)
+                except Exception as exc:
+                    for job_id, _log_file in lane_job_list:
+                        _clear_job_email_inputs(job_id)
+                        db.update_job(
+                            job_id,
+                            status="failed",
+                            error=f"队列提交失败：{type(exc).__name__}: {exc}"[:500],
+                            completed_at=_local_now().isoformat(timespec="seconds"),
+                        )
+                    logger.exception(
+                        "[Service] Gmail API URL lane %s 提交线程池失败",
+                        lane_id,
+                    )
     logger.info(f"[Service] 已提交 {count} 个注册任务，源={email_source}，workers={effective_workers}")
     return jobs
 

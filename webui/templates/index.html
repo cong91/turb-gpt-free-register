@@ -2308,7 +2308,7 @@
         <button type="button" class="jobs-tb-btn" id="btnRefreshJobsV2" title="手动刷新任务列表">刷新</button>
         <label class="jobs-tb-field" id="regCountFieldV2">注册数量
           <span class="el-input-number">
-            <input id="regCountV2" type="number" min="1" max="1000" value="1" inputmode="numeric">
+            <input id="regCountV2" type="number" min="1" max="83" value="1" inputmode="numeric">
             <button type="button" class="el-input-number__increase" data-step-for="regCountV2" data-step="1" aria-label="增加">
               <svg viewBox="0 0 24 24"><polyline points="6 14 12 8 18 14"/></svg>
             </button>
@@ -2332,8 +2332,7 @@
           <select id="emailProviderV2" data-email-provider>
             <option value="">Theo cấu hình hiện tại</option>
             <option value="gmail_123452026">Gmail CDK</option>
-            <option value="gmail_api_url">Gmail API URL</option>
-            <option value="qan8_gmail_api">QAN8 Gmail API (lazy)</option>
+            <option value="gmail_api_url">Gmail API URL (shop.qan8.com)</option>
             <option value="paymesh">Paymesh (MAIL card)</option>
             <option value="tinyhost">TinyHost email tạm</option>
           </select>
@@ -2380,29 +2379,12 @@
       </div>
       <div class="gmail-cdk-batch-v2 hidden" data-provider-input="gmail_api_url">
         <div class="provider-inline-config">
-          <label class="fld-inline">Số bí danh mỗi email (tối đa 12)
-            <input id="gmailApiUrlAliasCountV2" type="number" min="1" max="12" value="12"
-              inputmode="numeric" autocomplete="off"
-              title="1 email gốc → sinh tối đa 12 bí danh: tối đa 1 bí danh có dấu chấm, các bí danh còn lại dùng +; tổng 6 gmail.com + 6 googlemail.com. Tất cả dùng chung URL lấy OTP.">
-          </label>
-          <button type="button" class="jobs-tb-btn" id="btnUseAllGmailApiUrlV2" title="Đặt số nhóm theo toàn bộ alias còn khả dụng trong kho">Dùng hết alias khả dụng</button>
+          <span class="hint">Mỗi Gmail API URL source tự động dùng tối đa 12 alias.</span>
+          <button type="button" class="jobs-tb-btn" id="btnUseAllGmailApiUrlV2" title="Đặt số source theo toàn bộ source local còn alias khả dụng">Dùng hết source local</button>
           <span class="hint">
-            Ô <b>Số bản ghi</b> chọn bao nhiêu email chưa dùng trong kho sẽ đăng ký.
-            Nhóm email gốc còn khả dụng: <b id="gmailApiUrlPoolAvailableV2">?</b> · Alias còn khả dụng: <b id="gmailApiUrlAliasAvailableV2">?</b>.
-            Bấm <b>Dùng hết</b> để lấy toàn bộ.<br>
-            Hệ thống nhân với số bí danh mỗi bản ghi (tối đa 12). Ví dụ: 3 × 12 = 36 tài khoản.
-          </span>
-        </div>
-      </div>
-      <div class="gmail-cdk-batch-v2 hidden" data-provider-input="qan8_gmail_api">
-        <div class="provider-inline-config">
-          <label class="fld-inline">Số bí danh mỗi nguồn
-            <input id="qan8AliasCountV2" type="number" min="1" max="12" value="12"
-              inputmode="numeric" autocomplete="off"
-              title="Mỗi luồng sở hữu một nguồn Gmail riêng; nguồn chỉ được thay khi hết bí danh.">
-          </label>
-          <span class="hint">
-            Mỗi luồng = một lane = một email gốc QAN8 khác nhau. Bí danh do client sinh ra và cùng nhận OTP qua URL lấy mã của email gốc.
+             Số lượng đăng ký là số source Gmail cần dùng/mua.
+             Số bản ghi chưa dùng / source local còn alias: <b id="gmailApiUrlPoolAvailableV2">?</b> · Alias local: <b id="gmailApiUrlAliasAvailableV2">?</b>.
+            Mỗi source được dùng tuần tự đủ 12 alias rồi mới mua source kế tiếp.
           </span>
         </div>
       </div>
@@ -2455,8 +2437,7 @@
             <span>Nguồn</span>
             <select id="accountSourceFilterV2">
               <option value="">Tất cả nguồn</option>
-              <option value="gmail_api_url">Gmail API URL</option>
-              <option value="qan8_gmail_api">QAN8 Gmail API (lazy)</option>
+              <option value="gmail_api_url">Gmail API URL (shop.qan8.com)</option>
               <option value="paymesh">Paymesh</option>
               <option value="gmail_123452026">Gmail CDK</option>
               <option value="outlook">Outlook</option>
@@ -3219,6 +3200,7 @@ async function loadSummary() {
     $('#statUsed').textContent = s.outlook_used;
     $('#statFailed').textContent = s.outlook_failed;
     window.GMAIL_API_URL_POOL_AVAILABLE = Number(s.gmail_api_url_available || 0);
+    window.GMAIL_API_URL_SOURCE_AVAILABLE = Number(s.gmail_api_url_alias_source_available || 0);
     window.GMAIL_API_URL_ALIAS_AVAILABLE = Number(s.gmail_api_url_alias_available || 0);
     syncGmailApiUrlCountLabel($('#emailProviderV2'));
   } catch(e) {}
@@ -3231,22 +3213,7 @@ async function startRegistrationFromInputs(countEl, workersEl, providerEl, start
   const email_source = (providerEl?.value || '').trim();
   const providerPanel = providerEl?.closest('#tab-register')?.querySelector(`[data-provider-input="${email_source}"]`);
   const provider_cdks = parseProviderCdkBatch(providerPanel?.querySelector('[data-cdk-batch-input]')?.value || '');
-  const gmailApiUrlAliasCount = email_source === 'gmail_api_url'
-    ? readGmailApiUrlAliasCount(providerPanel)
-    : 1;
-  const qan8AliasCount = email_source === 'qan8_gmail_api'
-    ? Math.min(12, Math.max(1, parseInt(providerPanel?.querySelector('#qan8AliasCountV2')?.value || '12', 10) || 12))
-    : 1;
-  const unusedRecords = gmailApiUrlAvailableCount(gmailApiUrlAliasCount);
-  if (email_source === 'gmail_api_url') {
-    if (unusedRecords < 1) {
-      const warnEl = $('#regWarnV2');
-      if (warnEl) warnEl.innerHTML = '<div class="banner warn">Kho Gmail API URL không còn đủ alias cho nhóm đã chọn.</div>';
-      return;
-    }
-    count = Math.min(Math.max(1, count || 1), unusedRecords);
-    if (countEl) countEl.value = String(count);
-  }
+  const gmailApiUrlAliasCount = email_source === 'gmail_api_url' ? 12 : 1;
   const submitCount = email_source === 'gmail_api_url' && gmailApiUrlAliasCount > 1
     ? count * gmailApiUrlAliasCount
     : count;
@@ -3277,12 +3244,6 @@ async function startRegistrationFromInputs(countEl, workersEl, providerEl, start
       payload.paymesh_cdks = provider_cdks;
       payload.paymesh_routed_domains = Array.from(providerPanel?.querySelectorAll('[data-paymesh-routed-domain]') || [])
         .map(el => el.value.trim()).filter(Boolean);
-    }
-    if (email_source === 'gmail_api_url') {
-      payload.gmail_api_url_alias_count = gmailApiUrlAliasCount;
-    }
-    if (email_source === 'qan8_gmail_api') {
-      payload.qan8_alias_count = qan8AliasCount;
     }
     const r = await api('/api/jobs', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     const warnHtml = r.warning ? `<div class="banner warn">${esc(r.warning)}（本次并发 ${r.workers || workers}）</div>` : `<div class="banner info">已提交 ${r.submitted} 个任务，本次并发 ${r.workers || workers}</div>`;
@@ -3369,8 +3330,6 @@ function bindJobsBodyEvents(bodyEl) {
   if (startV2) startV2.addEventListener('click', () => startRegistrationFromInputs($('#regCountV2'), $('#regWorkersV2'), providerV2, startV2));
   if (providerV2) providerV2.addEventListener('change', () => { syncProviderInputs(providerV2); syncCdkBatchCount(providerV2); });
   if (providerV2) syncProviderInputs(providerV2);
-  const gmailAliasCountV2 = $('#gmailApiUrlAliasCountV2');
-  if (gmailAliasCountV2) gmailAliasCountV2.addEventListener('input', () => syncGmailApiUrlCountLabel(providerV2));
   const useAllGmailApiUrl = $('#btnUseAllGmailApiUrlV2');
   if (useAllGmailApiUrl) useAllGmailApiUrl.addEventListener('click', useAllUnusedGmailApiUrlRecords);
   if (cdkBatchV2) cdkBatchV2.addEventListener('input', () => updateCdkBatchCount(cdkBatchV2));
@@ -7932,13 +7891,10 @@ function readConfigElementValue(el, f) {
   return isPlaceholderEmpty(el.value) ? '' : el.value.trim();
 }
 
-function readGmailApiUrlAliasCount(root = document) {
-  return Math.min(12, Math.max(1, parseInt(root?.querySelector?.('#gmailApiUrlAliasCountV2')?.value || '12', 10) || 12));
-}
-
-function gmailApiUrlAvailableCount(aliasCount = 1) {
-  const aliases = Math.max(1, Number(aliasCount || 1));
-  return Math.floor(gmailApiUrlAliasAvailableCount() / aliases);
+function gmailApiUrlAvailableCount() {
+  return Math.max(0, Number(
+    window.GMAIL_API_URL_SOURCE_AVAILABLE || window.GMAIL_API_URL_POOL_AVAILABLE || 0
+  ));
 }
 
 function gmailApiUrlAliasAvailableCount() {
@@ -7947,19 +7903,13 @@ function gmailApiUrlAliasAvailableCount() {
 
 function clampGmailApiUrlRecordCount() {
   const countEl = $('#regCountV2');
-  const aliasCount = readGmailApiUrlAliasCount();
-  const available = gmailApiUrlAvailableCount(aliasCount);
   if (!countEl) return;
-  const current = parseInt(countEl.value || '1', 10) || 1;
-  const max = Math.max(1, available || 1);
-  countEl.max = String(max);
-  if (available > 0 && current > available) countEl.value = String(available);
+  countEl.max = '83';
 }
 
 function useAllUnusedGmailApiUrlRecords() {
   const countEl = $('#regCountV2');
-  const aliasCount = readGmailApiUrlAliasCount();
-  const available = gmailApiUrlAvailableCount(aliasCount);
+  const available = Math.min(gmailApiUrlAvailableCount(), 83);
   if (!countEl || available < 1) return;
   countEl.max = String(available);
   countEl.value = String(available);
@@ -7974,13 +7924,12 @@ function syncGmailApiUrlCountLabel(providerEl) {
   const useAllBtn = $('#btnUseAllGmailApiUrlV2');
   const aliasAvailable = gmailApiUrlAliasAvailableCount();
   const isGmailApiUrl = (providerEl?.value || '') === 'gmail_api_url';
-  const aliasCount = isGmailApiUrl ? readGmailApiUrlAliasCount() : 1;
-  const available = gmailApiUrlAvailableCount(aliasCount);
+  const available = isGmailApiUrl ? gmailApiUrlAvailableCount() : 0;
   if (field) {
     const first = field.childNodes[0];
     if (first && first.nodeType === Node.TEXT_NODE) {
       first.textContent = isGmailApiUrl
-        ? (aliasCount > 1 ? 'Số nhóm email gốc còn khả dụng' : 'Số alias còn khả dụng')
+        ? 'Số source Gmail cần dùng'
         : '注册数量';
     }
   }

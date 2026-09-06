@@ -48,6 +48,7 @@ class EmailChangeInputTests(unittest.TestCase):
             root = Path(temp_dir)
             raw_json = root / "gmail-pool.json"
             raw_txt = root / "gmail-pool.txt"
+            sqlite_path = root / "turb.sqlite3"
             store = GmailApiUrlBatchStore(root / "gmail-state.sqlite3")
             code_url = "https://mail.example/terminal"
             item = EmailChangeInput(
@@ -61,6 +62,10 @@ class EmailChangeInputTests(unittest.TestCase):
             with (
                 patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", raw_json),
                 patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", raw_txt),
+                patch.object(db, "_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
             ):
                 db.import_gmail_api_url_emails([
                     {"email": "source@example.com", "code_url": code_url},

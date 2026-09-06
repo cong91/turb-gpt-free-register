@@ -8,6 +8,38 @@ from core import email_provider
 class GmailApiUrlProviderTests(unittest.TestCase):
     """Gmail API URL provider 集成测试套件。"""
 
+    @patch("core.gmail_api_url_client.get_account_context", return_value=None)
+    @patch("core.gmail_api_url_client.get_batch_account_context")
+    @patch("core.db.get_job")
+    @patch("core.email_provider._current_otp_job_id", return_value=1572)
+    def test_retry_job_resolves_alias_from_persisted_batch_context(
+        self,
+        _mock_job_id,
+        mock_get_job,
+        mock_batch_context,
+        _mock_raw_context,
+    ):
+        mock_get_job.return_value = {
+            "id": 1572,
+            "provider_context": {
+                "gmail_api_url_batch_id": "batch-1",
+            },
+        }
+        expected = object()
+        mock_batch_context.return_value = expected
+
+        account = email_provider._get_code_url_account(
+            "alias+one@gmail.com",
+            "gmail_api_url",
+        )
+
+        self.assertIs(account, expected)
+        mock_batch_context.assert_called_once_with(
+            "alias+one@gmail.com",
+            job_id=1572,
+            batch_id="batch-1",
+        )
+
     def test_parse_sources_includes_gmail_api_url(self):
         """parse_email_sources 保留 gmail_api_url。"""
         sources = email_provider.parse_email_sources("outlook,gmail_api_url,generic_api")
@@ -46,16 +78,16 @@ class GmailApiUrlProviderTests(unittest.TestCase):
         },
     )
     @patch("core.email_provider._registered_email_source", return_value=None)
-    @patch("core.qan8_gmail_api_allocator.Qan8GmailApiAllocator.get_account_context")
+    @patch("core.gmail_api_url_client.get_batch_account_context")
     def test_active_job_source_wins_when_alias_exists_in_two_providers(
-        self, mock_qan8_context, _mock_registered, _mock_job, _mock_job_id
+        self, mock_gmail_context, _mock_registered, _mock_job, _mock_job_id
     ):
-        mock_qan8_context.return_value = object()
+        mock_gmail_context.return_value = object()
 
         source = email_provider.resolve_email_source("alias@gmail.com")
 
         self.assertEqual(source, "gmail_api_url")
-        mock_qan8_context.assert_not_called()
+        mock_gmail_context.assert_not_called()
 
     @patch("core.db.get_gmail_api_url_email_by_email")
     @patch("core.gmail_api_url_client.poll_verification_code", return_value="654321")
@@ -442,8 +474,8 @@ class GmailApiUrlProviderTests(unittest.TestCase):
 
         mock_release.assert_called_once_with("test@gmail.com", status="used", note="")
 
-    @patch("core.gmail_api_url_client.get_batch_account_context", return_value=object())
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator.get_batch_account_context", return_value=object())
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.get_gmail_api_url_email_by_email", return_value=None)
     def test_batch_alias_consumption_completes_assignment(self, _mock_get, mock_store_factory, _mock_context):
         active = type("Assignment", (), {"assignment_id": "assignment-1"})()
@@ -457,8 +489,8 @@ class GmailApiUrlProviderTests(unittest.TestCase):
         store.complete.assert_called_once_with("assignment-1")
         store.release.assert_not_called()
 
-    @patch("core.gmail_api_url_client.get_batch_account_context", return_value=object())
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator.get_batch_account_context", return_value=object())
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.get_gmail_api_url_email_by_email", return_value=None)
     def test_failed_batch_alias_is_discarded_instead_of_released(
         self, _mock_get, mock_store_factory, _mock_context

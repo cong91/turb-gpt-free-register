@@ -2,6 +2,7 @@
 import sqlite3
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -13,14 +14,21 @@ from core.gmail_api_url_client import (
     GmailApiUrlAccount,
     GmailApiUrlBatchError,
     GmailApiUrlError,
+    _extract_qan8_uid,
     _fetch_code_once,
+    _is_qan8_purchased_code_url,
+    _quarantine_provider_code_url,
     _reconcile_batch_queue,
+    _request_qan8_after_sales,
     acknowledge_verification_code,
     create_registration_batch,
     get_account_context,
+    get_batch_account_context,
     get_email_from_batch,
+    materialize_next_available_source,
     pick_account,
     poll_verification_code,
+    provision_next_gmail_api_url_source,
     release_account,
 )
 from core.gmail_batch_store_base import Assignment
@@ -28,6 +36,323 @@ from core.gmail_batch_store_base import Assignment
 
 class FakeHttpError(RuntimeError):
     """HTTP error used only by the response test double."""
+
+
+class GmailApiUrlUidTests(unittest.TestCase):
+    def test_extract_qan8_uid_from_code_url(self):
+        self.assertEqual(
+            _extract_qan8_uid(
+                "https://gapi.mailsapi.com/api/get-code?uid=s629b2dc0ff9ec304d8"
+            ),
+            "s629b2dc0ff9ec304d8",
+        )
+        self.assertIsNone(_extract_qan8_uid("https://example.test/code"))
+
+    @patch("core.qan8_gmail_api_client.Qan8GmailApiClient")
+    def test_qan8_after_sales_delegates_uid(self, mock_client):
+        mock_client.return_value.request_after_sales.return_value = {
+            "success": True,
+            "code": 602,
+            "message": "售后处理完成",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _request_qan8_after_sales(
+                "s629b2dc0ff9ec304d8",
+                code_url="https://gapi.mailsapi.com/api/get-code?uid=s629b2dc0ff9ec304d8",
+                sqlite_path=Path(temp_dir) / "state.sqlite3",
+            )
+
+        mock_client.return_value.request_after_sales.assert_called_once_with(
+            "s629b2dc0ff9ec304d8"
+        )
+
+    @patch("core.qan8_gmail_api_client.Qan8GmailApiClient")
+    def test_qan8_after_sales_failure_does_not_mask_and_can_retry(self, mock_client):
+        mock_client.return_value.request_after_sales.side_effect = [
+            {"success": False, "code": 602, "message": "not eligible"},
+            {"success": True, "code": 602, "message": "售后处理完成"},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store_path = Path(temp_dir) / "state.sqlite3"
+            url = "https://gapi.mailsapi.com/api/get-code?uid=retry"
+            _request_qan8_after_sales("retry", code_url=url, sqlite_path=store_path)
+            _request_qan8_after_sales("retry", code_url=url, sqlite_path=store_path)
+
+        self.assertEqual(mock_client.return_value.request_after_sales.call_count, 2)
+
+    def test_imported_uid_url_is_not_qan8_purchase_provenance(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GmailApiUrlBatchStore(Path(temp_dir) / "state.sqlite3")
+            self.assertFalse(
+                _is_qan8_purchased_code_url(
+                    "https://gapi.mailsapi.com/api/get-code?uid=imported",
+                    sqlite_path=store.path,
+                )
+            )
+            self.assertTrue(
+                store.claim_after_sales_uid(
+                    "imported", "https://gapi.mailsapi.com/api/get-code?uid=imported"
+                )
+            )
+            self.assertFalse(
+                store.claim_after_sales_uid(
+                    "imported", "https://gapi.mailsapi.com/api/get-code?uid=imported"
+                )
+            )
+
+    def test_after_sales_claim_can_retry_after_failed_attempt(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GmailApiUrlBatchStore(Path(temp_dir) / "state.sqlite3")
+            self.assertTrue(store.claim_after_sales_uid("retry", "https://example/code?uid=retry"))
+            store.finish_after_sales_uid("retry", success=False, message="timeout")
+            self.assertTrue(store.claim_after_sales_uid("retry", "https://example/code?uid=retry"))
+            store.finish_after_sales_uid("retry", success=True)
+            self.assertFalse(store.claim_after_sales_uid("retry", "https://example/code?uid=retry"))
+
+    def test_after_sales_skips_source_that_already_returned_otp(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=received"
+            batch_id = store.create_batch([( "user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-received", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            store.record_qan8_after_sales_observation(
+                code_url,
+                0,
+                otp_received=True,
+            )
+
+            with patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales:
+                _quarantine_provider_code_url(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    GmailApiUrlError("Provider error code=602"),
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
+
+    def test_after_sales_requires_first_provider_response_to_be_602(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=waited"
+            batch_id = store.create_batch([( "user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-waited", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            store.record_qan8_after_sales_observation(code_url, 601)
+
+            with patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales:
+                _quarantine_provider_code_url(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    GmailApiUrlError("Provider error code=602"),
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
+
+    @patch("core.gmail_api_url_client.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_poll_601_then_602_does_not_request_after_sales(self, mock_get, _sleep):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=waited"
+            batch_id = store.create_batch([("user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-waited-poll", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            mock_get.side_effect = [
+                _Response({"code": 601}),
+                _Response({"code": 602, "message": "expired"}),
+            ]
+
+            with (
+                patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales,
+                self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"),
+            ):
+                poll_verification_code(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    max_wait=5,
+                    poll_interval=0,
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
+
+    @patch("core.gmail_api_url_client.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_poll_non_602_then_602_does_not_request_after_sales(self, mock_get, _sleep):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=unexpected"
+            batch_id = store.create_batch([("user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-unexpected-poll", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            mock_get.side_effect = [
+                _Response({"code": 999}),
+                _Response({"code": 602, "message": "expired"}),
+            ]
+
+            with (
+                patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales,
+                self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"),
+            ):
+                poll_verification_code(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    max_wait=5,
+                    poll_interval=0,
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
+
+    @patch("core.gmail_api_url_client.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_poll_invalid_code_0_then_602_does_not_request_after_sales(self, mock_get, _sleep):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=invalid-otp"
+            batch_id = store.create_batch([("user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-invalid-otp", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            mock_get.side_effect = [
+                _Response({"code": 0, "data": {"code": "12ab"}}),
+                _Response({"code": 602, "message": "expired"}),
+            ]
+
+            with (
+                patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales,
+                self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"),
+            ):
+                poll_verification_code(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    max_wait=5,
+                    poll_interval=0,
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
+
+    @patch("core.gmail_api_url_client.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_poll_invalid_json_then_602_does_not_request_after_sales(self, mock_get, _sleep):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=invalid-json"
+            batch_id = store.create_batch([("user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-invalid-json", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            mock_get.side_effect = [
+                _Response(ValueError("invalid JSON")),
+                _Response({"code": 602, "message": "expired"}),
+            ]
+
+            with (
+                patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales,
+                self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"),
+            ):
+                poll_verification_code(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    max_wait=5,
+                    poll_interval=0,
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
+
+    @patch("core.gmail_api_url_client.requests.get")
+    def test_poll_valid_otp_then_602_does_not_request_after_sales(self, mock_get):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=received-otp"
+            batch_id = store.create_batch([("user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-received-otp", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            mock_get.return_value = _Response({"code": 0, "data": {"code": "123456"}})
+
+            self.assertEqual(
+                poll_verification_code(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    max_wait=5,
+                    poll_interval=0,
+                    sqlite_path=store.path,
+                ),
+                "123456",
+            )
+
+            with patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales:
+                _quarantine_provider_code_url(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    GmailApiUrlError("Provider error code=602"),
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
+
+    @patch("core.db.get_gmail_api_url_last_otp", return_value="123456")
+    def test_persisted_otp_also_blocks_after_sales(self, _last_otp):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            code_url = "https://gapi.mailsapi.com/api/get-code?uid=legacy"
+            batch_id = store.create_batch([("user@gmail.com", code_url)], capacity=1)
+            order = store.create_purchase_order(batch_id, "qan8-legacy", "156")
+            store.update_purchase_order(
+                batch_id,
+                str(order["out_order_no"]),
+                status="completed",
+                code_url=code_url,
+            )
+            store.record_qan8_after_sales_observation(code_url, 602)
+
+            with patch("core.gmail_api_url_client._request_qan8_after_sales") as after_sales:
+                _quarantine_provider_code_url(
+                    GmailApiUrlAccount("user@gmail.com", code_url),
+                    GmailApiUrlError("Provider error code=602"),
+                    sqlite_path=store.path,
+                )
+
+            after_sales.assert_not_called()
 
 
 class _Response:
@@ -50,7 +375,361 @@ class _Response:
 class GmailApiUrlClientTests(unittest.TestCase):
     """Gmail API URL 客户端测试套件。"""
 
-    @patch("core.gmail_api_url_client._batch_store")
+    def test_completed_assignment_still_resolves_mailbox_for_same_job(self):
+        """2FA re-auth may need the mailbox after registration claim completes."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GmailApiUrlBatchStore(Path(temp_dir) / "state.sqlite3")
+            batch_id = store.create_batch_multi([
+                {
+                    "source_email": "root@gmail.com",
+                    "code_url": "https://mail.example/otp",
+                    "aliases": ["root+alias@gmail.com"],
+                }
+            ])
+            assignment = store.claim(batch_id, "job-1")
+
+            self.assertEqual(
+                store.find_item_by_alias_for_job("root+alias@gmail.com", "job-1"),
+                ("root+alias@gmail.com", "https://mail.example/otp"),
+            )
+            self.assertTrue(store.complete(assignment.assignment_id))
+            self.assertEqual(
+                store.find_item_by_alias_for_job("root+alias@gmail.com", "job-1"),
+                ("root+alias@gmail.com", "https://mail.example/otp"),
+            )
+            self.assertIsNone(
+                store.find_item_by_alias_for_job("root+alias@gmail.com", "job-2")
+            )
+
+    def test_completed_assignment_resolves_mailbox_from_original_batch_for_retry_job(self):
+        """A twofa_retry child job must reuse its parent's canonical batch URL."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GmailApiUrlBatchStore(Path(temp_dir) / "state.sqlite3")
+            batch_id = store.create_batch_multi([
+                {
+                    "source_email": "root@gmail.com",
+                    "code_url": "https://mail.example/otp",
+                    "aliases": ["root+alias@gmail.com"],
+                }
+            ])
+            assignment = store.claim(batch_id, "registration-job")
+            self.assertTrue(store.complete(assignment.assignment_id))
+
+            with patch("core.gmail_api_url_batch_coordinator._batch_store", return_value=store):
+                account = get_batch_account_context(
+                    "root+alias@gmail.com",
+                    job_id="twofa-retry-job",
+                    batch_id=batch_id,
+                )
+
+            self.assertIsNotNone(account)
+            self.assertEqual(account.email, "root+alias@gmail.com")
+            self.assertEqual(account.code_url, "https://mail.example/otp")
+
+    @patch("core.gmail_api_url_batch_coordinator.provision_next_gmail_api_url_source", return_value=True)
+    @patch("core.gmail_api_url_batch_coordinator._reconcile_batch_queue")
+    @patch("core.gmail_api_url_batch_coordinator.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
+    def test_batch_does_not_claim_alias_from_another_batch(
+        self, mock_store_factory, _sleep, _reconcile, provision
+    ):
+        store = mock_store_factory.return_value
+        store.claim_waiting.side_effect = [
+            None,
+            Assignment(
+                "new-assignment",
+                "new-batch",
+                "new-alias@gmail.com----https://new.example/code",
+                "job-new",
+                "active",
+            ),
+        ]
+        store.claim_any_available.return_value = Assignment(
+            "old-assignment",
+            "old-batch",
+            "old-alias@gmail.com----https://old.example/code",
+            "job-new",
+            "active",
+        )
+        store.batch_status.return_value = {
+            "exhausted_batch": True,
+            "pending": 0,
+            "active_assignments": 0,
+            "waiting_jobs": 1,
+            "available_code_urls": 0,
+        }
+        store.acquire_provision_lease.return_value = True
+
+        account = get_email_from_batch("new-batch", "job-new", poll_interval=0)
+
+        self.assertEqual(account.email, "new-alias@gmail.com")
+        self.assertEqual(account.code_url, "https://new.example/code")
+        provision.assert_called_once_with(
+            "new-batch",
+            aliases_per_source=12,
+            store=store,
+        )
+        store.claim_any_available.assert_not_called()
+
+    def test_materializer_skips_source_url_owned_by_another_batch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            store = GmailApiUrlBatchStore(root / "state.sqlite3")
+            old_url = "https://mail.example/already-owned"
+            old_batch = store.create_batch_multi([
+                {
+                    "source_email": "oldroot@gmail.com",
+                    "code_url": old_url,
+                    "aliases": ["oldroot+first@gmail.com"],
+                }
+            ])
+            target_batch = store.create_empty_batch(
+                target_count=1,
+                aliases_per_source=12,
+                desired_sources=1,
+            )
+            raw_records = [
+                {
+                    "email": "oldroot@gmail.com",
+                    "code_url": old_url,
+                    "_claimed_from_available": True,
+                },
+                {
+                    "email": "freshroot@gmail.com",
+                    "code_url": "https://mail.example/fresh",
+                    "_claimed_from_available": True,
+                },
+            ]
+
+            with patch(
+                "core.db.claim_next_gmail_api_url_email",
+                side_effect=raw_records + [None],
+            ), patch(
+                "core.db.release_gmail_api_url_email"
+            ) as release_source:
+                self.assertTrue(
+                    materialize_next_available_source(
+                        target_batch,
+                        aliases_per_source=12,
+                        store=store,
+                    )
+                )
+
+            self.assertEqual(store.list_batch_ids_for_code_urls({old_url}), [old_batch])
+            self.assertEqual(
+                store.list_batch_ids_for_code_urls({"https://mail.example/fresh"}),
+                [target_batch],
+            )
+            release_source.assert_any_call(
+                "oldroot@gmail.com",
+                "exhausted",
+                "Gmail API source đã thuộc canonical batch khác",
+                sqlite_path=store.path,
+            )
+
+    def test_parallel_lane_materialization_assigns_distinct_sources(self):
+        """Three parallel lanes must receive three exclusive source URLs."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GmailApiUrlBatchStore(Path(temp_dir) / "state.sqlite3")
+            batches = [
+                store.create_empty_batch(
+                    target_count=12,
+                    aliases_per_source=12,
+                    desired_sources=1,
+                )
+                for _ in range(3)
+            ]
+            records = [
+                {
+                    "email": "laneone@gmail.com",
+                    "code_url": "https://mail.example/lane-one",
+                    "_claimed_from_available": True,
+                },
+                {
+                    "email": "lanetwo@gmail.com",
+                    "code_url": "https://mail.example/lane-two",
+                    "_claimed_from_available": True,
+                },
+                {
+                    "email": "lanethree@gmail.com",
+                    "code_url": "https://mail.example/lane-three",
+                    "_claimed_from_available": True,
+                },
+            ]
+
+            with patch(
+                "core.db.claim_next_gmail_api_url_email",
+                side_effect=records,
+            ), ThreadPoolExecutor(max_workers=3) as executor:
+                results = list(
+                    executor.map(
+                        lambda batch_id: materialize_next_available_source(
+                            batch_id,
+                            aliases_per_source=12,
+                            store=store,
+                        ),
+                        batches,
+                    )
+                )
+
+            self.assertEqual(results, [True, True, True])
+            source_owners = {
+                code_url: store.list_batch_ids_for_code_urls({code_url})
+                for code_url in (
+                    "https://mail.example/lane-one",
+                    "https://mail.example/lane-two",
+                    "https://mail.example/lane-three",
+                )
+            }
+            self.assertEqual(
+                {batch_id for owners in source_owners.values() for batch_id in owners},
+                set(batches),
+            )
+            self.assertEqual(
+                [
+                    len(
+                        store.list_batch_ids_for_code_urls({
+                            code_url,
+                        })
+                    )
+                    for code_url in source_owners
+                ],
+                [1, 1, 1],
+            )
+            self.assertEqual(
+                [store.count_source_groups(batch_id) for batch_id in batches],
+                [1, 1, 1],
+            )
+
+    @patch("core.gmail_api_url_batch_coordinator.provision_next_gmail_api_url_source", return_value=True)
+    @patch("core.gmail_api_url_batch_coordinator._reconcile_batch_queue")
+    @patch("core.gmail_api_url_batch_coordinator.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
+    def test_empty_canonical_batch_provisions_before_reporting_exhaustion(
+        self, mock_store_factory, _sleep, _reconcile, provision
+    ):
+        store = mock_store_factory.return_value
+        store.claim_waiting.side_effect = [None, Assignment(
+            "assignment-1",
+            "batch-1",
+            "alias@gmail.com----https://api.example/code",
+            "job-1",
+            "active",
+        )]
+        store.batch_status.side_effect = [
+            {
+                "exhausted_batch": True,
+                "pending": 0,
+                "active_assignments": 0,
+                "waiting_jobs": 1,
+                "available_code_urls": 0,
+            },
+            {
+                "exhausted_batch": False,
+                "pending": 1,
+                "active_assignments": 0,
+                "waiting_jobs": 1,
+                "available_code_urls": 1,
+            },
+        ]
+        store.acquire_provision_lease.return_value = True
+
+        account = get_email_from_batch("batch-1", "job-1", poll_interval=0)
+
+        self.assertEqual(account.email, "alias@gmail.com")
+        provision.assert_called_once_with(
+            "batch-1",
+            aliases_per_source=12,
+            store=store,
+        )
+        store.acquire_provision_lease.assert_called_once_with(
+            "gmail-api:batch-1:job-1",
+            batch_id="batch-1",
+        )
+        store.release_provision_lease.assert_called_once_with(
+            "gmail-api:batch-1:job-1",
+            batch_id="batch-1",
+        )
+
+    def test_lazy_batch_uses_twelve_aliases_before_provisioning_next_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = GmailApiUrlBatchStore(Path(temp_dir) / "turb.sqlite3")
+            batch_id = store.create_empty_batch(
+                target_count=24,
+                aliases_per_source=12,
+                desired_sources=2,
+            )
+            provisioned = []
+
+            def provision_next(batch, *, aliases_per_source, store):
+                index = len(provisioned)
+                code_url = f"https://mail.example/source-{index}"
+                aliases = [
+                    f"alias-{index}-{slot}@gmail.com"
+                    for slot in range(aliases_per_source)
+                ]
+                store.append_source_group(
+                    batch,
+                    f"source-{index}@gmail.com",
+                    code_url,
+                    aliases,
+                )
+                provisioned.append(code_url)
+                return True
+
+            with patch(
+                "core.gmail_api_url_batch_coordinator._batch_store",
+                return_value=store,
+            ), patch(
+                "core.gmail_api_url_batch_coordinator._reconcile_batch_queue"
+            ), patch(
+                "core.gmail_api_url_batch_coordinator.provision_next_gmail_api_url_source",
+                side_effect=provision_next,
+            ):
+                for index in range(24):
+                    account = get_email_from_batch(
+                        batch_id,
+                        f"job-{index}",
+                        poll_interval=0,
+                    )
+                    self.assertEqual(account.code_url, provisioned[-1])
+                    assignment = store.find_active_assignment_for_job(f"job-{index}")
+                    self.assertIsNotNone(assignment)
+                    store.complete(assignment.assignment_id)
+
+            self.assertEqual(provisioned, [
+                "https://mail.example/source-0",
+                "https://mail.example/source-1",
+            ])
+            self.assertEqual(store.count_source_groups(batch_id), 2)
+            self.assertEqual(store.batch_status(batch_id)["completed"], 24)
+
+    @patch("core.gmail_api_url_batch_coordinator.materialize_next_available_source")
+    @patch("core.qan8_gmail_api_purchaser.Qan8GmailApiPurchaser")
+    def test_source_budget_blocks_purchase_after_desired_sources_are_materialized(
+        self, purchaser_class, materialize
+    ):
+        store = Mock()
+        store.batch_provision_plan.return_value = {
+            "target_count": 12,
+            "aliases_per_source": 12,
+            "desired_sources": 1,
+        }
+        store.count_source_groups.return_value = 1
+        materialize.return_value = False
+
+        self.assertFalse(
+            provision_next_gmail_api_url_source(
+                "batch-1",
+                aliases_per_source=12,
+                store=store,
+            )
+        )
+
+        materialize.assert_not_called()
+        purchaser_class.assert_not_called()
+
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.claim_next_gmail_api_url_email")
     def test_create_registration_batch_generates_twelve_aliases_per_source(
         self, mock_claim, mock_store_factory
@@ -81,7 +760,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
         for source, group in zip(sources, groups):
             self.assertNotIn(source["email"], group["aliases"])
 
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.claim_next_gmail_api_url_email")
     def test_create_registration_batch_reuses_used_sources_with_alias_capacity(
         self, mock_claim, mock_store_factory
@@ -107,7 +786,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
         self.assertEqual(batch_id, "batch-used-source")
         mock_store_factory.return_value.create_batch_multi.assert_called_once()
 
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.claim_next_gmail_api_url_email")
     def test_create_registration_batch_skips_alias_used_by_same_source_record(
         self, mock_claim, mock_store_factory
@@ -149,6 +828,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
                 patch.object(db, "_SQLITE_PATH", state),
                 patch.object(db, "_DEFAULT_SQLITE_PATH", state),
                 patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
             ):
                 db.import_gmail_api_url_emails([
                     {"email": first_source, "code_url": first_url},
@@ -163,7 +843,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
                     "aliases": [existing],
                 }])
 
-                with patch("core.gmail_api_url_client._batch_store", return_value=store):
+                with patch("core.gmail_api_url_batch_coordinator._batch_store", return_value=store):
                     batch_id = create_registration_batch(3, aliases_per_email=2)
 
                 with closing(sqlite3.connect(state)) as connection:
@@ -178,7 +858,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
                 self.assertEqual(sum(item["code_url"] == third_url for item in items), 1)
                 self.assertNotIn(second_url, {item["code_url"] for item in items})
 
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.claim_next_gmail_api_url_email")
     def test_create_registration_batch_skips_alias_owned_by_another_code_url(
         self, mock_claim, mock_store_factory
@@ -205,7 +885,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
             "so.urce@gmail.com", source["code_url"]
         )
 
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.release_gmail_api_url_email")
     @patch("core.db.claim_next_gmail_api_url_email")
     def test_exhausted_source_is_not_reopened_by_batch_rollback(
@@ -230,7 +910,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
             "Record đã dùng hết alias Gmail khả dụng",
         )
 
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     @patch("core.db.release_gmail_api_url_email")
     @patch("core.db.claim_next_gmail_api_url_email")
     def test_pending_alias_does_not_terminalize_raw_source(
@@ -273,6 +953,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
                 patch.object(db, "_SQLITE_PATH", state),
                 patch.object(db, "_DEFAULT_SQLITE_PATH", state),
                 patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
             ):
                 db.import_gmail_api_url_emails([
                     {"email": source_email, "code_url": code_url},
@@ -292,7 +973,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
                 self.assertIsNotNone(active)
 
                 with patch(
-                    "core.gmail_api_url_client._batch_store",
+                    "core.gmail_api_url_batch_coordinator._batch_store",
                     return_value=store,
                 ), self.assertRaises(GmailApiUrlBatchError):
                     create_registration_batch(1, aliases_per_email=1)
@@ -325,8 +1006,8 @@ class GmailApiUrlClientTests(unittest.TestCase):
                 {"a.one@gmail.com"},
             )
 
-    @patch("core.gmail_api_url_client.time.sleep", return_value=None)
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     def test_get_email_from_batch_waits_for_temporary_code_url_lock(
         self, mock_store_factory, mock_sleep
     ):
@@ -361,7 +1042,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
         mock_sleep.assert_called_once_with(0)
 
     @patch("core.registration_service.is_stop_requested", return_value=True)
-    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.gmail_api_url_batch_coordinator._batch_store")
     def test_get_email_from_batch_stops_queued_job_after_lane_quarantine(
         self, mock_store_factory, _mock_is_stop_requested
     ):
@@ -490,7 +1171,7 @@ class GmailApiUrlClientTests(unittest.TestCase):
         store.complete.assert_not_called()
 
     @patch("core.gmail_api_url_client.requests.get")
-    @patch("core.gmail_api_url_client.time.sleep", return_value=None)
+    @patch("core.gmail_api_url_batch_coordinator.time.sleep", return_value=None)
     def test_poll_returns_otp_on_code_0_success(self, _sleep, mock_get):
         """code=0 时返回 OTP。"""
         mock_get.return_value = _Response({"code": 0, "data": {"code": "123456"}})
@@ -646,11 +1327,16 @@ class GmailApiUrlClientTests(unittest.TestCase):
             raw_json = root / "gmail-pool.json"
             raw_txt = root / "gmail-pool.txt"
             store = GmailApiUrlBatchStore(root / "gmail-state.sqlite3")
-            code_url = "https://api.example/terminal"
+            sqlite_path = root / "turb.sqlite3"
+            code_url = "https://api.example/terminal?uid=s629b2dc0ff9ec304d8"
 
             with (
                 patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", raw_json),
                 patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", raw_txt),
+                patch.object(db, "_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
             ):
                 self.assertEqual(
                     db.import_gmail_api_url_emails([
@@ -666,16 +1352,33 @@ class GmailApiUrlClientTests(unittest.TestCase):
                         "aliases": ["alias-one@gmail.com", "alias-two@gmail.com"],
                     },
                 ])
+                order = store.create_purchase_order(batch_id, "qan8-order-1", "156")
+                store.update_purchase_order(
+                    batch_id,
+                    str(order["out_order_no"]),
+                    status="completed",
+                    code_url=code_url,
+                )
                 assignment = store.claim(batch_id, "job-terminal")
                 mock_get.return_value = _Response({"code": 602, "message": "expired"})
 
-                with self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"):
+                with (
+                    patch(
+                        "core.gmail_api_url_client._request_qan8_after_sales"
+                    ) as after_sales,
+                    self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"),
+                ):
                     poll_verification_code(
                         GmailApiUrlAccount("alias-one@gmail.com", code_url),
                         max_wait=5,
                         poll_interval=0,
                         sqlite_path=store.path,
                     )
+                after_sales.assert_called_once_with(
+                    "s629b2dc0ff9ec304d8",
+                    code_url=code_url,
+                    sqlite_path=store.path,
+                )
 
                 rows = db.list_gmail_api_url_email_pool(limit=10)
                 self.assertEqual({row["status"] for row in rows}, {"failed"})

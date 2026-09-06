@@ -55,6 +55,7 @@ def resolve_rotating_proxy(
     *,
     scope: str,
     lane_id: int | None = None,
+    force_refresh: bool | None = None,
 ) -> str | None:
     """Return an explicit proxy or acquire one rotating lease for this workflow lane."""
     if proxy is not None:
@@ -69,8 +70,16 @@ def resolve_rotating_proxy(
     from core.rotating_proxy_manager import get_rotating_proxy_manager
 
     manager = get_rotating_proxy_manager()
+    if force_refresh is None:
+        force_refresh = bool(
+            scope == REGISTRATION_PROXY_SCOPE
+            and getattr(proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False)
+        )
     if scope == REGISTRATION_PROXY_SCOPE:
-        lease = manager.acquire(effective_lane)
+        if force_refresh:
+            lease = manager.acquire(effective_lane, force_refresh=True)
+        else:
+            lease = manager.acquire(effective_lane)
     else:
         lease = manager.acquire(effective_lane, scope=scope)
     return lease.proxy_url
