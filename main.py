@@ -171,13 +171,13 @@ def run_registration(
     force_refresh_proxy: bool | None = None,
 ):
     """Run registration with the configured rotating-proxy lifecycle."""
+    from config import proxy as proxy_config
     from core.rotating_proxy_runtime import (
         REGISTRATION_PROXY_SCOPE,
         release_rotating_proxy,
-        retire_rotating_proxy,
         resolve_rotating_proxy,
+        retire_rotating_proxy,
     )
-    from config import proxy as proxy_config
 
     one_account_per_ip = bool(
         getattr(proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False)

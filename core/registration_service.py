@@ -960,7 +960,6 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 lease_owner_id=f"registration-job:{job_id}",
                 force_refresh_proxy=bool(
                     getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False)
-                    and int(current.get("retry_attempt") or 0) > 0
                 ),
             )
             if is_stop_requested(job_id):

@@ -111,7 +111,7 @@ ROTATING_PROXY_WHITELIST=
 
 批量注册的 `workers` 会映射为稳定的 lane（`index % workers`）。lane 有未过期 lease 时不会重复请求 API；proxy TTL 到期才调用 `proxyxoay.shop/api/get.php`。配置页状态区会分别显示 workflow scope（例如 `registration:0`、`codex_retry:0`），且只展示脱敏 key、assignment 和 proxy，不展示主 API Key。
 
-开启 `ROTATING_PROXY_ONE_ACCOUNT_PER_IP=true` 后，仅 registration workflow 会强制使用单 worker lane；一个 job 从开始到结束固定使用一个 proxy，同一 job 内的失败重试、关闭并重新打开 browser 都继续复用该 proxy。child retry job 是新的 job，会 force-refresh 获取新的 proxy；只有账号 setup 成功后才 retire lease/cache。其他 workflow 仍按原来的 `scope + lane` TTL 复用规则运行。
+开启 `ROTATING_PROXY_ONE_ACCOUNT_PER_IP=true` 后，仅 registration workflow 会强制使用单 worker lane；每次进入一个 registration job 都会在 job boundary force-refresh 一个 proxy，并从开始到结束固定使用它。同一 job 内的失败重试、关闭并重新打开 browser 都继续复用该 proxy，不会重新 acquisition。child retry job 是新的 job，因此也会 force-refresh 获取新的 proxy；只有账号 setup 成功后才 retire lease/cache。其他 workflow 仍按原来的 `scope + lane` TTL 复用规则运行。
 
 ### 数据存储
 

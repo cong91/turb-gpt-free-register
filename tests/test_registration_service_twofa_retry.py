@@ -289,7 +289,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             "密码页提交失败：vui lòng thử lại",
             discard_on_failure=True,
         )
-        self.assertFalse(run_registration.call_args.kwargs["force_refresh_proxy"])
+        self.assertTrue(run_registration.call_args.kwargs["force_refresh_proxy"])
         self.assertEqual(len(submitted), 1)
         self.assertIs(submitted[0][0], registration_service._run_one_job)
 

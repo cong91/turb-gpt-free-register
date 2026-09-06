@@ -870,7 +870,7 @@ class RotatingProxyConfigTests(unittest.TestCase):
         )
         retire_proxy.assert_not_called()
 
-    def test_one_account_registration_retry_reuses_proxy_without_force_refresh(self):
+    def test_one_account_registration_explicit_proxy_override_reuses_proxy(self):
         import main
 
         lease = Mock(proxy_url="http://203.0.113.23:8080", lane_id=0, proxy_expires_at=200.0)
