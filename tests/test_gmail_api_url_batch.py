@@ -11,7 +11,6 @@ from core.gmail_api_url_batch_store import (
     GmailApiUrlBatchStore,
 )
 from core.gmail_api_url_client import GmailApiUrlAccount
-from core.qan8_gmail_api_store import Qan8GmailApiStore
 
 
 def test_create_batch_with_capacity(tmp_path):
@@ -156,6 +155,41 @@ def test_claim_blocks_same_code_url_across_batches_until_released(tmp_path):
     assert second.inventory_id.startswith("second+alias@gmail.com----")
 
 
+def test_provision_leases_are_scoped_to_each_batch(tmp_path):
+    """Parallel source lanes may materialize independently."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+
+    assert store.acquire_provision_lease("lane-a", batch_id="batch-a")
+    assert store.acquire_provision_lease("lane-b", batch_id="batch-b")
+    assert not store.acquire_provision_lease("other-a", batch_id="batch-a")
+    assert store.release_provision_lease("lane-a", batch_id="batch-a")
+    assert store.acquire_provision_lease("other-a", batch_id="batch-a")
+
+
+def test_exclusive_source_append_rejects_code_url_owned_by_another_batch(tmp_path):
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    code_url = "https://api.mail.com/exclusive"
+    first_batch = store.create_batch_multi([
+        {
+            "source_email": "first@gmail.com",
+            "code_url": code_url,
+            "aliases": ["first+alias@gmail.com"],
+        }
+    ])
+    second_batch = store.create_empty_batch(target_count=1)
+
+    with pytest.raises(GmailApiUrlBatchConflict, match="already owned"):
+        store.append_source_group(
+            second_batch,
+            "second@gmail.com",
+            code_url,
+            ["second+alias@gmail.com"],
+            exclusive_code_url=True,
+        )
+
+    assert store.list_batch_ids_for_code_urls({code_url}) == [first_batch]
+
+
 def test_claim_blocks_historical_dot_variant_of_same_gmail_root(tmp_path):
     """Legacy dotted/undotted spellings cannot race two provider URLs."""
     store = GmailApiUrlBatchStore(tmp_path / "batch.db")
@@ -217,33 +251,6 @@ def test_unavailable_aliases_exclude_terminal_released_assignment(tmp_path):
 
     assert unavailable == {failed_alias}
     assert released_alias not in unavailable
-
-
-def test_global_unavailable_aliases_keep_qan8_available_aliases_reusable(tmp_path):
-    """QAN8 provenance rows are unavailable only while active or terminal."""
-    path = tmp_path / "shared.db"
-    q8_store = Qan8GmailApiStore(path)
-    q8_batch = q8_store.create_batch(
-        1,
-        requested_workers=1,
-        aliases_per_source=2,
-    )
-    q8_store.create_source_group(
-        q8_batch["batch_id"],
-        0,
-        "source@gmail.com",
-        "https://api.mail.com/qan8",
-        ["available@gmail.com", "other@gmail.com"],
-    )
-    store = GmailApiUrlBatchStore(path)
-
-    assert store.list_globally_unavailable_aliases().isdisjoint(
-        {"available@gmail.com", "other@gmail.com"}
-    )
-
-    assignment = q8_store.claim_alias(q8_batch["batch_id"], 0, "q8-job")
-    assert assignment is not None
-    assert "available@gmail.com" in store.list_globally_unavailable_aliases()
 
 
 def test_quarantine_code_url_exhausts_every_alias_for_that_mailbox(tmp_path):

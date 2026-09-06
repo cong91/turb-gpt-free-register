@@ -129,6 +129,8 @@ def _coerce_browser_mapping(driver, result, *, label: str) -> dict:
 def _is_transient_email_submission_error(exc: Exception) -> bool:
     """Identify browser-state failures that are recoverable by reloading login."""
     message = str(exc or "").lower()
+    if isinstance(exc, TimeoutError) or type(exc).__name__ == "TimeoutError":
+        return True
     if isinstance(exc, AttributeError) and "has no attribute 'get'" in message:
         return True
     return any(
@@ -1089,6 +1091,61 @@ def _is_email_login_page_still_present(driver) -> bool:
     return bool(state.get("inputs"))
 
 
+def _auth_flow_url_state(url: object) -> str | None:
+    """Classify auth transitions that can be observed without a page script."""
+    lower_url = str(url or "").lower()
+    if "/log-in/password" in lower_url:
+        return "login_password"
+    if any(marker in lower_url for marker in ("email-verification", "email_otp")):
+        return "otp"
+    if "verify" in lower_url and "email" in lower_url:
+        return "otp"
+    if any(
+        marker in lower_url
+        for marker in ("/create-account/password", "/u/signup/password", "/signup/password")
+    ):
+        return "password"
+    return None
+
+
+def _wait_email_submit_next_state_with_bounded_adapter(
+    driver,
+    timeout: float,
+    read_auth_flow_state,
+) -> str:
+    """Wait for Cloak auth transitions without unbounded synchronous JS probes."""
+    end = time.monotonic() + max(0.0, float(timeout))
+    last_url = ""
+    while time.monotonic() < end:
+        remaining = max(0.0, end - time.monotonic())
+        try:
+            last_url = str(getattr(driver, "current_url", "") or "")
+        except Exception:  # noqa: BLE001
+            last_url = ""
+        url_state = _auth_flow_url_state(last_url)
+        if url_state:
+            return url_state
+        try:
+            snapshot = read_auth_flow_state(
+                timeout_ms=max(1, min(400, int(remaining * 1000))),
+            ) or {}
+        except Exception as exc:
+            if _is_transient_email_submission_error(exc):
+                snapshot = {}
+            else:
+                raise
+        code = detect_account_unusable_text(str(snapshot.get("body_text") or ""))
+        if code:
+            raise AccountUnusableError(account_unusable_error_message(code), error_code=code)
+        state = str(snapshot.get("state") or "")
+        if state in {"otp", "password", "login_password"}:
+            return state
+        if _has_access_token(driver, timeout_ms=max(1, int(min(5.0, remaining) * 1000))):
+            return "logged_in"
+        time.sleep(min(0.8, remaining))
+    return "email_page" if "/auth/login" in last_url.lower() else "unknown"
+
+
 def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     """邮箱提交后等待进入 password / otp / logged_in；仍停留邮箱页则返回 email_page。
 
@@ -1099,23 +1156,34 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
     这里对 email_cleared 做去抖：只记录并继续观察几秒；若期间进入
     password/otp/login_password/logged_in 则按真实状态返回，持续清空才让上层重试。
     """
-    end = time.time() + timeout
+    end = time.monotonic() + max(0.0, float(timeout))
     last = None
     cleared_seen_at: float | None = None
     cleared_last_log_at = 0.0
     cleared_recover_done = False
     expected_email = str(email or "").strip().lower()
-    while time.time() < end:
+    read_auth_flow_state = getattr(driver, "read_auth_flow_state", None)
+    if callable(read_auth_flow_state):
+        return _wait_email_submit_next_state_with_bounded_adapter(
+            driver,
+            timeout,
+            read_auth_flow_state,
+        )
+    while time.monotonic() < end:
+        remaining = max(0.0, end - time.monotonic())
         _raise_if_account_unusable(driver)
         challenge_state = _browser_challenge_state(driver)
         if challenge_state.get("is_challenge"):
-            _wait_for_browser_challenge(driver, timeout=_registration_timeout(driver))
+            _wait_for_browser_challenge(
+                driver,
+                timeout=min(float(_registration_timeout(driver)), remaining),
+            )
             continue
         if _is_email_verification_page(driver):
             return "otp"
         if _is_signup_password_page(driver):
             return "password"
-        if _has_access_token(driver):
+        if _has_access_token(driver, timeout_ms=max(1, int(min(5.0, remaining) * 1000))):
             return "logged_in"
         if _is_login_password_page(driver):
             return "login_password"
@@ -1128,7 +1196,7 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             has_blank = any(v == "" for v in values)
             has_expected = any(v.strip().lower() == expected_email for v in values)
             if has_blank and not has_expected:
-                now = time.time()
+                now = time.monotonic()
                 if cleared_seen_at is None:
                     cleared_seen_at = now
                 # URL 已带 email 查询参数时更像是提交后的中间态，给它更长观察窗口。
@@ -1155,7 +1223,8 @@ def _wait_email_submit_next_state(driver, email: str, timeout: int = 18) -> str:
             # 仍是当前邮箱页，继续短等。
         time.sleep(0.8)
     logger.info("%s 邮箱提交后等待下一步超时，最后邮箱页状态=%s", _log_prefix(driver), last)
-    return "email_page" if _is_email_login_page_still_present(driver) else "unknown"
+    last_inputs = last.get("inputs") if isinstance(last, dict) else None
+    return "email_page" if last_inputs else "unknown"
 
 
 def _reset_login_page_for_retry(driver) -> None:
@@ -1190,7 +1259,11 @@ def _submit_email_and_wait_next(driver, email: str | None, attempts: int = 3, al
             if state_name in ("password", "otp", "logged_in", "login_password"):
                 logger.info("%s 邮箱提交后已进入下一步：%s", _log_prefix(driver), state_name)
                 return state_name
-            logger.warning("%s 邮箱提交后仍未进入下一步：%s，准备重填重试 state=%s", _log_prefix(driver), state_name, _email_input_value_state(driver))
+            logger.warning(
+                "%s 邮箱提交后仍未进入下一步：%s，准备重填重试",
+                _log_prefix(driver),
+                state_name,
+            )
             if attempt < attempts:
                 _reset_login_page_for_retry(driver)
             else:
@@ -1617,14 +1690,48 @@ def _page_snapshot(driver) -> dict:
         return {"error": f"{type(exc).__name__}: {exc}", "url": getattr(driver, 'current_url', '')}
 
 
-def _has_access_token(driver) -> bool:
+def _has_access_token(driver, *, timeout_ms: int | None = None) -> bool:
+    """Check for a session token without allowing a page fetch to stall polling."""
+    if timeout_ms is None:
+        timeout_ms = min(5000, max(1000, _registration_timeout(driver) * 1000))
+    else:
+        try:
+            timeout_ms = max(1, int(timeout_ms))
+        except (TypeError, ValueError):
+            timeout_ms = 1000
+
+    request_session = getattr(driver, "get_chatgpt_auth_session", None)
+    if callable(request_session):
+        try:
+            result = request_session(timeout_ms=timeout_ms)
+            return isinstance(result, dict) and bool(result.get("accessToken"))
+        except Exception:  # noqa: BLE001
+            return False
+
     try:
-        result = driver.execute_async_script(r"""
-        const done = arguments[0];
-        fetch('https://chatgpt.com/api/auth/session', {credentials:'include'})
-          .then(r => r.json()).then(j => done(Boolean(j && j.accessToken)))
-          .catch(() => done(false));
-        """)
+        script = f"""
+        const timeoutMs = {timeout_ms};
+        const done = arguments[arguments.length - 1];
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        const options = {{credentials: 'include'}};
+        if (controller) options.signal = controller.signal;
+        let settled = false;
+        const finish = value => {{
+          if (settled) return;
+          settled = true;
+          done(value);
+        }};
+        const timer = setTimeout(() => {{
+          try {{ if (controller) controller.abort(); }} catch (_) {{}}
+          finish(false);
+        }}, timeoutMs);
+        fetch('https://chatgpt.com/api/auth/session', options)
+          .then(r => r.json())
+          .then(j => finish(Boolean(j && j.accessToken)))
+          .catch(() => finish(false))
+          .finally(() => clearTimeout(timer));
+        """
+        result = driver.execute_async_script(script)
         if isinstance(result, dict):
             return bool(result.get("accessToken"))
         return bool(result)

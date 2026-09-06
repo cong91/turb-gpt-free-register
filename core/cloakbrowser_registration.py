@@ -387,6 +387,65 @@ def run_cloak_registration(
                 twofa_status = "failed"
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
+                logger.error(
+                    "[Cloak注册] 2FA 设置失败，当前浏览器内 re-auth 已耗尽，准备关闭浏览器并重新执行 email OTP 登录：%s",
+                    twofa_error,
+                )
+                try:
+                    # setup_2fa() already exhausted its 3 in-session attempts.
+                    # The recovery workflow owns a fresh browser for each of its
+                    # three attempts and logs in with email + OTP before retrying MFA.
+                    driver.quit()
+                except Exception as close_exc:  # noqa: BLE001 - recovery must still be attempted.
+                    logger.debug("[Cloak注册] 2FA recovery browser close failed: %s", close_exc)
+                driver = None
+                if traffic_tracker is not None:
+                    try:
+                        traffic_tracker.stop()
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                    traffic_tracker = None
+                if openai_password:
+                    try:
+                        from core.browser_twofa_retry import run_twofa_retry
+
+                        recovery = run_twofa_retry(
+                            {
+                                "id": account_id,
+                                "email": email,
+                                "registration_password": openai_password,
+                                "access_token": access_token,
+                                "proxy_used": proxy,
+                            },
+                            max_attempts=3,
+                            browser_restart_attempts=3,
+                            proxy=proxy,
+                        )
+                    except Exception as recovery_exc:  # noqa: BLE001 - preserve the checkpointed account.
+                        recovery = {
+                            "ok": False,
+                            "message": f"{type(recovery_exc).__name__}: {str(recovery_exc)[:300]}",
+                        }
+                    if recovery.get("ok"):
+                        logger.info(
+                            "[Cloak注册] 关闭浏览器后重新 email OTP 登录成功，2FA 已激活：account_id=%s",
+                            recovery.get("account_id") or account_id,
+                        )
+                        return {
+                            "success": True,
+                            "email": recovery.get("email") or email,
+                            "account_id": recovery.get("account_id") or account_id,
+                            "access_token": recovery.get("access_token") or access_token,
+                            "totp_secret": recovery.get("totp_secret"),
+                            "twofa_status": "active",
+                            "twofa_error": None,
+                            "codex": recovery.get("codex"),
+                            "error": None,
+                        }
+                    twofa_error = (
+                        f"{twofa_error}; 浏览器重启 3 次后仍无法完成 email OTP/2FA: "
+                        f"{str(recovery.get('message') or 'unknown error')[:300]}"
+                    )
                 logger.error("[Cloak注册] 2FA 设置失败，账号已保留待重试：%s", twofa_error)
                 return {"success": False, "email": email, "account_id": account_id, "access_token": access_token, "twofa_status": twofa_status, "twofa_error": twofa_error, "error": f"2FA 设置失败，账号已保存：{twofa_error}"}
 

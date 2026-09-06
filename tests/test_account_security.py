@@ -9,12 +9,14 @@ from core import db
 from core.account_security import (
     TwofaChangeInput,
     _extract_mfa_factor_id,
+    _login_and_get_access_token,
     change_twofa_in_browser,
     deactivate_2fa_in_page,
     parse_twofa_change_inputs,
 )
 from core.browser_profile import open_browser_profile
 from core.browser_twofa_change import run_twofa_change
+from core.openai_auth import AccountUnusableError
 from webui.app import create_app
 
 
@@ -230,6 +232,20 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["access_token"], "fresh-token")
+
+    def test_deactivated_login_is_not_retried(self):
+        driver = Mock(current_url="https://chatgpt.com/")
+        item = TwofaChangeInput("locked@example.com", "password", "OLDSECRET")
+        with (
+            patch(
+                "core.email_change._login_chatgpt_with_credentials",
+                side_effect=AccountUnusableError("OpenAI đã khóa tài khoản", error_code="account_deactivated"),
+            ) as login,
+            self.assertRaisesRegex(AccountUnusableError, "đã khóa"),
+        ):
+            _login_and_get_access_token(driver, item)
+
+        login.assert_called_once()
 
 
 class TwofaRunnerTests(unittest.TestCase):

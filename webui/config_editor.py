@@ -389,23 +389,23 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,tinyhost,gmail_123452026,paymesh,qan8_gmail_api",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,tinyhost,gmail_123452026,paymesh,gmail_api_url；QAN8 仅用于按需购买 Gmail API URL source",
     },
     {
         "key": "QAN8_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "QAN8 API 地址", "help": "默认 https://shop.qan8.com；QAN8 Gmail provider API 根地址", "storage": "env",
+        "label": "Gmail API URL 购买地址", "help": "默认 https://shop.qan8.com；QAN8 仅作为 Gmail API URL source 的购买后端", "storage": "env",
     },
     {
         "key": "QAN8_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "QAN8 API Key", "help": "QAN8 Open API Key；保存在 .env，不会写入 config 源码", "storage": "env", "secret": True,
+        "label": "shop.qan8 API Key", "help": "购买 Gmail API URL source 的 Open API Key；保存在 .env，不会写入 config 源码", "storage": "env", "secret": True,
     },
     {
         "key": "QAN8_API_PROXY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "QAN8 API 代理", "help": "可选 HTTP(S)/SOCKS5(H) 代理；留空时优先使用已启用的 NordVPN WireGuard，否则直连", "storage": "env", "secret": True,
+        "label": "shop.qan8 API 代理", "help": "可选 HTTP(S)/SOCKS5(H) 代理；留空时优先使用已启用的 NordVPN WireGuard，否则直连", "storage": "env", "secret": True,
     },
     {
         "key": "QAN8_GMAIL_SKU_ID", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "QAN8 Gmail SKU", "help": "从 QAN8 products API 选择 Gmail API URL 商品的 sku_id", "storage": "env",
+        "label": "shop.qan8 Gmail SKU", "help": "从 shop.qan8 products API 选择 Gmail API URL 商品的 sku_id", "storage": "env",
     },
     {
         "key": "QAN8_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
@@ -414,10 +414,6 @@ EDITABLE_FIELDS = [
     {
         "key": "QAN8_ORDER_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
         "label": "QAN8 订单等待上限", "help": "processing 订单轮询的最大秒数；超时不重复下单",
-    },
-    {
-        "key": "QAN8_ALIASES_PER_SOURCE", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
-        "label": "每个 QAN8 source 的 alias 数", "help": "默认 12；单次任务仍可在注册页覆盖，范围 1-12",
     },
     {
         "key": "GMAIL_123452026_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -637,6 +633,10 @@ EDITABLE_FIELDS = [
         "label": "Bật proxy xoay Proxy.vn", "help": "Đăng ký, Codex, kiểm tra tài khoản, kiểm tra gói, lấy link, 2FA, đổi email và Agent dùng lease bền vững theo từng lane; cùng scope + lane sẽ dùng lại proxy, key xoay không trùng giữa các lane đang hoạt động",
     },
     {
+        "key": "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", "file": "proxy.py", "type": "bool", "group": "代理池",
+        "label": "Đăng ký một account một IP", "help": "Chỉ áp dụng cho registration: chạy tuần tự, retire proxy sau mỗi account và đợi Proxy.vn xoay sang IP mới trước account kế tiếp",
+    },
+    {
         "key": "ROTATING_PROXY_API_KEY", "file": "proxy.py", "type": "str", "group": "代理池",
         "label": "API Key chính của Proxy.vn", "help": "Dùng để xem danh sách, mua và gia hạn key xoay; chỉ lưu vào .env, không ghi vào mã nguồn cấu hình",
         "storage": "env", "secret": True,
@@ -728,8 +728,12 @@ EDITABLE_FIELDS = [
         "label": "本地 Checkout 应用优惠", "help": "验证首月免费金额为 0",
     },
     {
+        "key": "EXTRACT_LINK_LOCAL_PROVIDER_ATTEMPTS", "file": "extract_link.py", "type": "int", "group": "提链",
+        "label": "PAY.153 本地支付重试次数", "help": "MoMo、PIX、GCash 默认 10 次；每次使用新 Checkout 和新的轮换代理。",
+    },
+    {
         "key": "EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS", "file": "extract_link.py", "type": "int", "group": "提链",
-        "label": "本地 Checkout 重试次数", "help": "PAY.153 本地创建 Checkout 的最大尝试数，建议 1-3",
+        "label": "旧提链器 Checkout 重试次数", "help": "仅用于 legacy/remote 提链器；PAY.153 使用上方的独立重试次数",
     },
     {
         "key": "EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS", "file": "extract_link.py", "type": "int", "group": "提链",

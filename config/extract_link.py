@@ -23,6 +23,9 @@ EXTRACT_LINK_LOCAL_CURRENCY: str = "PHP"
 EXTRACT_LINK_LOCAL_PLAN_NAME: str = "chatgptplusplan"
 EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID: str = "plus-1-month-free"
 EXTRACT_LINK_LOCAL_APPLY_PROMO: bool = True
+# PAY.153 defaults high-variance local rails (MoMo/PIX/GCash) to ten fresh
+# Checkout attempts; the legacy extractor keeps its lower retry setting.
+EXTRACT_LINK_LOCAL_PROVIDER_ATTEMPTS: int = 10
 EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS: int = 3
 EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS: int = 3
 
@@ -39,6 +42,7 @@ apply_env_overrides(globals(), {
     'EXTRACT_LINK_LOCAL_PLAN_NAME': 'str',
     'EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID': 'str',
     'EXTRACT_LINK_LOCAL_APPLY_PROMO': 'bool',
+    'EXTRACT_LINK_LOCAL_PROVIDER_ATTEMPTS': 'int',
     'EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS': 'int',
     'EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS': 'int',
 })

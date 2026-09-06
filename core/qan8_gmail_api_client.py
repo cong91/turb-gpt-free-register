@@ -160,6 +160,20 @@ class Qan8GmailApiClient:
         )
         return self._order_from_payload(payload, fallback_order_no=value)
 
+    def request_after_sales(self, uid: str) -> dict:
+        """Request QAN8's documented automatic after-sales for a 602 UID."""
+        value = str(uid or "").strip()
+        if not value:
+            raise ValueError("uid is required")
+        payload = self._request(
+            "POST",
+            "/api/after-sales/check",
+            json={"uid": value},
+        )
+        if not isinstance(payload, dict):
+            raise Qan8GmailApiError("QAN8 after-sales response is invalid")
+        return dict(payload)
+
     def parse_delivery(self, delivery: object) -> list[Qan8SourceRecord]:
         if isinstance(delivery, str):
             lines = delivery.splitlines()

@@ -1303,7 +1303,7 @@ def _credential_file_name(email: str, plan_type: str) -> str:
 def save_codex_credential(storage: dict, email: str, plan_type: str) -> str:
     """保存 Codex 凭证到 SQLite，不创建本地文件。"""
     fname = _credential_file_name(email, plan_type)
-    db.upsert_codex_credential(storage, fname)
+    db.upsert_codex_credential(storage, fname, reset_export_state=True)
     return f"sqlite://codex_accounts/{fname}"
 
 
@@ -1386,7 +1386,7 @@ def _save_cpa_local_record(
         "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "note": "授权地址由 CPA 生成；callback 已提交给 CPA。若 CPA 响应未包含 token，本文件为本地回执记录。",
     }
-    db.upsert_codex_credential(record, fname)
+    db.upsert_codex_credential(record, fname, reset_export_state=True)
     return f"sqlite://codex_accounts/{fname}"
 
 
@@ -1425,7 +1425,7 @@ def _save_sub2_local_record(
         "submitted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "note": "授权地址由 sub2 生成；callback 已上传给 sub2。若 sub2 响应未包含 token，本文件为本地回执记录。",
     }
-    db.upsert_codex_credential(record, fname)
+    db.upsert_codex_credential(record, fname, reset_export_state=True)
     return f"sqlite://codex_accounts/{fname}"
 
 

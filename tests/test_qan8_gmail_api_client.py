@@ -175,6 +175,21 @@ class Qan8GmailApiClientTests(unittest.TestCase):
             timeout=3,
         )
 
+    @patch("core.qan8_gmail_api_client.requests.post")
+    def test_request_after_sales_uses_uid_endpoint(self, mock_post):
+        mock_post.return_value = _Response(
+            {"success": True, "code": 602, "message": "售后处理完成"}
+        )
+
+        result = self.client.request_after_sales("s629b2dc0ff9ec304d8")
+
+        self.assertEqual(result["success"], True)
+        mock_post.assert_called_once_with(
+            "https://shop.example/api/after-sales/check",
+            json={"uid": "s629b2dc0ff9ec304d8"},
+            timeout=3,
+        )
+
     @patch("core.qan8_gmail_api_client.requests.post", side_effect=RuntimeError("connection lost"))
     def test_create_timeout_has_unknown_outcome_without_secret(self, _mock_post):
         with self.assertRaises(Qan8OrderUnknownError) as raised:

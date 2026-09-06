@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -129,6 +131,7 @@ def _run_local_checkout(
     proxy: str | None,
     payment_proxy: str | None = None,
     promotion_proxy: str | None = None,
+    local_method_strategy: str = "standalone",
     log,
 ) -> dict:
     """Run PAY.153's direct access-token checkout flow and normalize its result."""
@@ -143,6 +146,7 @@ def _run_local_checkout(
             entry_proxy=proxy,
             payment_proxy=payment_proxy or proxy,
             promotion_proxy=promotion_proxy or proxy,
+            local_method_strategy=local_method_strategy,
             log=log,
         )
         checkout_url = str(
@@ -164,6 +168,9 @@ def _run_local_checkout(
             "payment_link_type": link_type,
             "expires_at": provider_result.get("expires_at"),
             "checkout_session_id": provider_result.get("checkout_session_id"),
+            "stripe_checkout_session_id": provider_result.get("stripe_checkout_session_id"),
+            "custom_checkout_session_id": provider_result.get("custom_checkout_session_id"),
+            "checkout_session_ids": provider_result.get("checkout_session_ids") or {},
             "processor_entity": provider_result.get("processor_entity"),
             "billing_country": provider_result.get("checkout_country") or provider_result.get("country"),
             "currency": provider_result.get("checkout_currency") or provider_result.get("currency"),
@@ -618,6 +625,33 @@ def _format_failure_reason(exc: Exception, logs: list[str] | None = None, last_e
     return reason[:500]
 
 
+def _local_provider_attempts(link_type: str) -> int:
+    if str(link_type or "").lower() in {"pix", "momo", "gcash"}:
+        return _int_setting("EXTRACT_LINK_LOCAL_PROVIDER_ATTEMPTS", 10, 1, 50)
+    return _int_setting("EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS", 3, 1, 10)
+
+
+def _provider_method_unavailable(link_type: str, exc: Exception) -> bool:
+    provider = str(link_type or "").strip().lower()
+    return bool(provider) and f"未开放 {provider}" in str(exc).lower()
+
+
+def _proxy_cooldown_seconds(exc: Exception) -> int | None:
+    match = re.search(r"(?:con|còn)\s+(\d+)\s*s", str(exc), re.IGNORECASE)
+    return max(1, int(match.group(1))) if match else None
+
+
+def _retryable_local_checkout_error(link_type: str, exc: Exception) -> bool:
+    if _provider_method_unavailable(link_type, exc):
+        return True
+    detail = str(exc).lower()
+    if "status=101" in detail or "cooldown" in detail:
+        return True
+    from core.pay153_checkout_extractor import is_retryable_network_error
+
+    return is_retryable_network_error(exc)
+
+
 def _run_extract(
     *,
     account_id: int,
@@ -638,6 +672,8 @@ def _run_extract(
         if not db.mark_account_extract_running(account_id):
             return {"ok": False, "error": "账号已删除或提链状态已被重置"}
         if _mode() == "local":
+            from core.pay153_provider_workflow import local_method_strategy
+
             roles = _proxy_roles(link_type)
             supplied = {
                 EXTRACT_LINK_PROXY_SCOPE: proxy,
@@ -645,34 +681,88 @@ def _run_extract(
                 EXTRACT_LINK_PROMOTION_PROXY_SCOPE: promotion_proxy,
             }
             fallback_proxy = next((value for value in supplied.values() if value), None)
-            active_by_scope: dict[str, str | None] = {}
-            for scope in roles:
-                value = supplied.get(scope)
-                if value is None and fallback_proxy is None:
-                    value = resolve_rotating_proxy(None, scope=scope, lane_id=proxy_lane_id)
-                    rotating_proxies.append((scope, value))
-                elif value is None:
-                    value = fallback_proxy
-                active_by_scope[scope] = value
-            active_proxy = next((active_by_scope.get(scope) for scope in roles if active_by_scope.get(scope)), None)
-            active_payment_proxy = active_by_scope.get(EXTRACT_LINK_PAYMENT_PROXY_SCOPE) or active_proxy
-            active_promotion_proxy = active_by_scope.get(EXTRACT_LINK_PROMOTION_PROXY_SCOPE) or active_proxy
-            final = _run_local_checkout(
-                token=access_token,
-                link_type=link_type,
-                proxy=active_proxy,
-                payment_proxy=active_payment_proxy,
-                promotion_proxy=active_promotion_proxy,
-                log=lambda message: db.update_account_extract(account_id, {
-                    "ok": False,
-                    "status": "running",
-                    "link_type": link_type,
-                    "message": str(message)[:300],
-                }),
-            )
-            db.update_account_extract(account_id, final)
-            logger.info("[提链] 本地 PAY.153 成功: %s type=%s", email, link_type)
-            return final
+            max_attempts = _local_provider_attempts(link_type)
+            for attempt in range(1, max_attempts + 1):
+                attempt_rotating_proxies: list[tuple[str, str | None]] = []
+                retired_rotating_proxies: set[tuple[str, str | None]] = set()
+                try:
+                    active_by_scope: dict[str, str | None] = {}
+                    for scope in roles:
+                        value = supplied.get(scope)
+                        if value is None and fallback_proxy is None:
+                            value = resolve_rotating_proxy(None, scope=scope, lane_id=proxy_lane_id)
+                            attempt_rotating_proxies.append((scope, value))
+                        elif value is None:
+                            value = fallback_proxy
+                        active_by_scope[scope] = value
+                    active_proxy = next((active_by_scope.get(scope) for scope in roles if active_by_scope.get(scope)), None)
+                    active_payment_proxy = active_by_scope.get(EXTRACT_LINK_PAYMENT_PROXY_SCOPE) or active_proxy
+                    active_promotion_proxy = active_by_scope.get(EXTRACT_LINK_PROMOTION_PROXY_SCOPE) or active_proxy
+                    final = _run_local_checkout(
+                        token=access_token,
+                        link_type=link_type,
+                        proxy=active_proxy,
+                        payment_proxy=active_payment_proxy,
+                        promotion_proxy=active_promotion_proxy,
+                        local_method_strategy=local_method_strategy(link_type, attempt),
+                        log=lambda message: db.update_account_extract(account_id, {
+                            "ok": False,
+                            "status": "running",
+                            "link_type": link_type,
+                            "message": str(message)[:300],
+                        }),
+                    )
+                    db.update_account_extract(account_id, final)
+                    logger.info("[提链] 本地 PAY.153 成功: %s type=%s", email, link_type)
+                    return final
+                except Exception as exc:
+                    retry = attempt < max_attempts and _retryable_local_checkout_error(link_type, exc)
+                    if not retry:
+                        raise
+                    reason = _format_failure_reason(exc)
+                    transport_error = not _provider_method_unavailable(link_type, exc)
+                    route_change = "；đổi proxy" if attempt_rotating_proxies else ""
+                    cooldown_seconds = _proxy_cooldown_seconds(exc)
+                    db.update_account_extract(account_id, {
+                        "ok": False,
+                        "status": "running",
+                        "link_type": link_type,
+                        "message": (
+                            f"Proxy.vn cooldown còn {cooldown_seconds}s; chờ rồi tạo Checkout mới"
+                            if cooldown_seconds is not None
+                            else (
+                            f"Checkout TLS/transport attempt {attempt}/{max_attempts}{route_change}; tạo Checkout mới"
+                            if transport_error
+                            else f"{str(link_type).upper()} attempt {attempt}/{max_attempts} chỉ có card{route_change}; tạo Checkout mới"
+                            )
+                        ),
+                    })
+                    logger.info("[提链] local checkout retry %s/%s for %s: %s", attempt, max_attempts, email, reason)
+                    for scope, rotating_proxy in attempt_rotating_proxies:
+                        if rotating_proxy is None:
+                            continue
+                        release_rotating_proxy(
+                            scope=scope,
+                            lane_id=proxy_lane_id,
+                            proxy_url=rotating_proxy,
+                            retire=True,
+                        )
+                        retired_rotating_proxies.add((scope, rotating_proxy))
+                    delay = (
+                        min(90, cooldown_seconds + 1)
+                        if cooldown_seconds is not None
+                        else min(4, 1 + attempt * 0.35)
+                    )
+                    time.sleep(delay)
+                finally:
+                    for scope, rotating_proxy in attempt_rotating_proxies:
+                        if rotating_proxy is None or (scope, rotating_proxy) in retired_rotating_proxies:
+                            continue
+                        release_rotating_proxy(
+                            scope=scope,
+                            lane_id=proxy_lane_id,
+                            proxy_url=rotating_proxy,
+                        )
 
         active_proxy = resolve_rotating_proxy(
             proxy,

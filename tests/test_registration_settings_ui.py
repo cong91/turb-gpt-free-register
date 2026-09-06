@@ -27,6 +27,10 @@ class RegistrationSettingsUiTests(unittest.TestCase):
         self.assertIn("/api/proxy/rotating/refresh", source)
         self.assertIn("bindRotatingProxyToolsV2", source)
 
+    def test_proxy_settings_expose_one_account_per_ip_mode(self):
+        source = CONFIG_EDITOR.read_text(encoding="utf-8")
+        self.assertIn('"key": "ROTATING_PROXY_ONE_ACCOUNT_PER_IP"', source)
+
     def test_proxy_settings_are_split_into_static_and_rotating_tabs(self):
         source = INDEX_TEMPLATE.read_text(encoding="utf-8")
 

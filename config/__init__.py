@@ -115,7 +115,6 @@ from config.email import (
     PAYMESH_API_BASE,
     PAYMESH_REQUEST_TIMEOUT,
     PAYMESH_ROUTED_DOMAINS,
-    QAN8_ALIASES_PER_SOURCE,
     QAN8_API_BASE,
     QAN8_API_KEY,
     QAN8_GMAIL_SKU_ID,
@@ -355,7 +354,6 @@ __all__ = [
     "PROXY",
     # proxy
     "PROXY_POOL",
-    "QAN8_ALIASES_PER_SOURCE",
     "QAN8_API_BASE",
     "QAN8_API_KEY",
     "QAN8_GMAIL_SKU_ID",

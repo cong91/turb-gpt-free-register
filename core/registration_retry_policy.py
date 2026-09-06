@@ -39,8 +39,10 @@ def should_auto_retry_registration_failure(
     if int(max_attempts or 0) <= int(retry_attempt or 0):
         return False
     message = str(error or "").strip().lower()
-    source = str(email_source or "").strip().lower()
-    if "code=602" in message and source in {"gmail_api_url", "qan8_gmail_api"}:
+    from core.email_provider import normalize_email_source
+
+    source = normalize_email_source(str(email_source or ""))
+    if "code=602" in message and source == "gmail_api_url":
         return True
     if not message or any(marker in message for marker in _TERMINAL_MARKERS):
         return False

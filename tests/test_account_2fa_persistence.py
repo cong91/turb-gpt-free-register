@@ -10,9 +10,14 @@ class AccountTwofaPersistenceTests(unittest.TestCase):
     def test_gmail_api_url_last_otp_is_persisted_by_code_url(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            sqlite_path = root / "turb.sqlite3"
             patches = (
                 patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", root / "gmail.json"),
                 patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", root / "gmail.txt"),
+                patch.object(db, "_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
             )
             for item in patches:
                 item.start()

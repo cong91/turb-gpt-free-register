@@ -32,17 +32,15 @@ class RegistrationRetryPolicyTests(unittest.TestCase):
             )
         )
 
-    def test_retries_602_only_for_url_backed_gmail_sources(self):
-        for source in ("gmail_api_url", "qan8_gmail_api"):
-            with self.subTest(source=source):
-                self.assertTrue(
-                    should_auto_retry_registration_failure(
-                        "Provider error code=602",
-                        email_source=source,
-                        retry_attempt=0,
-                        max_attempts=1,
-                    )
-                )
+    def test_retries_602_only_for_gmail_api_url_source(self):
+        self.assertTrue(
+            should_auto_retry_registration_failure(
+                "Provider error code=602",
+                email_source="gmail_api_url",
+                retry_attempt=0,
+                max_attempts=1,
+            )
+        )
         self.assertFalse(
             should_auto_retry_registration_failure(
                 "Provider error code=602",

@@ -100,4 +100,42 @@ Command:
   node -e "parse both template script blocks and assert Extract URL element IDs"
 Literal result:
   webui/templates/index.html: scripts=5, ids=ok; webui/templates/index_legacy.html: scripts=1, ids=ok
+
+CURRENT CHECKOUT-ID TRACE FIX
+Changed branch/field:
+- `core/pay153_provider_workflow.py::_create_checkout` now preserves both detected identifiers as `stripe_checkout_session_id`, `custom_checkout_session_id`, and `checkout_session_ids` while selecting the execution ID by checkout mode.
+- `core/extract_link_service.py` forwards the same fields in the extract-link result payload.
+
+BASELINE
+Command:
+  .\\.venv\\Scripts\\python.exe -m unittest tests.test_rotating_proxy.RotatingProxyWorkflowRoutingTests.test_extract_link_job_reuses_one_proxy_for_create_and_event_stream -v
+Literal result:
+  test_extract_link_job_reuses_one_proxy_for_create_and_event_stream ... ok
+  Ran 1 test in 0.062s
+  OK
+Exit status: 0
+
+MODIFIED
+Command:
+  .\\.venv\\Scripts\\python.exe -m unittest tests.test_pay153_provider_workflow tests.test_extract_link_local -q
+Literal result:
+  Ran 35 tests in 0.469s
+  OK
+Exit status: 0
+
+MODIFIED STATIC/DEPENDENCY CHECK
+Command:
+  .\\.venv\\Scripts\\python.exe -m compileall -q core config webui tests; .\\.venv\\Scripts\\python.exe -m pip check
+Literal result:
+  No broken requirements found.
+Exit status: 0
+
+ROLLBACK
+Command:
+  bash artifacts/pay153_port/ROLLBACK.sh artifacts/pay153_port/rollback_test_current.py
+Literal result:
+  841e26f9122e86ee2483c5f79fd2bd89f1741a092b5d535a574c077f0a64bf3a  artifacts/pay153_port/rollback_test_current.py
+  MODIFIED_FILE SHA256=53A1D06DE474249A0A64BADEF6B421B38EC69E08600869BC4452787154859B5F
+  rollback_test_current.py restored to ORIGINAL_FILE; MODIFIED_FILE remains changed.
+Exit status: 0
 Exit status: 0

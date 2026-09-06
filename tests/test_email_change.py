@@ -8,7 +8,12 @@ from unittest.mock import Mock, patch
 
 from core import app_state_db, db, email_change
 from core.email_change import EmailChangeInput, parse_email_change_inputs
-from core.gmail_api_url_client import GmailApiUrlAccount, poll_verification_code
+from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
+from core.gmail_api_url_client import (
+    GmailApiUrlAccount,
+    GmailApiUrlError,
+    poll_verification_code,
+)
 from webui.app import create_app
 
 
@@ -32,6 +37,63 @@ class EmailChangeInputTests(unittest.TestCase):
                 )
             ],
         )
+
+    @patch("core.gmail_api_url_client.requests.get")
+    @patch("core.gmail_api_url_client._batch_store")
+    def test_email_change_602_quarantines_raw_source_before_retry(
+        self, mock_batch_store, mock_get
+    ):
+        """The direct email-change polling path must persist the terminal state."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw_json = root / "gmail-pool.json"
+            raw_txt = root / "gmail-pool.txt"
+            sqlite_path = root / "turb.sqlite3"
+            store = GmailApiUrlBatchStore(root / "gmail-state.sqlite3")
+            code_url = "https://mail.example/terminal"
+            item = EmailChangeInput(
+                old_email="old@example.com",
+                password="secret",
+                totp_secret="JBSWY3DPEHPK3PXP",
+                new_email="alias@example.com",
+                code_url=code_url,
+            )
+
+            with (
+                patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", raw_json),
+                patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", raw_txt),
+                patch.object(db, "_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_DEFAULT_SQLITE_PATH", sqlite_path),
+                patch.object(db, "_SQLITE_READY", False),
+                patch.object(db, "_SQLITE_READY_PATH", None),
+            ):
+                db.import_gmail_api_url_emails([
+                    {"email": "source@example.com", "code_url": code_url},
+                ])
+                mock_batch_store.return_value = store
+                response = Mock(status_code=200)
+                response.json.return_value = {"code": 602, "message": "expired"}
+                mock_get.return_value = response
+
+                with self.assertRaisesRegex(GmailApiUrlError, r"code=602.*expired"):
+                    email_change.poll_new_email_otp(
+                        item,
+                        after_ts=1.0,
+                        before_code=None,
+                    )
+
+                self.assertEqual(
+                    db.get_gmail_api_url_email_by_email("source@example.com")["status"],
+                    "failed",
+                )
+                mock_get.reset_mock()
+                with self.assertRaisesRegex(GmailApiUrlError, r"code=602.*quarantined"):
+                    email_change.poll_new_email_otp(
+                        item,
+                        after_ts=1.0,
+                        before_code=None,
+                    )
+                mock_get.assert_not_called()
 
     def test_quota_defaults_to_one_and_expands_one_gmail_source_up_to_six(self):
         credentials = "\n".join(

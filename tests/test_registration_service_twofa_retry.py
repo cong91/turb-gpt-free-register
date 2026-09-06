@@ -5,7 +5,6 @@ from types import SimpleNamespace
 from unittest.mock import call, patch
 
 from core import db, registration_service
-from core.qan8_gmail_api_store import Qan8GmailApiStore
 
 
 class RegistrationServiceTwofaRetryTests(unittest.TestCase):
@@ -223,12 +222,12 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         release_email.assert_not_called()
         disable_email.assert_not_called()
 
-    def test_qan8_registration_exception_discards_unconsumed_alias(self):
+    def test_gmail_api_url_registration_exception_discards_unconsumed_alias(self):
         job = db.create_job(
-            email_source="qan8_gmail_api",
+            email_source="gmail_api_url",
             provider_context={
-                "qan8_gmail_api_batch_id": "batch-1",
-                "qan8_gmail_api_lane_id": 0,
+                "gmail_api_url_batch_id": "batch-1",
+                "gmail_api_url_lane_id": 0,
             },
         )
 
@@ -247,9 +246,10 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             discard_on_failure=True,
         )
 
+    @patch("config.proxy.ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True, create=True)
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
     def test_transient_registration_failure_queues_one_new_registration_job(self):
-        source = db.create_job(email_source="qan8_gmail_api")
+        source = db.create_job(email_source="gmail_api_url")
         submitted = []
 
         class ImmediateExecutor:
@@ -263,7 +263,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         ), patch(
             "main.run_registration",
             return_value={"success": False, "error": "密码页提交失败：vui lòng thử lại"},
-        ), patch.object(
+        ) as run_registration, patch.object(
             registration_service,
             "_release_unconsumed_job_email",
         ) as release_email, patch.object(
@@ -289,17 +289,45 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             "密码页提交失败：vui lòng thử lại",
             discard_on_failure=True,
         )
+        self.assertTrue(run_registration.call_args.kwargs["force_refresh_proxy"])
         self.assertEqual(len(submitted), 1)
         self.assertIs(submitted[0][0], registration_service._run_one_job)
 
+    @patch("config.proxy.ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True, create=True)
+    @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 0, create=True)
+    def test_registration_retry_job_force_refreshes_proxy_for_new_child_job(self):
+        source = db.create_job(email_source="outlook")
+        db.update_job(source["id"], status="failed")
+        retry_job, created = db.create_retry_job(
+            source["id"],
+            job_type="registration",
+            email_source="outlook",
+        )
+        self.assertTrue(created)
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("retry@example.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            return_value={"success": False, "error": "account deactivated"},
+        ) as run_registration, patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+        ):
+            registration_service._run_one_job(retry_job["id"], retry_job["log_file"])
+
+        self.assertTrue(run_registration.call_args.kwargs["force_refresh_proxy"])
+
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
-    def test_provider_602_queues_fresh_qan8_job_on_same_lane(self):
+    def test_provider_602_queues_fresh_gmail_api_url_job_on_same_lane(self):
         provider_context = {
-            "qan8_gmail_api_batch_id": "batch-1",
-            "qan8_gmail_api_lane_id": 0,
+            "gmail_api_url_batch_id": "batch-1",
+            "gmail_api_url_lane_id": 0,
         }
         source = db.create_job(
-            email_source="qan8_gmail_api",
+            email_source="gmail_api_url",
             provider_context=provider_context,
         )
         submitted = []
@@ -343,7 +371,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
 
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
     def test_terminal_registration_failure_does_not_queue_a_new_job(self):
-        source = db.create_job(email_source="qan8_gmail_api")
+        source = db.create_job(email_source="gmail_api_url")
         submitted = []
 
         class ImmediateExecutor:
@@ -370,47 +398,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertEqual(len(db.list_jobs(limit=10)), 1)
         self.assertEqual(submitted, [])
 
-    @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
-    def test_transient_failure_retries_when_main_already_failed_qan8_assignment(self):
-        source = db.create_job(
-            email_source="qan8_gmail_api",
-            provider_context={"qan8_gmail_api_batch_id": "batch-1", "qan8_gmail_api_lane_id": 0},
-        )
-        submitted = []
-
-        class ImmediateExecutor:
-            def submit(self, fn, *args):
-                submitted.append((fn, args))
-
-        with patch.object(
-            registration_service,
-            "_prepare_registration_args",
-            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
-        ), patch(
-            "main.run_registration",
-            return_value={"success": False, "error": "密码页提交失败：vui lòng thử lại"},
-        ), patch.object(
-            registration_service,
-            "_release_unconsumed_job_email",
-            return_value=False,
-        ), patch(
-            "core.qan8_gmail_api_store.Qan8GmailApiStore.get_assignment",
-            return_value={"state": "failed"},
-        ), patch.object(
-            registration_service,
-            "get_executor",
-            return_value=ImmediateExecutor(),
-        ), patch.object(
-            registration_service,
-            "get_executor_workers",
-            return_value=1,
-        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
-            registration_service._run_one_job(source["id"], source["log_file"])
-
-        self.assertEqual(len(db.list_jobs(limit=10)), 2)
-        self.assertEqual(len(submitted), 1)
-
-    def test_qan8_alias_is_failed_when_registration_fails_before_create(self):
+    def test_gmail_api_url_alias_is_released_when_registration_fails_before_create(self):
         import main
 
         with (
@@ -431,7 +419,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             ),
             patch(
                 "core.email_provider.resolve_email_source",
-                return_value="qan8_gmail_api",
+                return_value="gmail_api_url",
             ),
             patch("core.email_provider.release_email") as release_email,
         ):
@@ -444,63 +432,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
 
         self.assertFalse(result["success"])
         release_email.assert_called_once()
-        self.assertEqual(release_email.call_args.kwargs["status"], "failed")
-
-    def test_recoverable_qan8_twofa_failure_consumes_alias_and_frees_lane(self):
-        store = Qan8GmailApiStore(Path(self.temp_dir.name) / "qan8.sqlite3")
-        batch = store.create_batch(2, requested_workers=1, aliases_per_source=2)
-        store.create_source_group(
-            batch["batch_id"],
-            0,
-            "source@gmail.com",
-            "https://mail.example/source",
-            ["source+one@gmail.com", "source+two@gmail.com"],
-        )
-        job = db.create_job(
-            email_source="qan8_gmail_api",
-            provider_context={
-                "qan8_gmail_api_batch_id": batch["batch_id"],
-                "qan8_gmail_api_lane_id": 0,
-            },
-        )
-        assignment = store.claim_alias(batch["batch_id"], 0, job["id"])
-        account_id = db.insert_account(
-            email=assignment["alias"],
-            access_token="token",
-            registration_password="password",
-            twofa_status="failed",
-        )
-
-        with patch.object(
-            registration_service,
-            "_prepare_registration_args",
-            return_value=(assignment["alias"], "Test User", "1990-01-01"),
-        ), patch(
-            "main.run_registration",
-            return_value={
-                "success": False,
-                "email": assignment["alias"],
-                "account_id": account_id,
-                "twofa_status": "failed",
-                "error": "2FA timeout",
-            },
-        ), patch(
-            "core.email_provider.resolve_email_source",
-            return_value="qan8_gmail_api",
-        ), patch(
-            "core.email_provider.mark_email_consumed",
-            side_effect=lambda _email: store.complete_assignment(job["id"]),
-        ) as mark_consumed:
-            registration_service._run_one_job(job["id"], job["log_file"])
-
-        mark_consumed.assert_called_once_with(assignment["alias"])
-        self.assertIsNone(store.get_lane(batch["batch_id"], 0)["active_job_id"])
-        self.assertEqual(store.get_account_context(assignment["alias"])["alias_state"], "consumed")
-        next_job = "next-job"
-        next_assignment = store.claim_alias(batch["batch_id"], 0, next_job)
-        self.assertIsNotNone(next_assignment)
-        self.assertNotEqual(next_assignment["alias"], assignment["alias"])
-
+        self.assertEqual(release_email.call_args.kwargs["status"], "available")
 
 if __name__ == "__main__":
     unittest.main()

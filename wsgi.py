@@ -11,10 +11,10 @@ def _initialize_app():
     registration_recovery = registration_service.reconcile_interrupted_registration_jobs()
     if any(registration_recovery.values()):
         logger.warning(
-            "Reconciled stale registration state: stopped_jobs=%s failed_qan8_assignments=%s completed_qan8_assignments=%s",
+            "Reconciled stale registration state: stopped_jobs=%s failed_gmail_assignments=%s completed_gmail_assignments=%s",
             registration_recovery["stopped_jobs"],
-            registration_recovery["failed_qan8_assignments"],
-            registration_recovery["completed_qan8_assignments"],
+            registration_recovery["failed_gmail_assignments"],
+            registration_recovery["completed_gmail_assignments"],
         )
     retry_recovery = codex_retry_service.reconcile_persisted_retrying_statuses()
     if retry_recovery["reset"]:

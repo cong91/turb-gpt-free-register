@@ -371,6 +371,39 @@ missing@example.com
         self.assertTrue(result["ok"])
         open_profile.assert_called_once_with(proxy="socks5://proxy.example:1080")
 
+    def test_login_detects_wrapped_deactivated_error(self):
+        from contextlib import contextmanager
+
+        from core.account_plan_import import _login_and_save_account
+
+        profile = MagicMock()
+        profile.driver = object()
+
+        @contextmanager
+        def selected_route(*_args, **_kwargs):
+            yield None, "direct"
+
+        with (
+            patch("core.account_plan_import.selected_account_proxy", side_effect=selected_route),
+            patch("core.browser_profile.open_browser_profile", return_value=profile),
+            patch(
+                "core.account_security._login_and_get_access_token",
+                side_effect=RuntimeError("AccountUnusableError: OpenAI đã khóa tài khoản (account_deactivated)"),
+            ),
+            patch("core.account_plan_import.db.update_account_access_token") as update_token,
+        ):
+            result = _login_and_save_account(
+                account_id=7,
+                email="locked@example.com",
+                password="password",
+                totp_secret="JBSWY3DPEHPK3PXP",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "deactivated")
+        self.assertEqual(result["error_code"], "account_deactivated")
+        update_token.assert_not_called()
+
     def test_reports_free_accounts_and_marks_free_plus_trial_subset(self):
         from core.account_plan_import import build_import_plan_status
 

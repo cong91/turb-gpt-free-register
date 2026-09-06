@@ -11,12 +11,15 @@ from core.browser_registration import (
     _click_resend_email_otp,
     _fetch_chatgpt_session,
     _has_access_token,
+    _human_click,
+    _human_type_text,
     _is_email_verification_page,
+    _is_login_password_page,
     _maybe_accept,
+    _raise_if_account_unusable,
     _submit_email_and_wait_next,
     _type_otp,
     _wait_after_email_otp_submit,
-    _wait_after_password_submit,
 )
 from core.email_provider import (
     acknowledge_verification_code,
@@ -28,38 +31,153 @@ from core.humanize import delay as human_delay
 logger = logging.getLogger(__name__)
 
 
-def _login_password(driver, password: str, timeout: int = 30) -> None:
+def _find_login_password_controls(
+    driver,
+    *,
+    require_enabled_submit: bool = False,
+) -> dict:
+    """Find the live password input and its submit control."""
+    return driver.execute_script(
+        """
+        const displayed = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+        const visible = el => displayed(el) && !el.disabled && !el.readOnly;
+        const enabled = el => visible(el) && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true';
+        const input = [...document.querySelectorAll('input[type="password"], input[name*="password" i], input[autocomplete="current-password"]')]
+          .find(visible);
+        if (!input) return {ok:false, reason:'missing_password_input'};
+        const form = input.closest('form');
+        const scope = form || document;
+        const candidates = [...scope.querySelectorAll('button[type="submit"], input[type="submit"], button, [role="button"]')]
+          .filter(el => displayed(el) && (!arguments[0] || enabled(el)))
+          .filter(el => {
+            const attrs = [el.getAttribute('name'), el.getAttribute('value'), el.getAttribute('aria-label'),
+              el.getAttribute('data-dd-action-name'), el.textContent].join(' ').toLowerCase();
+            return !/back|cancel|forgot|help|\u8fd4\u56de|\u53d6\u6d88|\u5fd8\u8bb0|\u5e2e助/.test(attrs);
+          });
+        if (!candidates.length) return {ok:false, reason:'missing_enabled_submit'};
+        const scored = candidates.map((el, index) => {
+          const attrs = [
+            el.getAttribute('type'), el.getAttribute('name'), el.getAttribute('value'),
+            el.getAttribute('aria-label'), el.getAttribute('data-dd-action-name'), el.textContent
+          ].join(' ').toLowerCase();
+          let score = index;
+          if ((el.getAttribute('type') || '').toLowerCase() === 'submit') score -= 100;
+          if (/continue|next|sign.?in|login|submit|\u7ee7\u7eed|\u767b\u5f55/.test(attrs)) score -= 50;
+          if (/back|cancel|forgot|\u8fd4\u56de|\u53d6\u6d88/.test(attrs)) score += 100;
+          return {el, score};
+        }).sort((a, b) => a.score - b.score);
+        const target = scored[0].el;
+        target.scrollIntoView({block:'center'});
+        return {
+          ok:true,
+          input,
+          button:target,
+          type:target.getAttribute('type') || '',
+          text:(target.textContent || target.getAttribute('value') || '').trim().slice(0, 80)
+        };
+        """,
+        require_enabled_submit,
+    ) or {}
+
+
+def _request_login_password_submit(driver) -> bool:
+    """Trigger the form's native submit path after an unresponsive click."""
+    result = driver.execute_script(
+        """
+        const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+          && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
+          && !el.disabled && !el.readOnly;
+        const input = [...document.querySelectorAll('input[type="password"], input[name*="password" i], input[autocomplete="current-password"]')]
+          .find(visible);
+        const form = input?.closest('form');
+        if (!form) return false;
+        const submit = [...form.querySelectorAll('button[type="submit"], input[type="submit"]')]
+          .find(el => visible(el) && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true');
+        if (typeof form.requestSubmit === 'function') {
+          form.requestSubmit(submit);
+          return true;
+        }
+        if (submit) {
+          submit.click();
+          return true;
+        }
+        return false;
+        """
+    )
+    return bool(result)
+
+
+def _password_submit_state(driver) -> str:
+    """Classify the page after submitting an existing-account password."""
+    if _is_email_verification_page(driver):
+        return "otp"
+    if _has_access_token(driver, timeout_ms=1000):
+        return "logged_in"
+    if _is_login_password_page(driver):
+        return "login_password"
+    return "next"
+
+
+def _wait_for_password_submit_state(driver, timeout: float = 10.0) -> str:
+    """Wait until password submission leaves the password page."""
+    end = time.monotonic() + max(0.0, float(timeout))
+    state = "login_password"
+    while time.monotonic() < end:
+        state = _password_submit_state(driver)
+        if state != "login_password":
+            return state
+        time.sleep(0.25)
+    return state
+
+
+def _login_password(driver, password: str, timeout: int = 30) -> str:
     """Fill and submit the existing-account password page."""
     end = time.time() + timeout
-    last_state = None
+    last_detail = None
     while time.time() < end:
-        last_state = str(getattr(driver, "current_url", "") or "")
-        result = driver.execute_script(
-            """
-            const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-              && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
-              && !el.disabled && !el.readOnly;
-            const input = [...document.querySelectorAll('input[type="password"], input[name*="password" i]')].find(visible);
-            if (!input) return {ok:false, reason:'missing_password_input'};
-            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
-            if (setter) setter.call(input, String(arguments[0])); else input.value = String(arguments[0]);
-            input.dispatchEvent(new Event('input', {bubbles:true}));
-            input.dispatchEvent(new Event('change', {bubbles:true}));
-            const scope = input.closest('form') || document;
-            const submit = [...scope.querySelectorAll('button[type="submit"], input[type="submit"], button')]
-              .find(el => visible(el));
-            if (!submit) return {ok:false, reason:'missing_submit'};
-            submit.click();
-            return {ok:true};
-            """,
-            password,
-        ) or {}
+        _raise_if_account_unusable(driver)
+        result = _find_login_password_controls(driver)
+        last_detail = result
         if result.get("ok"):
-            logger.info("[Browser 2FA] 已提交已有账号密码")
-            _wait_after_password_submit(driver, last_state, timeout=min(timeout, 5))
-            return
+            _human_type_text(driver, result["input"], password, clear=True)
+            # Let React commit the controlled input and enable Continue before clicking.
+            human_delay("form", minimum=2.0, maximum=3.6)
+            submit_result = _find_login_password_controls(
+                driver,
+                require_enabled_submit=True,
+            )
+            last_detail = submit_result
+            if not submit_result.get("ok"):
+                time.sleep(0.5)
+                continue
+            initial_url = str(getattr(driver, "current_url", "") or "")
+            _human_click(driver, submit_result["button"], label="password_submit")
+            logger.info(
+                "[Browser 2FA] 已点击已有账号密码 Continue：detail=%s",
+                {k: v for k, v in submit_result.items() if k not in {"input", "button"}},
+            )
+            state = _wait_for_password_submit_state(driver, timeout=min(10.0, max(0.0, end - time.time())))
+            if state != "login_password":
+                return state
+
+            logger.warning(
+                "[Browser 2FA] 密码 Continue 点击后仍停留密码页，改用原生 form submit：url=%s",
+                initial_url,
+            )
+            if _request_login_password_submit(driver):
+                state = _wait_for_password_submit_state(driver, timeout=min(8.0, max(0.0, end - time.time())))
+                if state != "login_password":
+                    return state
+            raise RuntimeError(
+                "登录密码提交后仍停留在密码页，未进入邮箱验证码页"
+                f"：url={getattr(driver, 'current_url', '') or initial_url} detail={last_detail}"
+            )
         time.sleep(0.5)
-    raise RuntimeError(f"登录密码页处理超时：url={last_state}")
+    raise RuntimeError(
+        "登录密码页处理超时："
+        f"url={getattr(driver, 'current_url', '')} detail={last_detail}"
+    )
 
 
 def _login_existing_account(driver, email: str, password: str, timeout: int = 120) -> dict:
@@ -84,7 +202,17 @@ def _login_existing_account(driver, email: str, password: str, timeout: int = 12
         allow_login_password=True,
     )
     if next_state in ("login_password", "password"):
-        _login_password(driver, password)
+        password_state = _login_password(driver, password)
+        if password_state == "logged_in":
+            session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+            if not session_info.get("accessToken"):
+                raise RuntimeError("已有账号登录成功但未拿到 accessToken")
+            return session_info
+        if password_state != "otp" and not _is_email_verification_page(driver):
+            raise RuntimeError(
+                "登录密码提交后未进入邮箱验证码页"
+                f"：state={password_state} url={getattr(driver, 'current_url', '')}"
+            )
     if next_state == "logged_in":
         session_info = _fetch_chatgpt_session(driver, timeout=timeout)
         if not session_info.get("accessToken"):

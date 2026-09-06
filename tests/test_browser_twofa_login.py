@@ -7,6 +7,101 @@ from core.openai_auth import AccountUnusableError
 
 
 class BrowserTwofaLoginTests(unittest.TestCase):
+    @patch("core.browser_twofa_login._wait_for_password_submit_state", return_value="otp")
+    @patch("core.browser_twofa_login._human_click")
+    @patch("core.browser_twofa_login._human_type_text")
+    @patch(
+        "core.browser_twofa_login._find_login_password_controls",
+        side_effect=[
+            {"ok": True, "input": object(), "button": object()},
+            {"ok": True, "input": object(), "button": object(), "type": "submit"},
+        ],
+    )
+    @patch("core.browser_twofa_login._raise_if_account_unusable")
+    @patch("core.browser_twofa_login.human_delay")
+    def test_login_password_waits_for_enabled_submit_and_returns_otp_state(
+        self,
+        _human_delay,
+        _raise_unusable,
+        find_controls,
+        type_text,
+        click,
+        wait_state,
+    ):
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/log-in/password"})()
+
+        state = _login_password(driver, "password", timeout=1)
+
+        self.assertEqual(state, "otp")
+        self.assertEqual(find_controls.call_args_list[0].kwargs, {})
+        self.assertTrue(find_controls.call_args_list[1].kwargs["require_enabled_submit"])
+        type_text.assert_called_once()
+        click.assert_called_once()
+        wait_state.assert_called_once()
+
+    @patch(
+        "core.browser_twofa_login._wait_for_password_submit_state",
+        side_effect=["login_password", "otp"],
+    )
+    @patch("core.browser_twofa_login._request_login_password_submit", return_value=True)
+    @patch("core.browser_twofa_login._human_click")
+    @patch("core.browser_twofa_login._human_type_text")
+    @patch(
+        "core.browser_twofa_login._find_login_password_controls",
+        side_effect=[
+            {"ok": True, "input": object(), "button": object()},
+            {"ok": True, "input": object(), "button": object()},
+        ],
+    )
+    @patch("core.browser_twofa_login._raise_if_account_unusable")
+    @patch("core.browser_twofa_login.human_delay")
+    def test_login_password_uses_native_submit_when_click_stays_on_password_page(
+        self,
+        _human_delay,
+        _raise_unusable,
+        _find_controls,
+        _type_text,
+        _click,
+        request_submit,
+        _wait_state,
+    ):
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/log-in/password"})()
+
+        state = _login_password(driver, "password", timeout=1)
+
+        self.assertEqual(state, "otp")
+        request_submit.assert_called_once_with(driver)
+
+    @patch("core.browser_twofa_login._wait_for_password_submit_state", return_value="login_password")
+    @patch("core.browser_twofa_login._request_login_password_submit", return_value=False)
+    @patch("core.browser_twofa_login._human_click")
+    @patch("core.browser_twofa_login._human_type_text")
+    @patch(
+        "core.browser_twofa_login._find_login_password_controls",
+        side_effect=[
+            {"ok": True, "input": object(), "button": object()},
+            {"ok": True, "input": object(), "button": object()},
+        ],
+    )
+    @patch("core.browser_twofa_login._raise_if_account_unusable")
+    @patch("core.browser_twofa_login.human_delay")
+    def test_login_password_never_falls_through_to_otp_when_submit_fails(
+        self,
+        _human_delay,
+        _raise_unusable,
+        _find_controls,
+        _type_text,
+        _click,
+        request_submit,
+        _wait_state,
+    ):
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/log-in/password"})()
+
+        with self.assertRaisesRegex(RuntimeError, "仍停留在密码页"):
+            _login_password(driver, "password", timeout=1)
+
+        request_submit.assert_called_once_with(driver)
+
     def test_password_login_stops_when_deactivated_html_is_rendered(self):
         html = (
             '<div class="_titleBlock"><h1>Authentication Error</h1>'
@@ -24,6 +119,28 @@ class BrowserTwofaLoginTests(unittest.TestCase):
 
         with self.assertRaisesRegex(AccountUnusableError, "account_deactivated"):
             _login_password(Driver(), "password", timeout=1)
+
+    @patch("core.browser_twofa_login.wait_for_otp")
+    @patch("core.browser_twofa_login._login_password", side_effect=RuntimeError("password submit stuck"))
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="login_password")
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_does_not_poll_otp_when_password_submit_fails(
+        self,
+        _human_delay,
+        _maybe_accept,
+        _snapshot,
+        _submit_email,
+        _login_password_mock,
+        wait_for_otp,
+    ):
+        driver = type("Driver", (), {"get": lambda self, _url: None})()
+
+        with self.assertRaisesRegex(RuntimeError, "password submit stuck"):
+            _login_existing_account(driver, "user@example.com", "password")
+
+        wait_for_otp.assert_not_called()
 
     @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
     @patch("core.browser_twofa_login.wait_for_otp")

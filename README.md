@@ -93,7 +93,7 @@ EMAIL_SOURCE = "outlook,generic_api,gmail_api_url"
 - Roxy/Cloak/Browser Use/Skyvern 浏览器注册完成后统计整个浏览器会话的上传、下载和总流量，任务列表与账号扩展信息均会保存结果。
 - 配置页支持热加载，保存后无需重启。
 - Roxy 团队/项目可在配置页获取并保存。
-- 代理池配置支持 Proxy.vn 代理旋转：注册、Codex OAuth/补跑、查活、套餐、提链、2FA、改邮箱和 Codex Agent 等账号 workflow 都通过持久 lease 取 proxy；同一 `scope/lane` 复用 proxy TTL，`keyxoay` 在所有 scope 之间全局不重复。
+- 代理池配置支持 Proxy.vn 代理旋转：注册、Codex OAuth/补跑、查活、套餐、提链、2FA、改邮箱和 Codex Agent 等账号 workflow 都通过持久 lease 取 proxy；同一 `scope/lane` 复用 proxy TTL，`keyxoay` 在所有 scope 之间全局不重复。注册可选开启「一号一 IP」，此时注册串行执行，每个账号完成后清除 proxy cache，下一账号会等待 provider cooldown 并重新取 IP。
 - 独立「Extract URL」工作区只列出 `free + Plus 试用资格` 账号，可单选/多选并选择 PAY.153 支付方式。`auto` 固定走本地 PAY.153；代理模式支持旋转、代理池下拉或手动输入。MoMo/PIX/Hosted 使用 1 条线路，PH/GCash 使用 checkout + promotion 两条线路，PayPal/UPI/Kakao 使用 payment + promotion 两条线路，iDEAL/TWINT 使用 entry + payment 两条线路。
 
 ### Proxy.vn 代理旋转
@@ -110,6 +110,8 @@ ROTATING_PROXY_WHITELIST=
 ```
 
 批量注册的 `workers` 会映射为稳定的 lane（`index % workers`）。lane 有未过期 lease 时不会重复请求 API；proxy TTL 到期才调用 `proxyxoay.shop/api/get.php`。配置页状态区会分别显示 workflow scope（例如 `registration:0`、`codex_retry:0`），且只展示脱敏 key、assignment 和 proxy，不展示主 API Key。
+
+开启 `ROTATING_PROXY_ONE_ACCOUNT_PER_IP=true` 后，仅 registration workflow 会强制使用单 worker lane；每次进入一个 registration job 都会在 job boundary force-refresh 一个 proxy，并从开始到结束固定使用它。同一 job 内的失败重试、关闭并重新打开 browser 都继续复用该 proxy，不会重新 acquisition。child retry job 是新的 job，因此也会 force-refresh 获取新的 proxy；只有账号 setup 成功后才 retire lease/cache。其他 workflow 仍按原来的 `scope + lane` TTL 复用规则运行。
 
 ### 数据存储
 
@@ -316,24 +318,36 @@ EMAIL_SOURCE = "gmail_api_url"
 
 轮询响应码规则：
 - `{"code": 601}` — 等待中，继续轮询
-- `{"code": 602}` — 提供商错误，标记邮箱为失败并记录退款提示
+- `{"code": 602}` — 提供商错误，标记邮箱为失败；仅当这是 QAN8 购买 source 的首次取码响应（此前没有 `601`、其他响应或 OTP）时，才自动提取 `uid` 调用售后接口
 - `{"code": 0, "data": {"code": "123456"}}` — 成功，返回验证码
 
 邮箱池业务状态保存在 `turb.sqlite3`；`用于注册的Gmail API邮箱.json` 仅为同步导出。
 
-#### QAN8 Gmail API lazy provider
+#### Gmail API URL（shop.qan8.com 购买后端）
 
-QAN8 provider dùng tài liệu API chính thức tại [shop.qan8.com/api-docs](https://shop.qan8.com/api-docs). Cấu hình:
+QAN8 chỉ là API mua source Gmail API URL; nguồn đăng ký trong runtime chỉ có
+`gmail_api_url`. Tài liệu API chính thức ở [shop.qan8.com/api-docs](https://shop.qan8.com/api-docs). Cấu hình:
 
 ```dotenv
-EMAIL_SOURCE=qan8_gmail_api
+EMAIL_SOURCE=gmail_api_url
 QAN8_API_BASE=https://shop.qan8.com
 QAN8_API_KEY=your_qan8_api_key
 QAN8_GMAIL_SKU_ID=your_gmail_sku_id
-QAN8_ALIASES_PER_SOURCE=12
 ```
 
-Số worker hiệu dụng là giới hạn xử lý vật lý; số lane nguồn là `min(workers, ceil(count / aliases_per_source))`. Với `count=6`, `workers=3`, `aliases=12`, hệ thống tạo đúng 6 job nhưng chỉ mở 1 lane nguồn. Ba worker vật lý vẫn có thể được lập lịch, nhưng sẽ xếp hàng trên cùng source/code URL; alias canonical tiếp theo chỉ được claim sau khi assignment trước hoàn tất hoặc được giải phóng. Nếu kho Gmail API đã có alias khả dụng thì dùng lại trước; chỉ khi hết alias khả dụng mới mua thêm đúng một source QAN8 (`quantity=1`). WebUI cũng giữ nguyên `count` là số đăng ký; alias chỉ là sức chứa tái sử dụng của source, không nhân số job. Khi source của một lane hết alias mà vẫn còn job, lane đó mới mua source thay thế. Client sinh alias từ mail gốc; mọi alias của source dùng chung `code_url` để nhận OTP. QAN8 delivery phải trả về đúng một bản ghi `email----code_url`, vì quantity luôn là 1.
+Mỗi source Gmail API URL có tối đa 12 alias. Trên WebUI, `count` là số source
+Gmail cần dùng/mua: `count=3` sẽ tạo 3 source group và 36 job đăng ký. Alias
+được hệ thống tự cố định ở mức 12, không cần nhập riêng. Trên Sub2API,
+`count` vẫn là số tài khoản cần đăng ký: `count=30` tạo 30 job và cần
+`ceil(30 / 12)` source group.
+
+Mỗi lane Gmail có một batch canonical riêng nhưng chưa mua hàng. Hệ thống dùng
+alias Gmail đã nhập còn khả dụng của đúng lane đó trước; khi không còn alias có
+thể claim thì mới mua đúng một source từ shop.qan8 (`quantity=1`), sinh tối đa
+12 alias tại local và đưa chúng vào ledger `gmail_api_url`. Một lane dùng hết
+12 alias của source hiện tại rồi mới mua source tiếp theo; các lane khác có thể
+tiếp tục song song nhưng không claim chéo source hay `code_url`. Delivery của
+QAN8 phải trả đúng một bản ghi `email----code_url`.
 
 Chi tiết lifecycle, recovery và contract delivery xem [docs/qan8_gmail_api_lazy.md](docs/qan8_gmail_api_lazy.md).
 

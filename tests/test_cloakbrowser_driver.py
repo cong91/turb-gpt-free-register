@@ -149,6 +149,37 @@ class _ScriptTimeoutPage:
         pass
 
 
+class _CaptureEvaluatePage:
+    def __init__(self):
+        self.calls = []
+
+    def evaluate(self, expression, arg):
+        self.calls.append((expression, arg))
+        return {"ok": True}
+
+
+class _CaptureSelectorPage:
+    url = "https://chatgpt.com/auth/login"
+
+    def __init__(self):
+        self.calls = []
+
+    def locator(self, selector):
+        if selector != "body":
+            raise AssertionError(f"unexpected locator: {selector}")
+        return self
+
+    def inner_text(self, *, timeout):
+        self.calls.append(("body", "inner_text", timeout))
+        return ""
+
+    def wait_for_selector(self, selector, *, state, timeout):
+        self.calls.append((selector, state, timeout))
+        if "password" in selector:
+            return object()
+        raise TimeoutError("selector timeout")
+
+
 class CloakAdapterContractTests(unittest.TestCase):
     def test_each_cloak_open_result_has_unique_session_identity(self):
         first = CloakOpenResult()
@@ -185,6 +216,44 @@ class CloakAdapterContractTests(unittest.TestCase):
             [("https://chatgpt.com/api/auth/session", 7000)],
         )
 
+    def test_chatgpt_session_accepts_explicit_timeout(self):
+        context = _SessionContext()
+        driver = BrowserSeleniumDriver(
+            browser=None,
+            context=context,
+            page=_ScriptTimeoutPage(),
+        )
+
+        driver.get_chatgpt_auth_session(timeout_ms=2300)
+
+        self.assertEqual(
+            context.request.calls,
+            [("https://chatgpt.com/api/auth/session", 2300)],
+        )
+
+    def test_async_script_wrapper_uses_configured_script_timeout(self):
+        page = _CaptureEvaluatePage()
+        driver = BrowserSeleniumDriver(browser=None, context=None, page=page)
+        driver.set_script_timeout(7)
+
+        self.assertEqual(
+            {"ok": True},
+            driver.execute_async_script("arguments[arguments.length - 1]({ok:true});"),
+        )
+        expression, payload = page.calls[0]
+        self.assertIn("timeoutMs", expression)
+        self.assertEqual(7000, payload["timeoutMs"])
+
+    def test_auth_flow_state_uses_bounded_selector_waits(self):
+        page = _CaptureSelectorPage()
+        driver = BrowserSeleniumDriver(browser=None, context=None, page=page)
+
+        self.assertEqual(
+            {"state": "password", "body_text": ""},
+            driver.read_auth_flow_state(timeout_ms=2300),
+        )
+        self.assertEqual(3, len(page.calls))
+        self.assertTrue(all(timeout >= 1 for _, _, timeout in page.calls))
 
 class BrowserSeleniumDriverTests(unittest.TestCase):
     @patch("core.browser_registration._find_any")

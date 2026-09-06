@@ -101,6 +101,32 @@ class WebUiPerformanceAndLimitsTests(unittest.TestCase):
         self.assertTrue(target["plus_trial_eligible"])
         self.assertIsNone(other.get("plan_check_status"))
 
+    def test_plan_check_deactivation_marks_account_locked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (
+                patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_schedule_static_viewer_refresh"),
+            ):
+                account_id = db.insert_account(email="locked@example.com", access_token="old-token")
+                self.assertTrue(db.update_account_plan_check(
+                    acc_id=account_id,
+                    result={
+                        "ok": False,
+                        "error": "OpenAI đã khóa tài khoản",
+                        "check_stage": "login",
+                        "account_status": "deactivated",
+                    },
+                ))
+                row = db.get_account(account_id)
+
+        self.assertEqual(row["live_check_status"], "deactivated")
+        self.assertFalse(row["live_check_ok"])
+        self.assertEqual(row["live_check_error"], "OpenAI đã khóa tài khoản")
+
     def test_plan_check_state_transitions_do_not_rewrite_accounts(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -11,8 +11,8 @@ class WebStartupRecoveryTests(unittest.TestCase):
         app = Mock()
         registration_recovery = {
             "stopped_jobs": 1,
-            "failed_qan8_assignments": 1,
-            "completed_qan8_assignments": 0,
+            "failed_gmail_assignments": 1,
+            "completed_gmail_assignments": 0,
         }
         with patch.object(sys, "argv", ["web.py", "--port", "5099"]), patch.object(
             web, "_assert_listen_address_available"

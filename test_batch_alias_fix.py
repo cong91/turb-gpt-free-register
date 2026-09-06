@@ -112,9 +112,9 @@ def test_assignment_finalize_code_exists():
     
     import inspect
 
-    from core import gmail_api_url_client
-    
-    source = inspect.getsource(gmail_api_url_client.release_account)
+    from core import gmail_api_url_batch_coordinator
+
+    source = inspect.getsource(gmail_api_url_batch_coordinator.release_account)
     
     # Check for key finalize logic
     has_batch_context = 'get_batch_account_context' in source

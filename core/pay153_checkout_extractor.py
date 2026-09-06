@@ -18,9 +18,9 @@ An explicit non-zero amount is rejected. If neither the update response nor the
 checkout page exposes an amount, the result is returned as ``pending`` so a
 payment client can verify it before payment.
 
-Only ``curl_cffi`` is required::
+Only ``curl_cffi`` 0.16.3+ is required::
 
-    python -m pip install "curl_cffi>=0.15.0"
+    python -m pip install "curl_cffi>=0.16.3"
 
 Recommended usage keeps credentials out of the process list::
 
@@ -838,7 +838,7 @@ class CheckoutExtractor:
         if session_factory is None:
             if CurlSession is None:
                 raise ExtractorError(
-                    'curl_cffi is required; install it with: python -m pip install "curl_cffi>=0.15.0"'
+                    'curl_cffi is required; install it with: python -m pip install "curl_cffi>=0.16.3"'
                 )
             session_factory = lambda: CurlSession(impersonate="firefox144")
         self.session_factory = session_factory

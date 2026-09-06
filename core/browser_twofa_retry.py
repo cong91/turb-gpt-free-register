@@ -21,6 +21,8 @@ from core.rotating_proxy_runtime import TWOFA_RETRY_PROXY_SCOPE
 
 logger = logging.getLogger(__name__)
 
+_TWOFA_BROWSER_RESTART_ATTEMPTS = 3
+
 
 def _account_credentials(account: dict) -> tuple[int, str, str] | None:
     account_id = int(account.get("id") or 0)
@@ -67,16 +69,183 @@ def _retry_browser_profile(
                     profile.close()
                 except Exception as exc:  # noqa: BLE001 - driver shutdown is best effort.
                     logger.debug("[Browser 2FA] driver cleanup failed: %s", exc)
+                if getattr(profile, "keep_open", None) is True:
+                    try:
+                        quit_driver = getattr(profile.driver, "quit", None)
+                        if callable(quit_driver):
+                            quit_driver()
+                    except Exception as exc:  # noqa: BLE001 - forced recovery shutdown is best effort.
+                        logger.debug("[Browser 2FA] forced driver shutdown failed: %s", exc)
                 try:
                     profile.cleanup()
                 except Exception as exc:  # noqa: BLE001 - profile cleanup is best effort.
                     logger.debug("[Browser 2FA] profile cleanup failed: %s", exc)
 
 
+def _run_twofa_retry_in_profile(
+    account: dict,
+    *,
+    profile,
+    active_proxy: str | None,
+    max_attempts: int,
+) -> dict[str, object]:
+    """Try the existing-account login and 2FA flow within one browser profile."""
+    account_id, email, password = _account_credentials(account) or (0, "", "")
+    attempts = max(1, int(max_attempts))
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            logger.info(
+                "[Browser 2FA] 开始第 %s/%s 次已有账号登录：%s provider=%s",
+                attempt,
+                attempts,
+                email,
+                profile.provider,
+            )
+            session_info = _login_existing_account(
+                profile.driver,
+                email,
+                password,
+                timeout=profile.timeout,
+            )
+            secret = setup_2fa_in_page(profile.driver, email, reauth=True)
+            if not secret:
+                raise RuntimeError("2FA 流程未返回 TOTP secret")
+
+            codex_result = {
+                "status": "skipped",
+                "ok": True,
+                "message": "2FA retry did not run Codex",
+            }
+            try:
+                from config import codex as codex_config
+                from config import register as register_config
+
+                post_auth_automation_enabled = bool(
+                    getattr(register_config, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
+                    or getattr(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+                    or getattr(codex_config, "ENABLE_CODEX_AUTO", False)
+                )
+                if post_auth_automation_enabled:
+                    from core.codex_login_credentials import CodexLoginCredentials
+                    from core.codex_oauth import run_codex_oauth
+                    from core.registration_auto_codex import run_registration_auto_codex
+
+                    credentials_for_codex = CodexLoginCredentials(
+                        email=email,
+                        password=password,
+                        totp_secret=secret,
+                    )
+                    existing_opened = SimpleNamespace(
+                        profile_id=profile.provider,
+                        raw={"driver": profile.provider},
+                    )
+
+                    def _run_codex_in_current_browser(
+                        _existing_opened=existing_opened,
+                        _credentials=credentials_for_codex,
+                    ) -> dict:
+                        cloud_provider = profile.provider in {"browser_use", "skyvern"}
+                        existing_driver = None if cloud_provider else profile.driver
+                        existing_browser = (
+                            getattr(profile.driver, "browser", None)
+                            if cloud_provider
+                            else None
+                        )
+                        existing_context = (
+                            getattr(profile.driver, "context", None)
+                            if cloud_provider
+                            else None
+                        )
+                        existing_page = (
+                            getattr(profile.driver, "page", None)
+                            if cloud_provider
+                            else None
+                        )
+                        return run_codex_oauth(
+                            email,
+                            oauth_driver=profile.provider,
+                            force=True,
+                            credentials=_credentials,
+                            existing_driver=existing_driver,
+                            existing_opened=(None if cloud_provider else _existing_opened),
+                            existing_browser=existing_browser,
+                            existing_context=existing_context,
+                            existing_page=existing_page,
+                            existing_session_info=(profile.session_info if cloud_provider else None),
+                        )
+
+                    auto_codex = run_registration_auto_codex(
+                        account_id=account_id,
+                        email=email,
+                        access_token=session_info.get("accessToken")
+                        or str(account.get("access_token") or ""),
+                        proxy=active_proxy,
+                        browser_transport=BrowserPageTransport(profile.driver),
+                        run_codex=_run_codex_in_current_browser,
+                        twofa_status="active",
+                    )
+                    codex_result = auto_codex["codex"]
+            except Exception as exc:  # noqa: BLE001 - preserve active account for later Codex retry.
+                codex_result = {
+                    "status": "failed",
+                    "ok": False,
+                    "message": f"{type(exc).__name__}: {str(exc)[:180]}",
+                }
+
+            saved_id = save_account_data(
+                email=email,
+                access_token=session_info.get("accessToken") or str(account.get("access_token") or ""),
+                totp_secret=secret,
+                email_source=resolve_email_source(email),
+                proxy_used=active_proxy or account.get("proxy_used"),
+                registration_ip=account.get("registration_ip"),
+                extra={
+                    "user": session_info.get("user"),
+                    "account": session_info.get("account"),
+                    "expires": session_info.get("expires"),
+                    "registration_password": password,
+                    "registration_driver": profile.provider,
+                    "twofa_status": "active",
+                    "twofa_error": None,
+                    "twofa_retry_source_account_id": account_id,
+                    "codex": codex_result,
+                },
+                auto_plan_check=False,
+            )
+            return {
+                "ok": True,
+                "status": "success",
+                "email": email,
+                "account_id": saved_id,
+                "access_token": session_info.get("accessToken"),
+                "totp_secret": secret,
+                "browser_provider": profile.provider,
+                "codex": codex_result,
+            }
+        except Exception as exc:  # noqa: BLE001 - isolate each retry attempt.
+            last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+            logger.warning(
+                "[Browser 2FA] 第 %s/%s 次失败：provider=%s error=%s",
+                attempt,
+                attempts,
+                profile.provider,
+                last_error,
+            )
+            if attempt < attempts:
+                try:
+                    profile.driver.get("https://chatgpt.com/auth/login")
+                    human_delay("navigate")
+                except Exception as exc:  # noqa: BLE001 - retry navigation is best effort.
+                    logger.debug("[Browser 2FA] retry navigation failed: %s", exc)
+    return {"ok": False, "status": "failed", "message": last_error}
+
+
 def run_twofa_retry(
     account: dict,
     *,
-    max_attempts: int = 2,
+    max_attempts: int = 3,
+    browser_restart_attempts: int = _TWOFA_BROWSER_RESTART_ATTEMPTS,
     proxy: str | None = None,
     proxy_lane_id: int | None = None,
     lease_owner_id: str | None = None,
@@ -96,166 +265,39 @@ def run_twofa_retry(
             "message": "账号缺少 OpenAI 登录密码，无法补做 2FA",
         }
 
-    account_id, email, password = credentials
+    account_id, email, _ = credentials
     last_error = ""
-    try:
-        with _retry_browser_profile(
-            proxy,
-            proxy_lane_id=proxy_lane_id,
-            lease_owner_id=lease_owner_id,
-        ) as (profile, active_proxy):
-            attempts = max(1, int(max_attempts))
-            for attempt in range(1, attempts + 1):
-                try:
-                    logger.info(
-                        "[Browser 2FA] 开始第 %s/%s 次已有账号登录：%s provider=%s",
-                        attempt,
-                        attempts,
-                        email,
-                        profile.provider,
-                    )
-                    session_info = _login_existing_account(
-                        profile.driver,
-                        email,
-                        password,
-                        timeout=profile.timeout,
-                    )
-                    secret = setup_2fa_in_page(profile.driver, email, reauth=True)
-                    if not secret:
-                        raise RuntimeError("2FA 流程未返回 TOTP secret")
-
-                    codex_result = {
-                        "status": "skipped",
-                        "ok": True,
-                        "message": "2FA retry did not run Codex",
-                    }
-                    try:
-                        from config import codex as codex_config
-                        from config import register as register_config
-
-                        post_auth_automation_enabled = bool(
-                            getattr(register_config, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
-                            or getattr(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
-                            or getattr(codex_config, "ENABLE_CODEX_AUTO", False)
-                        )
-                        if post_auth_automation_enabled:
-                            from core.codex_login_credentials import (
-                                CodexLoginCredentials,
-                            )
-                            from core.codex_oauth import run_codex_oauth
-                            from core.registration_auto_codex import (
-                                run_registration_auto_codex,
-                            )
-
-                            credentials_for_codex = CodexLoginCredentials(
-                                email=email,
-                                password=password,
-                                totp_secret=secret,
-                            )
-                            existing_opened = SimpleNamespace(
-                                profile_id=profile.provider,
-                                raw={"driver": profile.provider},
-                            )
-
-                            def _run_codex_in_current_browser(
-                                _existing_opened=existing_opened,
-                                _credentials=credentials_for_codex,
-                            ) -> dict:
-                                cloud_provider = profile.provider in {"browser_use", "skyvern"}
-                                existing_driver = None if cloud_provider else profile.driver
-                                existing_browser = (
-                                    getattr(profile.driver, "browser", None)
-                                    if cloud_provider
-                                    else None
-                                )
-                                existing_context = (
-                                    getattr(profile.driver, "context", None)
-                                    if cloud_provider
-                                    else None
-                                )
-                                existing_page = (
-                                    getattr(profile.driver, "page", None)
-                                    if cloud_provider
-                                    else None
-                                )
-                                return run_codex_oauth(
-                                    email,
-                                    oauth_driver=profile.provider,
-                                    force=True,
-                                    credentials=_credentials,
-                                    existing_driver=existing_driver,
-                                    existing_opened=(None if cloud_provider else _existing_opened),
-                                    existing_browser=existing_browser,
-                                    existing_context=existing_context,
-                                    existing_page=existing_page,
-                                    existing_session_info=(profile.session_info if cloud_provider else None),
-                                )
-
-                            auto_codex = run_registration_auto_codex(
-                                account_id=account_id,
-                                email=email,
-                                access_token=session_info.get("accessToken")
-                                or str(account.get("access_token") or ""),
-                                proxy=active_proxy,
-                                browser_transport=BrowserPageTransport(profile.driver),
-                                run_codex=_run_codex_in_current_browser,
-                                twofa_status="active",
-                            )
-                            codex_result = auto_codex["codex"]
-                    except Exception as exc:  # noqa: BLE001 - preserve active account for later Codex retry.
-                        codex_result = {
-                            "status": "failed",
-                            "ok": False,
-                            "message": f"{type(exc).__name__}: {str(exc)[:180]}",
-                        }
-
-                    saved_id = save_account_data(
-                        email=email,
-                        access_token=session_info.get("accessToken") or str(account.get("access_token") or ""),
-                        totp_secret=secret,
-                        email_source=resolve_email_source(email),
-                        proxy_used=active_proxy or account.get("proxy_used"),
-                        registration_ip=account.get("registration_ip"),
-                        extra={
-                            "user": session_info.get("user"),
-                            "account": session_info.get("account"),
-                            "expires": session_info.get("expires"),
-                            "registration_password": password,
-                            "registration_driver": profile.provider,
-                            "twofa_status": "active",
-                            "twofa_error": None,
-                            "twofa_retry_source_account_id": account_id,
-                            "codex": codex_result,
-                        },
-                        auto_plan_check=False,
-                    )
-                    codex_ok = bool(codex_result.get("ok")) or codex_result.get("status") == "skipped"
-                    return {
-                        "ok": codex_ok,
-                        "status": "success",
-                        "email": email,
-                        "account_id": saved_id,
-                        "access_token": session_info.get("accessToken"),
-                        "totp_secret": secret,
-                        "browser_provider": profile.provider,
-                        "codex": codex_result,
-                    }
-                except Exception as exc:  # noqa: BLE001 - isolate each retry attempt.
-                    last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
-                    logger.warning(
-                        "[Browser 2FA] 第 %s/%s 次失败：provider=%s error=%s",
-                        attempt,
-                        attempts,
-                        profile.provider,
-                        last_error,
-                    )
-                    if attempt < attempts:
-                        try:
-                            profile.driver.get("https://chatgpt.com/auth/login")
-                            human_delay("navigate")
-                        except Exception as exc:  # noqa: BLE001 - retry navigation is best effort.
-                            logger.debug("[Browser 2FA] retry navigation failed: %s", exc)
-            return _failure_result(account_id, email, last_error)
-    except Exception as exc:  # noqa: BLE001 - isolate the browser workflow.
-        last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
-        return _failure_result(account_id, email, last_error)
+    browser_attempts = max(1, int(browser_restart_attempts))
+    for browser_attempt in range(1, browser_attempts + 1):
+        try:
+            with _retry_browser_profile(
+                proxy,
+                proxy_lane_id=proxy_lane_id,
+                lease_owner_id=lease_owner_id,
+            ) as (profile, active_proxy):
+                result = _run_twofa_retry_in_profile(
+                    account,
+                    profile=profile,
+                    active_proxy=active_proxy,
+                    max_attempts=max_attempts,
+                )
+            if result.get("ok"):
+                return result
+            last_error = str(result.get("message") or "2FA retry failed")
+        except Exception as exc:  # noqa: BLE001 - isolate each browser restart.
+            last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+        if browser_attempt < browser_attempts:
+            logger.warning(
+                "[Browser 2FA] 浏览器内重试耗尽，关闭浏览器并重新执行 email OTP 登录（第 %s/%s 个浏览器）: %s",
+                browser_attempt,
+                browser_attempts,
+                last_error,
+            )
+            human_delay("navigate")
+    logger.error(
+        "[Browser 2FA] 浏览器重启重试已耗尽（%s/%s），当前 job 失败并交由队列继续下一个 job: %s",
+        browser_attempts,
+        browser_attempts,
+        last_error,
+    )
+    return _failure_result(account_id, email, last_error)

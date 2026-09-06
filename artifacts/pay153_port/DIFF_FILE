@@ -593,3 +593,10 @@ warning: in the working copy of 'tests/test_extract_link_local.py', LF will be r
 +
 +if __name__ == "__main__":
 +    unittest.main()
++
++--- current checkout-id trace delta ---
++core/pay153_provider_workflow.py:
+++ preserve stripe_checkout_session_id and custom_checkout_session_id when both cs_* and oaics_* are detected
+++ choose direct checkout_session_id first; otherwise prefer oaics_* for checkout_ui_mode=custom
++core/extract_link_service.py:
+++ forward checkout_session_ids, stripe_checkout_session_id, and custom_checkout_session_id
