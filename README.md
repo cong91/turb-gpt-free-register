@@ -52,6 +52,7 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 - Cloudflare 域名邮箱 + QQ 邮箱 IMAP 收信（`cloudflare_domain`）
 - Cloudflare Worker 临时邮箱：自动创建 + JWT 取码（`cloudflare`，兼容 cloudflare_temp_email）
 - 通用 API 邮箱：`email----取码地址`
+- 通用 IMAP 邮箱池：每行 `email----imap_password` 或 `email:imap_password`，服务器、端口和 SSL 在导入界面填写
 - Gmail API URL 邮箱：`email----取码URL`，轮询 API 响应 `code=601`（等待）、`code=602`（失败/退款）、`code=0`（成功）
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
 - TinyHost 临时邮箱 API：从全量在线域名中选择域名，生成随机邮箱并自动收取验证码（`tinyhost`）

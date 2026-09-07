@@ -389,7 +389,11 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,tinyhost,gmail_123452026,paymesh,gmail_api_url；QAN8 仅用于按需购买 Gmail API URL source",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,tinyhost,gmail_123452026,paymesh,gmail_api_url；QAN8 仅用于按需购买 Gmail API URL source",
+    },
+    {
+        "key": "IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "通用 IMAP 收件箱", "help": "通用 IMAP 邮箱默认目录，通常为 INBOX；服务器、端口和凭证在邮箱池导入",
     },
     {
         "key": "QAN8_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",

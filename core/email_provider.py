@@ -6,12 +6,13 @@ EMAIL_SOURCE 支持单个或多个来源：
     "cloudflare_domain"   # 自有域名 + QQ IMAP
     "cloudflare"          # Cloudflare Worker 临时邮箱
     "generic_api"
+    "imap"
     "gptmail"
     "mailnest"
     "cloudmail"
     "tinyhost"
-    "outlook,generic_api,mailnest,cloudmail"          # 按顺序兜底
-    ["outlook", "generic_api", "mailnest", "cloudmail"]  # 也兼容列表写法
+    "outlook,generic_api,imap,mailnest,cloudmail"     # 按顺序兜底
+    ["outlook", "generic_api", "imap", "mailnest"]   # 也兼容列表写法
 """
 import logging
 import re
@@ -195,7 +196,7 @@ def acknowledge_verification_code(
     )
 
 _VALID_SOURCES = (
-    "outlook", "generic_api", "gmail_api_url", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "tinyhost",
+    "outlook", "generic_api", "imap", "gmail_api_url", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "tinyhost",
     "gmail_123452026", "paymesh", "remail",
 )
 
@@ -376,6 +377,9 @@ def _pick_from_source(
     if source == "generic_api":
         from core.generic_api_mail_client import pick_account
         return pick_account().email
+    if source == "imap":
+        from core.imap_mail_client import pick_account
+        return pick_account().email
     if source == "gmail_api_url":
         if gmail_api_url_batch_id:
             from core.gmail_api_url_client import get_email_from_batch
@@ -489,6 +493,8 @@ def resolve_email_source(email: str) -> str:
     from core import db
     if db.get_gmail_api_url_email_by_email(email):
         return "gmail_api_url"
+    if db.get_imap_email_by_email(email):
+        return "imap"
     from core.gmail_api_url_client import get_batch_account_context
     if get_batch_account_context(email):
         return "gmail_api_url"
@@ -663,6 +669,9 @@ def wait_for_otp(
     if source == "generic_api":
         from core.generic_api_mail_client import fetch_latest_otp
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "imap":
+        from core.imap_mail_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "gmail_api_url":
         # Email gốc trong pool trước; nếu là alias batch thì tra batch context
         # (mọi alias share code_url của email gốc).
@@ -729,6 +738,9 @@ def release_email(email: str, status: str = "available", note: str | None = None
     elif source == "generic_api":
         from core.generic_api_mail_client import release_account
         release_account(email, status=status, note=note)
+    elif source == "imap":
+        from core.imap_mail_client import release_account
+        release_account(email, status=status, note=note)
     elif source == "gmail_api_url":
         from core.gmail_api_url_client import release_account
         release_kwargs = {"status": status, "note": note}
@@ -775,6 +787,8 @@ def release_email_if_unconsumed(
         changed = db.release_unconsumed_outlook(email, note=note)
     elif source == "generic_api":
         changed = db.release_unconsumed_generic_api_email(email, note=note)
+    elif source == "imap":
+        changed = db.release_unconsumed_imap_email(email, note=note)
     elif source == "gmail_api_url":
         from core.gmail_api_url_client import get_batch_account_context, release_account
 

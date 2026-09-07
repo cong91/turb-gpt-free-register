@@ -43,7 +43,7 @@ def _pool_source_arg(default: str = "outlook") -> str:
     if not src and request.method == "POST":
         data = request.get_json(silent=True) or {}
         src = (data.get("source") or data.get("type") or "").strip()
-    return src if src in ("all", "outlook", "generic_api", "gmail_api_url", "cloudflare_domain") else default
+    return src if src in ("all", "outlook", "generic_api", "imap", "gmail_api_url", "cloudflare_domain") else default
 
 
 
@@ -376,6 +376,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             if src not in summaries:
                 summaries[src] = (
                     db.generic_api_email_pool_summary() if src == "generic_api"
+                    else db.imap_email_pool_summary() if src == "imap"
                     else db.gmail_api_url_email_pool_summary() if src == "gmail_api_url"
                     else db.domain_email_pool_summary() if src == "cloudflare_domain"
                     else db.outlook_pool_summary()
@@ -878,6 +879,99 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not queued.get("accepted"):
             return jsonify({"ok": False, **queued_payload}), 503
         return jsonify({"ok": True, "started": True, **queued_payload}), 202
+
+    @app.post("/api/accounts/totp-setup-bulk")
+    def api_accounts_totp_setup_bulk():
+        """批量把账号 2FA/TOTP 设置任务加入后台队列。Body {account_ids:[...]}。"""
+        data = request.get_json(silent=True) or {}
+        ids = data.get("account_ids") or data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
+        if len(ids) > 500:
+            return jsonify({"ok": False, "error": "单次最多提交 500 个账号"}), 400
+
+        account_ids = []
+        skipped = []
+        seen = set()
+        for raw in ids:
+            try:
+                acc_id = int(raw)
+            except (TypeError, ValueError):
+                skipped.append({"id": raw, "reason": "ID 非法"})
+                continue
+            if acc_id in seen:
+                continue
+            seen.add(acc_id)
+            account_ids.append(acc_id)
+
+        accounts = []
+        for acc_id in account_ids:
+            acc = db.get_account(acc_id)
+            if not acc:
+                skipped.append({"id": acc_id, "reason": "账号不存在"})
+                continue
+            email = str(acc.get("email") or "").strip()
+            token = str(acc.get("access_token") or "").strip()
+            if not token:
+                skipped.append({"id": acc_id, "email": email, "reason": "缺少 access_token"})
+                continue
+            if str(acc.get("totp_secret") or "").strip():
+                skipped.append({"id": acc_id, "email": email, "reason": "该账号已经开启 2FA"})
+                continue
+            if not email:
+                skipped.append({"id": acc_id, "reason": "邮箱为空"})
+                continue
+            accounts.append(acc)
+
+        try:
+            from core import twofa_service
+        except Exception as exc:  # noqa: BLE001
+            return jsonify({"ok": False, "error": f"2FA 服务加载失败：{type(exc).__name__}: {exc}"}), 503
+
+        started = []
+        busy = []
+        failed = []
+        for acc in accounts:
+            acc_id = int(acc.get("id") or 0)
+            email = str(acc.get("email") or "").strip()
+            try:
+                queued = twofa_service.enqueue_account_totp_setup(
+                    account_id=acc_id,
+                    email=email,
+                    access_token=str(acc.get("access_token") or "").strip(),
+                    trigger="manual_bulk",
+                    proxy=str(acc.get("proxy_used") or "") or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed.append({
+                    "id": acc_id,
+                    "email": email,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+
+            public_result = {k: v for k, v in queued.items() if k != "future"}
+            item = {"id": acc_id, "email": email, **public_result}
+            if queued.get("accepted"):
+                item["status"] = "queued"
+                started.append(item)
+            elif queued.get("busy"):
+                busy.append(item)
+            else:
+                failed.append(item)
+
+        return jsonify({
+            "ok": True,
+            "message": f"已入队 {len(started)} 个 2FA 设置任务",
+            "started": started,
+            "started_count": len(started),
+            "busy": busy,
+            "busy_count": len(busy),
+            "failed": failed,
+            "failed_count": len(failed),
+            "skipped": skipped,
+            "skipped_count": len(skipped),
+        }), 202
 
     @app.post("/api/accounts/note-bulk")
     def api_accounts_note_bulk():
@@ -1822,6 +1916,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 rows = []
                 rows += _with_pool_source(db.list_outlook_pool(status=status, limit=fetch_limit), "outlook")
                 rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
+                rows += _with_pool_source(db.list_imap_email_pool(status=status, limit=fetch_limit), "imap")
                 rows += _with_pool_source(db.list_gmail_api_url_email_pool(status=status, limit=fetch_limit), "gmail_api_url")
                 rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
                 rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
@@ -1858,10 +1953,19 @@ def create_app(auth_code: str | None = None) -> Flask:
         """
         data = request.get_json(silent=True) or {}
         source = (data.get("source") or data.get("type") or "").strip()
-        if source not in ("outlook", "generic_api", "gmail_api_url", "credentials"):
-            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API、Gmail API URL 或 Codex 凭据"}), 400
+        if source not in ("outlook", "generic_api", "imap", "gmail_api_url", "credentials"):
+            return jsonify({"ok": False, "error": "导入时请选择具体类型：Outlook、通用 API、通用 IMAP、Gmail API URL 或 Codex 凭据"}), 400
         text = data.get("text") or ""
         as_registered = bool(data.get("as_registered", False))
+        imap_server = str(data.get("imap_server") or "").strip()
+        try:
+            imap_port = int(data.get("imap_port") or 993)
+        except (TypeError, ValueError):
+            imap_port = 0
+        imap_ssl_raw = data.get("imap_ssl", True)
+        imap_ssl = imap_ssl_raw if isinstance(imap_ssl_raw, bool) else str(imap_ssl_raw).strip().lower() not in {"0", "false", "no", "off"}
+        if source == "imap" and (not imap_server or not (1 <= imap_port <= 65535)):
+            return jsonify({"ok": False, "error": "通用 IMAP 导入必须填写有效的服务器和端口"}), 400
         if source == "credentials":
             from core.codex_account_import import parse_credential_lines
 
@@ -1872,7 +1976,17 @@ def create_app(auth_code: str | None = None) -> Flask:
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                parts = line.split("----") if "----" in line else line.split("====")
+                if source == "imap":
+                    if "----" in line:
+                        parts = line.split("----", 1)
+                    elif "====" in line:
+                        parts = line.split("====", 1)
+                    elif ":" in line:
+                        parts = line.split(":", 1)
+                    else:
+                        continue
+                else:
+                    parts = line.split("----") if "----" in line else line.split("====")
                 parts = [p.strip() for p in parts]
                 if source in ("generic_api", "gmail_api_url"):
                     if len(parts) < 2:
@@ -1880,6 +1994,15 @@ def create_app(auth_code: str | None = None) -> Flask:
                     records.append({
                         "email": parts[0],
                         "code_url": parts[1],
+                    })
+                    continue
+                if source == "imap":
+                    if len(parts) < 2 or not parts[0] or not parts[1]:
+                        continue
+                    records.append({
+                        "email": parts[0], "imap_password": parts[1],
+                        "imap_server": imap_server, "imap_port": imap_port,
+                        "imap_ssl": imap_ssl, "imap_username": "",
                     })
                     continue
                 if len(parts) < 4:
@@ -1897,7 +2020,9 @@ def create_app(auth_code: str | None = None) -> Flask:
                 need = "USER | PASS | 2FA"
                 delimiter = "| 分隔"
             else:
-                need = "2 段：邮箱----取码地址" if source in ("generic_api", "gmail_api_url") else "4 段：email----password----clientId----refreshToken"
+                need = ("2 段：邮箱----取码地址" if source in ("generic_api", "gmail_api_url") else
+                        "邮箱----IMAP密码 或 邮箱:IMAP密码" if source == "imap" else
+                        "4 段：email----password----clientId----refreshToken")
                 delimiter = "---- 或 ==== 分隔"
             return jsonify({"ok": False, "error": f"未解析到有效邮箱行（需 {need}，{delimiter}）"}), 400
         updated = 0
@@ -1908,6 +2033,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             inserted, skipped = db.import_registered_email_accounts(records, source=source)
         elif source == "generic_api":
             inserted, skipped = db.import_generic_api_emails(records)
+        elif source == "imap":
+            inserted, skipped = db.import_imap_emails(records)
         elif source == "gmail_api_url":
             inserted, skipped = db.import_gmail_api_url_emails(records)
         else:
@@ -1934,6 +2061,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             source = "outlook"
         if source == "generic_api":
             db.release_generic_api_email(email, status=status, note=data.get("note"))
+        elif source == "imap":
+            db.release_imap_email(email, status=status, note=data.get("note"))
         elif source == "gmail_api_url":
             db.release_gmail_api_url_email(email, status=status, note=data.get("note"))
         elif source == "cloudflare_domain":
@@ -1994,6 +2123,8 @@ def create_app(auth_code: str | None = None) -> Flask:
             try:
                 if item_source == "generic_api":
                     db.release_generic_api_email(email, status=status, note=note)
+                elif item_source == "imap":
+                    db.release_imap_email(email, status=status, note=note)
                 elif item_source == "gmail_api_url":
                     db.release_gmail_api_url_email(email, status=status, note=note)
                 elif item_source == "cloudflare_domain":
@@ -2018,16 +2149,10 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not email:
             return jsonify({"ok": False, "error": "email 为空"}), 400
         source = (data.get("source") or _pool_source_arg()).strip()
-        if source == "all":
-            source = "outlook"
         deleted = (
-            db.delete_generic_api_email(email)
-            if source == "generic_api"
-            else db.delete_gmail_api_url_email(email)
+            db.delete_gmail_api_url_email(email)
             if source == "gmail_api_url"
-            else db.delete_domain_email(email)
-            if source == "cloudflare_domain"
-            else db.delete_outlook(email)
+            else db.delete_email_pool(email, source=source)
         )
         return jsonify({"ok": True, "deleted": deleted})
 
@@ -2052,8 +2177,6 @@ def create_app(auth_code: str | None = None) -> Flask:
             else:
                 email = (str(raw_item or "")).strip()
                 item_source = source
-            if item_source == "all":
-                item_source = "outlook"
             key = f"{item_source}:{email.lower()}"
             if not email:
                 skipped.append({"email": raw_item, "reason": "邮箱为空"})
@@ -2062,13 +2185,9 @@ def create_app(auth_code: str | None = None) -> Flask:
                 continue
             seen.add(key)
             deleted_ok = (
-                db.delete_generic_api_email(email)
-                if item_source == "generic_api"
-                else db.delete_gmail_api_url_email(email)
+                db.delete_gmail_api_url_email(email)
                 if item_source == "gmail_api_url"
-                else db.delete_domain_email(email)
-                if item_source == "cloudflare_domain"
-                else db.delete_outlook(email)
+                else db.delete_email_pool(email, source=item_source)
             )
             if deleted_ok:
                 deleted.append({"email": email, "source": item_source})
