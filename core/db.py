@@ -79,11 +79,12 @@ _TABLES = {
     "accounts": "accounts",
     "outlook": "email_pool",
     "generic_api": "email_pool",
+    "imap": "email_pool",
     "jobs": "registration_jobs",
     "domain": "email_pool",
     "codex": "codex_accounts",
 }
-_EMAIL_SOURCES = {"outlook": "outlook", "generic_api": "generic_api", "domain": "cloudflare_domain"}
+_EMAIL_SOURCES = {"outlook": "outlook", "generic_api": "generic_api", "imap": "imap", "domain": "cloudflare_domain"}
 _LEGACY_TABLES = {"outlook": "outlook_pool", "generic_api": "generic_api_pool", "domain": "domain_email_pool"}
 _CODEX_EXPORT_STATE = _LEGACY_CODEX_EXPORT_STATE
 _PERSONAL_INFO_CHANGE_STATE_KEY = "personal_info_change_batches"
@@ -326,6 +327,54 @@ def _ensure_sqlite() -> None:
                           int(bool(row.get("archived"))), str(row.get("created_at") or row.get("imported_at") or ""),
                           str(row.get("updated_at") or ""), json.dumps(row, ensure_ascii=False))),
                     )
+        # Repair early email-pool rows written before the source column was
+        # persisted. Infer only from unambiguous payload fields.
+        conn.execute(
+            "UPDATE email_pool SET source=? WHERE (source IS NULL OR trim(source)='') AND ("
+            "json_extract(payload, '$.code_url') IS NOT NULL OR "
+            "json_extract(payload, '$.url') IS NOT NULL OR "
+            "json_extract(payload, '$.source') IN ('generic_api', 'generic-api') OR "
+            "json_extract(payload, '$.email_source') IN ('generic_api', 'generic-api')"
+            ")",
+            (_EMAIL_SOURCES["generic_api"],),
+        )
+        conn.execute(
+            "UPDATE email_pool SET source=? WHERE (source IS NULL OR trim(source)='') AND ("
+            "json_extract(payload, '$.client_id') IS NOT NULL OR "
+            "json_extract(payload, '$.clientId') IS NOT NULL OR "
+            "json_extract(payload, '$.refresh_token') IS NOT NULL OR "
+            "json_extract(payload, '$.refreshToken') IS NOT NULL OR "
+            "json_extract(payload, '$.source') IN ('outlook', 'outlook_pool') OR "
+            "json_extract(payload, '$.email_source') = 'outlook'"
+            ")",
+            (_EMAIL_SOURCES["outlook"],),
+        )
+        conn.execute(
+            "UPDATE email_pool SET source=? WHERE (source IS NULL OR trim(source)='') AND ("
+            "json_extract(payload, '$.imap_server') IS NOT NULL OR "
+            "json_extract(payload, '$.server') IS NOT NULL OR "
+            "json_extract(payload, '$.source') = 'imap' OR "
+            "json_extract(payload, '$.email_source') = 'imap'"
+            ")",
+            (_EMAIL_SOURCES["imap"],),
+        )
+        conn.execute(
+            "UPDATE email_pool SET source=? WHERE (source IS NULL OR trim(source)='') AND NOT ("
+            "json_extract(payload, '$.code_url') IS NOT NULL OR "
+            "json_extract(payload, '$.url') IS NOT NULL OR "
+            "json_extract(payload, '$.source') IN ('generic_api', 'generic-api', 'outlook', 'outlook_pool') OR "
+            "json_extract(payload, '$.email_source') IN ('generic_api', 'generic-api', 'outlook') OR "
+            "json_extract(payload, '$.client_id') IS NOT NULL OR "
+            "json_extract(payload, '$.clientId') IS NOT NULL OR "
+            "json_extract(payload, '$.refresh_token') IS NOT NULL OR "
+            "json_extract(payload, '$.refreshToken') IS NOT NULL OR "
+            "json_extract(payload, '$.imap_server') IS NOT NULL OR "
+            "json_extract(payload, '$.server') IS NOT NULL OR "
+            "json_extract(payload, '$.source') = 'imap' OR "
+            "json_extract(payload, '$.email_source') = 'imap'"
+            ")",
+            (_EMAIL_SOURCES["domain"],),
+        )
         # CPA Codex 凭证首次导入数据库；后续列表查询不再扫描 codex_accounts/ 文件。
         if not migration_done and not conn.execute("SELECT 1 FROM codex_accounts LIMIT 1").fetchone() and _CODEX_DIR.exists():
             state = _read_json(_LEGACY_CODEX_EXPORT_STATE, {})
@@ -425,18 +474,34 @@ def _save_collection(collection: str, rows: list[dict], *, replace_existing: boo
                 json.dumps(row, ensure_ascii=False),
             )
             if replace_existing:
-                conn.execute(
-                    f"INSERT INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
-                    values,
-                )
+                if table == "email_pool":
+                    conn.execute(
+                        "INSERT INTO email_pool(id,email,source,status,archived,created_at,updated_at,payload) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (rid, str(row.get("email") or ""), _EMAIL_SOURCES[collection], *values[2:]),
+                    )
+                else:
+                    conn.execute(
+                        f"INSERT INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?)",
+                        values,
+                    )
             else:
-                conn.execute(
-                    f"INSERT INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?) "
-                    "ON CONFLICT(id) DO UPDATE SET email=excluded.email, status=excluded.status, "
-                    "archived=excluded.archived, created_at=excluded.created_at, "
-                    "updated_at=excluded.updated_at, payload=excluded.payload",
-                    values,
-                )
+                if table == "email_pool":
+                    conn.execute(
+                        "INSERT INTO email_pool(id,email,source,status,archived,created_at,updated_at,payload) "
+                        "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET email=excluded.email, "
+                        "source=excluded.source, status=excluded.status, archived=excluded.archived, "
+                        "created_at=excluded.created_at, updated_at=excluded.updated_at, payload=excluded.payload",
+                        (rid, str(row.get("email") or ""), _EMAIL_SOURCES[collection], *values[2:]),
+                    )
+                else:
+                    conn.execute(
+                        f"INSERT INTO {table}(id,email,status,archived,created_at,updated_at,payload) VALUES(?,?,?,?,?,?,?) "
+                        "ON CONFLICT(id) DO UPDATE SET email=excluded.email, status=excluded.status, "
+                        "archived=excluded.archived, created_at=excluded.created_at, "
+                        "updated_at=excluded.updated_at, payload=excluded.payload",
+                        values,
+                    )
 
 
 def _query_collection(collection: str, *, status: str | None = None, archived: str | bool | None = None,
@@ -529,10 +594,16 @@ def _account_filter_sql(
         "CAST(json_extract(payload, '$.plan_type') AS TEXT), ''))"
     )
     if plan and plan not in {"all", "any"}:
-        if plan in {"free_plus", "free_plus_trial", "plus_trial_eligible"}:
+        if plan in {"free_plus", "free_plus_trial", "plus_trial", "plus_trial_eligible", "trial", "trial_eligible"}:
             where.extend([
                 f"{plan_expr} = ?",
                 "COALESCE(json_extract(payload, '$.plus_trial_eligible'), 0) IN (1, '1', 'true')",
+            ])
+            params.append("free")
+        elif plan in {"free_no_trial", "free_without_trial", "free_not_trial"}:
+            where.extend([
+                f"{plan_expr} = ?",
+                "lower(COALESCE(CAST(json_extract(payload, '$.plus_trial_eligible') AS TEXT), '')) IN ('0', 'false', 'no', 'off')",
             ])
             params.append("free")
         elif plan == "plus":
@@ -689,6 +760,13 @@ def _generic_api_email_line(row: dict) -> str:
     ])
 
 
+def _imap_email_line(row: dict) -> str:
+    return "----".join([
+        row.get("email") or "",
+        row.get("imap_password") or row.get("password") or "",
+    ])
+
+
 def _extract_registration_password(row: dict) -> str:
     extra_raw = row.get("extra_json")
     if isinstance(extra_raw, str) and extra_raw.strip():
@@ -805,6 +883,16 @@ def _sync_generic_api_email_txt(rows: list[dict]) -> None:
     available_rows = [r for r in rows if r.get("status") == "available"]
     lines = [_generic_api_email_line(r) for r in sorted(available_rows, key=lambda x: int(x.get("id") or 0))]
     _GENERIC_API_EMAIL_TXT.write_text(("\n".join(lines) + ("\n" if lines else "")), encoding="utf-8")
+
+
+def _load_imap_emails() -> list[dict]:
+    return _load_collection("imap")
+
+
+def _save_imap_emails(rows: list[dict]) -> None:
+    for row in rows:
+        row["copy_line"] = _imap_email_line(row)
+    _save_collection("imap", rows)
 
 
 def _sync_gmail_api_url_email_txt(rows: list[dict]) -> None:
@@ -1331,6 +1419,8 @@ def _mutate_email_pool_row(
             row["copy_line"] = _outlook_line(row)
         elif source == "generic_api":
             row["copy_line"] = _generic_api_email_line(row)
+        elif source == "imap":
+            row["copy_line"] = _imap_email_line(row)
         conn.execute(
             "UPDATE email_pool SET email=?, status=?, archived=?, updated_at=?, payload=? WHERE id=?",
             (
@@ -1496,6 +1586,23 @@ def _decorate_generic_api_email(row: dict, account_by_email: dict[str, dict] | N
     return out
 
 
+def _decorate_imap_email(row: dict, account_by_email: dict[str, dict] | None = None) -> dict:
+    out = dict(row)
+    out["copy_line"] = _imap_email_line(out)
+    account = account_by_email.get((out.get("email") or "").lower()) if account_by_email else None
+    if account:
+        out["registered_account_id"] = account.get("id")
+        out["access_token"] = account.get("access_token")
+        out["access_token_preview"] = (
+            (account.get("access_token") or "")[:40] + "..."
+            if account.get("access_token")
+            else ""
+        )
+        out["account_copy_line"] = _account_line(account)
+        out["totp_secret"] = account.get("totp_secret")
+    return out
+
+
 def list_email_pool_page(
     source: str = "all",
     status: str | None = None,
@@ -1510,7 +1617,7 @@ def list_email_pool_page(
     不再先加载全部邮箱再由 WebUI 切片。
     """
     source = str(source or "outlook").strip().lower()
-    if source not in {"all", "outlook", "generic_api", "cloudflare_domain"}:
+    if source not in {"all", "outlook", "generic_api", "imap", "cloudflare_domain"}:
         source = "outlook"
     collection = "domain" if source == "cloudflare_domain" else source
     db_source = None if source == "all" else _EMAIL_SOURCES[collection]
@@ -1519,8 +1626,17 @@ def list_email_pool_page(
     where = ["1=1"]
     params: list[Any] = []
     if db_source is not None:
-        where.append("ep.source=?")
-        params.append(db_source)
+        where.append("(ep.source=? OR (trim(ep.source)='' AND "
+                     "((?='generic_api' AND (json_extract(ep.payload, '$.code_url') IS NOT NULL OR "
+                     "json_extract(ep.payload, '$.url') IS NOT NULL)) OR "
+                     "(?='outlook' AND (json_extract(ep.payload, '$.client_id') IS NOT NULL OR "
+                     "json_extract(ep.payload, '$.clientId') IS NOT NULL OR "
+                     "json_extract(ep.payload, '$.refresh_token') IS NOT NULL OR "
+                     "json_extract(ep.payload, '$.refreshToken') IS NOT NULL)) OR "
+                     "(?='imap' AND json_extract(ep.payload, '$.imap_server') IS NOT NULL) OR "
+                     "(?='cloudflare_domain' AND json_extract(ep.payload, '$.code_url') IS NULL AND "
+                     "json_extract(ep.payload, '$.client_id') IS NULL))))")
+        params.extend([db_source, source, source, source, source])
     if status:
         where.append("ep.status=?")
         params.append(status)
@@ -1551,7 +1667,12 @@ def list_email_pool_page(
             [*params, limit, offset],
         ).fetchall()
 
-    source_names = {value: key for key, value in _EMAIL_SOURCES.items()}
+    source_names = {
+        _EMAIL_SOURCES["outlook"]: "outlook",
+        _EMAIL_SOURCES["generic_api"]: "generic_api",
+        _EMAIL_SOURCES["imap"]: "imap",
+        _EMAIL_SOURCES["domain"]: "cloudflare_domain",
+    }
     items: list[dict] = []
     for row in rows:
         item = json.loads(row["payload"])
@@ -1563,10 +1684,22 @@ def list_email_pool_page(
             except (TypeError, ValueError):
                 account = None
         item_source = source_names.get(str(row["source"]), str(row["source"]))
+        if not str(row["source"] or "").strip():
+            payload = item
+            if source == "generic_api" or payload.get("code_url") or payload.get("url"):
+                item_source = "generic_api"
+            elif source == "outlook" or any(payload.get(k) for k in ("client_id", "clientId", "refresh_token", "refreshToken")):
+                item_source = "outlook"
+            elif source == "imap" or payload.get("imap_server"):
+                item_source = "imap"
+            else:
+                item_source = "cloudflare_domain"
         if item_source == "outlook":
             item = _decorate_outlook(item, {str(item.get("email") or "").lower(): account} if account else {})
         elif item_source == "generic_api":
             item = _decorate_generic_api_email(item, {str(item.get("email") or "").lower(): account} if account else {})
+        elif item_source == "imap":
+            item = _decorate_imap_email(item, {str(item.get("email") or "").lower(): account} if account else {})
         else:
             item = dict(item)
         item["source"] = item_source
@@ -3280,17 +3413,19 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
     source:
       - outlook: records 元素 {email,password,client_id,refresh_token[,access_token,totp_secret]}
       - generic_api: records 元素 {email,code_url[,access_token,totp_secret]}
+      - imap: records 元素 {email,imap_password,imap_server,imap_port,imap_ssl}
 
     返回 (新增账号数, 跳过数)。已存在账号会跳过；邮箱池中已存在的素材会复用并标记 used。
     """
     source = (source or "").strip().lower()
-    if source not in ("outlook", "generic_api"):
-        raise ValueError("source 必须显式传入 outlook / generic_api")
+    if source not in ("outlook", "generic_api", "imap"):
+        raise ValueError("source 必须显式传入 outlook / generic_api / imap")
 
     with _LOCK:
         accounts = _load_accounts()
         outlook_rows = _load_outlook()
         generic_rows = _load_generic_api_emails()
+        imap_rows = _load_imap_emails()
         inserted = skipped = 0
 
         for raw in records:
@@ -3306,7 +3441,42 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
             original_line = email
             pool_row = None
 
-            if source == "generic_api":
+            if source == "imap":
+                password = str(raw.get("imap_password") or raw.get("password") or "").strip()
+                server = str(raw.get("imap_server") or raw.get("server") or "").strip()
+                try:
+                    port = int(raw.get("imap_port") or raw.get("port") or 993)
+                except (TypeError, ValueError):
+                    port = 0
+                if not password or not server or not (1 <= port <= 65535):
+                    skipped += 1
+                    continue
+                ssl_raw = raw.get("imap_ssl", raw.get("use_ssl", True))
+                use_ssl = ssl_raw if isinstance(ssl_raw, bool) else str(ssl_raw).strip().lower() not in {"0", "false", "no", "off"}
+                pool_row = _find_by_email(imap_rows, email)
+                values = {
+                    "imap_password": password,
+                    "imap_server": server,
+                    "imap_port": port,
+                    "imap_username": str(raw.get("imap_username") or raw.get("username") or "").strip(),
+                    "imap_ssl": bool(use_ssl),
+                }
+                if pool_row is None:
+                    pool_row = {
+                        "id": _next_id(imap_rows), "email": email, **values,
+                        "status": "used", "used_at": now,
+                        "note": "导入为已注册账号，用于 Codex 授权", "imported_at": now,
+                    }
+                    imap_rows.append(pool_row)
+                else:
+                    pool_row.update(values)
+                pool_row["status"] = "used"
+                pool_row["used_at"] = pool_row.get("used_at") or now
+                pool_row["completed_at"] = pool_row.get("completed_at") or now
+                pool_row["note"] = pool_row.get("note") or "导入为已注册账号，用于 Codex 授权"
+                pool_row["copy_line"] = _imap_email_line(pool_row)
+                original_line = _imap_email_line(pool_row)
+            elif source == "generic_api":
                 code_url = (raw.get("code_url") or raw.get("url") or "").strip()
                 if not code_url:
                     skipped += 1
@@ -3401,6 +3571,7 @@ def import_registered_email_accounts(records: list[dict], source: str | None) ->
 
         _save_outlook(outlook_rows)
         _save_generic_api_emails(generic_rows)
+        _save_imap_emails(imap_rows)
         _save_accounts(accounts)
         return inserted, skipped
 
@@ -3468,6 +3639,31 @@ def claim_next_outlook() -> dict | None:
         return _decorate_outlook(row) if row else None
 
 
+def delete_email_pool(email: str, source: str = "all") -> bool:
+    """Delete a mailbox from one source or from every local pool."""
+    target = str(email or "").strip()
+    source = str(source or "all").strip().lower()
+    if not target:
+        return False
+    if source not in {"all", "outlook", "generic_api", "imap", "cloudflare_domain"}:
+        raise ValueError(f"非法邮箱来源: {source}")
+    with _LOCK:
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            if source == "all":
+                cur = conn.execute(
+                    "DELETE FROM email_pool WHERE email = ? COLLATE NOCASE", (target,)
+                )
+            else:
+                db_source = _EMAIL_SOURCES["domain"] if source == "cloudflare_domain" else _EMAIL_SOURCES[source]
+                cur = conn.execute(
+                    "DELETE FROM email_pool WHERE email = ? COLLATE NOCASE AND source = ?",
+                    (target, db_source),
+                )
+            conn.commit()
+            return cur.rowcount > 0
+
+
 def release_outlook(email: str, status: str = "available", note: str | None = None) -> None:
     """把账号状态改回 available，或标记为 used/failed/disabled。"""
     with _LOCK:
@@ -3499,14 +3695,7 @@ def release_unconsumed_outlook(email: str, note: str | None = None) -> bool:
 
 def delete_outlook(email: str) -> bool:
     """从邮箱池彻底删除一个邮箱（按 email 匹配）。返回是否删到。"""
-    with _LOCK:
-        rows = _load_outlook()
-        target = (email or "").lower()
-        new_rows = [r for r in rows if (r.get("email") or "").lower() != target]
-        if len(new_rows) == len(rows):
-            return False
-        _save_outlook(new_rows)
-        return True
+    return delete_email_pool(email, source="outlook")
 
 
 def list_outlook_pool(status: str | None = None, limit: int = 500) -> list[dict]:
@@ -3583,6 +3772,99 @@ def claim_next_generic_api_email() -> dict | None:
             mutator=lambda item: item.update({"status": "used", "used_at": _now(), "note": None}),
         )
         return _decorate_generic_api_email(row) if row else None
+
+
+# ============================================================
+# generic IMAP email pool
+# ============================================================
+
+def import_imap_emails(records: list[dict]) -> tuple[int, int]:
+    """Import generic IMAP mailbox credentials into the shared email pool."""
+    with _LOCK:
+        rows = _load_imap_emails()
+        inserted = skipped = 0
+        for raw in records:
+            email = str(raw.get("email") or "").strip()
+            password = str(raw.get("imap_password") or raw.get("password") or "").strip()
+            server = str(raw.get("imap_server") or raw.get("server") or "").strip()
+            try:
+                port = int(raw.get("imap_port") or raw.get("port") or 993)
+            except (TypeError, ValueError):
+                port = 0
+            if not email or not password or not server or not (1 <= port <= 65535) or _find_by_email(rows, email):
+                skipped += 1
+                continue
+            ssl_raw = raw.get("imap_ssl", raw.get("use_ssl", True))
+            use_ssl = ssl_raw if isinstance(ssl_raw, bool) else str(ssl_raw).strip().lower() not in {"0", "false", "no", "off"}
+            row = {
+                "id": _next_id(rows), "email": email,
+                "imap_password": password, "imap_server": server, "imap_port": port,
+                "imap_username": str(raw.get("imap_username") or raw.get("username") or "").strip(),
+                "imap_ssl": bool(use_ssl), "status": "available", "used_at": None,
+                "note": None, "imported_at": _now(),
+            }
+            row["copy_line"] = _imap_email_line(row)
+            rows.append(row)
+            inserted += 1
+        _save_imap_emails(rows)
+        return inserted, skipped
+
+
+def claim_next_imap_email() -> dict | None:
+    with _LOCK:
+        row = _mutate_email_pool_row(
+            "imap",
+            status="available",
+            mutator=lambda item: item.update({"status": "used", "used_at": _now(), "note": None}),
+        )
+        return _decorate_imap_email(row) if row else None
+
+
+def release_imap_email(email: str, status: str = "available", note: str | None = None) -> None:
+    with _LOCK:
+        def mutate(row: dict) -> None:
+            row["status"] = status
+            if status == "available":
+                row["used_at"] = None
+            elif status in ("used", "failed", "disabled"):
+                row["used_at"] = row.get("used_at") or _now()
+            if note is not None:
+                row["note"] = note
+
+        _mutate_email_pool_row("imap", email=email, mutator=mutate)
+
+
+def release_unconsumed_imap_email(email: str, note: str | None = None) -> bool:
+    with _LOCK:
+        if get_account_by_email(email) is not None:
+            return False
+
+        def mutate(row: dict) -> None:
+            row["status"] = "available"
+            row["used_at"] = None
+            if note is not None:
+                row["note"] = note
+
+        return _mutate_email_pool_row("imap", email=email, status="used", mutator=mutate) is not None
+
+
+def delete_imap_email(email: str) -> bool:
+    return delete_email_pool(email, source="imap")
+
+
+def list_imap_email_pool(status: str | None = None, limit: int = 500) -> list[dict]:
+    return list_email_pool_page(source="imap", status=status, limit=limit, offset=0)["items"]
+
+
+def imap_email_pool_summary() -> dict:
+    with _LOCK:
+        return _pool_summary_sql("imap")
+
+
+def get_imap_email_by_email(email: str) -> dict | None:
+    with _LOCK:
+        row = _find_by_email(_load_imap_emails(), email)
+        return _decorate_imap_email(row) if row else None
 
 
 # ============================================================
@@ -4111,14 +4393,7 @@ def release_unconsumed_gmail_api_url_email(email: str, note: str | None = None) 
 
 def delete_generic_api_email(email: str) -> bool:
     """从通用 API 邮箱池彻底删除一个邮箱。"""
-    with _LOCK:
-        rows = _load_generic_api_emails()
-        target = (email or "").lower()
-        new_rows = [r for r in rows if (r.get("email") or "").lower() != target]
-        if len(new_rows) == len(rows):
-            return False
-        _save_generic_api_emails(new_rows)
-        return True
+    return delete_email_pool(email, source="generic_api")
 
 
 def delete_gmail_api_url_email(email: str) -> bool:

@@ -92,6 +92,31 @@ class EmailPoolSourceTests(unittest.TestCase):
                 items = db.list_email_pool_page(source="cloudflare_domain", limit=10)["items"]
                 self.assertEqual(items[0]["source"], "cloudflare_domain")
 
+    def test_repairs_source_for_legacy_imap_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            with patch.multiple(db, **self._storage_patches(root)):
+                db._ensure_sqlite()
+                payload = {
+                    "id": 1,
+                    "email": "legacy-imap@example.com",
+                    "imap_password": "password",
+                    "imap_server": "imap.example.com",
+                    "status": "available",
+                }
+                with closing(db._sqlite_conn()) as conn:
+                    conn.execute(
+                        "INSERT INTO email_pool(id,email,source,status,archived,created_at,updated_at,payload) "
+                        "VALUES(?,?,?,?,?,?,?,?)",
+                        (1, payload["email"], "", "available", 0, "", "", json.dumps(payload)),
+                    )
+                    conn.commit()
+
+                db._SQLITE_READY = False
+                db._SQLITE_READY_PATH = None
+                items = db.list_email_pool_page(source="imap", limit=10)["items"]
+                self.assertEqual(items[0]["source"], "imap")
+
     def test_delete_pool_supports_all_sources(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

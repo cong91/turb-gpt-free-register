@@ -123,12 +123,17 @@ def _pool_warning(
     if sources == ["generic_api"]:
         available = database.generic_api_email_pool_summary().get("available", 0)
         return f"通用 API 邮箱池仅 {available} 个可用，少于任务数 {count}，不足的会失败" if available < count else ""
+    if sources == ["imap"]:
+        available = database.imap_email_pool_summary().get("available", 0)
+        return f"通用 IMAP 邮箱池仅 {available} 个可用，少于任务数 {count}，不足的会失败" if available < count else ""
     if len(sources) > 1:
         available = 0
         if "outlook" in sources:
             available += database.outlook_pool_summary().get("available", 0)
         if "generic_api" in sources:
             available += database.generic_api_email_pool_summary().get("available", 0)
+        if "imap" in sources:
+            available += database.imap_email_pool_summary().get("available", 0)
         return f"多个邮箱池合计仅 {available} 个可用，少于任务数 {count}，不足的会失败" if available < count else ""
     available = database.outlook_pool_summary().get("available", 0)
     return f"可用邮箱仅 {available} 个，少于任务数 {count}，不足的会失败" if available < count else ""
