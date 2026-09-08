@@ -7,7 +7,7 @@
 - 总请求：236
 - 域名分布：`chatgpt.com` 125、`browser-intake-datadoghq.com` 107、`auth.openai.com` 2、`ab.chatgpt.com` 1、测试回调 1
 - 主要状态：200 共 112、202 共 111、0 共 13（Datadog/octet-stream 中断或被采集器标记）
-- 主浏览器画像：macOS + Chrome 149；语言/时区由代理出口 IP 自动决定，本 HAR 样本为 zh-CN + Asia/Shanghai
+- 主浏览器画像：当前 CloakBrowser Windows + Chrome 146；语言/时区由固定 `BROWSER_LOCALE_PROFILE` 决定，出口 IP 单独验证
 - ChatGPT 前端版本：`prod-fb4a8a2a751dfec391053cfd7b01c52699ccf78c`
 - OAI build number：`8370486`
 - Sentinel SDK：`20260219f9f6`
@@ -72,7 +72,7 @@
 | 1 | `new Date().toString()` | `Sun Jul 19 2026 ... GMT+0800 (中国标准时间)` |
 | 2 | `performance.memory.jsHeapSizeLimit` | `4395630592` |
 | 3 | 初始/PoW attempt | 初始 `1`，create_account token 为 `5` |
-| 4 | UA | `Mozilla/5.0 ... Chrome/149.0.0.0 Safari/537.36` |
+| 4 | UA | `Mozilla/5.0 ... Chrome/146.0.0.0 Safari/537.36` |
 | 5 | script src | 见下方 JS 入口 |
 | 6 | build id / data-build | ChatGPT prepare 为 `prod-fb4a8a...`；Auth token 为 `null` |
 | 7 | `navigator.language` | `zh-CN` |
@@ -96,7 +96,7 @@ HAR 没有直接保存 `.js` 响应正文，但从 Sentinel `p[5]` 还原出被�
 2. `https://chatgpt.com/cdn-cgi/challenge-platform/scripts/jsd/api.js?onload=jsdOnload`
 3. `https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js`
 
-项目本地已有 SDK 文件：`sentinel/sdk.js`；Node VM 执行器为 `sentinel/sentinel-runner.js`。本轮已按 HAR 补齐 runner 的 Chrome 149 DOM/Navigator/Window 样本。
+项目本地已有 SDK 文件：`sentinel/sdk.js`；Node VM 执行器为 `sentinel/sentinel-runner.js`。runner 的 DOM/Navigator/Window 样本必须跟当前浏览器 runtime 一起更新。
 
 ## 5. 已同步到代码的纯协议细节
 
@@ -105,7 +105,8 @@ HAR 没有直接保存 `.js` 响应正文，但从 Sentinel `p[5]` 还原出被�
   - 新增 `OAI_CLIENT_BUILD_NUMBER=8370486`、`OAI_CLIENT_VERSION`
   - 补齐 Statsig/AB SDK key/version 常量。
 - `config/browser.py`
-  - 切到 Chrome 149 HTTP/JS 画像：UA、Client Hints、动态语言/时区；窗口/屏幕尺寸从画像池随机选择，HAR 的 `1680x1050` / `hardwareConcurrency=6` / `jsHeapSizeLimit=4395630592` 只作为候选之一。
+  - HTTP/TLS/JS 版本固定为 Chrome 146：项目锁定 `curl_cffi==0.16.3`，显式 impersonate target 为 `chrome146`；本机 CloakBrowser 0.5.10 bundled Chromium 为 `146.0.7680.177`，UA/Client Hints/navigator platform 必须与 Windows runtime 同步。
+  - 当前画像固定采用实测的 `1920x1080` / `hardwareConcurrency=8` / `devicePixelRatio=1`；HAR 的 `1680x1050` / `hardwareConcurrency=6` / `jsHeapSizeLimit=4395630592` 仅保留作显式复现实验用途。
   - 补齐 `createAuctionNonce`、`clearOriginJoinedAdInterestGroups`、`login`、`locationbar`、`scrollX`、`ondevicemotion` 等 HAR 出现的采样键。
 - `core/session.py`
   - 所有前端 API 请求统一补 `oai-client-build-number`、`oai-client-version`、`oai-session-id`。
@@ -125,27 +126,27 @@ HAR 没有直接保存 `.js` 响应正文，但从 Sentinel `p[5]` 还原出被�
 
 ## 7. `.env` 覆盖项
 
-语言/时区不固定，按代理出口 IP 自动设置：
+语言/时区固定使用配置 profile；代理出口 IP 不参与 fingerprint 选择：
 
 ```env
-AUTO_BROWSER_LOCALE_FROM_IP="True"
+AUTO_BROWSER_LOCALE_FROM_IP="False"
 ```
 
-`BROWSER_LOCALE_PROFILE="jp"` 仅作为 GeoIP 检测失败时的兜底画像；正常情况下会根据出口国家/时区生成 `Accept-Language`、`navigator.language`、`navigator.languages`、`Date`/`Intl` 时区。
+`BROWSER_LOCALE_PROFILE` 决定固定的 `Accept-Language`、`navigator.language`、`navigator.languages`、`Date`/`Intl` 时区。IP/GeoIP 只用于确认 curl 与浏览器是否经过同一出口。
 
 ## 8. runner 继续补齐项
 
 `sentinel/sentinel-runner.js` 不只补 HAR 中直接命中的几个 key，还需要保证 Python 画像传入 Node VM 后一致：
 
 - `--language` / `--languages`：由 `BrowserSession.browser_profile` 传入。
-- `--time-zone` / `--timezone-name` / `--timezone-offset-minutes`：由代理 GeoIP 画像传入。
-- `process.env.TZ`：runner 启动时按 `--time-zone` 设置，使 VM 里的 `Date.toString()` 与代理时区一致。
+- `--time-zone` / `--timezone-name` / `--timezone-offset-minutes`：由固定 `BROWSER_LOCALE_PROFILE` 画像传入。
+- `process.env.TZ`：runner 启动时按固定 profile 的 `--time-zone` 设置，使 VM 里的 `Date.toString()` 与浏览器时区一致。
 - `Intl.DateTimeFormat().resolvedOptions().timeZone`：在 VM 内覆盖为同一个 `timeZone`。
 - `document` React key：同时支持 `_reactListening...` 和 `__reactContainer$...`。
 - `navigator` Chrome 专有采样：`createAuctionNonce`、`clearOriginJoinedAdInterestGroups`、`canLoadAdAuctionFencedFrame`、`login` 等。
 - `window` Chrome/页面采样：`locationbar`、`scrollX`、`scrollY`、`ondevicemotion` 等。
 
-因此语言/时区最终链路是：代理出口 IP → `pick_browser_profile()` → Python Sentinel `p` → runner CLI 参数 → Node VM `Date`/`Intl`/`navigator`。
+因此语言/时区最终链路是：`BROWSER_LOCALE_PROFILE` → `pick_browser_profile()` → Python Sentinel `p` → runner CLI 参数 → Node VM `Date`/`Intl`/`navigator`。代理出口 IP 只用于网络身份与 WebRTC 绑定，不参与 locale 选择。
 
 ## 9. 二次对齐检查与补齐
 
@@ -173,9 +174,9 @@ AUTO_BROWSER_LOCALE_FROM_IP="True"
    - ChatGPT `accounts/check` URL 使用 JS `Date.getTimezoneOffset()` 语义：东八区是 `-480`，日本是 `-540`。
    - 已新增 `BrowserSession.js_timezone_offset_min()`，避免把内部 `timezone_offset_minutes`（东区为正）直接用于 URL。
 
-5. **兜底地区**
-   - 代理 GeoIP 检测失败时兜底日本：`BROWSER_LOCALE_PROFILE="jp"`。
-   - GeoIP 成功时仍按出口 IP 自动设置语言/时区。
+5. **固定地区**
+   - `BROWSER_LOCALE_PROFILE` 是唯一的浏览器 locale/timezone 来源；例如当前运行时为 `vi`（`vi-VN` + `Asia/Ho_Chi_Minh`）。
+   - GeoIP 成功或失败、以及 NordVPN 更换出口 IP，都不会改变浏览器语言或时区。
 
 ### 当前仍未强制补的链路
 

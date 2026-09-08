@@ -2589,6 +2589,7 @@ def run_roxy_registration(
                 "expires": session_info.get("expires"),
                 "roxybrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
                 "registration_password": openai_password,
+                "registration_driver": "roxy",
                 "twofa_status": twofa_status,
                 "twofa_error": twofa_error,
                 "codex": codex_result,

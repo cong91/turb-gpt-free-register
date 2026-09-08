@@ -28,6 +28,9 @@ def prepare_export(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    registration_driver_filter: str | None = None,
+    plan_filter: str | None = None,
+    totp_filter: str | None = None,
 ) -> dict:
     normalized_format = db._normalize_account_line_format(format_name)
     scope = str(scope or "selected").strip().lower()
@@ -57,20 +60,24 @@ def prepare_export(
                 continue
             rows.append(row)
     else:
-        rows = db.list_accounts(
-            limit=_MAX_EXPORT_ACCOUNTS + 1,
-            archived=archived,
-            plan_filter="free_plus",
-            codex_filter=codex_filter,
-            twofa_filter=twofa_filter,
-            q=q,
-            date_from=date_from,
-            date_to=date_to,
-            account_locale_filter=account_locale_filter,
-            email_source_filter=email_source_filter,
-            email_domain_filter=email_domain_filter,
-            free_plus_export_filter="unexported",
-        )
+        list_kwargs = {
+            "limit": _MAX_EXPORT_ACCOUNTS + 1,
+            "archived": archived,
+            "plan_filter": str(plan_filter or "free_plus").strip().lower() or "free_plus",
+            "codex_filter": codex_filter,
+            "twofa_filter": twofa_filter,
+            "totp_filter": totp_filter,
+            "q": q,
+            "date_from": date_from,
+            "date_to": date_to,
+            "account_locale_filter": account_locale_filter,
+            "email_source_filter": email_source_filter,
+            "email_domain_filter": email_domain_filter,
+            "free_plus_export_filter": "unexported",
+        }
+        if str(registration_driver_filter or "").strip():
+            list_kwargs["registration_driver_filter"] = registration_driver_filter
+        rows = db.list_accounts(**list_kwargs)
         if len(rows) > _MAX_EXPORT_ACCOUNTS:
             raise ValueError(f"筛选结果超过 {_MAX_EXPORT_ACCOUNTS} 个，请缩小范围后再导出")
 

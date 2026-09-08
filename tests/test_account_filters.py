@@ -94,6 +94,41 @@ class AccountFilterTests(unittest.TestCase):
         self.assertEqual({row["email"] for row in gmail_rows}, {"first@Gmail.com", "second@gmail.com"})
         self.assertEqual([row["email"] for row in unknown_rows], ["without-domain"])
 
+    def test_registration_driver_filter_supports_aliases_and_unknown_accounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with self._db_context(root):
+                db.insert_account(
+                    email="roxy@example.com",
+                    access_token="token",
+                    extra={"registration_driver": "roxybrowser"},
+                )
+                db.insert_account(
+                    email="cloak@example.com",
+                    access_token="token",
+                    extra={"registration_driver": "cloak"},
+                )
+                db.insert_account(email="legacy@example.com", access_token="token")
+                db.insert_account(
+                    email="unknown@example.com",
+                    access_token="token",
+                    extra={"registration_driver": "unknown"},
+                )
+
+                roxy_rows = db.list_accounts(registration_driver_filter="roxy")
+                cloak_rows = db.list_accounts_page(limit=20, registration_driver_filter="cloak")
+                unknown_rows = db.list_account_plan_check_statuses(
+                    limit=20,
+                    registration_driver_filter="unknown",
+                )
+
+        self.assertEqual([row["email"] for row in roxy_rows], ["roxy@example.com"])
+        self.assertEqual([row["email"] for row in cloak_rows["items"]], ["cloak@example.com"])
+        self.assertEqual(
+            [row["email"] for row in unknown_rows["items"]],
+            ["unknown@example.com", "legacy@example.com"],
+        )
+
     def test_plan_filter_supports_unknown_plan_without_matching_free_plus(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -158,13 +193,14 @@ class AccountFilterTests(unittest.TestCase):
         client = create_app(auth_code="test-auth").test_client()
 
         response = client.get(
-            "/api/accounts?paged=1&page=1&page_size=50&email_source=paymesh&email_domain=gmail.com&plan=pro&twofa_status=failed",
+            "/api/accounts?paged=1&page=1&page_size=50&email_source=paymesh&email_domain=gmail.com&registration_driver=cloak&plan=pro&twofa_status=failed",
             headers={"X-Auth-Code": "test-auth"},
         )
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(list_accounts_page.call_args.kwargs["email_source_filter"], "paymesh")
         self.assertEqual(list_accounts_page.call_args.kwargs["email_domain_filter"], "gmail.com")
+        self.assertEqual(list_accounts_page.call_args.kwargs["registration_driver_filter"], "cloak")
         self.assertEqual(list_accounts_page.call_args.kwargs["plan_filter"], "pro")
         self.assertEqual(list_accounts_page.call_args.kwargs["twofa_filter"], "failed")
 
@@ -190,7 +226,8 @@ class AccountFilterTests(unittest.TestCase):
         response = client.get(
             "/api/accounts/filtered-ids?archived=0&plan=free&codex_status=failed"
             "&email_source=paymesh&email_domain=gmail.com&account_locale=jp"
-            "&free_plus_export=unexported&twofa_status=failed&q=alpha"
+            "&registration_driver=roxy"
+            "&free_plus_export=unexported&twofa_status=failed&totp_status=enabled&q=alpha"
             "&date_from=2026-08-01&date_to=2026-08-27",
             headers={"X-Auth-Code": "test-auth"},
         )
@@ -209,7 +246,9 @@ class AccountFilterTests(unittest.TestCase):
             "account_locale_filter": "jp",
             "email_source_filter": "paymesh",
             "email_domain_filter": "gmail.com",
+            "registration_driver_filter": "roxy",
             "twofa_filter": "failed",
+            "totp_filter": "enabled",
         })
 
     @patch("webui.app.db.list_accounts")
@@ -249,6 +288,19 @@ class AccountFilterTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(list_statuses.call_args.kwargs["email_source_filter"], "gmail_api_url")
         self.assertEqual(list_statuses.call_args.kwargs["twofa_filter"], "failed")
+
+    @patch("webui.app.db.list_account_plan_check_statuses")
+    def test_plan_status_api_passes_registration_driver_filter(self, list_statuses):
+        list_statuses.return_value = {"items": [], "total": 0, "offset": 0, "limit": 50, "revision": "0"}
+        client = create_app(auth_code="test-auth").test_client()
+
+        response = client.get(
+            "/api/accounts/plan-check-status?page=1&page_size=50&registration_driver=roxy",
+            headers={"X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list_statuses.call_args.kwargs["registration_driver_filter"], "roxy")
 
     @patch("webui.app.db.list_account_plan_check_statuses")
     def test_plan_status_api_passes_totp_filter(self, list_statuses):
@@ -295,12 +347,26 @@ class AccountFilterTests(unittest.TestCase):
                 scope="all_filtered",
                 email_source_filter="paymesh",
                 email_domain_filter="gmail.com",
+                registration_driver_filter="cloak",
                 twofa_filter="failed",
             )
 
         self.assertEqual(list_accounts.call_args.kwargs["email_source_filter"], "paymesh")
         self.assertEqual(list_accounts.call_args.kwargs["email_domain_filter"], "gmail.com")
+        self.assertEqual(list_accounts.call_args.kwargs["registration_driver_filter"], "cloak")
         self.assertEqual(list_accounts.call_args.kwargs["twofa_filter"], "failed")
+
+    @patch("core.free_plus_export.db.list_accounts")
+    def test_free_plus_export_uses_selected_plan_filter(self, list_accounts):
+        list_accounts.return_value = []
+
+        with self.assertRaises(ValueError):
+            free_plus_export.prepare_export(
+                scope="all_filtered",
+                plan_filter="plus",
+            )
+
+        self.assertEqual(list_accounts.call_args.kwargs["plan_filter"], "plus")
 
     @patch("webui.app.db.mark_accounts_free_plus_exported", return_value=([{"id": 7}], []))
     @patch("webui.app.free_plus_export.prepare_export")
@@ -331,6 +397,8 @@ class AccountFilterTests(unittest.TestCase):
                 "account_locale": "jp",
                 "email_source": "paymesh",
                 "email_domain": "gmail.com",
+                "registration_driver": "cloak",
+                "totp_status": "enabled",
                 "twofa_status": "failed",
             },
             headers={"X-Auth-Code": "test-auth"},
@@ -349,7 +417,10 @@ class AccountFilterTests(unittest.TestCase):
             "account_locale_filter": "jp",
             "email_source_filter": "paymesh",
             "email_domain_filter": "gmail.com",
+            "registration_driver_filter": "cloak",
+            "plan_filter": "free_plus",
             "twofa_filter": "failed",
+            "totp_filter": "enabled",
         })
 
     def test_account_template_exposes_source_and_plan_filters(self):
@@ -357,17 +428,26 @@ class AccountFilterTests(unittest.TestCase):
 
         self.assertIn('id="accountSourceFilterV2"', template)
         self.assertIn('id="accountDomainFilterV2"', template)
+        self.assertIn('id="accountRegistrationDriverFilterV2"', template)
+        self.assertIn('value="cloak"', template)
         self.assertIn('value="gmail_api_url"', template)
         self.assertIn('value="paymesh"', template)
         self.assertIn('id="accountPlanFilterV2"', template)
         self.assertIn('value="free_plus"', template)
         self.assertIn('value="unknown"', template)
         self.assertIn('id="accountTwofaFilterV2"', template)
+        self.assertIn('id="totpStatusFilterV2"', template)
         self.assertIn('value="failed"', template)
-        self.assertIn("twofa_status=", template)
         self.assertIn('id="accountBulkScopeV2"', template)
-        self.assertIn('email_source=${encodeURIComponent(emailSource)}', template)
-        self.assertIn('email_domain=${encodeURIComponent(emailDomain)}', template)
+        self.assertIn('id="btnResetAccountFiltersV2"', template)
+        self.assertIn('function getAccountFilterParams()', template)
+        self.assertIn("getAccountFilterQuery({paged: '1', page: p.page, page_size: p.size})", template)
+        self.assertIn("getAccountFilterQuery({page: p.page, page_size: p.size})", template)
+        self.assertIn('id="btnExportFreePlusV2"', template)
+        self.assertIn('const selectedScope = getAccountBulkScope();', template)
+        self.assertIn("? {scope: 'all_filtered', format: formatName, ...getAccountFilterParams()}", template)
+        self.assertNotIn('btnExportFreePlusAllV2', template)
+        self.assertNotIn('btnExportFreePlusSelectedV2', template)
 
 
 if __name__ == "__main__":

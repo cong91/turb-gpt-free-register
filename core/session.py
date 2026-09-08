@@ -89,7 +89,7 @@ class BrowserSession:
             proxy: 代理地址，如 "socks5h://user:pass@host:port"。
                    不传则从 config.PROXY_POOL 随机抽一个。
                    显式传 "" 表示禁用代理。
-            detect_exit_geo: 是否探测出口 IP 并自动选择语言/时区画像。
+            detect_exit_geo: 是否探测出口 IP 供网络身份诊断；不会改变固定 locale/timezone 画像。
                              套餐查询等短请求可关闭，避免额外网络等待。
         """
         # proxy=None  → 从池里随机抽（默认行为）
@@ -169,8 +169,7 @@ class BrowserSession:
         self.blocked_until = 0.0
         self.blocked_reason = ""
 
-        # 先用当前代理检测出口 IP 地理信息，再为本会话挑一份稳定浏览器画像。
-        # 这样 Accept-Language / navigator.language / timezone 可自动跟随出口地区。
+        # 先记录当前代理出口的地理信息供诊断；浏览器 locale/timezone 仍来自固定 profile。
         self.exit_geo = self._detect_exit_geo() if detect_exit_geo else {}
         self._enforce_proxy_quality()
         if browser_profile:
@@ -182,7 +181,7 @@ class BrowserSession:
         self.browser_profile["react_resources_key"] = self.react_resources_key
         issues = validate_browser_profile(self.browser_profile)
         if issues:
-            logger.warning("[指纹] 浏览器画像存在不一致: %s", "; ".join(issues))
+            raise ValueError(f"[指纹] 浏览器画像与运行时 target 不一致: {'; '.join(issues)}")
 
         # 让 HTTP Cookie、OAuth 参数 ext-oai-did、Sentinel 里的 id 三者一致。
         # 浏览器里 oai-did 通常会作为一方 Cookie 存在；协议层主动补齐可减少同一会话内
@@ -327,7 +326,7 @@ class BrowserSession:
         return self._cookie_header_for_domain("chatgpt.com") or f"oai-did={self.device_id}"
 
     def _detect_exit_geo(self) -> dict:
-        """通过当前代理检测出口 IP 地理信息；失败返回空 dict 并回退到默认地区画像。"""
+        """通过当前代理检测出口 IP 地理信息供诊断；失败返回空 dict。"""
         try:
             from config import browser as _browser_cfg
             if not getattr(_browser_cfg, "AUTO_BROWSER_LOCALE_FROM_IP", True):

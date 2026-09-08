@@ -391,6 +391,7 @@ class ForcePasswordFlowTests(unittest.TestCase):
         # Must always call _fill_password_page_if_present, even when next_state == "otp"
         fill_pwd.assert_called_once()
         self.assertEqual(fill_pwd.call_args.args[1], "user@example.com")
+        self.assertEqual(_save.call_args.kwargs["extra"]["registration_driver"], "roxy")
 
     @patch("core.roxy_registration._click_continue_with_password_link", return_value=True)
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", False)

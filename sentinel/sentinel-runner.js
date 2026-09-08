@@ -932,7 +932,7 @@ function createBrowserContext(options) {
     hardwareConcurrency: options.hardwareConcurrency,
     ...(isSafari ? {} : { deviceMemory: options.deviceMemory }),
     maxTouchPoints: 0,
-    platform: options.navigatorPlatform || "MacIntel",
+    platform: options.navigatorPlatform || "Win32",
     vendor: options.navigatorVendor || (isSafari ? "Apple Computer, Inc." : "Google Inc."),
     webdriver: false,
     bluetooth: { toString: () => "[object Bluetooth]" },
@@ -953,18 +953,19 @@ function createBrowserContext(options) {
       login: { toString: () => "[object NavigatorLogin]" },
       userAgentData: {
         mobile: false,
-        platform: options.userAgentDataPlatform || options.secChUaPlatform || "macOS",
+        platform: options.userAgentDataPlatform || options.secChUaPlatform || "Windows",
         brands: parseSecChBrands(options.secChUa, options.chromeMajor),
         getHighEntropyValues: async (hints = []) => {
           const values = {
-            architecture: options.secChUaArch || "arm",
+            architecture: options.secChUaArch || "x86",
             bitness: options.secChUaBitness || "64",
             mobile: false,
             model: options.secChUaModel || "",
-            platform: options.userAgentDataPlatform || options.secChUaPlatform || "macOS",
-            platformVersion: options.secChUaPlatformVersion || "15.7.0",
+            platform: options.userAgentDataPlatform || options.secChUaPlatform || "Windows",
+            platformVersion: options.secChUaPlatformVersion || "19.0.0",
             uaFullVersion: options.chromeFullVersion || "",
             fullVersionList: parseSecChBrands(options.secChUaFullVersionList, options.chromeFullVersion || options.chromeMajor),
+            wow64: false,
           };
           if (!Array.isArray(hints) || hints.length === 0) return values;
           const picked = {};
@@ -1319,13 +1320,13 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
         args["user-agent"],
         cfg("userAgent", "user_agent"),
         process.env.SENTINEL_USER_AGENT,
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
       ),
     contentType,
     browserFamily: pick(args["browser-family"], cfg("browserFamily", "browser_family"), process.env.SENTINEL_BROWSER_FAMILY, "chrome"),
-    navigatorPlatform: pick(args["navigator-platform"], cfg("navigatorPlatform", "navigator_platform"), process.env.SENTINEL_NAVIGATOR_PLATFORM, "MacIntel"),
+    navigatorPlatform: pick(args["navigator-platform"], cfg("navigatorPlatform", "navigator_platform"), process.env.SENTINEL_NAVIGATOR_PLATFORM, "Win32"),
     navigatorVendor: pick(args["navigator-vendor"], cfg("navigatorVendor", "navigator_vendor"), process.env.SENTINEL_NAVIGATOR_VENDOR, "Google Inc."),
-    userAgentDataPlatform: pick(args["user-agent-data-platform"], cfg("userAgentDataPlatform", "user_agent_data_platform"), process.env.SENTINEL_UA_DATA_PLATFORM, "macOS"),
+    userAgentDataPlatform: pick(args["user-agent-data-platform"], cfg("userAgentDataPlatform", "user_agent_data_platform"), process.env.SENTINEL_UA_DATA_PLATFORM, "Windows"),
     requestIdleCallback: truthy(pick(args["request-idle-callback"], cfg("requestIdleCallback", "request_idle_callback"), process.env.SENTINEL_REQUEST_IDLE_CALLBACK, "0")),
     language: pick(args.language, cfg("language"), process.env.SENTINEL_LANGUAGE, "ja-JP"),
     languages: normalizeList(pick(args.languages, cfg("languages")), process.env.SENTINEL_LANGUAGES || "ja-JP"),
@@ -1340,13 +1341,13 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
         : Number.NaN,
     deviceMemory: Number(pick(args["device-memory"], cfg("deviceMemory", "device_memory"), process.env.SENTINEL_DEVICE_MEMORY, 8)),
     devicePixelRatio: Number(pick(args["device-pixel-ratio"], cfg("devicePixelRatio", "device_pixel_ratio"), process.env.SENTINEL_DEVICE_PIXEL_RATIO, 2)),
-    chromeMajor: pick(args["chrome-major"], cfg("chromeMajor", "chrome_major"), process.env.SENTINEL_CHROME_MAJOR, "149"),
-    chromeFullVersion: pick(args["chrome-full-version"], cfg("chromeFullVersion", "chrome_full_version"), process.env.SENTINEL_CHROME_FULL_VERSION, "149.0.0.0"),
-    secChUa: pick(args["sec-ch-ua"], cfg("secChUa", "sec_ch_ua"), process.env.SENTINEL_SEC_CH_UA, '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'),
-    secChUaPlatform: String(pick(args["sec-ch-ua-platform"], cfg("secChUaPlatform", "sec_ch_ua_platform"), process.env.SENTINEL_SEC_CH_UA_PLATFORM, "macOS")).replace(/^"|"$/g, ""),
+    chromeMajor: pick(args["chrome-major"], cfg("chromeMajor", "chrome_major"), process.env.SENTINEL_CHROME_MAJOR, "146"),
+    chromeFullVersion: pick(args["chrome-full-version"], cfg("chromeFullVersion", "chrome_full_version"), process.env.SENTINEL_CHROME_FULL_VERSION, "146.0.7680.177"),
+    secChUa: pick(args["sec-ch-ua"], cfg("secChUa", "sec_ch_ua"), process.env.SENTINEL_SEC_CH_UA, '"Google Chrome";v="146", "Chromium";v="146", "Not-A.Brand";v="24"'),
+    secChUaPlatform: String(pick(args["sec-ch-ua-platform"], cfg("secChUaPlatform", "sec_ch_ua_platform"), process.env.SENTINEL_SEC_CH_UA_PLATFORM, "Windows")).replace(/^"|"$/g, ""),
     secChUaFullVersionList: pick(args["sec-ch-ua-full-version-list"], cfg("secChUaFullVersionList", "sec_ch_ua_full_version_list"), process.env.SENTINEL_SEC_CH_UA_FULL_VERSION_LIST, ""),
-    secChUaPlatformVersion: String(pick(args["sec-ch-ua-platform-version"], cfg("secChUaPlatformVersion", "sec_ch_ua_platform_version"), process.env.SENTINEL_SEC_CH_UA_PLATFORM_VERSION, "15.7.0")).replace(/^"|"$/g, ""),
-    secChUaArch: String(pick(args["sec-ch-ua-arch"], cfg("secChUaArch", "sec_ch_ua_arch"), process.env.SENTINEL_SEC_CH_UA_ARCH, "arm")).replace(/^"|"$/g, ""),
+    secChUaPlatformVersion: String(pick(args["sec-ch-ua-platform-version"], cfg("secChUaPlatformVersion", "sec_ch_ua_platform_version"), process.env.SENTINEL_SEC_CH_UA_PLATFORM_VERSION, "19.0.0")).replace(/^"|"$/g, ""),
+    secChUaArch: String(pick(args["sec-ch-ua-arch"], cfg("secChUaArch", "sec_ch_ua_arch"), process.env.SENTINEL_SEC_CH_UA_ARCH, "x86")).replace(/^"|"$/g, ""),
     secChUaBitness: String(pick(args["sec-ch-ua-bitness"], cfg("secChUaBitness", "sec_ch_ua_bitness"), process.env.SENTINEL_SEC_CH_UA_BITNESS, "64")).replace(/^"|"$/g, ""),
     secChUaModel: String(pick(args["sec-ch-ua-model"], cfg("secChUaModel", "sec_ch_ua_model"), process.env.SENTINEL_SEC_CH_UA_MODEL, "")).replace(/^"|"$/g, ""),
     cfEdgeMsec: Number(pick(args["cf-edge-msec"], cfg("cfEdgeMsec", "cf_edge_msec"), process.env.SENTINEL_CF_EDGE_MSEC, 38)),
@@ -1354,15 +1355,15 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
     cfTcpRttMsec: Number(pick(args["cf-tcp-rtt-msec"], cfg("cfTcpRttMsec", "cf_tcp_rtt_msec"), process.env.SENTINEL_CF_TCP_RTT_MSEC, 22)),
     cfQuicRttMsec: Number(pick(args["cf-quic-rtt-msec"], cfg("cfQuicRttMsec", "cf_quic_rtt_msec"), process.env.SENTINEL_CF_QUIC_RTT_MSEC, 0)),
     screen: (() => {
-      const width = Number(pick(args.width, cfg("width", "screenWidth"), process.env.SENTINEL_SCREEN_WIDTH, 1680));
-      const height = Number(pick(args.height, cfg("height", "screenHeight"), process.env.SENTINEL_SCREEN_HEIGHT, 1050));
+      const width = Number(pick(args.width, cfg("width", "screenWidth"), process.env.SENTINEL_SCREEN_WIDTH, 1920));
+      const height = Number(pick(args.height, cfg("height", "screenHeight"), process.env.SENTINEL_SCREEN_HEIGHT, 1080));
       return {
         width,
         height,
         availWidth: width,
-        availHeight: Math.max(0, height - 38),
-        colorDepth: 30,
-        pixelDepth: 30,
+        availHeight: Math.max(0, height - 48),
+        colorDepth: 24,
+        pixelDepth: 24,
         orientation: { type: "landscape-primary", angle: 0 },
       };
     })(),

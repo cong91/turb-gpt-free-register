@@ -932,15 +932,6 @@ def run_parallel_batch(
     batch_dir=None,
 ) -> list[dict]:
     """使用线程池并发执行批量注册。"""
-    from config import proxy as proxy_config
-
-    if (
-        bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False))
-        and bool(getattr(proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False))
-    ):
-        logger.info("[批量] Proxy.vn one-account-per-IP 已启用，改用串行注册以保证一号一 IP")
-        return run_serial_batch(count, delay, continue_on_fail, batch_dir)
-
     logger.info(f"[批量] 启用多线程注册：目标 {count}，并发 {workers}")
     from core.rotating_proxy_runtime import (
         REGISTRATION_PROXY_SCOPE,

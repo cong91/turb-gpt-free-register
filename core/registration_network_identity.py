@@ -163,6 +163,7 @@ def probe_socks_public_ip(
     import time
 
     from curl_cffi import requests
+    from config.browser import IMPERSONATE
 
     errors: list[str] = []
     for endpoint in endpoints:
@@ -172,7 +173,7 @@ def probe_socks_public_ip(
                     endpoint,
                     proxies={"http": proxy_url, "https": proxy_url},
                     timeout=timeout,
-                    impersonate="chrome",
+                    impersonate=IMPERSONATE,
                 )
                 response.raise_for_status()
                 try:

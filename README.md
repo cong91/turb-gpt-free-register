@@ -4,7 +4,7 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 
 - **protocol**：原纯协议注册，基于 `curl_cffi` + Sentinel/PoW。
 - **roxy**：RoxyBrowser 指纹浏览器 + Selenium 自动化注册，兼容新版页面流，例如 `create-account/password`、`about-you` 年龄/生日表单、地区本地化页面等。
-- **cloak**：CloakBrowser + Playwright 适配层自动化注册，支持免费 binary、无头模式、humanize、固定 fingerprint seed、代理 geoip。
+  - **cloak**：CloakBrowser + Playwright 适配层自动化注册，支持免费 binary、无头模式、humanize、固定 fingerprint seed，以及仅用于 WebRTC 出口绑定的代理 GeoIP。
 - **browser_use**：Browser Use Cloud stealth Chromium + Playwright（可选住宅代理，无需本机安装 Roxy）。
 - **skyvern**：Skyvern Browser Sessions 云端浏览器 + Playwright CDP。
 
@@ -35,7 +35,7 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
   - `REGISTRATION_DRIVER = "skyvern"`
 - 支持 RoxyBrowser 一号一环境：自动创建、打开、关闭、删除 Roxy Profile。
 - 支持 Roxy 无头启动：`ROXY_OPEN_HEADLESS=True`。
-- 支持 CloakBrowser：免费 binary、无头模式、humanize、固定 fingerprint seed、按出口 IP 自动匹配语言/时区/WebRTC。
+- 支持 CloakBrowser：免费 binary、无头模式、humanize、固定 fingerprint seed、固定 locale/timezone。
 - Roxy / Cloak / Browser Use / Skyvern 浏览器注册统一强制使用 OpenAI 注册密码：
   - 即使填邮箱后直接进入邮箱验证码页，也会先切换到 `create-account/password` 设置密码；
   - 无法进入或填写密码页时直接失败，不降级为 OTP-only；
@@ -545,9 +545,9 @@ CloakBrowser 专用配置在 `config/cloakbrowser.py`：
 ```python
 CLOAK_HEADLESS = False          # True=无头；False=显示窗口
 CLOAK_HUMANIZE = True           # 人工鼠标/键盘/滚动行为
-CLOAK_GEOIP = True              # 按当前出口 IP 自动匹配语言/时区/WebRTC
-CLOAK_LOCALE = ""               # 留空自动；也可强制如 ja-JP / en-US
-CLOAK_TIMEZONE = ""             # 留空自动；也可强制如 Asia/Tokyo
+CLOAK_GEOIP = True              # 仅绑定当前出口 IP 的 WebRTC；locale/timezone 仍固定
+CLOAK_LOCALE = ""               # 留空使用 BROWSER_LOCALE_PROFILE；也可强制如 ja-JP / en-US
+CLOAK_TIMEZONE = ""             # 留空使用 BROWSER_LOCALE_PROFILE；也可强制如 Asia/Tokyo
 CLOAK_LICENSE_KEY = ""          # 留空使用免费 binary；填 Pro key 使用最新版
 CLOAK_FINGERPRINT_SEED = ""     # 留空每次随机；固定值=固定指纹
 CLOAK_USER_DATA_DIR = ""        # 留空临时环境；填路径可持久化 profile
@@ -555,8 +555,8 @@ CLOAK_USER_DATA_DIR = ""        # 留空临时环境；填路径可持久化 pro
 
 说明：
 
-- `CLOAK_GEOIP=True` 会按当前出口 IP 自动生成 `locale / timezone / Accept-Language`，并传给 CloakBrowser 与 Playwright context。
-- 如果你通过项目代理池使用代理，请在 `config/proxy.py` 的 `PROXY_POOL` 填写代理；如果你使用系统代理/VPN，也会按当前实际出口 IP 自动定位。
+- locale/timezone 由 `BROWSER_LOCALE_PROFILE` 固定生成，并传给 CloakBrowser 与 Playwright context；IP 变化不会改变浏览器画像。`CLOAK_GEOIP=True` 只用于 WebRTC 出口 IP 绑定。
+- 如果你通过项目代理池或 WireGuard 使用代理，请配置对应 route；出口 IP 只用于网络身份检查，不会改变 locale/timezone。
 - 免费版没有在项目侧限制窗口数；本项目每个注册任务会启动一个 CloakBrowser 实例，即一个实例一套指纹。
 - WebUI 中，`Codex授权驱动` 位于「CPA / Codex」分组，对应 `config/codex.py` 的 `CODEX_OAUTH_DRIVER`。
 

@@ -114,6 +114,34 @@ class CodexSub2FreeLoginTests(unittest.TestCase):
         self.assertEqual(response.get_json()["skipped_retrying"], 0)
         active_retrying.assert_called_once_with()
 
+    @patch("webui.codex_sub2_api.db.list_account_plan_check_statuses")
+    @patch("webui.codex_sub2_api.db.list_codex_accounts", return_value=[])
+    @patch("webui.codex_sub2_api.codex_retry_service.active_retrying_emails", return_value=set())
+    @patch("webui.codex_sub2_api._codex_cfg.CODEX_AUTH_URL_SOURCE", "sub2")
+    def test_targets_api_uses_current_account_filter_contract(
+        self,
+        _active_retrying,
+        _list_codex_accounts,
+        list_statuses,
+    ):
+        list_statuses.return_value = {"items": [self._eligible(7)], "total": 1}
+
+        response = self.client.get(
+            "/api/codex/sub2-free-no-trial-targets?archived=0&email_source=paymesh"
+            "&registration_driver=cloak&twofa_status=failed&totp_status=enabled",
+            headers=self.headers,
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(list_statuses.call_args.kwargs, {
+            "limit": 5001,
+            "archived": "0",
+            "email_source_filter": "paymesh",
+            "registration_driver_filter": "cloak",
+            "twofa_filter": "failed",
+            "totp_filter": "enabled",
+        })
+
     @patch("webui.codex_sub2_api._codex_cfg.CODEX_AUTH_URL_SOURCE", "cpa")
     def test_targets_api_rejects_non_sub2_oauth_source(self):
         response = self.client.get(

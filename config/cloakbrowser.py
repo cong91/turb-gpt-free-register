@@ -7,10 +7,11 @@ CLOAK_HEADLESS: bool = True
 # 是否启用 CloakBrowser humanize 行为。
 CLOAK_HUMANIZE: bool = True
 
-# 使用当前出口 IP 自动匹配时区/语言/WebRTC IP。
+# GeoIP 仅用于根据当前出口 IP 锁定 WebRTC；显式 locale/timezone 不随 IP 变化。
+# AUTO_BROWSER_LOCALE_FROM_IP=False 负责关闭项目侧的 locale/timezone 选择。
 CLOAK_GEOIP: bool = True
 
-# 显式指定 Cloak 语言/时区；留空则在 CLOAK_GEOIP=True 时按出口 IP 自动推断。
+# 显式指定 Cloak 语言/时区；留空则使用 BROWSER_LOCALE_PROFILE 的固定画像。
 # 例如：CLOAK_LOCALE="ja-JP"，CLOAK_TIMEZONE="Asia/Tokyo"。
 CLOAK_LOCALE: str = ""
 CLOAK_TIMEZONE: str = ""
