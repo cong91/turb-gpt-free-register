@@ -392,6 +392,7 @@ class ForcePasswordFlowTests(unittest.TestCase):
         fill_pwd.assert_called_once()
         self.assertEqual(fill_pwd.call_args.args[1], "user@example.com")
         self.assertEqual(_save.call_args.kwargs["extra"]["registration_driver"], "roxy")
+        self.assertFalse(_save.call_args.kwargs["auto_plan_check"])
 
     @patch("core.roxy_registration._click_continue_with_password_link", return_value=True)
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", False)

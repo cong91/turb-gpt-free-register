@@ -7,6 +7,80 @@ from core import roxy_registration
 
 
 class RoxyRegistrationRetryTests(unittest.TestCase):
+    def _run_successful_roxy_registration(self, *, browser_geo, browser_ip=None):
+        email = "user@example.com"
+        driver = Mock()
+        opened = SimpleNamespace(profile_id="profile-geo", raw={})
+        client = Mock()
+        client.open_profile.return_value = opened
+        checkpoint = Mock(return_value=7)
+        save = Mock(return_value=7)
+
+        with ExitStack() as stack:
+            for target in (
+                "core.roxy_registration._center_browser_window",
+                "core.roxy_registration._safe_get",
+                "core.roxy_registration._page_warmup",
+                "core.roxy_registration._maybe_accept",
+                "core.roxy_registration._check_manual_stop",
+                "core.roxy_registration._complete_email_otp",
+                "core.roxy_registration.human_delay",
+                "core.roxy_registration.post_register_dwell",
+            ):
+                stack.enter_context(patch(target))
+            stack.enter_context(patch("core.roxy_registration.RoxyBrowserClient", return_value=client))
+            stack.enter_context(patch("core.roxy_registration._build_driver", return_value=driver))
+            stack.enter_context(patch("core.roxy_registration.SeleniumTrafficTracker", side_effect=RuntimeError("disabled")))
+            stack.enter_context(patch("core.registration_network_identity.probe_browser_geo", return_value=browser_geo))
+            if browser_ip is not None:
+                stack.enter_context(patch("core.registration_network_identity.probe_browser_public_ip", return_value=browser_ip))
+            stack.enter_context(patch("core.roxy_registration._submit_email_and_wait_next", return_value="password"))
+            stack.enter_context(patch("core.roxy_registration._fill_password_page_if_present", return_value="openai-password"))
+            stack.enter_context(patch("core.roxy_registration._complete_profile_page", return_value=True))
+            stack.enter_context(
+                patch(
+                    "core.roxy_registration._fetch_chatgpt_session",
+                    return_value={"accessToken": "access-token", "user": {}, "account": {}, "expires": None},
+                )
+            )
+            stack.enter_context(patch("core.roxy_registration.resolve_email_source", return_value="paymesh"))
+            stack.enter_context(patch("core.roxy_registration.checkpoint_account_data", checkpoint))
+            stack.enter_context(patch("core.roxy_registration.save_account_data", save))
+            stack.enter_context(patch("config.twofa.ENABLE_2FA", False))
+            stack.enter_context(patch("config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", False))
+            stack.enter_context(patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False))
+            stack.enter_context(patch("config.codex.ENABLE_CODEX_AUTO", False))
+            stack.enter_context(patch("config.roxybrowser.ROXY_KEEP_BROWSER_OPEN", True))
+
+            result = roxy_registration.run_roxy_registration(
+                email=email,
+                name="Test User",
+                birthday="1990-01-01",
+                proxy="socks5://127.0.0.1:25000",
+            )
+
+        return result, checkpoint, save
+
+    def test_roxy_registration_persists_browser_ip_and_geo_locale(self):
+        browser_geo = {"ip": "203.0.113.10", "country": "VN", "timezone": "Asia/Ho_Chi_Minh"}
+        result, checkpoint, save = self._run_successful_roxy_registration(browser_geo=browser_geo)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(checkpoint.call_args.kwargs["registration_ip"], "203.0.113.10")
+        self.assertEqual(checkpoint.call_args.kwargs["extra"]["network_identity"]["browser_geo"], browser_geo)
+        self.assertEqual(save.call_args.kwargs["registration_ip"], "203.0.113.10")
+        self.assertEqual(save.call_args.kwargs["extra"]["network_identity"]["browser_geo"], browser_geo)
+
+    def test_roxy_registration_falls_back_to_direct_browser_ip_probe(self):
+        result, checkpoint, save = self._run_successful_roxy_registration(
+            browser_geo={},
+            browser_ip="198.51.100.7",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(checkpoint.call_args.kwargs["registration_ip"], "198.51.100.7")
+        self.assertEqual(save.call_args.kwargs["registration_ip"], "198.51.100.7")
+
     def test_free_without_plus_trial_runs_codex_oauth_in_current_profile(self):
         email = "user@example.com"
         driver = Mock()

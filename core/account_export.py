@@ -1084,35 +1084,10 @@ def save_account_data(
     )
     logger.info("[Save] 账号及凭证已保存到 SQLite, id=%s, email=%s", row_id, email)
 
-    auto_twofa = False
-    try:
-        from config import twofa as _twofa_cfg
-
-        auto_twofa = bool(getattr(_twofa_cfg, "ENABLE_2FA", False))
-    except Exception:  # noqa: BLE001
-        auto_twofa = False
-    if auto_twofa and not str(totp_secret or "").strip():
-        try:
-            from core.twofa_service import enqueue_account_totp_setup
-
-            queued = enqueue_account_totp_setup(
-                account_id=row_id,
-                email=email,
-                access_token=access_token,
-                trigger="registration_auto",
-                proxy=proxy_used,
-            )
-            if queued.get("accepted"):
-                logger.info(f"[2FA] 注册后自动开启 2FA 已入队: id={row_id}, email={email}")
-            elif queued.get("busy"):
-                logger.info(f"[2FA] 账号已有 2FA 任务，注册流程不重复入队: id={row_id}, email={email}")
-            else:
-                logger.warning(f"[2FA] 注册后自动开启 2FA 入队失败（不影响注册结果）: {email}, {queued.get('error')}")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                f"[2FA] 注册后自动开启 2FA 入队异常（不影响注册结果）: "
-                f"{email}, {type(exc).__name__}: {str(exc)[:180]}"
-            )
+    # 2FA setup must run inside the browser session that authenticated the
+    # account.  Failed setup remains retryable from the account list; a
+    # bearer-token-only background worker cannot establish the required
+    # ChatGPT session cookie.
 
     if auto_plan_check is None:
         try:

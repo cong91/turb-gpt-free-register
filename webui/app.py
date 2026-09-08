@@ -881,127 +881,21 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.post("/api/accounts/<int:acc_id>/totp-setup")
     def api_account_totp_setup(acc_id: int):
-        """为单个账号开启 2FA/TOTP，成功后自动把 secret 写回账号记录。"""
-        acc = db.get_account(acc_id)
-        if not acc:
-            return jsonify({"ok": False, "error": "账号不存在"}), 404
-        token = str(acc.get("access_token") or "").strip()
-        if not token:
-            return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
-        if bool(acc.get("totp_secret")):
-            return jsonify({"ok": False, "error": "该账号已经开启 2FA"}), 400
-
+        """兼容旧入口，但强制通过浏览器重新登录完成 2FA。"""
+        data = request.get_json(silent=True) or {}
         try:
-            from core import twofa_service
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"ok": False, "error": f"2FA 服务加载失败：{type(exc).__name__}: {exc}"}), 503
-
-        queued = twofa_service.enqueue_account_totp_setup(
-            account_id=acc_id,
-            email=str(acc.get("email") or ""),
-            access_token=token,
-            trigger="manual",
-            proxy=str(acc.get("proxy_used") or "") or None,
-        )
-        queued_payload = {k: v for k, v in queued.items() if k != "future"}
-        if queued.get("busy"):
-            return jsonify({"ok": False, **queued_payload}), 409
-        if not queued.get("accepted"):
-            return jsonify({"ok": False, **queued_payload}), 503
-        return jsonify({"ok": True, "started": True, **queued_payload}), 202
+            workers = max(1, min(16, int(data.get("workers", svc.get_executor_workers()))))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "workers 非法"}), 400
+        result = svc.retry_account_twofa(acc_id, workers=workers)
+        if not result.get("ok"):
+            return jsonify(result), int(result.get("status") or 400)
+        return jsonify(result)
 
     @app.post("/api/accounts/totp-setup-bulk")
     def api_accounts_totp_setup_bulk():
-        """批量把账号 2FA/TOTP 设置任务加入后台队列。Body {account_ids:[...]}。"""
-        data = request.get_json(silent=True) or {}
-        ids = data.get("account_ids") or data.get("ids") or []
-        if not isinstance(ids, list) or not ids:
-            return jsonify({"ok": False, "error": "account_ids 必须是非空数组"}), 400
-        if len(ids) > 500:
-            return jsonify({"ok": False, "error": "单次最多提交 500 个账号"}), 400
-
-        account_ids = []
-        skipped = []
-        seen = set()
-        for raw in ids:
-            try:
-                acc_id = int(raw)
-            except (TypeError, ValueError):
-                skipped.append({"id": raw, "reason": "ID 非法"})
-                continue
-            if acc_id in seen:
-                continue
-            seen.add(acc_id)
-            account_ids.append(acc_id)
-
-        accounts = []
-        for acc_id in account_ids:
-            acc = db.get_account(acc_id)
-            if not acc:
-                skipped.append({"id": acc_id, "reason": "账号不存在"})
-                continue
-            email = str(acc.get("email") or "").strip()
-            token = str(acc.get("access_token") or "").strip()
-            if not token:
-                skipped.append({"id": acc_id, "email": email, "reason": "缺少 access_token"})
-                continue
-            if str(acc.get("totp_secret") or "").strip():
-                skipped.append({"id": acc_id, "email": email, "reason": "该账号已经开启 2FA"})
-                continue
-            if not email:
-                skipped.append({"id": acc_id, "reason": "邮箱为空"})
-                continue
-            accounts.append(acc)
-
-        try:
-            from core import twofa_service
-        except Exception as exc:  # noqa: BLE001
-            return jsonify({"ok": False, "error": f"2FA 服务加载失败：{type(exc).__name__}: {exc}"}), 503
-
-        started = []
-        busy = []
-        failed = []
-        for acc in accounts:
-            acc_id = int(acc.get("id") or 0)
-            email = str(acc.get("email") or "").strip()
-            try:
-                queued = twofa_service.enqueue_account_totp_setup(
-                    account_id=acc_id,
-                    email=email,
-                    access_token=str(acc.get("access_token") or "").strip(),
-                    trigger="manual_bulk",
-                    proxy=str(acc.get("proxy_used") or "") or None,
-                )
-            except Exception as exc:  # noqa: BLE001
-                failed.append({
-                    "id": acc_id,
-                    "email": email,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
-                continue
-
-            public_result = {k: v for k, v in queued.items() if k != "future"}
-            item = {"id": acc_id, "email": email, **public_result}
-            if queued.get("accepted"):
-                item["status"] = "queued"
-                started.append(item)
-            elif queued.get("busy"):
-                busy.append(item)
-            else:
-                failed.append(item)
-
-        return jsonify({
-            "ok": True,
-            "message": f"已入队 {len(started)} 个 2FA 设置任务",
-            "started": started,
-            "started_count": len(started),
-            "busy": busy,
-            "busy_count": len(busy),
-            "failed": failed,
-            "failed_count": len(failed),
-            "skipped": skipped,
-            "skipped_count": len(skipped),
-        }), 202
+        """旧路径别名：统一走重新登录后补做 2FA 的流程。"""
+        return api_accounts_twofa_reactivate_bulk()
 
     @app.post("/api/accounts/note-bulk")
     def api_accounts_note_bulk():
@@ -2915,19 +2809,21 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.get("/api/accounts/totp-setup-log")
     def api_account_totp_setup_log():
-        """读取某邮箱最近一次 2FA 设置日志。?email=xxx"""
-        from core import twofa_service
+        """读取某邮箱最近一次 reactive 2FA 任务日志。?email=xxx"""
         email = (request.args.get("email") or "").strip()
         if not email:
             return jsonify({"ok": False, "error": "email 为空"}), 400
-        p = twofa_service.log_path(email)
-        data = _read_log_tail(p, max_bytes=80_000, running_fn=lambda: False)
-        try:
-            acc = db.get_account_by_email(email) or {}
-            data["running"] = bool(str(acc.get("totp_setup_status") or "") in {"queued", "running"}) or twofa_service.is_running(int(acc.get("id") or 0))
-        except Exception:  # noqa: BLE001, S110
-            pass
-        return jsonify(data)
+        job = db.get_latest_twofa_job_for_email(email)
+        if not job:
+            return jsonify({"ok": True, "log": "", "running": False})
+        status = str(job.get("status") or "").strip().lower()
+        return jsonify({
+            "ok": True,
+            "log": svc.read_job_log(int(job["id"])),
+            "running": status in {"pending", "running", "stopping"},
+            "job_id": int(job["id"]),
+            "status": status,
+        })
 
     # ----------------------------------------------------------
     # 注册任务

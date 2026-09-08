@@ -47,6 +47,40 @@ class WebuiTwofaReactivateTests(unittest.TestCase):
         self.assertTrue(response.get_json()["ok"])
         retry_account_twofa.assert_called_once_with(7, workers=2)
 
+    @patch("webui.app.svc.retry_account_twofa")
+    def test_legacy_totp_setup_route_dispatches_reauthentication(self, retry_account_twofa):
+        retry_account_twofa.return_value = {
+            "ok": True,
+            "created": True,
+            "retry_action": "2fa",
+            "message": "started",
+        }
+        client = create_app(auth_code="test-auth").test_client()
+        response = client.post(
+            "/api/accounts/7/totp-setup",
+            headers={"X-Auth-Code": "test-auth"},
+            json={"workers": 2},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["ok"])
+        retry_account_twofa.assert_called_once_with(7, workers=2)
+
+    @patch("webui.app.svc.read_job_log", return_value="reactive log")
+    @patch("webui.app.db.get_latest_twofa_job_for_email")
+    def test_totp_log_route_reads_reactive_job_log(self, get_latest_twofa_job_for_email, read_job_log):
+        get_latest_twofa_job_for_email.return_value = {"id": 12, "status": "running"}
+        client = create_app(auth_code="test-auth").test_client()
+        response = client.get(
+            "/api/accounts/totp-setup-log?email=user@example.com",
+            headers={"X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["log"], "reactive log")
+        self.assertTrue(response.get_json()["running"])
+        read_job_log.assert_called_once_with(12)
+
     @patch("webui.app.svc.retry_accounts_twofa", create=True)
     def test_bulk_reactivate_route_dispatches_account_ids_and_workers(self, retry_accounts_twofa):
         retry_accounts_twofa.return_value = {
@@ -94,6 +128,17 @@ class WebuiTwofaReactivateTests(unittest.TestCase):
         self.assertIn("const twofaStatus", html)
         self.assertIn("const twofaError", html)
         self.assertIn("Lỗi 2FA", html)
+
+    def test_account_template_removes_legacy_totp_button(self):
+        client = create_app(auth_code="test-auth").test_client()
+        response = client.get("/", headers={"X-Auth-Code": "test-auth"})
+
+        self.assertEqual(response.status_code, 200)
+        html = response.get_data(as_text=True)
+        self.assertIn('data-account-twofa-reactivate="${esc(r.id)}"', html)
+        self.assertIn("/twofa/reactivate", html)
+        self.assertNotIn("data-account-totp-setup", html)
+        self.assertNotIn("async function setupAccountTotp", html)
 
 
 if __name__ == "__main__":
