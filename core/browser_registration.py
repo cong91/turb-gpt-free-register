@@ -468,9 +468,10 @@ def _human_type_text(driver, el, value: str, *, clear: bool = True) -> None:
             "arguments[0].dispatchEvent(new Event('change', {bubbles:true}));",
             el,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.debug("%s 人工化输入失败，回退 JS setter err=%s", _log_prefix(driver), exc)
-        _set_element_value(driver, el, value)
+        if not _set_element_value(driver, el, value):
+            raise RuntimeError("输入控件在页面重绘期间失效，无法写入值") from exc
 
 
 def _page_warmup(driver, *, reason: str = "") -> None:
@@ -660,16 +661,14 @@ def _wait_for_email_input(driver, timeout: int | None = None):
     last_state = None
     clicked_email_option = False
     while time.time() < end:
-        if driver.__class__.__name__ == "BrowserSeleniumDriver":
-            try:
-                el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)
-                return el
-            except Exception as exc:  # noqa: BLE001
-                last_state = {"native_locator_error": f"{type(exc).__name__}: {exc}"}
-        else:
-            el = _find_visible_email_input_js(driver)
-            if el:
-                return
+        try:
+            # All providers expose the same Selenium-compatible locator surface.
+            # Returning an element from execute_script can leave a detached/null
+            # handle when React remounts the auth form between lookup and typing.
+            el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)
+            return el
+        except Exception as exc:  # noqa: BLE001
+            last_state = {"native_locator_error": f"{type(exc).__name__}: {exc}"}
         last_state = _email_entry_state(driver)
         if not clicked_email_option and _click_email_entry_option(driver):
             clicked_email_option = True
@@ -682,7 +681,17 @@ def _wait_for_email_input(driver, timeout: int | None = None):
 
 def _type_email_address(driver, email: str, timeout: int | None = None) -> None:
     """进入邮箱登录/注册方式并填写邮箱。全程不依赖页面可见文字，避免非日本出口本地化后误点 Google。"""
-    _human_type_text(driver, _wait_for_email_input(driver, timeout=timeout), email, clear=True)
+    element = _wait_for_email_input(driver, timeout=timeout)
+    try:
+        _human_type_text(driver, element, email, clear=True)
+    except Exception as exc:  # noqa: BLE001 - auth forms may remount while typing.
+        logger.warning(
+            "%s 邮箱输入控件在输入期间被页面替换，重新定位后重试：error=%s",
+            _log_prefix(driver),
+            str(exc)[:180],
+        )
+        replacement = _wait_for_email_input(driver, timeout=min(5, timeout or 5))
+        _human_type_text(driver, replacement, email, clear=True)
 
 
 def _submit_nearest_form_for_active_input(driver) -> bool:
@@ -1772,10 +1781,11 @@ def _is_profile_like(snapshot: dict) -> bool:
     return has_profile_url and (has_name_field or has_age_or_birth_field or bool(inputs) or bool(widgets))
 
 
-def _set_element_value(driver, el, value: str) -> None:
+def _set_element_value(driver, el, value: str) -> bool:
     """兼容 React 受控输入框：用原生 setter 设置值并派发 input/change。"""
-    driver.execute_script(r"""
+    return driver.execute_script(r"""
     const el = arguments[0];
+    if (!el) return false;
     const value = String(arguments[1]);
     const tag = (el.tagName || '').toLowerCase();
     if (typeof el?.scrollIntoView === 'function') el.scrollIntoView({block:'center'});
@@ -1791,6 +1801,7 @@ def _set_element_value(driver, el, value: str) -> None:
     el.dispatchEvent(new Event('input', {bubbles:true}));
     el.dispatchEvent(new Event('change', {bubbles:true}));
     el.blur();
+    return true;
     """, el, value)
 
 

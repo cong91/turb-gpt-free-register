@@ -449,6 +449,20 @@ class AccountFilterTests(unittest.TestCase):
         self.assertNotIn('btnExportFreePlusAllV2', template)
         self.assertNotIn('btnExportFreePlusSelectedV2', template)
 
+    def test_account_template_places_registration_ip_under_email_not_source(self):
+        template = Path("webui/templates/index.html").read_text(encoding="utf-8")
+        renderer = template[template.index("const rowHtmlV2 = (r) => `"):]
+        email_start = renderer.index('<td class="col-email"')
+        source_start = renderer.index('<td class="col-source"', email_start)
+        source_end = renderer.index("</td>", source_start)
+
+        email_cell = renderer[email_start:source_start]
+        source_cell = renderer[source_start:source_end]
+
+        self.assertIn("registration_ip", email_cell)
+        self.assertIn("acc-v2-ip", email_cell)
+        self.assertNotIn("registration_ip", source_cell)
+
 
 if __name__ == "__main__":
     unittest.main()

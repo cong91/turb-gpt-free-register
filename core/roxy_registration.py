@@ -2357,6 +2357,13 @@ def run_roxy_registration(
 
             network_identity = network_identity_for_tunnel(tunnel, opened.profile_id)
         driver = _build_driver(opened)
+        from core.registration_network_identity import (
+            NetworkIdentityError,
+            probe_browser_geo,
+            probe_browser_public_ip,
+        )
+
+        browser_geo = probe_browser_geo(driver) or {}
         try:
             traffic_tracker = SeleniumTrafficTracker(driver, label="Roxy")
         except Exception as exc:  # noqa: BLE001
@@ -2371,6 +2378,25 @@ def run_roxy_registration(
             )
 
             network_identity = verify_profile_network_identity(driver, network_identity)
+        if network_identity is None:
+            network_identity = {"verified": False}
+        if browser_geo:
+            network_identity["browser_geo"] = browser_geo
+        browser_ip = str(
+            network_identity.get("browser_egress_ip")
+            or browser_geo.get("ip")
+            or ""
+        ).strip()
+        if not browser_ip:
+            try:
+                browser_ip = probe_browser_public_ip(driver)
+            except NetworkIdentityError as exc:
+                logger.warning(
+                    "[Roxy网络] 无法记录浏览器出口 IP（不影响注册）：%s",
+                    str(exc)[:180],
+                )
+        if browser_ip:
+            network_identity.setdefault("browser_egress_ip", browser_ip)
         _center_browser_window(driver)
         driver.set_page_load_timeout(int(_cfg.ROXY_SELENIUM_TIMEOUT))
         try:
@@ -2458,6 +2484,7 @@ def run_roxy_registration(
             "expires": session_info.get("expires"),
             "device_id": getattr(driver, "device_id", None),
             "roxybrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
+            "network_identity": network_identity,
             "registration_password": openai_password,
             "registration_driver": "roxy",
         }
@@ -2466,6 +2493,7 @@ def run_roxy_registration(
             access_token=access_token,
             email_source=email_source,
             proxy_used=str(proxy) if proxy else None,
+            registration_ip=(network_identity or {}).get("browser_egress_ip"),
             extra=checkpoint_extra,
         )
         logger.info("[Roxy注册] token 检查点已保存：account_id=%s twofa=pending", account_id)
@@ -2582,12 +2610,15 @@ def run_roxy_registration(
             totp_secret=totp_secret,
             email_source=email_source,
             proxy_used=proxy or None,
+            registration_ip=(network_identity or {}).get("browser_egress_ip"),
             batch_dir=batch_dir,
+            auto_plan_check=False,
             extra={
                 "user": session_info.get("user"),
                 "account": session_info.get("account"),
                 "expires": session_info.get("expires"),
                 "roxybrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
+                "network_identity": network_identity,
                 "registration_password": openai_password,
                 "registration_driver": "roxy",
                 "twofa_status": twofa_status,

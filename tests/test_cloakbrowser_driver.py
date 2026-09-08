@@ -96,7 +96,7 @@ class BrowserElementTests(unittest.TestCase):
 
         self.assertIn('native = getattr(el, "locator", None) or getattr(el, "handle", None)', source)
         self.assertIn('if getattr(el, "locator", None) is not None or getattr(el, "handle", None) is not None:', source)
-        self.assertIn('if driver.__class__.__name__ == "BrowserSeleniumDriver":', source)
+        self.assertIn('el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)', source)
 
 
 class _NavigatingPage:

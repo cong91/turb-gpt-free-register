@@ -796,8 +796,8 @@
       text-align: left; vertical-align: middle;
     }
     .accounts-table-v2 .col-id { width: 72px; }
-    .accounts-table-v2 .col-email { width: 240px; }
-    .accounts-table-v2 .col-source { width: 90px; }
+    .accounts-table-v2 .col-email { width: 260px; }
+    .accounts-table-v2 .col-source { width: 130px; }
     .accounts-table-v2 .col-token { width: 100px; }
     .accounts-table-v2 .col-password { width: 120px; }
     .accounts-table-v2 .col-plan { width: 120px; }
@@ -835,6 +835,7 @@
     .accounts-table-v2 tbody td:first-child { padding-left: 16px; }
     .accounts-table-v2 tbody td:last-child { padding-right: 16px; }
     .accounts-table-v2 .col-email,
+    .accounts-table-v2 .col-source,
     .accounts-table-v2 .col-password,
     .accounts-table-v2 .col-plan,
     .accounts-table-v2 .col-note,
@@ -849,6 +850,9 @@
     .accounts-table-v2 .acc-v2-sub {
       margin-top: 2px; color: #909399; font-size: 12px; line-height: 1.3;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .accounts-table-v2 .acc-v2-ip {
+      color: #52606d; font-variant-numeric: tabular-nums;
     }
     .accounts-table-v2 .acc-v2-muted { color: #c0c4cc; }
     .accounts-table-v2 .pill {
@@ -3968,9 +3972,9 @@ function _totpCellV2(r) {
     const label = status === 'queued' ? '排队中' : '开启中';
     return `<div class="agent-token-cell"><span class="pill status-running"${titleAttr}>${label}</span></div>`;
   }
-  const btnTitle = titleText ? ` title="${esc(titleText)}"` : ` title="为该账号开启 2FA，并把 TOTP 密钥写回账号信息"`;
+  const btnTitle = titleText ? ` title="${esc(titleText)}"` : '';
   const btn = r.has_access_token
-    ? `<button type="button" class="acc-v2-twofa-btn" data-account-totp-setup="${esc(r.id)}"${btnTitle}>开启2FA</button>`
+    ? `<span class="acc-v2-muted"${btnTitle}>未开启</span>`
     : `<span class="acc-v2-muted">无Token</span>`;
   if (twofaStatus === 'failed') {
     const failureTitle = esc(twofaError || '2FA 设置失败，但没有保存具体原因');
@@ -4167,6 +4171,7 @@ function renderAccounts() {
       <td class="col-id">#${esc(r.id)}</td>
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
+        ${r.registration_ip ? `<div class="acc-v2-sub acc-v2-ip" title="${esc(r.registration_ip)}">IP: ${esc(r.registration_ip)}</div>` : ''}
         <div class="acc-v2-domain">${r.email_domain && r.email_domain !== 'unknown' ? '@' + esc(r.email_domain) : 'Đuôi mail chưa xác định'}</div>
         <div class="acc-v2-sub">${esc(r.user_name || '-')}</div>
       </td>
@@ -4174,7 +4179,6 @@ function renderAccounts() {
         ${esc(r.email_source || '-')}
         ${r.registration_driver ? `<div class="acc-v2-sub">Provider: ${esc(r.registration_driver)}</div>` : '<div class="acc-v2-sub">Provider: chưa xác định</div>'}
         ${r.source_cdk ? `<div class="acc-v2-sub">CDK: ${esc(r.source_cdk)}</div>` : ''}
-        ${r.registration_ip ? `<div class="acc-v2-sub">IP: ${esc(r.registration_ip)}</div>` : ''}
         ${r.account_locale || r.account_country ? `<div class="acc-v2-sub">Locale: ${esc(r.account_locale || '-')} / ${esc(r.account_country || '-')}</div>` : '<div class="acc-v2-sub">Locale: chưa xác định</div>'}
       </td>
       <td class="col-token">${_tokenCellV2(r)}</td>
@@ -4813,12 +4817,6 @@ async function onAccountsBodyClick(e) {
     return;
   }
 
-  const totpBtn = e.target.closest('[data-account-totp-setup]');
-  if (totpBtn) {
-    await setupAccountTotp(Number(totpBtn.dataset.accountTotpSetup), totpBtn);
-    return;
-  }
-
   const agentBtn = e.target.closest('[data-codex-agent]');
   if (agentBtn) {
     await generateOneCodexAgent(Number(agentBtn.dataset.codexAgent), agentBtn);
@@ -5126,28 +5124,6 @@ async function showAccountTotpCode(id, btn) {
     showToast(`验证码：${code}`);
   } catch (err) {
     showToast('获取验证码失败: ' + err.message);
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-async function setupAccountTotp(id, btn) {
-  const acc = ACCOUNTS.find(a => Number(a.id) === Number(id));
-  const email = acc?.email || '';
-  if (!confirm(`确定为该账号开启 2FA？\n\n${email}\n\n完成后会把 TOTP 密钥写回账号信息。`)) return;
-  if (btn) btn.disabled = true;
-  try {
-    const r = await api(`/api/accounts/${encodeURIComponent(id)}/totp-setup`, {
-      method: 'POST',
-      headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({}),
-    });
-    showToast(r.message || '2FA 已开始开启');
-    planStatusRevision = '';
-    await loadAccounts();
-    await pollAccountPlanStatuses();
-  } catch (err) {
-    showToast('开启 2FA 失败: ' + err.message);
   } finally {
     if (btn) btn.disabled = false;
   }

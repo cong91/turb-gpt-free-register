@@ -5190,6 +5190,22 @@ def get_latest_job_for_email(email: str) -> dict | None:
         return dict(row) if row else None
 
 
+def get_latest_twofa_job_for_email(email: str) -> dict | None:
+    """返回邮箱最近一次 reactive 2FA 任务，不混入普通注册任务。"""
+    target = str(email or "").strip().casefold()
+    if not target:
+        return None
+    with _LOCK:
+        matches = [
+            r
+            for r in _load_jobs()
+            if r.get("job_type") == "twofa_retry"
+            and str(r.get("email") or "").strip().casefold() == target
+        ]
+        row = max(matches, key=lambda r: int(r.get("id") or 0), default=None)
+        return dict(row) if row else None
+
+
 def get_successful_retry_for_job(job_id: int) -> dict | None:
     """返回同一任务链中已成功的其他重试任务，用于保留原任务历史状态并阻止重复重试。"""
     with _LOCK:
