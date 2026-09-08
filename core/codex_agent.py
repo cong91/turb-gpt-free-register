@@ -34,19 +34,23 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from curl_cffi import requests
 
+from config.browser import CHROME_UA_VERSION as BROWSER_CHROME_UA_VERSION
+from config.browser import CHROME_MAJOR as BROWSER_CHROME_MAJOR
+from config.browser import IMPERSONATE as BROWSER_IMPERSONATE
+
 # ============================================================
 #  常量
 # ============================================================
 
 AUTHAPI_BASE = "https://auth.openai.com/api/accounts"
 CHATGPT_BASE = "https://chatgpt.com"
-IMPERSONATE = "chrome"
+IMPERSONATE = BROWSER_IMPERSONATE
 
-CHROME_VERSION = "146"
+CHROME_VERSION = BROWSER_CHROME_MAJOR
 USER_AGENT = (
     f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     f"AppleWebKit/537.36 (KHTML, like Gecko) "
-    f"Chrome/{CHROME_VERSION}.0.0.0 Safari/537.36"
+    f"Chrome/{BROWSER_CHROME_UA_VERSION} Safari/537.36"
 )
 
 # Codex CLI agent 版本信息

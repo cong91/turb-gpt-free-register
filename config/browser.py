@@ -18,41 +18,43 @@ from zoneinfo import ZoneInfo
 from config.env_loader import apply_env_overrides
 
 
-def _latest_chrome_major(default: str = "149") -> str:
-    """兼容旧模块导入；默认按 2026-07-19 抓包里的 Chrome 149 画像。"""
+def _latest_chrome_major(default: str = "146") -> str:
+    """兼容旧模块导入；必须与当前浏览器/TLS runtime 版本一致。"""
     return default
 
 
-CHROME_MAJOR = "149"
-CHROME_FULL_VERSION = "149.0.0.0"
+CHROME_MAJOR = "146"
+CHROME_FULL_VERSION = "146.0.7680.177"
+CHROME_UA_VERSION = "146.0.0.0"
 
 SAFARI_VERSION = ""
 SAFARI_WEBKIT_VERSION = "537.36"
 MAC_OS_UA_VERSION = "10_15_7"
 
 # ---------- curl_cffi 模拟浏览器 ----------
-# curl_cffi 0.16.3 当前最高内置到 chrome146；HTTP/JS 画像按抓包补齐到 Chrome/149。
+# CloakBrowser 0.5.10 当前 bundled Chromium 为 146.0.7680.177；curl_cffi 0.16.3
+# 的 chrome146 TLS/HTTP2 profile 与该 runtime 对齐。
 IMPERSONATE = "chrome146"
 
 # ---------- 桌面 Chrome 画像 ----------
 BROWSER_FAMILY = "chrome"
-BROWSER_OS = "macOS"
+BROWSER_OS = "Windows"
 # OS 相关字段必须和 UA / Client Hints / JS navigator 三方一致。
-NAVIGATOR_PLATFORM = "MacIntel"
+NAVIGATOR_PLATFORM = "Win32"
 NAVIGATOR_VENDOR = "Google Inc."
-USER_AGENT_DATA_PLATFORM = "macOS"
+USER_AGENT_DATA_PLATFORM = "Windows"
 USER_AGENT = (
-    f"Mozilla/5.0 (Macintosh; Intel Mac OS X {MAC_OS_UA_VERSION}) "
+    f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     f"AppleWebKit/{SAFARI_WEBKIT_VERSION} (KHTML, like Gecko) "
-    f"Chrome/{CHROME_FULL_VERSION} Safari/{SAFARI_WEBKIT_VERSION}"
+    f"Chrome/{CHROME_UA_VERSION} Safari/{SAFARI_WEBKIT_VERSION}"
 )
 
-SEC_CH_UA = '"Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24"'
-SEC_CH_UA_FULL_VERSION_LIST = '"Google Chrome";v="149.0.0.0", "Chromium";v="149.0.0.0", "Not)A;Brand";v="24.0.0.0"'
-SEC_CH_UA_PLATFORM = '"macOS"'
-SEC_CH_UA_PLATFORM_VERSION = '"15.7.0"'
+SEC_CH_UA = '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"'
+SEC_CH_UA_FULL_VERSION_LIST = '"Chromium";v="146.0.7680.177", "Not-A.Brand";v="24.0.0.0", "Google Chrome";v="146.0.7680.177"'
+SEC_CH_UA_PLATFORM = '"Windows"'
+SEC_CH_UA_PLATFORM_VERSION = '"19.0.0"'
 SEC_CH_UA_MOBILE = "?0"
-SEC_CH_UA_ARCH = '"arm"'
+SEC_CH_UA_ARCH = '"x86"'
 SEC_CH_UA_BITNESS = '"64"'
 SEC_CH_UA_MODEL = '""'
 SEND_CLIENT_HINTS = True
@@ -60,7 +62,9 @@ SEND_HIGH_ENTROPY_CLIENT_HINTS = False
 
 # ---------- 语言 / 时区 ----------
 BROWSER_LOCALE_PROFILE = "jp"
-AUTO_BROWSER_LOCALE_FROM_IP = True
+# Locale/timezone are a stable browser identity. Network egress is measured
+# separately and must not rotate this identity when a VPN server changes.
+AUTO_BROWSER_LOCALE_FROM_IP = False
 IP_GEO_TIMEOUT = 6.0
 IP_GEO_ENDPOINTS = [
     "https://ipinfo.io/json",
@@ -125,7 +129,7 @@ COUNTRY_LOCALE_PROFILE_MAP = {
 
 BROWSER_LOCALE_PROFILES = {
     "jp": {"navigator_language": "ja-JP", "navigator_languages": ["ja-JP"], "accept_language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7", "timezone_iana": "Asia/Tokyo", "timezone_offset_minutes": 9 * 60, "timezone_name": "Japan Standard Time"},
-    "vi": {"navigator_language": "vi-VN", "navigator_languages": ["vi-VN", "vi"], "accept_language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7", "timezone_iana": "Asia/Ho_Chi_Minh", "timezone_offset_minutes": 7 * 60, "timezone_name": "Indochina Time"},
+    "vi": {"navigator_language": "vi-VN", "navigator_languages": ["vi-VN"], "accept_language": "vi-VN", "timezone_iana": "Asia/Ho_Chi_Minh", "timezone_offset_minutes": 7 * 60, "timezone_name": "Indochina Time"},
     "cn": {"navigator_language": "zh-CN", "navigator_languages": ["zh-CN"], "accept_language": "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7", "timezone_iana": "Asia/Shanghai", "timezone_offset_minutes": 8 * 60, "timezone_name": "China Standard Time"},
     "us": {"navigator_language": "en-US", "navigator_languages": ["en-US"], "accept_language": "en-US,en;q=0.9", "timezone_iana": "America/Los_Angeles", "timezone_offset_minutes": -7 * 60, "timezone_name": "Pacific Daylight Time"},
     "sg": {"navigator_language": "en-SG", "navigator_languages": ["en-SG"], "accept_language": "en-SG,en-US;q=0.9,en;q=0.8", "timezone_iana": "Asia/Singapore", "timezone_offset_minutes": 8 * 60, "timezone_name": "Singapore Standard Time"},
@@ -252,16 +256,9 @@ REQUEST_TIMEOUT = 30
 # HAR 参考画像：Default-all-domains-1784468371563.json 解码 p[0]/p[2]/p[16] 得出。
 HAR_CAPTURE_BASE_PROFILE = {"screen_width": 1680, "screen_height": 1050, "hardware_concurrency": 6, "device_memory": 8, "js_heap_size_limit": 4395630592, "device_pixel_ratio": 2}
 
-# 常见 macOS Chrome 桌面画像池。同一 session 内保持不变；不同 session 随机分散。
-# HAR_CAPTURE_BASE_PROFILE 只是候选之一，不全局固定。
+# 当前 CloakBrowser Windows Chrome 桌面画像池。同一 session 内保持不变。
 BROWSER_PROFILE_POOL = [
-    HAR_CAPTURE_BASE_PROFILE,
-    {"screen_width": 1440, "screen_height": 900,  "hardware_concurrency": 8,  "device_memory": 8, "js_heap_size_limit": 4294967296, "device_pixel_ratio": 2},
-    {"screen_width": 1512, "screen_height": 982,  "hardware_concurrency": 8,  "device_memory": 8, "js_heap_size_limit": 4294967296, "device_pixel_ratio": 2},
-    {"screen_width": 1680, "screen_height": 1050, "hardware_concurrency": 8,  "device_memory": 8, "js_heap_size_limit": 4294967296, "device_pixel_ratio": 2},
-    {"screen_width": 1728, "screen_height": 1117, "hardware_concurrency": 10, "device_memory": 8, "js_heap_size_limit": 4294967296, "device_pixel_ratio": 2},
-    {"screen_width": 1800, "screen_height": 1169, "hardware_concurrency": 10, "device_memory": 8, "js_heap_size_limit": 4294967296, "device_pixel_ratio": 2},
-    {"screen_width": 2056, "screen_height": 1329, "hardware_concurrency": 12, "device_memory": 8, "js_heap_size_limit": 4294967296, "device_pixel_ratio": 2},
+    {"screen_width": 1920, "screen_height": 1080, "hardware_concurrency": 8, "device_memory": 8, "js_heap_size_limit": 4294967296, "device_pixel_ratio": 1},
 ]
 
 
@@ -287,6 +284,7 @@ def build_browser_environment(geo: dict | None = None, base_profile: dict | None
         "safari_webkit_version": SAFARI_WEBKIT_VERSION,
         "chrome_major": CHROME_MAJOR,
         "chrome_full_version": CHROME_FULL_VERSION,
+        "chrome_ua_version": CHROME_UA_VERSION,
         "user_agent": USER_AGENT,
         "send_client_hints": SEND_CLIENT_HINTS,
         "sec_ch_ua": SEC_CH_UA,
@@ -322,8 +320,25 @@ def validate_browser_profile(profile: dict) -> list[str]:
             issues.append("Safari UA 不一致")
         if profile.get("send_client_hints"):
             issues.append("Safari 不应发送 Chromium Client Hints")
-    elif f"Chrome/{profile.get('chrome_full_version')}" not in ua:
-        issues.append("UA 与 chrome_full_version 不一致")
+    elif family in {"chrome", "chromium"}:
+        profile_major = str(profile.get("chrome_major") or "")
+        target_major = str(IMPERSONATE).removeprefix("chrome")
+        full_version = str(profile.get("chrome_full_version") or "")
+        sec_ch_ua = str(profile.get("sec_ch_ua") or "")
+        sec_ch_ua_full_version_list = str(profile.get("sec_ch_ua_full_version_list") or "")
+        if profile_major != target_major:
+            issues.append("chrome_major 与 IMPERSONATE 不一致")
+        ua_version = str(profile.get("chrome_ua_version") or CHROME_UA_VERSION)
+        if f"Chrome/{ua_version}" not in ua:
+            issues.append("UA 与 chrome_ua_version 不一致")
+        if not ua_version.startswith(f"{profile_major}."):
+            issues.append("chrome_ua_version 与 chrome_major 不一致")
+        if not full_version.startswith(f"{profile_major}."):
+            issues.append("chrome_full_version 与 chrome_major 不一致")
+        if f'"Google Chrome";v="{profile_major}"' not in sec_ch_ua or f'"Chromium";v="{profile_major}"' not in sec_ch_ua:
+            issues.append("sec-ch-ua 与 chrome_major 不一致")
+        if sec_ch_ua_full_version_list and f'"Google Chrome";v="{full_version}"' not in sec_ch_ua_full_version_list:
+            issues.append("sec-ch-ua-full-version-list 与 chrome_full_version 不一致")
     if profile.get("browser_os") == "macOS":
         if "Macintosh; Intel Mac OS X" not in ua:
             issues.append("macOS 画像但 UA 不是 Macintosh")
@@ -331,6 +346,13 @@ def validate_browser_profile(profile: dict) -> list[str]:
             issues.append("macOS 画像但 navigator.platform 不是 MacIntel")
         if "macOS" not in str(profile.get("sec_ch_ua_platform") or ""):
             issues.append("macOS 画像但 sec-ch-ua-platform 不是 macOS")
+    elif profile.get("browser_os") == "Windows":
+        if "Windows NT" not in ua:
+            issues.append("Windows 画像但 UA 不是 Windows")
+        if str(profile.get("navigator_platform") or "") != "Win32":
+            issues.append("Windows 画像但 navigator.platform 不是 Win32")
+        if "Windows" not in str(profile.get("sec_ch_ua_platform") or ""):
+            issues.append("Windows 画像但 sec-ch-ua-platform 不是 Windows")
     if not profile.get("navigator_language"):
         issues.append("navigator_language 为空")
     languages = profile.get("navigator_languages") or []

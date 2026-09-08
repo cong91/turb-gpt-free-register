@@ -14,9 +14,7 @@ function readArgs(argv) {
     if (!item.startsWith("--")) continue;
     const key = item.slice(2);
     const next = argv[i + 1];
-    // Python 适配层会显式传空字符串表示“该字段不存在”（例如 Auth 页
-    // build-id）。空字符串是合法参数值，不能误解析成布尔标志 "1"。
-    if (next === undefined || next.startsWith("--")) {
+    if (!next || next.startsWith("--")) {
       args[key] = "1";
       continue;
     }
@@ -467,27 +465,6 @@ function createIntlObject(options) {
   return intlObject;
 }
 
-function createDateConstructor(options) {
-  const NativeDate = Date;
-  const format = (date) => {
-    const text = NativeDate.prototype.toString.call(date);
-    const name = String(options.timezoneName || "").trim();
-    return name ? text.replace(/\s*\([^)]*\)$/, ` (${name})`) : text;
-  };
-  function BrowserDate(...args) {
-    if (!new.target) return format(new NativeDate());
-    const date = new NativeDate(...args);
-    Object.setPrototypeOf(date, BrowserDate.prototype);
-    return date;
-  }
-  BrowserDate.prototype = Object.create(NativeDate.prototype, {
-    constructor: { value: BrowserDate, configurable: true, writable: true },
-    toString: { value() { return format(this); }, configurable: true, writable: true },
-  });
-  Object.setPrototypeOf(BrowserDate, NativeDate);
-  return BrowserDate;
-}
-
 function createPerformanceObserver(observerSet) {
   return class PerformanceObserverMock {
     constructor(callback) { this.callback = callback; this._observed = false; this._types = new Set(); }
@@ -553,56 +530,6 @@ function makeNativeFunction(name, impl = () => undefined) {
   return fn;
 }
 
-function defineReadonly(target, name, value, { enumerable = true } = {}) {
-  Object.defineProperty(target, name, {
-    configurable: true,
-    enumerable,
-    get: makeNativeFunction(`get ${name}`, () => value),
-  });
-}
-
-function createArrayLike(items, tagName, namedKey) {
-  const proto = {};
-  Object.defineProperty(proto, Symbol.toStringTag, { value: tagName, configurable: true });
-  Object.defineProperties(proto, {
-    item: {
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value: makeNativeFunction("item", function (index) {
-        const n = Number(index);
-        return Number.isInteger(n) && n >= 0 ? this[n] || null : null;
-      }),
-    },
-    namedItem: {
-      configurable: true,
-      enumerable: true,
-      writable: true,
-      value: makeNativeFunction("namedItem", function (name) {
-        const wanted = String(name);
-        for (let i = 0; i < this.length; i++) {
-          const item = this[i];
-          if (String(item?.[namedKey] || "") === wanted) return item;
-        }
-        return null;
-      }),
-    },
-    [Symbol.iterator]: {
-      configurable: true,
-      writable: true,
-      value: Array.prototype[Symbol.iterator],
-    },
-  });
-  const out = Object.create(proto);
-  items.forEach((item, index) => Object.defineProperty(out, index, {
-    value: item,
-    configurable: true,
-    enumerable: true,
-  }));
-  Object.defineProperty(out, "length", { value: items.length, configurable: true });
-  return out;
-}
-
 function createPluginArray(isSafari = false) {
   const makePlugin = (name) => ({
     name,
@@ -614,7 +541,7 @@ function createPluginArray(isSafari = false) {
   });
   const pdf = { type: "application/pdf", suffixes: "pdf", description: "Portable Document Format", enabledPlugin: null };
   const textPdf = { type: "text/pdf", suffixes: "pdf", description: "Portable Document Format", enabledPlugin: null };
-  const pluginItems = isSafari ? [
+  const plugins = isSafari ? [
     makePlugin("WebKit built-in PDF"),
     makePlugin("PDF Viewer"),
   ] : [
@@ -624,57 +551,34 @@ function createPluginArray(isSafari = false) {
     makePlugin("Microsoft Edge PDF Viewer"),
     makePlugin("WebKit built-in PDF"),
   ];
-  for (const plugin of pluginItems) {
+  for (const plugin of plugins) {
     plugin[0] = pdf;
     plugin[1] = textPdf;
     plugin["application/pdf"] = pdf;
     plugin["text/pdf"] = textPdf;
-    Object.defineProperty(plugin, Symbol.toStringTag, { value: "Plugin" });
   }
-  pdf.enabledPlugin = pluginItems[0];
-  textPdf.enabledPlugin = pluginItems[0];
-  Object.defineProperty(pdf, Symbol.toStringTag, { value: "MimeType" });
-  Object.defineProperty(textPdf, Symbol.toStringTag, { value: "MimeType" });
-  const plugins = createArrayLike(pluginItems, "PluginArray", "name");
-  Object.defineProperty(Object.getPrototypeOf(plugins), "refresh", {
-    configurable: true,
-    enumerable: true,
-    writable: true,
-    value: makeNativeFunction("refresh"),
-  });
+  pdf.enabledPlugin = plugins[0];
+  textPdf.enabledPlugin = plugins[0];
+  plugins.item = (index) => plugins[index] || null;
+  plugins.namedItem = (name) => plugins.find((p) => p.name === name) || null;
+  plugins.refresh = () => undefined;
+  Object.defineProperty(plugins, Symbol.toStringTag, { value: "PluginArray" });
   return plugins;
 }
 
 function createMimeTypeArray() {
   const plugin = { name: "PDF Viewer", filename: "internal-pdf-viewer", description: "Portable Document Format" };
-  const items = [
+  const mimes = [
     { type: "application/pdf", suffixes: "pdf", description: "Portable Document Format", enabledPlugin: plugin },
     { type: "text/pdf", suffixes: "pdf", description: "Portable Document Format", enabledPlugin: plugin },
   ];
-  for (const item of items) Object.defineProperty(item, Symbol.toStringTag, { value: "MimeType" });
-  return createArrayLike(items, "MimeTypeArray", "type");
+  mimes.item = (index) => mimes[index] || null;
+  mimes.namedItem = (type) => mimes.find((m) => m.type === type) || null;
+  Object.defineProperty(mimes, Symbol.toStringTag, { value: "MimeTypeArray" });
+  return mimes;
 }
 
-function createScreen(raw = {}) {
-  const values = {
-    width: Number(raw.width || 0),
-    height: Number(raw.height || 0),
-    availWidth: Number(raw.availWidth ?? raw.width ?? 0),
-    availHeight: Number(raw.availHeight ?? raw.height ?? 0),
-    colorDepth: Number(raw.colorDepth || 24),
-    pixelDepth: Number(raw.pixelDepth || raw.colorDepth || 24),
-    availLeft: Number(raw.availLeft || 0),
-    availTop: Number(raw.availTop || 0),
-    isExtended: false,
-    orientation: raw.orientation || { type: "landscape-primary", angle: 0 },
-  };
-  const proto = {};
-  Object.defineProperty(proto, Symbol.toStringTag, { value: "Screen", configurable: true });
-  for (const [name, value] of Object.entries(values)) defineReadonly(proto, name, value);
-  return Object.create(proto);
-}
-
-function createCanvas(width = 300, height = 150, isSafari = false, gpu = {}) {
+function createCanvas(width = 300, height = 150, isSafari = false) {
   const canvas = {
     tagName: "CANVAS",
     style: {},
@@ -706,15 +610,8 @@ function createCanvas(width = 300, height = 150, isSafari = false, gpu = {}) {
               [0x1f01, "WebKit WebGL"],              // RENDERER
               [0x1f02, isSafari ? "WebGL 2.0" : "WebGL 2.0 (OpenGL ES 3.0 Chromium)"],
               [0x8b8c, isSafari ? "WebGL GLSL ES 1.0" : "WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.0 Chromium)"],
-              [0x9245, gpu.vendor || (isSafari ? "Apple Inc." : "Google Inc. (Apple)")],
-              [0x9246, gpu.renderer || (isSafari
-                ? "Apple GPU"
-                : "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)")],
               [0x0d33, 16384],                       // MAX_TEXTURE_SIZE
               [0x8869, 16],                          // MAX_VERTEX_ATTRIBS
-              [0x0d3a, new Int32Array([16384, 16384])], // MAX_VIEWPORT_DIMS
-              [0x8dfb, 1024],                        // MAX_VERTEX_UNIFORM_VECTORS
-              [0x8872, 16],                          // MAX_TEXTURE_IMAGE_UNITS
             ]);
             return values.has(param) ? values.get(param) : 0;
           },
@@ -725,8 +622,6 @@ function createCanvas(width = 300, height = 150, isSafari = false, gpu = {}) {
             return {};
           },
           getSupportedExtensions() { return ["ANGLE_instanced_arrays", "EXT_blend_minmax", "WEBGL_debug_renderer_info", "WEBGL_lose_context"]; },
-          getContextAttributes() { return { alpha: true, antialias: true, depth: true, failIfMajorPerformanceCaveat: false, powerPreference: "default", premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: false, desynchronized: false, xrCompatible: false }; },
-          isContextLost() { return false; },
           clearColor() {}, clear() {}, viewport() {}, createBuffer() { return {}; }, bindBuffer() {}, bufferData() {},
         };
       }
@@ -795,8 +690,6 @@ function createBrowserContext(options) {
   }
 
   const browserIntl = createIntlObject(options);
-  const browserDate = createDateConstructor(options);
-  const browserScreen = createScreen(options.screen);
 
   const browserPerformance = {
     now: () => performance.now(),
@@ -819,24 +712,18 @@ function createBrowserContext(options) {
     mathObject.random = () => options.fixedRandom;
   }
   const currentScript = { src: options.scriptSrc, length: options.scriptSrc.length };
-  // 注册 flow 的 SDK 运行于 Sentinel iframe；正样本生成的 p[5] 始终来自
-  // 当前 Sentinel SDK，而不是父页面的 Google/Stripe/ChatGPT 脚本。
-  const scripts = [currentScript];
-  // Auth 注册页没有 data-build，也没有 ChatGPT c/<build> 脚本。只有明确传入
-  // buildId 的 ChatGPT 页面场景才注入该脚本，避免 SDK 从伪造路径推导出 c/1/_。
-  if (options.buildId) {
-    const appBuildPath = String(options.buildId).startsWith("c/")
-      ? String(options.buildId)
-      : `c/${options.buildId}/_/`;
-    const appScriptSrc = `https://chatgpt.com/${appBuildPath}ssg.js`;
-    scripts.push({ src: appScriptSrc, length: appScriptSrc.length });
-    scripts.push(
-      { src: "https://accounts.google.com/gsi/client", length: 38 },
-      { src: "https://chatgpt.com/cdn-cgi/challenge-platform/scripts/jsd/api.js?onload=jsdOnload", length: 84 },
-      { src: "https://chatgpt.com/_next/static/chunks/webpack.js", length: 48 },
-      { src: "https://js.stripe.com/v3/", length: 24 },
-    );
-  }
+  const appBuildPath = options.buildId && String(options.buildId).startsWith("c/")
+    ? String(options.buildId)
+    : (options.buildId ? `c/${options.buildId}/_/` : "c/prod-fb4a8a2a751dfec391053cfd7b01c52699ccf78c/_/");
+  const appScriptSrc = `https://chatgpt.com/${appBuildPath}ssg.js`;
+  const scripts = [
+    currentScript,
+    { src: "https://accounts.google.com/gsi/client", length: 38 },
+    { src: "https://chatgpt.com/cdn-cgi/challenge-platform/scripts/jsd/api.js?onload=jsdOnload", length: 84 },
+    { src: appScriptSrc, length: appScriptSrc.length },
+    { src: "https://chatgpt.com/_next/static/chunks/webpack.js", length: 48 },
+    { src: "https://js.stripe.com/v3/", length: 24 },
+  ];
   const attrs = new Map();
   if (options.buildId) attrs.set("data-build", options.buildId);
   const reactListeningKey = options.reactListeningKey || "_reactListening" + crypto.randomBytes(6).toString("hex");
@@ -948,7 +835,7 @@ function createBrowserContext(options) {
     createElement(tagName) {
       const lowerTag = String(tagName).toLowerCase();
       if (lowerTag === "canvas") {
-        const canvas = createCanvas(300, 150, isSafari, options.gpu);
+        const canvas = createCanvas(300, 150, isSafari);
         canvas.ownerDocument = document;
         return canvas;
       }
@@ -1031,9 +918,8 @@ function createBrowserContext(options) {
     sendBeacon: makeNativeFunction("sendBeacon", () => true),
     vibrate: makeNativeFunction("vibrate", () => false),
   };
-  Object.defineProperty(navigatorProto, Symbol.toStringTag, { value: "Navigator", configurable: true });
   const navigator = Object.create(navigatorProto);
-  const navigatorValues = {
+  Object.assign(navigator, {
     userAgent: options.userAgent,
     language: options.language,
     languages: options.languages,
@@ -1046,8 +932,9 @@ function createBrowserContext(options) {
     hardwareConcurrency: options.hardwareConcurrency,
     ...(isSafari ? {} : { deviceMemory: options.deviceMemory }),
     maxTouchPoints: 0,
-    platform: options.navigatorPlatform || "MacIntel",
+    platform: options.navigatorPlatform || "Win32",
     vendor: options.navigatorVendor || (isSafari ? "Apple Computer, Inc." : "Google Inc."),
+    webdriver: false,
     bluetooth: { toString: () => "[object Bluetooth]" },
     ...(isSafari ? {} : { gpu: { toString: () => "[object GPU]" } }),
     connection: createNetworkInformation(),
@@ -1066,18 +953,19 @@ function createBrowserContext(options) {
       login: { toString: () => "[object NavigatorLogin]" },
       userAgentData: {
         mobile: false,
-        platform: options.userAgentDataPlatform || options.secChUaPlatform || "macOS",
+        platform: options.userAgentDataPlatform || options.secChUaPlatform || "Windows",
         brands: parseSecChBrands(options.secChUa, options.chromeMajor),
         getHighEntropyValues: async (hints = []) => {
           const values = {
-            architecture: options.secChUaArch || "arm",
+            architecture: options.secChUaArch || "x86",
             bitness: options.secChUaBitness || "64",
             mobile: false,
             model: options.secChUaModel || "",
-            platform: options.userAgentDataPlatform || options.secChUaPlatform || "macOS",
-            platformVersion: options.secChUaPlatformVersion || "15.7.0",
+            platform: options.userAgentDataPlatform || options.secChUaPlatform || "Windows",
+            platformVersion: options.secChUaPlatformVersion || "19.0.0",
             uaFullVersion: options.chromeFullVersion || "",
             fullVersionList: parseSecChBrands(options.secChUaFullVersionList, options.chromeFullVersion || options.chromeMajor),
+            wow64: false,
           };
           if (!Array.isArray(hints) || hints.length === 0) return values;
           const picked = {};
@@ -1087,18 +975,6 @@ function createBrowserContext(options) {
         toJSON() { return { brands: this.brands, mobile: this.mobile, platform: this.platform }; },
       },
     }),
-  };
-  // WebIDL 属性位于 Navigator.prototype，实例本身通常没有这些 enumerable
-  // own properties。SDK 会随机抽取原型 key 并读取函数/属性的字符串表现。
-  for (const [name, value] of Object.entries(navigatorValues)) {
-    defineReadonly(navigatorProto, name, value);
-  }
-  // 浏览器中的 webdriver 是 Navigator 原型上的访问器，不是 navigator 自身的
-  // 可枚举数据属性。保留正样本的 undefined 返回值，同时修正 descriptor 形态。
-  Object.defineProperty(navigatorProto, "webdriver", {
-    configurable: true,
-    enumerable: true,
-    get: makeNativeFunction("get webdriver", () => undefined),
   });
   const localStorage = createStorage();
   const sessionStorage = createStorage();
@@ -1186,28 +1062,7 @@ function createBrowserContext(options) {
     blur() {},
     scrollTo() {},
     scrollBy() {},
-    matchMedia(query) {
-      const media = String(query);
-      const normalized = media.toLowerCase().replace(/\s+/g, "");
-      let matches = false;
-      if (normalized.includes("prefers-color-scheme:light")) matches = true;
-      if (normalized.includes("prefers-color-scheme:dark")) matches = false;
-      if (normalized.includes("prefers-reduced-motion:reduce")) matches = false;
-      if (normalized.includes("pointer:fine") || normalized.includes("hover:hover")) matches = true;
-      const resolution = normalized.match(/(?:min-)?resolution:([\d.]+)dppx/);
-      if (resolution) matches = options.devicePixelRatio >= Number(resolution[1]);
-      return {
-        matches,
-        media,
-        onchange: null,
-        addListener: makeNativeFunction("addListener"),
-        removeListener: makeNativeFunction("removeListener"),
-        addEventListener: makeNativeFunction("addEventListener"),
-        removeEventListener: makeNativeFunction("removeEventListener"),
-        dispatchEvent: makeNativeFunction("dispatchEvent", () => false),
-        [Symbol.toStringTag]: "MediaQueryList",
-      };
-    },
+    matchMedia(query) { return { matches: false, media: String(query), onchange: null, addListener() {}, removeListener() {}, addEventListener() {}, removeEventListener() {}, dispatchEvent() { return false; } }; },
     getComputedStyle(element) { return element?.style || createStyleDeclaration(); },
     MessageEvent: class MessageEvent { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
     Event: class Event { constructor(type, init = {}) { this.type = type; Object.assign(this, init); } },
@@ -1219,7 +1074,7 @@ function createBrowserContext(options) {
     PerformanceObserver: createPerformanceObserver(performanceObservers),
     document,
     navigator,
-    screen: browserScreen,
+    screen: options.screen,
     location,
     locationbar: { visible: true },
     menubar: { visible: true },
@@ -1232,16 +1087,10 @@ function createBrowserContext(options) {
     localStorage,
     sessionStorage,
     history,
-    innerWidth: options.innerWidth,
-    innerHeight: options.innerHeight,
-    outerWidth: options.outerWidth,
-    outerHeight: options.outerHeight,
-    screenX: 0,
-    screenY: 0,
-    screenLeft: 0,
-    screenTop: 0,
-    pageXOffset: 0,
-    pageYOffset: 0,
+    innerWidth: options.screen.width,
+    innerHeight: options.screen.height,
+    outerWidth: options.screen.width,
+    outerHeight: options.screen.height + 88,
     devicePixelRatio: options.devicePixelRatio,
     ...(isSafari ? { safari: { pushNotification: {} } } : { chrome: { runtime: {}, app: {} } }),
     performance: browserPerformance,
@@ -1261,7 +1110,7 @@ function createBrowserContext(options) {
     fetch: browserFetch,
     console,
     Math: mathObject,
-    Date: browserDate,
+    Date,
     Intl: browserIntl,
     AudioContext: createAudioContext(),
     webkitAudioContext: createAudioContext(),
@@ -1323,7 +1172,7 @@ function createBrowserContext(options) {
       globalThis: window,
       document,
       navigator,
-      screen: browserScreen,
+      screen: options.screen,
       location,
       localStorage,
       sessionStorage,
@@ -1353,7 +1202,7 @@ function createBrowserContext(options) {
       fetch: browserFetch,
       console,
       Math: mathObject,
-      Date: browserDate,
+      Date,
       Intl: browserIntl,
       AudioContext: window.AudioContext,
       webkitAudioContext: window.webkitAudioContext,
@@ -1448,12 +1297,6 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
   let cachedChallenge = null;
   const options = {
     flow,
-    challengeProof: pick(
-      args["challenge-proof"],
-      cfg("challengeProof", "challenge_proof"),
-      process.env.SENTINEL_CHALLENGE_PROOF,
-      ""
-    ),
     sentinelSid: pick(args["sentinel-sid"], cfg("sentinelSid", "sentinel_sid"), process.env.SENTINEL_SID, ""),
     pageUrl: pick(args["page-url"], cfg("pageUrl", "page_url"), process.env.SENTINEL_PAGE_URL, "https://chatgpt.com/checkout/openai_llc/cs_ctf"),
     scriptSrc:
@@ -1461,7 +1304,7 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
         args["script-src"],
         cfg("scriptSrc", "script_src"),
         process.env.SENTINEL_SCRIPT_SRC,
-      "https://sentinel.openai.com/sentinel/20260810913b/sdk.js",
+      "https://sentinel.openai.com/sentinel/20260219f9f6/sdk.js",
       ),
     buildId: pick(args["build-id"], cfg("buildId", "build_id"), process.env.SENTINEL_BUILD_ID, ""),
     reactListeningKey: pick(args["react-listening-key"], cfg("reactListeningKey", "react_listening_key"), process.env.SENTINEL_REACT_LISTENING_KEY, ""),
@@ -1477,20 +1320,20 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
         args["user-agent"],
         cfg("userAgent", "user_agent"),
         process.env.SENTINEL_USER_AGENT,
-      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
       ),
     contentType,
     browserFamily: pick(args["browser-family"], cfg("browserFamily", "browser_family"), process.env.SENTINEL_BROWSER_FAMILY, "chrome"),
-    navigatorPlatform: pick(args["navigator-platform"], cfg("navigatorPlatform", "navigator_platform"), process.env.SENTINEL_NAVIGATOR_PLATFORM, "MacIntel"),
+    navigatorPlatform: pick(args["navigator-platform"], cfg("navigatorPlatform", "navigator_platform"), process.env.SENTINEL_NAVIGATOR_PLATFORM, "Win32"),
     navigatorVendor: pick(args["navigator-vendor"], cfg("navigatorVendor", "navigator_vendor"), process.env.SENTINEL_NAVIGATOR_VENDOR, "Google Inc."),
-    userAgentDataPlatform: pick(args["user-agent-data-platform"], cfg("userAgentDataPlatform", "user_agent_data_platform"), process.env.SENTINEL_UA_DATA_PLATFORM, "macOS"),
+    userAgentDataPlatform: pick(args["user-agent-data-platform"], cfg("userAgentDataPlatform", "user_agent_data_platform"), process.env.SENTINEL_UA_DATA_PLATFORM, "Windows"),
     requestIdleCallback: truthy(pick(args["request-idle-callback"], cfg("requestIdleCallback", "request_idle_callback"), process.env.SENTINEL_REQUEST_IDLE_CALLBACK, "0")),
     language: pick(args.language, cfg("language"), process.env.SENTINEL_LANGUAGE, "ja-JP"),
     languages: normalizeList(pick(args.languages, cfg("languages")), process.env.SENTINEL_LANGUAGES || "ja-JP"),
     timeZone: pick(args["time-zone"], args.timezone, cfg("timeZone", "time_zone", "timezone"), process.env.SENTINEL_TIME_ZONE, "Asia/Tokyo"),
     timezoneName: pick(args["timezone-name"], cfg("timezoneName", "timezone_name"), process.env.SENTINEL_TIMEZONE_NAME, "Japan Standard Time"),
     timezoneOffsetMinutes: Number(pick(args["timezone-offset-minutes"], cfg("timezoneOffsetMinutes", "timezone_offset_minutes"), process.env.SENTINEL_TIMEZONE_OFFSET_MINUTES, 540)),
-    hardwareConcurrency: Number(pick(args.cores, cfg("cores", "hardwareConcurrency"), process.env.SENTINEL_CORES, 4)),
+    hardwareConcurrency: Number(pick(args.cores, cfg("cores", "hardwareConcurrency"), process.env.SENTINEL_CORES, 6)),
     jsHeapSizeLimit: Number(pick(args["js-heap-size-limit"], cfg("jsHeapSizeLimit", "js_heap_size_limit"), process.env.SENTINEL_JS_HEAP_SIZE_LIMIT, 4395630592)),
     fixedRandom:
       pick(args.random, cfg("random", "fixedRandom"), process.env.SENTINEL_FIXED_RANDOM)
@@ -1498,13 +1341,13 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
         : Number.NaN,
     deviceMemory: Number(pick(args["device-memory"], cfg("deviceMemory", "device_memory"), process.env.SENTINEL_DEVICE_MEMORY, 8)),
     devicePixelRatio: Number(pick(args["device-pixel-ratio"], cfg("devicePixelRatio", "device_pixel_ratio"), process.env.SENTINEL_DEVICE_PIXEL_RATIO, 2)),
-    chromeMajor: pick(args["chrome-major"], cfg("chromeMajor", "chrome_major"), process.env.SENTINEL_CHROME_MAJOR, "150"),
-    chromeFullVersion: pick(args["chrome-full-version"], cfg("chromeFullVersion", "chrome_full_version"), process.env.SENTINEL_CHROME_FULL_VERSION, "150.0.0.0"),
-    secChUa: pick(args["sec-ch-ua"], cfg("secChUa", "sec_ch_ua"), process.env.SENTINEL_SEC_CH_UA, '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"'),
-    secChUaPlatform: String(pick(args["sec-ch-ua-platform"], cfg("secChUaPlatform", "sec_ch_ua_platform"), process.env.SENTINEL_SEC_CH_UA_PLATFORM, "macOS")).replace(/^"|"$/g, ""),
+    chromeMajor: pick(args["chrome-major"], cfg("chromeMajor", "chrome_major"), process.env.SENTINEL_CHROME_MAJOR, "146"),
+    chromeFullVersion: pick(args["chrome-full-version"], cfg("chromeFullVersion", "chrome_full_version"), process.env.SENTINEL_CHROME_FULL_VERSION, "146.0.7680.177"),
+    secChUa: pick(args["sec-ch-ua"], cfg("secChUa", "sec_ch_ua"), process.env.SENTINEL_SEC_CH_UA, '"Google Chrome";v="146", "Chromium";v="146", "Not-A.Brand";v="24"'),
+    secChUaPlatform: String(pick(args["sec-ch-ua-platform"], cfg("secChUaPlatform", "sec_ch_ua_platform"), process.env.SENTINEL_SEC_CH_UA_PLATFORM, "Windows")).replace(/^"|"$/g, ""),
     secChUaFullVersionList: pick(args["sec-ch-ua-full-version-list"], cfg("secChUaFullVersionList", "sec_ch_ua_full_version_list"), process.env.SENTINEL_SEC_CH_UA_FULL_VERSION_LIST, ""),
-    secChUaPlatformVersion: String(pick(args["sec-ch-ua-platform-version"], cfg("secChUaPlatformVersion", "sec_ch_ua_platform_version"), process.env.SENTINEL_SEC_CH_UA_PLATFORM_VERSION, "15.7.0")).replace(/^"|"$/g, ""),
-    secChUaArch: String(pick(args["sec-ch-ua-arch"], cfg("secChUaArch", "sec_ch_ua_arch"), process.env.SENTINEL_SEC_CH_UA_ARCH, "arm")).replace(/^"|"$/g, ""),
+    secChUaPlatformVersion: String(pick(args["sec-ch-ua-platform-version"], cfg("secChUaPlatformVersion", "sec_ch_ua_platform_version"), process.env.SENTINEL_SEC_CH_UA_PLATFORM_VERSION, "19.0.0")).replace(/^"|"$/g, ""),
+    secChUaArch: String(pick(args["sec-ch-ua-arch"], cfg("secChUaArch", "sec_ch_ua_arch"), process.env.SENTINEL_SEC_CH_UA_ARCH, "x86")).replace(/^"|"$/g, ""),
     secChUaBitness: String(pick(args["sec-ch-ua-bitness"], cfg("secChUaBitness", "sec_ch_ua_bitness"), process.env.SENTINEL_SEC_CH_UA_BITNESS, "64")).replace(/^"|"$/g, ""),
     secChUaModel: String(pick(args["sec-ch-ua-model"], cfg("secChUaModel", "sec_ch_ua_model"), process.env.SENTINEL_SEC_CH_UA_MODEL, "")).replace(/^"|"$/g, ""),
     cfEdgeMsec: Number(pick(args["cf-edge-msec"], cfg("cfEdgeMsec", "cf_edge_msec"), process.env.SENTINEL_CF_EDGE_MSEC, 38)),
@@ -1512,18 +1355,15 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
     cfTcpRttMsec: Number(pick(args["cf-tcp-rtt-msec"], cfg("cfTcpRttMsec", "cf_tcp_rtt_msec"), process.env.SENTINEL_CF_TCP_RTT_MSEC, 22)),
     cfQuicRttMsec: Number(pick(args["cf-quic-rtt-msec"], cfg("cfQuicRttMsec", "cf_quic_rtt_msec"), process.env.SENTINEL_CF_QUIC_RTT_MSEC, 0)),
     screen: (() => {
-      const width = Number(pick(args.width, cfg("width", "screenWidth"), process.env.SENTINEL_SCREEN_WIDTH, 1680));
-      const height = Number(pick(args.height, cfg("height", "screenHeight"), process.env.SENTINEL_SCREEN_HEIGHT, 1050));
-      const availWidth = Number(pick(args["avail-width"], cfg("availWidth", "screenAvailWidth"), process.env.SENTINEL_SCREEN_AVAIL_WIDTH, width));
-      const availHeight = Number(pick(args["avail-height"], cfg("availHeight", "screenAvailHeight"), process.env.SENTINEL_SCREEN_AVAIL_HEIGHT, Math.max(0, height - 25)));
-      const colorDepth = Number(pick(args["color-depth"], cfg("colorDepth", "color_depth"), process.env.SENTINEL_COLOR_DEPTH, 24));
+      const width = Number(pick(args.width, cfg("width", "screenWidth"), process.env.SENTINEL_SCREEN_WIDTH, 1920));
+      const height = Number(pick(args.height, cfg("height", "screenHeight"), process.env.SENTINEL_SCREEN_HEIGHT, 1080));
       return {
         width,
         height,
-        availWidth,
-        availHeight,
-        colorDepth,
-        pixelDepth: colorDepth,
+        availWidth: width,
+        availHeight: Math.max(0, height - 48),
+        colorDepth: 24,
+        pixelDepth: 24,
         orientation: { type: "landscape-primary", angle: 0 },
       };
     })(),
@@ -1545,10 +1385,9 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
           ignoreEnv: ignoreEnvForCredentials,
         });
       }
-      const cachedProof = options.challengeProof || proof;
       if (debugDx && cachedChallenge?.turnstile?.dx) {
         try {
-          const decoded = decodeDx(cachedChallenge.turnstile.dx, cachedProof);
+          const decoded = decodeDx(cachedChallenge.turnstile.dx, proof);
           const limit = Number.isFinite(debugDxLimit) && debugDxLimit > 0 ? debugDxLimit : 80;
           process.stderr.write(`dx 前 ${limit} 条指令：${JSON.stringify(decoded.slice(0, limit))}\n`);
         } catch (error) {
@@ -1556,33 +1395,10 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
         }
       }
       return {
-        cachedProof,
+        cachedProof: proof,
         cachedChatReq: cachedChallenge,
       };
     },
-  };
-
-  // 窗口尺寸和 Screen 分开建模。真实桌面 Chrome 中 viewport 不会等于整块
-  // screen；未显式传入时按最大化窗口给出一组自洽的标题栏/工具栏差值。
-  options.outerWidth = Number(pick(
-    args["outer-width"], cfg("outerWidth", "outer_width"),
-    process.env.SENTINEL_OUTER_WIDTH, options.screen.availWidth,
-  ));
-  options.outerHeight = Number(pick(
-    args["outer-height"], cfg("outerHeight", "outer_height"),
-    process.env.SENTINEL_OUTER_HEIGHT, options.screen.availHeight,
-  ));
-  options.innerWidth = Number(pick(
-    args["inner-width"], cfg("innerWidth", "inner_width", "viewportWidth", "viewport_width"),
-    process.env.SENTINEL_INNER_WIDTH, options.outerWidth,
-  ));
-  options.innerHeight = Number(pick(
-    args["inner-height"], cfg("innerHeight", "inner_height", "viewportHeight", "viewport_height"),
-    process.env.SENTINEL_INNER_HEIGHT, Math.max(0, options.outerHeight - 87),
-  ));
-  options.gpu = {
-    vendor: pick(args["webgl-vendor"], cfg("webglVendor", "webgl_vendor"), process.env.SENTINEL_WEBGL_VENDOR),
-    renderer: pick(args["webgl-renderer"], cfg("webglRenderer", "webgl_renderer"), process.env.SENTINEL_WEBGL_RENDERER),
   };
 
   if (options.timeZone) {
@@ -1603,29 +1419,14 @@ async function main(argv = process.argv.slice(2), writeOutput = true) {
   }
 
   const tokenText = await context.SentinelSDK.token(flow);
-  const tokenPayload = parseJson(tokenText, "SentinelSDK.token 输出");
-  // SO collector 与主 token 是两条独立输出。浏览器随后调用
-  // sessionObserverToken(flow)，并把结果放进 openai-sentinel-so-token。
-  if (context.SentinelSDK.sessionObserverToken) {
-    const soText = await context.SentinelSDK.sessionObserverToken(flow);
-    if (soText) {
-      try {
-        const soPayload = typeof soText === "string" ? JSON.parse(soText) : soText;
-        tokenPayload._so = soPayload?.so || soPayload;
-      } catch {
-        tokenPayload._so = soText;
-      }
-    }
-  }
-  const outputText = JSON.stringify(tokenPayload);
   clearTimers();
-  if (!writeOutput) return outputText;
+  if (!writeOutput) return tokenText;
   if (args.pretty || process.env.SENTINEL_PRETTY === "1") {
-    process.stdout.write(`${JSON.stringify(tokenPayload, null, 2)}\n`);
+    process.stdout.write(`${JSON.stringify(JSON.parse(tokenText), null, 2)}\n`);
   } else {
-    process.stdout.write(`${outputText}\n`);
+    process.stdout.write(`${tokenText}\n`);
   }
-  return outputText;
+  return tokenText;
 }
 
 if (require.main === module) {

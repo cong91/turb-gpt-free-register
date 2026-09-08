@@ -1140,12 +1140,29 @@
     .accounts-filter-heading p { margin-top: 5px; color: #7b8794; font-size: 12px; line-height: 1.45; }
     .accounts-filter-result {
       flex: 0 0 auto; padding: 8px 10px; border: 1px solid #dce5ef; border-radius: 6px;
-      background: #fff; color: #52606d; font-size: 12px; font-weight: 700; white-space: nowrap;
+      max-width: min(58%, 620px); background: #fff; color: #52606d; font-size: 12px; font-weight: 700;
+      line-height: 1.45; text-align: right; white-space: normal;
     }
     .accounts-filter-grid {
       display: grid; grid-template-columns: minmax(220px, 2fr) repeat(5, minmax(130px, 1fr));
       gap: 12px; align-items: end;
     }
+    .accounts-filter-primary {
+      display: grid; grid-template-columns: minmax(220px, 2fr) repeat(3, minmax(150px, 1fr));
+      gap: 12px; align-items: end;
+    }
+    .accounts-filter-advanced {
+      margin-top: 14px; border-top: 1px solid #e8edf3;
+    }
+    .accounts-filter-advanced > summary {
+      display: flex; align-items: center; gap: 8px; min-height: 40px;
+      color: #52606d; font-size: 12px; font-weight: 800; cursor: pointer; list-style: none;
+    }
+    .accounts-filter-advanced > summary::-webkit-details-marker { display: none; }
+    .accounts-filter-advanced > summary::before { content: ">"; color: #7b8794; font-size: 16px; transition: transform .15s ease; }
+    .accounts-filter-advanced[open] > summary::before { transform: rotate(90deg); }
+    .accounts-filter-advanced > summary small { color: #8b98a7; font-size: 11px; font-weight: 500; }
+    .accounts-filter-advanced .accounts-filter-grid { padding-bottom: 4px; }
     .acc-v2-field { display: flex; min-width: 0; flex-direction: column; gap: 6px; color: #52606d; font-size: 11px; font-weight: 700; }
     .acc-v2-field input, .acc-v2-field select { width: 100%; min-width: 0; height: 38px; margin: 0; padding: 0 10px; border: 1px solid #dce5ef; border-radius: 6px; background: #fff; color: #273444; font-size: 13px; }
     .acc-v2-field input:focus, .acc-v2-field select:focus { outline: none; border-color: #377dff; box-shadow: 0 0 0 2px #377dff18; }
@@ -1176,6 +1193,12 @@
       display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 20px;
       background: #f8fbff; border-bottom: 1px solid #e8edf3;
     }
+    .accounts-action-status {
+      margin: 0; padding: 10px 20px; border-bottom: 1px solid #e8edf3;
+      background: #fff; color: #52606d; font-size: 12px; line-height: 1.45;
+    }
+    .accounts-action-status.is-error { color: #b42318; background: #fff5f4; }
+    .accounts-action-status.is-success { color: #176b3a; background: #f2fbf5; }
     .accounts-command-label { margin-right: 4px; color: #1f4f8f; font-size: 12px; font-weight: 800; }
     .accounts-command-section { border-bottom: 1px solid #eef2f6; }
     .accounts-command-section summary {
@@ -1194,13 +1217,17 @@
     .accounts-table-v2 .acc-v2-domain { color: #377dff; font-size: 11px; font-weight: 700; }
     @media (max-width: 1200px) {
       .accounts-filter-grid { grid-template-columns: repeat(4, minmax(150px, 1fr)); }
+      .accounts-filter-primary { grid-template-columns: minmax(220px, 2fr) repeat(3, minmax(150px, 1fr)); }
       .acc-v2-field-search, .acc-v2-field-locale { grid-column: span 2; }
       .accounts-filter-actions { grid-column: span 4; justify-content: flex-start; }
       .accounts-filter-actions button { flex: 0 1 auto; }
     }
     @media (max-width: 760px) {
       .accounts-filter-heading, .accounts-commandbar-head { align-items: flex-start; flex-direction: column; }
+      .accounts-filter-result { max-width: 100%; text-align: left; }
       .accounts-filter-grid { grid-template-columns: 1fr 1fr; }
+      .accounts-filter-primary { grid-template-columns: 1fr 1fr; }
+      .accounts-filter-primary .acc-v2-field-search { grid-column: span 2; }
       .acc-v2-field-search, .acc-v2-field-locale, .accounts-filter-actions { grid-column: span 2; }
       .accounts-commandbar-head { gap: 10px; }
       .accounts-workers-field { margin-left: 0; }
@@ -2428,7 +2455,7 @@
           </div>
           <div class="accounts-filter-result" id="accountsFilterResultV2">0 kết quả</div>
         </div>
-        <div class="accounts-filter-grid">
+        <div class="accounts-filter-primary">
           <label class="acc-v2-field acc-v2-field-search">
             <span>Tìm kiếm</span>
             <input id="qAccountsV2" type="search" placeholder="Email, token, nguồn, ghi chú…" autocomplete="off">
@@ -2451,13 +2478,14 @@
             </select>
           </label>
           <label class="acc-v2-field">
-            <span>Đuôi mail</span>
-            <select id="accountDomainFilterV2" title="Phân loại theo phần domain sau dấu @">
-              <option value="">Tất cả đuôi mail</option>
-              <option value="gmail.com">gmail.com</option>
-              <option value="outlook.com">outlook.com</option>
-              <option value="hotmail.com">hotmail.com</option>
-              <option value="yahoo.com">yahoo.com</option>
+            <span>Provider đăng ký</span>
+            <select id="accountRegistrationDriverFilterV2" title="Lọc theo provider dùng để đăng ký tài khoản">
+              <option value="">Tất cả provider</option>
+              <option value="protocol">Protocol</option>
+              <option value="roxy">RoxyBrowser</option>
+              <option value="cloak">CloakBrowser</option>
+              <option value="browser_use">Browser Use</option>
+              <option value="skyvern">Skyvern</option>
               <option value="unknown">Chưa xác định</option>
             </select>
           </label>
@@ -2474,6 +2502,21 @@
               <option value="unknown">Chưa kiểm tra</option>
             </select>
           </label>
+        </div>
+        <details class="accounts-filter-advanced">
+          <summary><span>Bộ lọc nâng cao</span><small>domain, trạng thái, khu vực, ngày tạo</small></summary>
+          <div class="accounts-filter-grid">
+          <label class="acc-v2-field">
+            <span>Đuôi mail</span>
+            <select id="accountDomainFilterV2" title="Phân loại theo phần domain sau dấu @">
+              <option value="">Tất cả đuôi mail</option>
+              <option value="gmail.com">gmail.com</option>
+              <option value="outlook.com">outlook.com</option>
+              <option value="hotmail.com">hotmail.com</option>
+              <option value="yahoo.com">yahoo.com</option>
+              <option value="unknown">Chưa xác định</option>
+            </select>
+          </label>
           <label class="acc-v2-field">
             <span>2FA</span>
             <select id="accountTwofaFilterV2" title="Lọc theo trạng thái bật 2FA">
@@ -2482,6 +2525,16 @@
               <option value="failed">Bật thất bại</option>
               <option value="pending">Đang xử lý</option>
               <option value="disabled">Chưa bật</option>
+            </select>
+          </label>
+          <label class="acc-v2-field">
+            <span>TOTP</span>
+            <select id="totpStatusFilterV2" title="Lọc theo trạng thái TOTP của tài khoản">
+              <option value="">Tất cả trạng thái</option>
+              <option value="enabled">Đã có khóa</option>
+              <option value="disabled">Chưa có khóa</option>
+              <option value="pending">Đang xử lý</option>
+              <option value="failed">Thiết lập thất bại</option>
             </select>
           </label>
           <label class="acc-v2-field">
@@ -2519,11 +2572,13 @@
               <input type="date" id="dateToAccountsV2">
             </div>
           </div>
-          <div class="accounts-filter-actions">
+          </div>
+        </details>
+        <div class="accounts-filter-actions">
+          <button type="button" class="jobs-tb-btn" id="btnResetAccountFiltersV2" title="Xóa toàn bộ bộ lọc và về danh sách mặc định">Xóa bộ lọc</button>
             <button type="button" class="acc-v2-toggle" id="showArchivedAccountsV2" aria-pressed="false" title="Mặc định chỉ hiển thị tài khoản chưa lưu trữ">Xem lưu trữ</button>
             <button type="button" class="jobs-tb-btn" id="btnRefreshAccountsV2" title="Tải lại theo bộ lọc hiện tại">Làm mới</button>
             <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnImportPlanEmailsV2" title="Đối chiếu từng email với tài khoản trong DB và lọc các tài khoản có gói Free">Lọc tài khoản Free</button>
-          </div>
         </div>
       </div>
       <div class="jobs-toolbar-v2" id="accountsToolbarV2">
@@ -2548,6 +2603,7 @@
           </label>
           <span class="accounts-scope-hint" id="accountsBulkScopeHintV2">Chọn checkbox trong bảng</span>
         </div>
+        <div class="accounts-action-status hidden" id="accountsActionStatusV2" role="status" aria-live="polite"></div>
         <div class="accounts-commandbar-primary">
           <span class="accounts-command-label">Xử lý chính</span>
           <button type="button" class="jobs-tb-btn jobs-tb-btn--primary" id="btnCheckSelectedLiveV2" onclick="checkSelectedLive()" disabled title="Kiểm tra trạng thái đăng nhập và làm mới accessToken theo phạm vi">Kiểm tra tài khoản</button>
@@ -2572,8 +2628,7 @@
             <label class="accounts-format-field">Định dạng
               <select id="accountExportFormatV2"><option value="modern">email | pass | 2fa</option><option value="legacy">Cũ</option></select>
             </label>
-            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusAllV2" title="Xuất các Free Plus chưa xuất trong kết quả lọc và tự lưu trữ">Xuất Free Plus theo bộ lọc</button>
-            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusSelectedV2" disabled title="Xuất Free Plus theo phạm vi đang chọn">Xuất Free Plus</button>
+            <button type="button" class="jobs-tb-btn jobs-tb-btn--good" id="btnExportFreePlusV2" disabled title="Xuất Free Plus trong phạm vi đang chọn">Xuất Free Plus trong phạm vi</button>
             <button type="button" class="jobs-tb-btn" id="btnRecoverLatestFreePlusV2" title="Tạo lại bản xuất Free Plus gần nhất">Lấy bản xuất gần nhất</button>
             <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusExportedV2" disabled title="Đánh dấu đã xuất theo phạm vi">Đánh dấu đã xuất</button>
             <button type="button" class="jobs-tb-btn" id="btnMarkFreePlusUnexportedV2" disabled title="Đánh dấu chưa xuất theo phạm vi">Đánh dấu chưa xuất</button>
@@ -2601,18 +2656,18 @@
           </colgroup>
           <thead>
             <tr>
-              <th class="col-check"><input type="checkbox" id="accountsSelectAllV2" title="全选/取消全选当前页账号" disabled></th>
+              <th class="col-check"><input type="checkbox" id="accountsSelectAllV2" aria-label="Chọn hoặc bỏ chọn toàn bộ tài khoản trên trang này" title="Chọn hoặc bỏ chọn toàn bộ tài khoản trên trang này" disabled></th>
               <th class="col-id">ID</th>
-              <th class="col-email">邮箱</th>
-              <th class="col-source">来源</th>
+              <th class="col-email">Email</th>
+              <th class="col-source">Nguồn</th>
               <th class="col-token">Token</th>
-              <th class="col-password">密码</th>
-              <th class="col-plan">套餐</th>
-              <th class="col-note">备注</th>
+              <th class="col-password">Mật khẩu</th>
+              <th class="col-plan">Gói</th>
+              <th class="col-note">Ghi chú</th>
               <th class="col-small">2FA</th>
               <th class="col-status">Codex</th>
-              <th class="col-time">创建时间</th>
-              <th class="col-actions">操作</th>
+              <th class="col-time">Ngày tạo</th>
+              <th class="col-actions">Thao tác</th>
             </tr>
           </thead>
           <tbody id="accountsBodyV2"></tbody>
@@ -3161,7 +3216,23 @@ function jobsV2OpIcons() {
     del: `<svg viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>`,
   };
 }
-function showToast(t) { const el=$('#toast'); const text = typeof window.__translateVi === 'function' ? window.__translateVi(String(t)) : t; el.textContent=text; el.classList.add('show'); clearTimeout(showToast.t); showToast.t=setTimeout(()=>el.classList.remove('show'),1400); }
+function setAccountActionStatus(message, tone = '') {
+  const el = $('#accountsActionStatusV2');
+  if (!el) return;
+  el.textContent = message || '';
+  el.classList.toggle('hidden', !message);
+  el.classList.toggle('is-error', tone === 'error');
+  el.classList.toggle('is-success', tone === 'success');
+}
+function showToast(t) {
+  const el=$('#toast');
+  const text = typeof window.__translateVi === 'function' ? window.__translateVi(String(t)) : t;
+  el.textContent=text;
+  el.classList.add('show');
+  clearTimeout(showToast.t);
+  showToast.t=setTimeout(()=>el.classList.remove('show'), 2400);
+  if ($('#accountsPanelV2')?.offsetParent !== null) setAccountActionStatus(text, /thất bại|lỗi|失败|错误/i.test(text) ? 'error' : 'success');
+}
 async function copyText(text) {
   if (!text) return;
   try {
@@ -3681,6 +3752,9 @@ function getAccountSourceFilter() {
 function getAccountDomainFilter() {
   return ($('#accountDomainFilterV2')?.value || '').trim();
 }
+function getAccountRegistrationDriverFilter() {
+  return ($('#accountRegistrationDriverFilterV2')?.value || '').trim();
+}
 let accountDomainOptionsCache = '';
 async function loadAccountDomainOptions(force = false) {
   const select = $('#accountDomainFilterV2');
@@ -3724,25 +3798,61 @@ function getCodexBulkWorkers() {
   const el = document.getElementById('codexBulkWorkersV2');
   return Math.max(1, Math.min(16, Number((el && el.value) || 3)));
 }
-function getAccountFilterQuery() {
+function getAccountFilterParams() {
   const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
   const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
-  return new URLSearchParams({
+  return {
     archived: SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0',
     plan: getAccountsPlanFilter(),
     twofa_status: getAccountsTwofaFilter(),
     email_source: getAccountSourceFilter(),
     email_domain: getAccountDomainFilter(),
+    registration_driver: getAccountRegistrationDriverFilter(),
+    totp_status: getAccountsTotpFilter(),
     codex_status: getAccountsCodexFilter(),
     free_plus_export: getFreePlusExportFilter(),
     account_locale: getAccountLocaleFilter(),
     q: getAccountsQuery(),
     date_from: dateFrom,
     date_to: dateTo,
-  }).toString();
+  };
+}
+function getActiveAccountFilterLabels() {
+  const labels = [];
+  const values = [
+    ['qAccountsV2', 'Từ khóa'],
+    ['accountSourceFilterV2', 'Nguồn'],
+    ['accountRegistrationDriverFilterV2', 'Provider'],
+    ['accountDomainFilterV2', 'Đuôi mail'],
+    ['accountPlanFilterV2', 'Gói'],
+    ['accountTwofaFilterV2', '2FA'],
+    ['totpStatusFilterV2', 'TOTP'],
+    ['codexStatusFilterV2', 'Codex'],
+    ['freePlusExportFilterV2', 'Free Plus'],
+    ['accountLocaleFilterV2', 'Khu vực'],
+  ];
+  values.forEach(([id, label]) => {
+    const el = document.getElementById(id);
+    const value = el?.value?.trim();
+    const displayValue = el?.tagName === 'SELECT'
+      ? el.selectedOptions?.[0]?.textContent?.trim()
+      : value;
+    if (value) labels.push(`${label}: ${displayValue || value}`);
+  });
+  const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
+  const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
+  if (dateFrom || dateTo) labels.push(`Ngày: ${dateFrom || '…'} ~ ${dateTo || '…'}`);
+  if (SHOW_ARCHIVED_ACCOUNTS) labels.push('Đã lưu trữ');
+  return labels;
+}
+function getAccountFilterQuery(extra = {}) {
+  return new URLSearchParams({...getAccountFilterParams(), ...extra}).toString();
 }
 function getAccountBulkScope() {
   return $('#accountBulkScopeV2')?.value || 'selected';
+}
+function getAccountBulkScopeLabel(scope = getAccountBulkScope()) {
+  return scope === 'selected' ? 'đã chọn' : scope === 'page' ? 'trang hiện tại' : 'toàn bộ kết quả lọc';
 }
 async function getAccountBulkIds() {
   try {
@@ -3755,7 +3865,7 @@ async function getAccountBulkIds() {
     }
     return (result.account_ids || []).map(Number).filter(Number.isFinite);
   } catch (err) {
-    showToast('读取批量范围失败: ' + err.message);
+    showToast('Đọc phạm vi thao tác thất bại: ' + err.message);
     return [];
   }
 }
@@ -3763,26 +3873,20 @@ async function loadAccounts() {
   if (accountsLoading) return;
   accountsLoading = true;
   try {
-    const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
-    const codex = getAccountsCodexFilter();
-    const plan = getAccountsPlanFilter();
-    const twofa = getAccountsTwofaFilter();
-    const emailSource = getAccountSourceFilter();
-    const emailDomain = getAccountDomainFilter();
-    const freePlusExport = getFreePlusExportFilter();
-    const q = getAccountsQuery();
-    const accountLocale = getAccountLocaleFilter();
-    const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
-    const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
     const p = PAGERS.accounts;
-    const res = await api(`/api/accounts?paged=1&page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&twofa_status=${encodeURIComponent(twofa)}&email_source=${encodeURIComponent(emailSource)}&email_domain=${encodeURIComponent(emailDomain)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&account_locale=${encodeURIComponent(accountLocale)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const res = await api(`/api/accounts?${getAccountFilterQuery({paged: '1', page: p.page, page_size: p.size})}`);
     ACCOUNTS = res.items || [];
     ACCOUNTS_TOTAL = Number(res.total || ACCOUNTS.length || 0);
     const totalPages = Math.max(1, Math.ceil(ACCOUNTS_TOTAL / p.size));
     if (p.page > totalPages) { p.page = totalPages; accountsLoading = false; return loadAccounts(); }
     renderAccounts();
     const resultHint = $('#accountsFilterResultV2');
-    if (resultHint) resultHint.textContent = `${ACCOUNTS_TOTAL} kết quả`;
+    if (resultHint) {
+      const activeFilters = getActiveAccountFilterLabels();
+      resultHint.textContent = activeFilters.length
+        ? `${ACCOUNTS_TOTAL} kết quả · ${activeFilters.join(' · ')}`
+        : `${ACCOUNTS_TOTAL} kết quả`;
+    }
   } catch(e) { showToast('加载账号失败: ' + e.message); }
   finally { accountsLoading = false; }
 }
@@ -3790,20 +3894,8 @@ async function pollAccountPlanStatuses() {
   if (planStatusLoading || accountsLoading) return;
   planStatusLoading = true;
   try {
-    const archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
-    const codex = getAccountsCodexFilter();
-    const totp = getAccountsTotpFilter();
-    const q = getAccountsQuery();
-    const dateFrom = document.getElementById('dateFromAccountsV2')?.value || '';
-    const dateTo = document.getElementById('dateToAccountsV2')?.value || '';
-    const accountLocale = getAccountLocaleFilter();
     const p = PAGERS.accounts;
-    const plan = getAccountsPlanFilter();
-    const twofa = getAccountsTwofaFilter();
-    const emailSource = getAccountSourceFilter();
-    const emailDomain = getAccountDomainFilter();
-    const freePlusExport = getFreePlusExportFilter();
-    const snapshot = await api(`/api/accounts/plan-check-status?page=${encodeURIComponent(p.page)}&page_size=${encodeURIComponent(p.size)}&archived=${encodeURIComponent(archived)}&plan=${encodeURIComponent(plan)}&twofa_status=${encodeURIComponent(twofa)}&email_source=${encodeURIComponent(emailSource)}&email_domain=${encodeURIComponent(emailDomain)}&codex_status=${encodeURIComponent(codex)}&free_plus_export=${encodeURIComponent(freePlusExport)}&account_locale=${encodeURIComponent(accountLocale)}&q=${encodeURIComponent(q)}&date_from=${encodeURIComponent(dateFrom)}&date_to=${encodeURIComponent(dateTo)}`);
+    const snapshot = await api(`/api/accounts/plan-check-status?${getAccountFilterQuery({page: p.page, page_size: p.size})}`);
     const items = snapshot.items || [];
     const accountById = new Map(ACCOUNTS.map(r => [Number(r.id), r]));
     const hasUnknown = items.some(item => !accountById.has(Number(item.id)));
@@ -4071,7 +4163,7 @@ function renderAccounts() {
   const rows = ACCOUNTS;
   const rowHtmlV2 = (r) => `
     <tr>
-      <td class="col-check"><input type="checkbox" class="account-row-check" data-account-id="${esc(r.id)}" ${ACCOUNT_SELECTED.has(Number(r.id)) ? 'checked' : ''}></td>
+      <td class="col-check"><input type="checkbox" class="account-row-check" aria-label="Chọn tài khoản ${esc(r.email || `#${r.id}`)}" data-account-id="${esc(r.id)}" ${ACCOUNT_SELECTED.has(Number(r.id)) ? 'checked' : ''}></td>
       <td class="col-id">#${esc(r.id)}</td>
       <td class="col-email" title="${esc(r.email || '')}">
         <div class="acc-v2-email">${esc(r.email)}${r.archived ? ' <span class="pill status-used" title="该账号已归档">归档</span>' : ''}</div>
@@ -4080,9 +4172,10 @@ function renderAccounts() {
       </td>
       <td class="col-source" title="${esc(r.source_cdk || r.email_source || '')}">
         ${esc(r.email_source || '-')}
+        ${r.registration_driver ? `<div class="acc-v2-sub">Provider: ${esc(r.registration_driver)}</div>` : '<div class="acc-v2-sub">Provider: chưa xác định</div>'}
         ${r.source_cdk ? `<div class="acc-v2-sub">CDK: ${esc(r.source_cdk)}</div>` : ''}
         ${r.registration_ip ? `<div class="acc-v2-sub">IP: ${esc(r.registration_ip)}</div>` : ''}
-        ${r.account_locale || r.account_country ? `<div class="acc-v2-sub">Locale: ${esc(r.account_locale || '-')} / ${esc(r.account_country || '-')}</div>` : '<div class="acc-v2-sub">Locale: 未识别</div>'}
+        ${r.account_locale || r.account_country ? `<div class="acc-v2-sub">Locale: ${esc(r.account_locale || '-')} / ${esc(r.account_country || '-')}</div>` : '<div class="acc-v2-sub">Locale: chưa xác định</div>'}
       </td>
       <td class="col-token">${_tokenCellV2(r)}</td>
       <td class="col-password">${r.password ? `<span class="mono" title="${esc(r.password)}">${esc(short(r.password, 18))}</span>` : '<span class="acc-v2-muted">-</span>'}</td>
@@ -4093,10 +4186,10 @@ function renderAccounts() {
       <td class="col-time" title="${esc(r.created_at || '-')}">${esc(r.created_at || '-')}</td>
       <td class="col-actions">
         <div class="acc-v2-actions">
-          <button type="button" class="danger" data-account-delete="${esc(r.id)}" data-email="${esc(r.email)}">删除</button>
+          <button type="button" class="danger" data-account-delete="${esc(r.id)}" data-email="${esc(r.email)}">Xóa</button>
           ${_twofaReactivateAction(r)}
           <div class="acc-v2-more">
-            <button type="button" class="acc-v2-more-btn" data-acc-more-toggle aria-haspopup="true" aria-expanded="false">更多</button>
+            <button type="button" class="acc-v2-more-btn" data-acc-more-toggle aria-haspopup="true" aria-expanded="false">Thêm</button>
             <div class="acc-v2-more-menu" role="menu">${_accountsV2MoreMenu(r)}</div>
           </div>
         </div>
@@ -4105,7 +4198,7 @@ function renderAccounts() {
 
   const bodyV2 = $('#accountsBodyV2');
   if (bodyV2) {
-    bodyV2.innerHTML = rows.map(rowHtmlV2).join('') || '<tr><td colspan="12" style="text-align:center;color:#909399;padding:28px;">暂无账号</td></tr>';
+    bodyV2.innerHTML = rows.map(rowHtmlV2).join('') || '<tr><td colspan="12" style="text-align:center;color:#909399;padding:28px;">Không có tài khoản phù hợp với bộ lọc hiện tại.</td></tr>';
   }
   updateAccountSelectionUi(rows);
   _renderPager('accounts', total);
@@ -4122,15 +4215,15 @@ function updateAccountSelectionUi(pageRows = null) {
   const scopeHint = $('#accountsBulkScopeHintV2');
   if (scopeHint) scopeHint.textContent = scope === 'selected' ? 'Chọn checkbox trong bảng' : scope === 'page' ? 'Tất cả bản ghi của trang hiện tại' : 'Tất cả bản ghi khớp bộ lọc';
 
-  const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? '恢复选中' : '归档选中';
-  const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? '把选中的归档账号恢复到默认账号列表' : '归档选中的账号；默认账号列表将不再查询/显示这些账号';
+  const archiveLabel = SHOW_ARCHIVED_ACCOUNTS ? 'Khôi phục tài khoản' : 'Lưu trữ tài khoản';
+  const archiveTitle = SHOW_ARCHIVED_ACCOUNTS ? 'Đưa tài khoản đã chọn về danh sách mặc định' : 'Lưu trữ tài khoản đã chọn; danh sách mặc định sẽ ẩn chúng';
   const v2Ids = [
     'btnCheckSelectedLiveV2', 'btnCheckSelectedPlansV2', 'btnReactivateSelectedTwofaV2',
     'btnGenerateSelectedAgentV2', 'btnDownloadSelectedAgentV2', 'btnUploadSelectedAgentSub2V2',
     'btnLoginFreeNoTrialSub2V2', 'btnRetrySelectedCodexV2', 'btnDownloadSelectedCpaV2', 'btnStopSelectedCodexV2',
     'btnNoteSelectedAccountsV2', 'btnCopySelectedLinesV2', 'btnCopySelectedTokensV2', 'btnCopySelectedEmailsV2',
     'btnDownloadSelectedTxtV2', 'btnArchiveSelectedAccountsV2', 'btnDeleteSelectedAccountsV2',
-    'btnExportFreePlusSelectedV2', 'btnMarkFreePlusExportedV2', 'btnMarkFreePlusUnexportedV2',
+    'btnExportFreePlusV2', 'btnMarkFreePlusExportedV2', 'btnMarkFreePlusUnexportedV2',
   ];
   v2Ids.forEach(id => {
     const el = document.getElementById(id);
@@ -4858,88 +4951,69 @@ async function applyAccountsArchivedFilter(on) {
   await loadAccounts();
   await pollAccountPlanStatuses();
 }
+async function resetAccountFilters() {
+  const ids = [
+    'qAccountsV2', 'accountSourceFilterV2', 'accountRegistrationDriverFilterV2',
+    'accountDomainFilterV2', 'accountPlanFilterV2', 'accountTwofaFilterV2',
+    'totpStatusFilterV2', 'codexStatusFilterV2', 'freePlusExportFilterV2',
+    'accountLocaleFilterV2', 'dateFromAccountsV2', 'dateToAccountsV2',
+  ];
+  ids.forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.value = '';
+  });
+  const dateButton = $('#btnDateFilterAccountsV2');
+  if (dateButton) dateButton.textContent = 'Chọn khoảng ngày';
+  if (SHOW_ARCHIVED_ACCOUNTS) await applyAccountsArchivedFilter(false);
+  else {
+    ACCOUNT_SELECTED.clear();
+    PAGERS.accounts.page = 1;
+    await loadAccounts();
+    await pollAccountPlanStatuses();
+  }
+}
 async function refreshAccountsList(btn) {
   if (!btn) return;
   const old = btn.textContent;
   btn.disabled = true;
-  btn.textContent = '刷新中…';
+  btn.textContent = 'Đang làm mới…';
   try {
     planStatusRevision = '';
     await loadAccounts();
     await pollAccountPlanStatuses();
     loadSummary();
-    showToast('账号列表已刷新');
+    showToast('Đã làm mới danh sách tài khoản');
   } catch(e) {
-    showToast('刷新账号失败: ' + e.message);
+    showToast('Làm mới tài khoản thất bại: ' + e.message);
   } finally {
     btn.textContent = old;
     btn.disabled = false;
   }
 }
 (function bindAccountsFilterV2() {
+  const refreshForFilter = () => {
+    ACCOUNT_SELECTED.clear();
+    PAGERS.accounts.page = 1;
+    loadAccounts().then(() => pollAccountPlanStatuses());
+  };
   const qV2 = $('#qAccountsV2');
-  if (qV2) qV2.addEventListener('input', debounce(() => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-  }, 250));
+  if (qV2) qV2.addEventListener('input', debounce(refreshForFilter, 250));
   const localeV2 = $('#accountLocaleFilterV2');
-  if (localeV2) localeV2.addEventListener('input', debounce(() => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-    pollAccountPlanStatuses();
-  }, 250));
-  const codexV2 = $('#codexStatusFilterV2');
-  if (codexV2) codexV2.addEventListener('change', () => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-  });
-  const totpV2 = $('#totpStatusFilterV2');
-  if (totpV2) totpV2.addEventListener('change', () => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-  });
-
-  const sourceV2 = $('#accountSourceFilterV2');
-  if (sourceV2) sourceV2.addEventListener('change', () => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-    pollAccountPlanStatuses();
-  });
-  const domainV2 = $('#accountDomainFilterV2');
-  if (domainV2) domainV2.addEventListener('change', () => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-    pollAccountPlanStatuses();
-  });
-  const planV2 = $('#accountPlanFilterV2');
-  if (planV2) planV2.addEventListener('change', () => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-    pollAccountPlanStatuses();
-  });
-  const twofaV2 = $('#accountTwofaFilterV2');
-  if (twofaV2) twofaV2.addEventListener('change', () => {
-    ACCOUNT_SELECTED.clear();
-    PAGERS.accounts.page = 1;
-    loadAccounts();
-    pollAccountPlanStatuses();
-  });
+  if (localeV2) localeV2.addEventListener('input', debounce(refreshForFilter, 250));
+  [
+    'accountSourceFilterV2', 'accountRegistrationDriverFilterV2', 'accountDomainFilterV2',
+    'accountPlanFilterV2', 'accountTwofaFilterV2', 'totpStatusFilterV2',
+    'codexStatusFilterV2', 'freePlusExportFilterV2',
+  ].forEach(id => document.getElementById(id)?.addEventListener('change', refreshForFilter));
 
   const archivedV2 = $('#showArchivedAccountsV2');
   if (archivedV2) archivedV2.addEventListener('click', () => {
     applyAccountsArchivedFilter(!SHOW_ARCHIVED_ACCOUNTS);
   });
-  const exportAllFreePlus = $('#btnExportFreePlusAllV2');
-  if (exportAllFreePlus) exportAllFreePlus.addEventListener('click', () => exportFreePlus('all_filtered'));
-  const exportSelectedFreePlus = $('#btnExportFreePlusSelectedV2');
-  if (exportSelectedFreePlus) exportSelectedFreePlus.addEventListener('click', () => exportFreePlus('selected'));
+  const resetFiltersV2 = $('#btnResetAccountFiltersV2');
+  if (resetFiltersV2) resetFiltersV2.addEventListener('click', () => resetAccountFilters());
+  const exportFreePlusV2 = $('#btnExportFreePlusV2');
+  if (exportFreePlusV2) exportFreePlusV2.addEventListener('click', () => exportFreePlus());
   const recoverLatestFreePlus = $('#btnRecoverLatestFreePlusV2');
   if (recoverLatestFreePlus) recoverLatestFreePlus.addEventListener('click', recoverLatestFreePlusExport);
   const markExported = $('#btnMarkFreePlusExportedV2');
@@ -4972,25 +5046,29 @@ function getAccountExportFormat() {
   return ($('#accountExportFormatV2')?.value || 'modern');
 }
 
-async function exportFreePlus(scope) {
-  const ids = scope === 'selected' ? await getAccountBulkIds() : [];
-  if (scope === 'selected' && !ids.length) { showToast('当前批量范围没有账号'); return; }
+async function exportFreePlus() {
+  const selectedScope = getAccountBulkScope();
+  const exportFilter = getFreePlusExportFilter();
+  if (selectedScope === 'filtered' && exportFilter === 'exported') {
+    showToast('Bộ lọc đang là Free Plus đã xuất; hãy chọn Chưa xuất để tạo file mới');
+    return;
+  }
+  const ids = selectedScope === 'filtered' ? [] : await getAccountBulkIds();
+  if (selectedScope !== 'filtered' && !ids.length) {
+    showToast(`Phạm vi ${getAccountBulkScopeLabel(selectedScope)} không có tài khoản`);
+    return;
+  }
   const formatName = getAccountExportFormat();
   if (formatName === 'legacy' && !confirm('Định dạng Cũ sẽ bao gồm dữ liệu email gốc và Access Token. Bạn có chắc muốn tiếp tục không?')) return;
   try {
-    const body = {scope, account_ids: scope === 'selected' ? ids : undefined, format: formatName};
-    if (scope === 'all_filtered') {
-      body.archived = SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0';
-      body.free_plus_export = getFreePlusExportFilter();
-      body.account_locale = getAccountLocaleFilter();
-      body.twofa_status = getAccountsTwofaFilter();
-      body.email_source = getAccountSourceFilter();
-      body.email_domain = getAccountDomainFilter();
-      body.codex_status = getAccountsCodexFilter();
-      body.q = getAccountsQuery();
-      body.date_from = document.getElementById('dateFromAccountsV2')?.value || '';
-      body.date_to = document.getElementById('dateToAccountsV2')?.value || '';
-    }
+    const isFiltered = selectedScope === 'filtered';
+    const body = isFiltered
+      ? {scope: 'all_filtered', format: formatName, ...getAccountFilterParams()}
+      : {scope: 'selected', account_ids: ids, format: formatName};
+    const countLabel = isFiltered
+      ? 'toàn bộ kết quả lọc'
+      : `${ids.length} tài khoản trong ${getAccountBulkScopeLabel(selectedScope)}`;
+    setAccountActionStatus(`Đang chuẩn bị xuất Free Plus cho ${countLabel}…`);
     const r = await api('/api/accounts/free-plus/export', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
     if (!r.download_url) throw new Error('服务端未返回下载地址');
     const a = document.createElement('a');
@@ -4999,24 +5077,24 @@ async function exportFreePlus(scope) {
     document.body.appendChild(a);
     a.click();
     setTimeout(() => a.remove(), 1000);
-    showToast(`已生成 ${r.count} 个 Free Plus TXT${r.skipped_count ? `，跳过 ${r.skipped_count} 个` : ''}`);
+    showToast(`Đã tạo ${r.count} Free Plus TXT trong ${countLabel}${r.skipped_count ? `, bỏ qua ${r.skipped_count}` : ''}`);
     setTimeout(() => { ACCOUNT_SELECTED.clear(); loadAccounts(); pollAccountPlanStatuses(); }, 900);
   } catch (err) {
-    showToast('Free Plus 导出失败: ' + err.message);
+    showToast('Xuất Free Plus thất bại: ' + err.message);
   }
 }
 
 async function setFreePlusExportState(exported) {
   const ids = await getAccountBulkIds();
-  if (!ids.length) { showToast('请先选择账号'); return; }
-  const action = exported ? '已导出' : '未导出';
-  if (!confirm(`确定将选中 ${ids.length} 个账号标记为${action}吗？`)) return;
+  if (!ids.length) { showToast(`Phạm vi ${getAccountBulkScopeLabel()} không có tài khoản`); return; }
+  const action = exported ? 'đã xuất' : 'chưa xuất';
+  if (!confirm(`Đánh dấu ${ids.length} tài khoản trong ${getAccountBulkScopeLabel()} là ${action}?`)) return;
   try {
     const r = await api('/api/accounts/free-plus/export-state', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({account_ids: ids, exported})});
-    showToast(`已更新 ${r.updated_count} 个账号`);
+    showToast(`Đã cập nhật ${r.updated_count} tài khoản thành ${action}`);
     ACCOUNT_SELECTED.clear();
     await loadAccounts();
-  } catch (err) { showToast('更新导出状态失败: ' + err.message); }
+  } catch (err) { showToast('Cập nhật trạng thái xuất thất bại: ' + err.message); }
 }
 
 async function fetchAccountSecrets(ids, field, formatName = getAccountExportFormat()) {
@@ -5900,7 +5978,7 @@ async function loginAllFreeNoTrialToSub2() {
       showToast('当前批量范围没有账号');
       return;
     }
-    const preview = await api('/api/codex/sub2-free-no-trial-targets');
+    const preview = await api(`/api/codex/sub2-free-no-trial-targets?${getAccountFilterQuery()}`);
     const scopeSet = new Set(scopeIds.map(Number));
     const targetIds = (preview.account_ids || [])
       .map(Number)
@@ -5912,13 +5990,14 @@ async function loginAllFreeNoTrialToSub2() {
     const workers = getCodexBulkWorkers();
     const workersElV2 = $('#codexBulkWorkersV2');
     if (workersElV2) workersElV2.value = workers;
-    const msg = `登录当前批量范围内 ${targetIds.length} 个已确认 Free 且无 Plus 试用资格的账号到 sub2api？
+    const msg = `Đăng nhập ${targetIds.length} tài khoản Free đã xác nhận, không có Plus trial trong phạm vi ${getAccountBulkScopeLabel()} lên sub2api?
 
-并发线程数：${workers}
+Luồng đồng thời: ${workers}
 
-将按账号消耗邮箱 OTP 和接码短信。`;
+Thao tác này dùng OTP email và SMS cho mỗi tài khoản.`;
     if (!confirm(msg)) return;
 
+    setAccountActionStatus(`Đang tạo ${targetIds.length} job đăng nhập Free không trial lên sub2api…`);
     const result = await api('/api/codex/retry-bulk', {
       method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -5926,15 +6005,15 @@ async function loginAllFreeNoTrialToSub2() {
     });
     const skippedCount = (result.skipped || []).length;
     showToast(skippedCount
-      ? `已开始登录 ${result.started_count || 0} 个，跳过 ${skippedCount} 个`
-      : `已开始登录 ${result.started_count || 0} 个 Free 无试用账号到 sub2api`);
+      ? `Đã bắt đầu ${result.started_count || 0} đăng nhập, bỏ qua ${skippedCount}`
+      : `Đã bắt đầu ${result.started_count || 0} đăng nhập Free không trial lên sub2api`);
     loadAccounts();
     const first = (result.started || [])[0];
     if (first && first.email) openRetryLog(first.email);
     const poll = setInterval(loadAccounts, 5000);
     setTimeout(() => clearInterval(poll), 10 * 60 * 1000);
   } catch(err) {
-    showToast('登录 Free 无试用账号失败: ' + err.message);
+    showToast('Đăng nhập Free không trial thất bại: ' + err.message);
   } finally {
     btn.disabled = false;
   }
@@ -7933,11 +8012,19 @@ function clampGmailApiUrlRecordCount() {
 function useAllUnusedGmailApiUrlRecords() {
   const countEl = $('#regCountV2');
   const available = Math.min(gmailApiUrlAvailableCount(), 83);
-  if (!countEl || available < 1) return;
+  if (!countEl) {
+    showToast('Không tìm thấy ô số source Gmail');
+    return;
+  }
+  if (available < 1) {
+    showToast('Không còn source Gmail local khả dụng');
+    return;
+  }
   countEl.max = String(available);
   countEl.value = String(available);
   countEl.dispatchEvent(new Event('input', { bubbles: true }));
   countEl.dispatchEvent(new Event('change', { bubbles: true }));
+  showToast(`Đã chọn ${available} source Gmail local`);
 }
 
 function syncGmailApiUrlCountLabel(providerEl) {

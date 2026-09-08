@@ -638,7 +638,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", "file": "proxy.py", "type": "bool", "group": "代理池",
-        "label": "Đăng ký một account một IP", "help": "Chỉ áp dụng cho registration: chạy tuần tự, retire proxy sau mỗi account và đợi Proxy.vn xoay sang IP mới trước account kế tiếp",
+        "label": "Đăng ký một account một IP", "help": "Chỉ áp dụng cho registration: mỗi job lấy IP mới từ Proxy.vn; giữ nguyên số luồng đã chọn và dùng key riêng cho các lane chạy đồng thời",
     },
     {
         "key": "ROTATING_PROXY_API_KEY", "file": "proxy.py", "type": "str", "group": "代理池",

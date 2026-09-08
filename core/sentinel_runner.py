@@ -25,6 +25,7 @@ from config import (
     JS_HEAP_SIZE_LIMIT,
     NAVIGATOR_LANGUAGE,
     NAVIGATOR_LANGUAGES,
+    NAVIGATOR_PLATFORM,
     OPENAI_BUILD_ID,
     SCREEN_HEIGHT,
     SCREEN_WIDTH,
@@ -39,6 +40,7 @@ from config import (
     TIMEZONE_IANA,
     TIMEZONE_NAME,
     TIMEZONE_OFFSET_MINUTES,
+    USER_AGENT_DATA_PLATFORM,
     USER_AGENT,
 )
 
@@ -134,9 +136,9 @@ def generate_sentinel_token(
     chrome_full_version = str(profile.get("chrome_full_version", CHROME_FULL_VERSION))
     sec_ch_ua = str(profile.get("sec_ch_ua", SEC_CH_UA))
     sec_ch_ua_platform = str(profile.get("sec_ch_ua_platform", SEC_CH_UA_PLATFORM))
-    navigator_platform = str(profile.get("navigator_platform", "MacIntel"))
+    navigator_platform = str(profile.get("navigator_platform", NAVIGATOR_PLATFORM))
     navigator_vendor = str(profile.get("navigator_vendor", "Google Inc."))
-    user_agent_data_platform = str(profile.get("user_agent_data_platform", sec_ch_ua_platform.strip('\"') or "macOS"))
+    user_agent_data_platform = str(profile.get("user_agent_data_platform", USER_AGENT_DATA_PLATFORM))
     sec_ch_ua_full_version_list = str(profile.get("sec_ch_ua_full_version_list", SEC_CH_UA_FULL_VERSION_LIST))
     sec_ch_ua_platform_version = str(profile.get("sec_ch_ua_platform_version", SEC_CH_UA_PLATFORM_VERSION))
     sec_ch_ua_arch = str(profile.get("sec_ch_ua_arch", SEC_CH_UA_ARCH))

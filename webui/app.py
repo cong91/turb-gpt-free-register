@@ -125,7 +125,7 @@ def _compact_account_for_list(row: dict) -> dict:
 
     # 这些是列表固定列直接展示字段。
     for key in (
-        "user_name", "email_source", "email_domain", "source_cdk", "registration_ip", "account_locale", "account_country", "account_locale_source", "note", "archived", "created_at",
+        "user_name", "email_source", "email_domain", "registration_driver", "source_cdk", "registration_ip", "account_locale", "account_country", "account_locale_source", "note", "archived", "created_at",
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "codex_agent_status",
         "totp_setup_status",
@@ -424,6 +424,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         account_locale_filter = str(request.args.get("account_locale", default="") or "").strip().lower()
         email_source_filter = str(request.args.get("email_source", default="") or "").strip().lower()
         email_domain_filter = str(request.args.get("email_domain", default="") or "").strip().lower()
+        registration_driver_filter = str(request.args.get("registration_driver", default="") or "").strip().lower()
         free_plus_export_filter = str(request.args.get("free_plus_export", default="") or "").lower()
         # 新分页接口：传 page/page_size 或 paged=1 时返回 {items,total,page,page_size,...}
         paged = str(request.args.get("paged", default="") or "").lower() in {"1", "true", "yes"}
@@ -433,39 +434,46 @@ def create_app(auth_code: str | None = None) -> Flask:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            result = db.list_accounts_page(
-                limit=page_size,
-                offset=offset,
-                archived=archived,
-                plan_filter=plan_filter,
-                twofa_filter=twofa_filter,
-                codex_filter=codex_filter,
-                q=q,
-                free_plus_export_filter=free_plus_export_filter,
-                date_from=date_from,
-                date_to=date_to,
-                account_locale_filter=account_locale_filter,
-                email_source_filter=email_source_filter,
-                email_domain_filter=email_domain_filter,
-                totp_filter=totp_filter,
-            )
+            page_kwargs = {
+                "limit": page_size,
+                "offset": offset,
+                "archived": archived,
+                "plan_filter": plan_filter,
+                "twofa_filter": twofa_filter,
+                "codex_filter": codex_filter,
+                "q": q,
+                "free_plus_export_filter": free_plus_export_filter,
+                "date_from": date_from,
+                "date_to": date_to,
+                "account_locale_filter": account_locale_filter,
+                "email_source_filter": email_source_filter,
+                "email_domain_filter": email_domain_filter,
+                "totp_filter": totp_filter,
+            }
+            if registration_driver_filter:
+                page_kwargs["registration_driver_filter"] = registration_driver_filter
+            result = db.list_accounts_page(**page_kwargs)
             result["items"] = [_compact_account_for_list(r) for r in (result.get("items") or [])]
             result.update({"ok": True, "page": page, "page_size": page_size, "compact": True})
             return jsonify(result)
-        return jsonify(db.list_accounts(
-            limit=limit,
-            archived=archived,
-            plan_filter=plan_filter,
-            twofa_filter=twofa_filter,
-            codex_filter=codex_filter,
-            q=q,
-            free_plus_export_filter=free_plus_export_filter,
-            date_from=date_from,
-            date_to=date_to,
-            account_locale_filter=account_locale_filter,
-            email_source_filter=email_source_filter,
-            email_domain_filter=email_domain_filter,
-        ))
+        list_kwargs = {
+            "limit": limit,
+            "archived": archived,
+            "plan_filter": plan_filter,
+            "twofa_filter": twofa_filter,
+            "codex_filter": codex_filter,
+            "q": q,
+            "free_plus_export_filter": free_plus_export_filter,
+            "date_from": date_from,
+            "date_to": date_to,
+            "account_locale_filter": account_locale_filter,
+            "email_source_filter": email_source_filter,
+            "email_domain_filter": email_domain_filter,
+            "totp_filter": totp_filter,
+        }
+        if registration_driver_filter:
+            list_kwargs["registration_driver_filter"] = registration_driver_filter
+        return jsonify(db.list_accounts(**list_kwargs))
 
     @app.get("/api/accounts/filtered-ids")
     def api_accounts_filtered_ids():
@@ -481,22 +489,28 @@ def create_app(auth_code: str | None = None) -> Flask:
         account_locale_filter = str(request.args.get("account_locale", default="") or "").strip().lower()
         email_source_filter = str(request.args.get("email_source", default="") or "").strip().lower()
         email_domain_filter = str(request.args.get("email_domain", default="") or "").strip().lower()
+        registration_driver_filter = str(request.args.get("registration_driver", default="") or "").strip().lower()
+        totp_filter = str(request.args.get("totp_status") or request.args.get("totp_filter") or "").strip().lower()
         free_plus_export_filter = str(request.args.get("free_plus_export", default="") or "").lower()
         normalized_limit = max(1, min(5001, int(limit or 5001)))
-        rows = db.list_accounts(
-            limit=normalized_limit,
-            archived=archived,
-            plan_filter=plan_filter,
-            twofa_filter=twofa_filter,
-            codex_filter=codex_filter,
-            q=q,
-            free_plus_export_filter=free_plus_export_filter,
-            date_from=date_from,
-            date_to=date_to,
-            account_locale_filter=account_locale_filter,
-            email_source_filter=email_source_filter,
-            email_domain_filter=email_domain_filter,
-        )
+        list_kwargs = {
+            "limit": normalized_limit,
+            "archived": archived,
+            "plan_filter": plan_filter,
+            "twofa_filter": twofa_filter,
+            "codex_filter": codex_filter,
+            "q": q,
+            "free_plus_export_filter": free_plus_export_filter,
+            "date_from": date_from,
+            "date_to": date_to,
+            "account_locale_filter": account_locale_filter,
+            "email_source_filter": email_source_filter,
+            "email_domain_filter": email_domain_filter,
+            "totp_filter": totp_filter,
+        }
+        if registration_driver_filter:
+            list_kwargs["registration_driver_filter"] = registration_driver_filter
+        rows = db.list_accounts(**list_kwargs)
         return jsonify({
             "ok": True,
             "account_ids": [int(row["id"]) for row in rows if row.get("id") is not None],
@@ -545,44 +559,52 @@ def create_app(auth_code: str | None = None) -> Flask:
         account_locale_filter = str(request.args.get("account_locale", default="") or "").strip().lower()
         email_source_filter = str(request.args.get("email_source", default="") or "").strip().lower()
         email_domain_filter = str(request.args.get("email_domain", default="") or "").strip().lower()
+        registration_driver_filter = str(request.args.get("registration_driver", default="") or "").strip().lower()
         page_arg = request.args.get("page", default=None, type=int)
         page_size_arg = request.args.get("page_size", default=None, type=int)
         if page_arg is not None or page_size_arg is not None:
             page = max(1, int(page_arg or 1))
             page_size = max(1, min(500, int(page_size_arg or limit or 50)))
             offset = (page - 1) * page_size
-            snapshot = db.list_account_plan_check_statuses(
-                limit=page_size,
-                offset=offset,
-                archived=archived,
-                plan_filter=plan_filter,
-                twofa_filter=twofa_filter,
-                codex_filter=codex_filter,
-                q=q,
-                free_plus_export_filter=free_plus_export_filter,
-                date_from=date_from,
-                date_to=date_to,
-                account_locale_filter=account_locale_filter,
-                email_source_filter=email_source_filter,
-                email_domain_filter=email_domain_filter,
-                totp_filter=totp_filter,
-            )
+            status_kwargs = {
+                "limit": page_size,
+                "offset": offset,
+                "archived": archived,
+                "plan_filter": plan_filter,
+                "twofa_filter": twofa_filter,
+                "codex_filter": codex_filter,
+                "q": q,
+                "free_plus_export_filter": free_plus_export_filter,
+                "date_from": date_from,
+                "date_to": date_to,
+                "account_locale_filter": account_locale_filter,
+                "email_source_filter": email_source_filter,
+                "email_domain_filter": email_domain_filter,
+                "totp_filter": totp_filter,
+            }
+            if registration_driver_filter:
+                status_kwargs["registration_driver_filter"] = registration_driver_filter
+            snapshot = db.list_account_plan_check_statuses(**status_kwargs)
             snapshot.update({"page": page, "page_size": page_size})
         else:
-            snapshot = db.list_account_plan_check_statuses(
-                limit=max(1, min(5000, limit)),
-                archived=archived,
-                plan_filter=plan_filter,
-                twofa_filter=twofa_filter,
-                codex_filter=codex_filter,
-                q=q,
-                free_plus_export_filter=free_plus_export_filter,
-                date_from=date_from,
-                date_to=date_to,
-                account_locale_filter=account_locale_filter,
-                email_source_filter=email_source_filter,
-                email_domain_filter=email_domain_filter,
-            )
+            status_kwargs = {
+                "limit": max(1, min(5000, limit)),
+                "archived": archived,
+                "plan_filter": plan_filter,
+                "twofa_filter": twofa_filter,
+                "codex_filter": codex_filter,
+                "q": q,
+                "free_plus_export_filter": free_plus_export_filter,
+                "date_from": date_from,
+                "date_to": date_to,
+                "account_locale_filter": account_locale_filter,
+                "email_source_filter": email_source_filter,
+                "email_domain_filter": email_domain_filter,
+                "totp_filter": totp_filter,
+            }
+            if registration_driver_filter:
+                status_kwargs["registration_driver_filter"] = registration_driver_filter
+            snapshot = db.list_account_plan_check_statuses(**status_kwargs)
         snapshot["queue"] = plan_check_service.queue_settings()
         return jsonify(snapshot)
 
@@ -672,21 +694,29 @@ def create_app(auth_code: str | None = None) -> Flask:
     @app.post("/api/accounts/free-plus/export")
     def api_accounts_free_plus_export():
         data = request.get_json(silent=True) or {}
+        export_kwargs = {
+            "scope": data.get("scope") or "selected",
+            "account_ids": data.get("account_ids") or data.get("ids"),
+            "format_name": data.get("format") or "modern",
+            "archived": data.get("archived") or "all",
+            "q": data.get("q") or "",
+            "codex_filter": data.get("codex_status") or "",
+            "date_from": data.get("date_from") or "",
+            "date_to": data.get("date_to") or "",
+            "account_locale_filter": data.get("account_locale") or "",
+            "email_source_filter": data.get("email_source") or "",
+            "email_domain_filter": data.get("email_domain") or "",
+            "twofa_filter": data.get("twofa_status") or "",
+            "totp_filter": data.get("totp_status") or data.get("totp_filter") or "",
+        }
+        registration_driver_filter = str(data.get("registration_driver") or "").strip()
+        if registration_driver_filter:
+            export_kwargs["registration_driver_filter"] = registration_driver_filter
+        plan_filter = str(data.get("plan") or "").strip()
+        if plan_filter:
+            export_kwargs["plan_filter"] = plan_filter
         try:
-            prepared = free_plus_export.prepare_export(
-                scope=data.get("scope") or "selected",
-                account_ids=data.get("account_ids") or data.get("ids"),
-                format_name=data.get("format") or "modern",
-                archived=data.get("archived") or "all",
-                q=data.get("q") or "",
-                codex_filter=data.get("codex_status") or "",
-                date_from=data.get("date_from") or "",
-                date_to=data.get("date_to") or "",
-                account_locale_filter=data.get("account_locale") or "",
-                email_source_filter=data.get("email_source") or "",
-                email_domain_filter=data.get("email_domain") or "",
-                twofa_filter=data.get("twofa_status") or "",
-            )
+            prepared = free_plus_export.prepare_export(**export_kwargs)
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
 

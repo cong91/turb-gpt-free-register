@@ -659,14 +659,23 @@ def _build_cloak_locale_options(proxy_url: str | None = None) -> dict:
     out = {}
     if explicit_locale:
         out["locale"] = explicit_locale
-        # Accept-Language 用 config.browser 自动推断更完整；显式时给一个保守值。
-        out["accept_language"] = f"{explicit_locale},{explicit_locale.split('-')[0]};q=0.9,en-US;q=0.8,en;q=0.7"
+        # Playwright/Cloak emits the configured locale as the browser default.
+        out["accept_language"] = explicit_locale
     if explicit_timezone:
         out["timezone"] = explicit_timezone
     if explicit_locale and explicit_timezone:
         return out
-    if not bool(getattr(_cfg, "CLOAK_GEOIP", True)):
-        return out
+    from config.browser import AUTO_BROWSER_LOCALE_FROM_IP, build_browser_environment
+
+    # Fixed mode must not call a GeoIP endpoint. Cloak's own geoip option still
+    # resolves the current exit IP internally for WebRTC, independently of this
+    # locale/timezone selection path.
+    if not AUTO_BROWSER_LOCALE_FROM_IP or not bool(getattr(_cfg, "CLOAK_GEOIP", True)):
+        profile = build_browser_environment()
+        out.setdefault("locale", str(profile.get("navigator_language") or ""))
+        out.setdefault("timezone", str(profile.get("timezone_iana") or ""))
+        out.setdefault("accept_language", str(profile.get("accept_language") or ""))
+        return {k: v for k, v in out.items() if v}
     try:
         from config.browser import build_browser_environment
         geo = _detect_cloak_exit_geo(proxy_url)
@@ -713,9 +722,9 @@ def build_cloak_driver(proxy: str | None = None) -> tuple[BrowserSeleniumDriver,
 
     proxy_url = _normalize_proxy(proxy) if bool(getattr(_cfg, "CLOAK_USE_PROXY", True)) else None
     locale_opts = _build_cloak_locale_options(proxy_url)
-    # geoip=True 交给 CloakBrowser 根据当前出口 IP 自动匹配 timezone/locale/WebRTC。
-    # 之前只有显式 proxy_url 时才开启；如果用户走系统代理/VPN/透明代理，代码层面
-    # 看不到 proxy_url，会误关 geoip，导致语言/时区不跟随出口。这里改为完全尊重配置。
+    # GeoIP 只让 CloakBrowser 解析当前出口 IP 并绑定 WebRTC；locale/timezone 已由
+    # _build_cloak_locale_options() 显式传入，且 AUTO_BROWSER_LOCALE_FROM_IP=False 时
+    # 不会按 GeoIP 改写浏览器语言或时区。
     opts = {
         "headless": bool(getattr(_cfg, "CLOAK_HEADLESS", False)),
         "humanize": bool(getattr(_cfg, "CLOAK_HUMANIZE", True)),

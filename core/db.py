@@ -1448,8 +1448,25 @@ def _find_by_email(rows: list[dict], email: str) -> dict | None:
     return next((r for r in rows if (r.get("email") or "").lower() == target), None)
 
 
+def _account_registration_driver(row: dict) -> str:
+    direct = str(row.get("registration_driver") or "").strip().lower()
+    if direct:
+        return direct
+    extra_raw = row.get("extra_json")
+    if not isinstance(extra_raw, str) or not extra_raw.strip():
+        return ""
+    try:
+        extra = json.loads(extra_raw)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ""
+    return str(extra.get("registration_driver") or "").strip().lower() if isinstance(extra, dict) else ""
+
+
 def _decorate_account(row: dict) -> dict:
     out = dict(row)
+    registration_driver = _account_registration_driver(out)
+    if registration_driver:
+        out["registration_driver"] = registration_driver
     out["email_domain"] = _account_email_domain(out.get("email")) or "unknown"
     if not out.get("account_locale") and not out.get("account_country"):
         try:
@@ -1542,6 +1559,29 @@ def _account_matches_email_domain_filter(row: dict, domain_filter: str | None = 
     if value in {"unknown", "unresolved", "none", "null", "未识别"}:
         return not domain
     return domain == value
+
+
+def _account_matches_registration_driver_filter(row: dict, driver_filter: str | None = None) -> bool:
+    """Filter accounts by the browser/protocol driver that created them."""
+    value = str(driver_filter or "").strip().lower()
+    if not value or value in {"all", "any", "*"}:
+        return True
+    raw = _account_registration_driver(row)
+    aliases = {
+        "roxybrowser": "roxy",
+        "fingerprint": "roxy",
+        "browser": "roxy",
+        "cloakbrowser": "cloak",
+        "browseruse": "browser_use",
+        "browser-use": "browser_use",
+        "bu": "browser_use",
+        "sv": "skyvern",
+    }
+    normalized = aliases.get(raw, raw)
+    wanted = aliases.get(value, value)
+    if wanted in {"unknown", "unresolved", "none", "null", "未识别"}:
+        return normalized in {"", "unknown", "unresolved", "none", "null", "未识别"}
+    return normalized == wanted
 
 
 
@@ -2503,6 +2543,7 @@ def _filtered_decorated_accounts(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
 ) -> list[dict]:
     rows = _load_accounts()
@@ -2520,6 +2561,7 @@ def _filtered_decorated_accounts(
     decorated = [r for r in decorated if _account_matches_locale_filter(r, account_locale_filter)]
     decorated = [r for r in decorated if _account_matches_email_source_filter(r, email_source_filter)]
     decorated = [r for r in decorated if _account_matches_email_domain_filter(r, email_domain_filter)]
+    decorated = [r for r in decorated if _account_matches_registration_driver_filter(r, registration_driver_filter)]
     decorated = [r for r in decorated if _account_matches_free_plus_export_filter(r, free_plus_export_filter)]
     decorated = [r for r in decorated if _account_matches_query(r, q)]
     # 按创建时间筛选（date_from/date_to 为 ISO 字符串或 YYYY-MM-DD）
@@ -2555,11 +2597,12 @@ def list_account_plan_check_statuses(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
 ) -> dict:
     """返回不含 Token/邮箱密码的套餐查询轻量状态快照。"""
     fields = (
-        "id", "email", "email_domain", "archived",
+        "id", "email", "email_domain", "archived", "registration_driver",
         "account_locale", "account_country", "account_locale_source",
         "twofa_status", "twofa_error",
         "plan_type", "current_plan_type", "plus_trial_eligible",
@@ -2590,7 +2633,7 @@ def list_account_plan_check_statuses(
         offset = max(0, int(offset or 0))
         extended_filters = any(
             str(value or "").strip()
-            for value in (twofa_filter, account_locale_filter, email_source_filter, email_domain_filter, totp_filter)
+            for value in (twofa_filter, account_locale_filter, email_source_filter, email_domain_filter, registration_driver_filter, totp_filter)
         )
         if extended_filters:
             all_rows = _filtered_decorated_accounts(
@@ -2605,6 +2648,7 @@ def list_account_plan_check_statuses(
                 account_locale_filter=account_locale_filter,
                 email_source_filter=email_source_filter,
                 email_domain_filter=email_domain_filter,
+                registration_driver_filter=registration_driver_filter,
                 totp_filter=totp_filter,
             )
             total = len(all_rows)
@@ -2698,10 +2742,11 @@ def list_accounts(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
 ) -> list[dict]:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter, totp_filter=totp_filter)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter, registration_driver_filter=registration_driver_filter, totp_filter=totp_filter)
         return rows[max(0, int(offset or 0)): max(0, int(offset or 0)) + max(1, int(limit))]
 
 
@@ -2719,6 +2764,7 @@ def list_accounts_page(
     account_locale_filter: str | None = None,
     email_source_filter: str | None = None,
     email_domain_filter: str | None = None,
+    registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
 ) -> dict:
     with _LOCK:
@@ -2731,6 +2777,7 @@ def list_accounts_page(
                 account_locale_filter,
                 email_source_filter,
                 email_domain_filter,
+                registration_driver_filter,
                 totp_filter,
             )
         )
@@ -2747,6 +2794,7 @@ def list_accounts_page(
                 account_locale_filter=account_locale_filter,
                 email_source_filter=email_source_filter,
                 email_domain_filter=email_domain_filter,
+                registration_driver_filter=registration_driver_filter,
                 totp_filter=totp_filter,
             )
             total = len(rows)

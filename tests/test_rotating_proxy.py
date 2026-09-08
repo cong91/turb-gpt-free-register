@@ -776,6 +776,8 @@ class RotatingProxyConfigTests(unittest.TestCase):
         lease = Mock(proxy_url="http://203.0.113.20:8080", lane_id=3, proxy_expires_at=200.0)
         with patch.object(main._roxy_cfg, "REGISTRATION_DRIVER", "roxy"), patch.object(
             proxy_config, "ROTATING_PROXY_ENABLED", True
+        ), patch.object(
+            proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False
         ), patch(
             "core.rotating_proxy_manager.get_rotating_proxy_manager"
         ) as get_manager, patch(
@@ -801,7 +803,7 @@ class RotatingProxyConfigTests(unittest.TestCase):
             proxy_url=lease.proxy_url,
         )
 
-    def test_one_account_registration_mode_retires_proxy_and_forces_single_worker(self):
+    def test_one_account_registration_mode_retires_proxy_without_reducing_workers(self):
         import main
         from core import registration_service
 
@@ -835,7 +837,7 @@ class RotatingProxyConfigTests(unittest.TestCase):
         with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
             proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True
         ), patch.object(registration_service, "_normalize_workers", return_value=8):
-            self.assertEqual(registration_service.effective_registration_workers(8), 1)
+            self.assertEqual(registration_service.effective_registration_workers(8), 8)
 
     def test_one_account_registration_failure_releases_proxy_for_retry(self):
         import main
@@ -894,18 +896,25 @@ class RotatingProxyConfigTests(unittest.TestCase):
         self.assertTrue(result["success"])
         get_manager.return_value.acquire.assert_called_once_with(0)
 
-    def test_parallel_batch_serializes_when_one_account_mode_is_enabled(self):
+    def test_parallel_batch_keeps_requested_workers_when_one_account_mode_is_enabled(self):
         import main
 
         with patch.object(proxy_config, "ROTATING_PROXY_ENABLED", True), patch.object(
             proxy_config, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True
-        ), patch.object(
-            main, "run_serial_batch", return_value=[{"success": True}]
-        ) as run_serial:
-            result = main.run_parallel_batch(1, 4, 0, True)
+        ), patch(
+            "core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"
+        ) as prepare, patch.object(
+            main, "run_one_batch_item", return_value={"success": True}
+        ) as run_one:
+            result = main.run_parallel_batch(3, 3, 0, True)
 
-        self.assertEqual(result, [{"success": True}])
-        run_serial.assert_called_once_with(1, 0, True, None)
+        self.assertEqual(len(result), 3)
+        prepare.assert_called_once_with(3, scope="registration")
+        self.assertEqual(run_one.call_count, 3)
+        self.assertEqual(
+            sorted(call.args[3] for call in run_one.call_args_list),
+            [0, 1, 2],
+        )
 
     def test_cli_batch_assigns_a_stable_lane_id_to_each_worker_slot(self):
         import main

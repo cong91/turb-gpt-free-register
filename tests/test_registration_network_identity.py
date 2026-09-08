@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+from config.browser import IMPERSONATE
 from core import registration_network_identity as identity
 
 
@@ -29,6 +30,7 @@ class NetworkIdentityTests(unittest.TestCase):
             request.call_args.kwargs["proxies"]["https"],
             "socks5://127.0.0.1:25000",
         )
+        self.assertEqual(request.call_args.kwargs["impersonate"], IMPERSONATE)
 
     def test_browser_tunnel_match_returns_observed_ip(self):
         with mock.patch.object(

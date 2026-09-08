@@ -597,20 +597,8 @@ def _normalize_workers(max_workers: int | None) -> int:
 
 
 def effective_registration_workers(max_workers: int | None) -> int:
-    """Serialize registration when the active network rotates system-wide."""
+    """Return the worker count unless the active network rotates system-wide."""
     requested = _normalize_workers(max_workers)
-    from config import proxy as _proxy_cfg
-
-    if (
-        bool(getattr(_proxy_cfg, "ROTATING_PROXY_ENABLED", False))
-        and bool(getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False))
-    ):
-        if requested != 1:
-            logger.info(
-                "[Service] Proxy.vn one-account-per-IP 使用单一 registration lane，workers 从 %s 调整为 1",
-                requested,
-            )
-        return 1
 
     from config import nordvpn as _nordvpn_cfg
 

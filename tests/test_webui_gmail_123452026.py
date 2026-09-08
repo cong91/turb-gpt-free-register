@@ -148,6 +148,17 @@ class Gmail123452026WebUiTests(unittest.TestCase):
         self.assertIn("gmail_routed_domains", source)
         self.assertIn("routedDomains.length", source)
 
+    def test_use_all_gmail_source_reports_selection_when_count_is_unchanged(self):
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        source = (root / "webui" / "templates" / "index.html").read_text(encoding="utf-8")
+        handler = source.split("function useAllUnusedGmailApiUrlRecords()", 1)[1].split(
+            "function syncGmailApiUrlCountLabel", 1
+        )[0]
+
+        self.assertIn("showToast(`Đã chọn ${available} source Gmail local`)", handler)
+
 
 if __name__ == "__main__":
     unittest.main()

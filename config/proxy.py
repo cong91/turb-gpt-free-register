@@ -52,8 +52,8 @@ PLAN_CHECK_JITTER = 0.3
 # Proxy xoay proxy.vn: lease chỉ tồn tại khi worker đang chạy. Khi hoàn tất,
 # key được trả ngay; proxy còn TTL được cache để workflow kế tiếp tái dùng.
 # Key mới chỉ được mua khi số worker đồng thời vượt số key nhàn rỗi.
-# Khi bật one-account-per-IP, registration được serialize; mỗi job force-refresh
-# ở boundary, còn retry/browser reopen trong cùng job giữ proxy hiện tại.
+# Khi bật one-account-per-IP, mỗi registration job force-refresh proxy ở boundary;
+# retry/browser reopen trong cùng job giữ proxy hiện tại và worker vẫn chạy song song.
 ROTATING_PROXY_ENABLED = False
 ROTATING_PROXY_ONE_ACCOUNT_PER_IP = False
 ROTATING_PROXY_API_BASE = "https://proxy.vn/proxyxoay"
