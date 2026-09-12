@@ -314,6 +314,11 @@ class BrowserSeleniumDriver:
             pass
         return None
 
+    def delete_all_cookies(self) -> None:
+        """Clear cookies for a reused profile before a credential login."""
+        if self.context is not None:
+            self.context.clear_cookies()
+
     def get(self, url: str) -> None:
         max_attempts = max(1, int(getattr(_cfg, "CLOAK_NAVIGATION_RETRIES", 3) or 3))
         base_delay = max(0.0, float(getattr(_cfg, "CLOAK_NAVIGATION_RETRY_DELAY", 1.5) or 1.5))

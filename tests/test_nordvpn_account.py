@@ -54,7 +54,7 @@ def _server(hostname="jp749.nordvpn.com", station="93.118.43.3", load=5):
 
 
 class NordVPNAccountClientTests(unittest.TestCase):
-    def test_private_key_uses_bearer_and_caches(self):
+    def test_private_key_uses_basic_token_credentials_and_caches(self):
         http = _Http([_Response({"nordlynx_private_key": _PRIVATE_KEY})])
         client = account.NordVPNAccountClient(access_token="token-secret", http=http)
 
@@ -63,7 +63,8 @@ class NordVPNAccountClientTests(unittest.TestCase):
         self.assertEqual(len(http.calls), 1)
         url, kwargs = http.calls[0]
         self.assertTrue(url.endswith("/v1/users/services/credentials"))
-        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer token:token-secret")
+        expected = base64.b64encode(b"token:token-secret").decode("ascii")
+        self.assertEqual(kwargs["headers"]["Authorization"], f"Basic {expected}")
 
     def test_missing_token_fails_before_request(self):
         http = _Http([])

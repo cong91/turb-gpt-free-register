@@ -2,11 +2,261 @@ import unittest
 from unittest.mock import patch
 
 from config import twofa as twofa_config
-from core.browser_twofa_login import _login_existing_account, _login_password
+from core.browser_twofa_login import (
+    _finish_existing_account_totp,
+    _login_existing_account,
+    _login_password,
+    _password_submit_state,
+    _submit_existing_account_totp,
+)
 from core.openai_auth import AccountUnusableError
 
 
 class BrowserTwofaLoginTests(unittest.TestCase):
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login._submit_existing_account_totp", return_value="unknown")
+    def test_existing_totp_transition_fetches_session_after_unknown_page_state(
+        self,
+        submit_totp,
+        fetch_session,
+    ):
+        driver = type("Driver", (), {})()
+
+        result = _finish_existing_account_totp(
+            driver,
+            "user@example.com",
+            120,
+            "JBSWY3DPEHPK3PXP",
+        )
+
+        self.assertEqual(result["accessToken"], "token")
+        submit_totp.assert_called_once_with(driver, "JBSWY3DPEHPK3PXP")
+        fetch_session.assert_called_once_with(driver, timeout=120)
+
+    @patch("core.browser_credential_login.classify_login_state", return_value="totp")
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login._is_email_verification_page", return_value=True)
+    def test_password_submit_state_prefers_authenticator_over_generic_code_input(
+        self,
+        _is_email_page,
+        _has_token,
+        _classify_state,
+    ):
+        driver = type("Driver", (), {})()
+
+        state = _password_submit_state(driver)
+
+        self.assertEqual(state, "totp")
+
+    @patch("core.browser_twofa_login.wait_for_otp")
+    @patch("core.browser_twofa_login._submit_existing_account_totp", return_value="totp_invalid")
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="otp")
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login._wait_for_browser_challenge")
+    @patch("core.browser_twofa_login._page_warmup")
+    @patch("core.browser_twofa_login._safe_get")
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_with_totp_never_waits_for_email_otp(
+        self,
+        _human_delay,
+        _safe_get,
+        _page_warmup,
+        _wait_for_challenge,
+        _maybe_accept,
+        _has_token,
+        _submit_email,
+        submit_totp,
+        wait_for_otp,
+    ):
+        driver = type("Driver", (), {})()
+
+        with self.assertRaisesRegex(RuntimeError, "authenticator TOTP"):
+            _login_existing_account(
+                driver,
+                "user@example.com",
+                "password",
+                totp_secret="JBSWY3DPEHPK3PXP",
+            )
+
+        wait_for_otp.assert_not_called()
+        submit_totp.assert_called_once_with(driver, "JBSWY3DPEHPK3PXP")
+
+    @patch("core.browser_twofa_login.wait_for_otp")
+    @patch("core.browser_twofa_login._submit_existing_account_totp", return_value="totp_invalid")
+    @patch("core.browser_twofa_login._login_password", return_value="next")
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="login_password")
+    @patch("core.browser_twofa_login._is_email_verification_page", return_value=True)
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login._wait_for_browser_challenge")
+    @patch("core.browser_twofa_login._page_warmup")
+    @patch("core.browser_twofa_login._safe_get")
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_with_totp_uses_secret_on_ambiguous_code_page_after_password(
+        self,
+        _human_delay,
+        _safe_get,
+        _page_warmup,
+        _wait_for_challenge,
+        _maybe_accept,
+        _has_token,
+        _is_email_page,
+        _submit_email,
+        _login_password,
+        submit_totp,
+        wait_for_otp,
+    ):
+        driver = type("Driver", (), {})()
+
+        with self.assertRaisesRegex(RuntimeError, "authenticator TOTP"):
+            _login_existing_account(
+                driver,
+                "user@example.com",
+                "password",
+                totp_secret="JBSWY3DPEHPK3PXP",
+            )
+
+        wait_for_otp.assert_not_called()
+        submit_totp.assert_called_once_with(driver, "JBSWY3DPEHPK3PXP")
+
+    @patch("core.browser_twofa_login._has_access_token", return_value=True)
+    @patch("core.browser_twofa_login._click_continue")
+    @patch("core.browser_twofa_login.human_delay")
+    @patch("core.browser_twofa_login._type_otp")
+    @patch("core.browser_twofa_login._clear_otp_inputs")
+    @patch("core.codex_login_credentials.generate_totp_code", return_value="123456")
+    def test_existing_account_totp_submits_generated_current_code(
+        self,
+        generate_code,
+        clear_inputs,
+        type_otp,
+        _human_delay,
+        click_continue,
+        _has_token,
+    ):
+        driver = type("Driver", (), {})()
+
+        state = _submit_existing_account_totp(driver, "JBSWY3DPEHPK3PXP")
+
+        self.assertEqual(state, "logged_in")
+        generate_code.assert_called_once_with("JBSWY3DPEHPK3PXP", previous_code=None)
+        clear_inputs.assert_called_once_with(driver)
+        type_otp.assert_called_once_with(driver, "123456")
+        click_continue.assert_called_once_with(driver)
+
+    @patch("core.browser_twofa_login._has_access_token", side_effect=[False, True])
+    @patch("core.browser_twofa_login._click_continue")
+    @patch("core.browser_twofa_login.human_delay")
+    @patch("core.browser_twofa_login._type_otp")
+    @patch("core.browser_twofa_login._clear_otp_inputs")
+    @patch(
+        "core.codex_login_credentials.generate_totp_code",
+        side_effect=["111111", "222222"],
+    )
+    @patch("core.browser_credential_login.classify_login_state", side_effect=["totp_invalid"])
+    def test_existing_account_totp_retries_after_invalid_code(
+        self,
+        _classify_state,
+        generate_code,
+        clear_inputs,
+        type_otp,
+        _human_delay,
+        click_continue,
+        _has_token,
+    ):
+        driver = type("Driver", (), {})()
+
+        state = _submit_existing_account_totp(driver, "JBSWY3DPEHPK3PXP")
+
+        self.assertEqual(state, "logged_in")
+        self.assertEqual(generate_code.call_args_list[0].kwargs, {"previous_code": None})
+        self.assertEqual(generate_code.call_args_list[1].kwargs, {"previous_code": "111111"})
+        self.assertEqual(type_otp.call_args_list[0].args, (driver, "111111"))
+        self.assertEqual(type_otp.call_args_list[1].args, (driver, "222222"))
+        self.assertEqual(clear_inputs.call_count, 2)
+        self.assertEqual(click_continue.call_count, 2)
+
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="logged_in")
+    @patch("core.browser_twofa_login._wait_for_browser_challenge")
+    @patch("core.browser_twofa_login._page_warmup")
+    @patch("core.browser_twofa_login._safe_get")
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_uses_registration_navigation_warmup(
+        self,
+        _human_delay,
+        _has_token,
+        _maybe_accept,
+        safe_get,
+        page_warmup,
+        wait_for_challenge,
+        submit_email,
+        fetch_session,
+    ):
+        driver = type("Driver", (), {})()
+
+        result = _login_existing_account(driver, "user@example.com", "password")
+
+        self.assertEqual(result["accessToken"], "token")
+        safe_get.assert_called_once_with(
+            driver,
+            "https://chatgpt.com/auth/login",
+            timeout=45,
+            attempts=2,
+            accept_hosts=("chatgpt.com", "auth.openai.com"),
+        )
+        page_warmup.assert_called_once_with(driver, reason="twofa_login_page")
+        wait_for_challenge.assert_called_once_with(driver, timeout=45)
+        submit_email.assert_called_once()
+        fetch_session.assert_called_once_with(driver, timeout=120)
+
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="logged_in")
+    @patch("core.browser_twofa_login._wait_for_browser_challenge")
+    @patch("core.browser_twofa_login._page_warmup")
+    @patch("core.browser_twofa_login._safe_get")
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_logs_out_stale_chatgpt_shell_before_email_login(
+        self,
+        _human_delay,
+        _has_token,
+        _maybe_accept,
+        safe_get,
+        page_warmup,
+        wait_for_challenge,
+        _submit_email,
+        _fetch_session,
+    ):
+        driver = type(
+            "Driver",
+            (),
+            {
+                "current_url": "https://chatgpt.com/",
+                "delete_all_cookies": lambda self: None,
+                "execute_script": lambda self, _script: None,
+            },
+        )()
+
+        with patch("core.browser_twofa_login._clear_stale_browser_auth_state") as clear_auth:
+            result = _login_existing_account(driver, "user@example.com", "password")
+
+        self.assertEqual(result["accessToken"], "token")
+        self.assertEqual(
+            [call.args[1] for call in safe_get.call_args_list],
+            [
+                "https://chatgpt.com/auth/login",
+                "https://chatgpt.com/auth/logout",
+                "https://chatgpt.com/auth/login",
+            ],
+        )
+        clear_auth.assert_called_once_with(driver)
+        page_warmup.assert_any_call(driver, reason="twofa_login_after_logout")
+
     @patch("core.browser_twofa_login._wait_for_password_submit_state", return_value="otp")
     @patch("core.browser_twofa_login._human_click")
     @patch("core.browser_twofa_login._human_type_text")
@@ -183,6 +433,39 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         self.assertEqual(result["accessToken"], "token")
         has_token.assert_called_once_with(driver)
         submit_email.assert_not_called()
+        fetch_session.assert_called_once_with(driver, timeout=120)
+
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login._submit_existing_account_totp", return_value="logged_in")
+    @patch("core.browser_twofa_login._login_password", return_value="totp")
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="login_password")
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_submits_current_totp_before_fetching_session(
+        self,
+        _human_delay,
+        _has_token,
+        _maybe_accept,
+        _snapshot,
+        _submit_email,
+        login_password,
+        submit_totp,
+        fetch_session,
+    ):
+        driver = type("Driver", (), {"get": lambda self, _url: None})()
+
+        result = _login_existing_account(
+            driver,
+            "user@example.com",
+            "password",
+            totp_secret="JBSWY3DPEHPK3PXP",
+        )
+
+        self.assertEqual(result["accessToken"], "token")
+        login_password.assert_called_once_with(driver, "password")
+        submit_totp.assert_called_once_with(driver, "JBSWY3DPEHPK3PXP")
         fetch_session.assert_called_once_with(driver, timeout=120)
 
     @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})

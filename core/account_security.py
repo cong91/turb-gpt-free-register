@@ -15,10 +15,24 @@ logger = logging.getLogger(__name__)
 _MFA_INFO_URL = "https://chatgpt.com/backend-api/accounts/mfa_info"
 _MFA_DISABLE_URL = "https://chatgpt.com/backend-api/accounts/mfa/user/disable_in_house"
 _BASE32_SECRET_RE = re.compile(r"\b[A-Z2-7]{16,}\b", re.IGNORECASE)
-_LOGIN_ATTEMPTS = 2
+_LOGIN_ATTEMPTS = 1
 _MFA_FACTOR_ID_KEYS = frozenset(
     {"factor_id", "factorid", "mfa_factor_id", "mfafactorid", "native_default_factor_id"}
 )
+
+
+def _is_session_token_failure(exc: BaseException | None) -> bool:
+    """Return whether the browser reached auth but failed to expose a session token."""
+    error_text = str(exc or "").casefold()
+    return any(
+        marker in error_text
+        for marker in (
+            "without accesstoken",
+            "未拿到 accesstoken",
+            "api/auth/session",
+            "session token",
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,15 +148,19 @@ def _mfa_request_headers(transport: BrowserPageTransport, access_token: str, pat
 
 
 def _login_and_get_access_token(driver, item: TwofaChangeInput) -> str:
-    """Login again once when the browser session does not expose a token."""
-    from core.email_change import _login_chatgpt_with_credentials
+    """Use the shared existing-account browser login and return its fresh token."""
+    from core.browser_twofa_login import _login_existing_account
     from core.openai_auth import AccountUnusableError
 
     last_error: Exception | None = None
     for attempt in range(1, _LOGIN_ATTEMPTS + 1):
         try:
-            _login_chatgpt_with_credentials(driver, item.credentials())
-            session = fetch_session(BrowserPageTransport(driver))
+            session = _login_existing_account(
+                driver,
+                item.email,
+                item.password,
+                totp_secret=item.current_totp_secret,
+            )
             access_token = str(session.get("accessToken") or "").strip()
             if access_token:
                 return access_token
@@ -159,9 +177,59 @@ def _login_and_get_access_token(driver, item: TwofaChangeInput) -> str:
                 )
 
     detail = _redacted_error(f"{type(last_error).__name__}: {last_error}", item)
+    if _is_session_token_failure(last_error):
+        failure_kind = "ChatGPT login did not provide accessToken"
+    else:
+        # Keep DOM/navigation/password failures distinct.  The caller may
+        # retry a fresh browser profile, but must not mistake them for a stale
+        # session and jump directly to the proxy-sensitive OAuth CSRF flow.
+        failure_kind = "ChatGPT browser login failed"
     raise RuntimeError(
-        f"ChatGPT login did not provide accessToken after {_LOGIN_ATTEMPTS} attempts: {detail}"
+        f"{failure_kind} after {_LOGIN_ATTEMPTS} attempts: {detail}"
     ) from last_error
+
+
+def _oauth_login_and_get_access_token(
+    item: TwofaChangeInput,
+    *,
+    proxy: str | None = None,
+) -> str:
+    """Run the protocol OAuth login when the browser session/token is stale."""
+    from core.account_liveness import login_account_via_oauth
+
+    result = login_account_via_oauth(
+        item.email,
+        item.password,
+        item.current_totp_secret,
+        proxy=proxy,
+    )
+    access_token = str(result.get("access_token") or "").strip()
+    if result.get("ok") and access_token:
+        logger.info("[2FA] OAuth login refreshed accessToken before MFA change")
+        return access_token
+
+    error = str(result.get("error") or "OAuth login did not return accessToken").strip()
+    raise RuntimeError(f"ChatGPT OAuth login failed: {error[:300]}")
+
+
+def _should_try_oauth_fallback(exc: BaseException) -> bool:
+    """Limit OAuth fallback to stale/missing-session failures."""
+    error_text = str(exc or "").casefold()
+    if any(
+        marker in error_text
+        for marker in (
+            "password was rejected",
+            "password_invalid",
+            "account chooser",
+            "totp was rejected",
+            "totp rejected",
+            "account deactivated",
+            "locked",
+            "suspended",
+        )
+    ):
+        return False
+    return "did not provide accesstoken" in error_text or _is_session_token_failure(exc)
 
 
 def deactivate_2fa_in_page(driver, access_token: str | None = None) -> bool:
@@ -205,21 +273,75 @@ def deactivate_2fa_in_page(driver, access_token: str | None = None) -> bool:
     return True
 
 
-def change_twofa_in_browser(driver, item: TwofaChangeInput) -> dict[str, object]:
+def change_twofa_in_browser(
+    driver,
+    item: TwofaChangeInput,
+    *,
+    proxy: str | None = None,
+    access_token: str | None = None,
+    allow_oauth_fallback: bool = True,
+) -> dict[str, object]:
     """Login, disable the old TOTP, and enroll a new TOTP in one session."""
     remote_disabled = False
-    access_token = ""
+    active_access_token = str(access_token or "").strip()
     try:
-        access_token = _login_and_get_access_token(driver, item)
-        deactivate_2fa_in_page(driver, access_token=access_token)
+        if active_access_token:
+            logger.info("[2FA] thử accessToken đã lưu một lần trước khi đăng nhập")
+            try:
+                deactivate_2fa_in_page(driver, access_token=active_access_token)
+                remote_disabled = True
+                new_secret = setup_2fa_in_page(
+                    driver,
+                    item.email,
+                    access_token=active_access_token,
+                )
+                return {
+                    "ok": True,
+                    "email": item.email,
+                    "new_totp_secret": new_secret,
+                    "remote_disabled": True,
+                    "access_token": active_access_token,
+                }
+            except Exception as exc:
+                if remote_disabled:
+                    raise
+                logger.warning(
+                    "[2FA] accessToken đã lưu không dùng được, bỏ qua và chuyển sang đăng nhập: %s: %s",
+                    type(exc).__name__,
+                    str(exc)[:180],
+                )
+                active_access_token = ""
+
+        try:
+            active_access_token = _login_and_get_access_token(driver, item)
+        except Exception as exc:
+            from core.openai_auth import AccountUnusableError
+
+            if (
+                not allow_oauth_fallback
+                or isinstance(exc, AccountUnusableError)
+                or not _should_try_oauth_fallback(exc)
+            ):
+                raise
+            logger.warning(
+                "[2FA] browser login did not establish a usable session; switching to OAuth login: %s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
+            active_access_token = _oauth_login_and_get_access_token(item, proxy=proxy)
+        deactivate_2fa_in_page(driver, access_token=active_access_token)
         remote_disabled = True
-        new_secret = setup_2fa_in_page(driver, item.email)
+        new_secret = setup_2fa_in_page(
+            driver,
+            item.email,
+            access_token=active_access_token,
+        )
         return {
             "ok": True,
             "email": item.email,
             "new_totp_secret": new_secret,
             "remote_disabled": True,
-            "access_token": access_token,
+            "access_token": active_access_token,
         }
     except Exception as exc:  # noqa: BLE001 - each account must produce a result.
         result = {
@@ -228,8 +350,8 @@ def change_twofa_in_browser(driver, item: TwofaChangeInput) -> dict[str, object]
             "remote_disabled": remote_disabled,
             "error": _redacted_error(f"{type(exc).__name__}: {exc}", item),
         }
-        if access_token:
-            result["access_token"] = access_token
+        if active_access_token:
+            result["access_token"] = active_access_token
         return result
     finally:
         logout = getattr(driver, "get", None)

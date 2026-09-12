@@ -138,6 +138,24 @@ class Qan8GmailApiClientTests(unittest.TestCase):
             self.client.create_order("out-rejected")
 
     @patch("core.qan8_gmail_api_client.requests.post")
+    def test_completed_response_preserves_failed_order_code(self, mock_post):
+        mock_post.return_value = _Response(
+            {
+                "success": True,
+                "data": {
+                    "order_no": "out-stock",
+                    "status": "failed",
+                    "code": "OUT_OF_STOCK",
+                },
+            }
+        )
+
+        result = self.client.create_order("out-stock")
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("code=OUT_OF_STOCK", result.message)
+
+    @patch("core.qan8_gmail_api_client.requests.post")
     def test_http_rejection_is_not_classified_as_unknown_order(self, mock_post):
         mock_post.return_value = _Response(
             {"success": False, "message": "order endpoint not found"},
@@ -148,6 +166,19 @@ class Qan8GmailApiClientTests(unittest.TestCase):
             self.client.create_order("out-http-rejected")
 
         mock_post.assert_called_once()
+
+    @patch("core.qan8_gmail_api_client.requests.post")
+    def test_http_rejection_preserves_provider_code(self, mock_post):
+        mock_post.return_value = _Response(
+            {
+                "code": "CHECKOUT_BLOCKED",
+                "message": "Request blocked by security policy",
+            },
+            status_code=429,
+        )
+
+        with self.assertRaisesRegex(Qan8GmailApiError, "code=CHECKOUT_BLOCKED"):
+            self.client.create_order("out-blocked")
 
     def test_create_order_rejects_non_quantity_one_without_http(self):
         with self.assertRaises(ValueError):

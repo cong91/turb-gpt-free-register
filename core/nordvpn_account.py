@@ -116,7 +116,9 @@ class NordVPNAccountClient:
                 raise NordVPNAccountError(
                     "NORDVPN_ACCESS_TOKEN chưa được cấu hình trong .env"
                 )
-            headers["Authorization"] = f"Bearer token:{self._access_token}"
+            credentials = f"token:{self._access_token}".encode()
+            encoded_credentials = base64.b64encode(credentials).decode("ascii")
+            headers["Authorization"] = f"Basic {encoded_credentials}"
         try:
             response = self._http.get(
                 self._url(path),

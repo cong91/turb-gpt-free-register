@@ -291,14 +291,37 @@ class BrowserContextTransport:
         self.page.goto(url, wait_until="domcontentloaded")
 
 
-def setup_2fa_in_browser(context, page, email: str, *, reauth: bool = False) -> str:
+def setup_2fa_in_browser(
+    context,
+    page,
+    email: str,
+    *,
+    reauth: bool = False,
+    access_token: str | None = None,
+) -> str:
     """在现有 Playwright 登录态中执行 2FA 设置。"""
-    return setup_2fa(BrowserContextTransport(context, page), email, reauth=reauth)
+    return setup_2fa(
+        BrowserContextTransport(context, page),
+        email,
+        access_token=access_token,
+        reauth=reauth,
+    )
 
 
-def setup_2fa_in_page(driver, email: str, *, reauth: bool = False) -> str:
+def setup_2fa_in_page(
+    driver,
+    email: str,
+    *,
+    reauth: bool = False,
+    access_token: str | None = None,
+) -> str:
     """在现有 Selenium 登录态中执行 2FA 设置。"""
-    return setup_2fa(BrowserPageTransport(driver), email, reauth=reauth)
+    return setup_2fa(
+        BrowserPageTransport(driver),
+        email,
+        access_token=access_token,
+        reauth=reauth,
+    )
 
 
 def _account_material_line(email: str, row: dict | None = None) -> str:
@@ -894,13 +917,14 @@ def setup_2fa(
         access_token = _exchange_new_token(session, continue_url)
     else:
         if access_token:
-            logger.info("[2FA] 复用现有登录态打开 2FA 页面")
+            logger.info("[2FA] 使用显式 accessToken 打开 2FA 页面")
         else:
             logger.info("[2FA] 使用当前登录态打开 2FA 页面")
         _open_twofa_action(session)
         human_delay("navigate")
-        home_session = fetch_session(session)
-        access_token = home_session["accessToken"]
+        if not access_token:
+            home_session = fetch_session(session)
+            access_token = home_session["accessToken"]
     human_delay("api")
 
     secret, session_id = _run_twofa_api_with_retry(

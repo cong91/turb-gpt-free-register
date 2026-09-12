@@ -5,6 +5,9 @@ import logging
 import time
 
 from config import twofa as _twofa_cfg
+from core.browser_challenge import (
+    wait_for_browser_challenge as _wait_for_browser_challenge,
+)
 from core.browser_registration import (
     _clear_otp_inputs,
     _click_continue,
@@ -16,7 +19,9 @@ from core.browser_registration import (
     _is_email_verification_page,
     _is_login_password_page,
     _maybe_accept,
+    _page_warmup,
     _raise_if_account_unusable,
+    _safe_get,
     _submit_email_and_wait_next,
     _type_otp,
     _wait_after_email_otp_submit,
@@ -29,6 +34,29 @@ from core.email_provider import (
 from core.humanize import delay as human_delay
 
 logger = logging.getLogger(__name__)
+
+
+def _clear_stale_browser_auth_state(driver) -> None:
+    """Clear provider-owned auth storage before reusing a stale browser shell."""
+    delete_cookies = getattr(driver, "delete_all_cookies", None)
+    if callable(delete_cookies):
+        try:
+            delete_cookies()
+        except Exception as exc:  # noqa: BLE001 - storage cleanup is best effort.
+            logger.debug("[Browser 2FA] cookie cleanup failed: %s", exc)
+    context = getattr(driver, "context", None)
+    clear_cookies = getattr(context, "clear_cookies", None)
+    if callable(clear_cookies):
+        try:
+            clear_cookies()
+        except Exception as exc:  # noqa: BLE001 - storage cleanup is best effort.
+            logger.debug("[Browser 2FA] Playwright cookie cleanup failed: %s", exc)
+    execute_script = getattr(driver, "execute_script", None)
+    if callable(execute_script):
+        try:
+            execute_script("window.localStorage?.clear(); window.sessionStorage?.clear();")
+        except Exception as exc:  # noqa: BLE001 - storage cleanup is best effort.
+            logger.debug("[Browser 2FA] web storage cleanup failed: %s", exc)
 
 
 def _find_login_password_controls(
@@ -110,10 +138,18 @@ def _request_login_password_submit(driver) -> bool:
 
 def _password_submit_state(driver) -> str:
     """Classify the page after submitting an existing-account password."""
-    if _is_email_verification_page(driver):
-        return "otp"
     if _has_access_token(driver, timeout_ms=1000):
         return "logged_in"
+    try:
+        from core.browser_credential_login import classify_login_state
+
+        authenticator_state = classify_login_state(driver)
+        if authenticator_state in {"totp", "totp_invalid"}:
+            return authenticator_state
+    except Exception:
+        logger.debug("[Browser 2FA] authenticator state probe failed", exc_info=True)
+    if _is_email_verification_page(driver):
+        return "otp"
     if _is_login_password_page(driver):
         return "login_password"
     return "next"
@@ -180,27 +216,154 @@ def _login_password(driver, password: str, timeout: int = 30) -> str:
     )
 
 
-def _login_existing_account(driver, email: str, password: str, timeout: int = 120) -> dict:
-    """Use email, password, and email OTP to establish an existing login session."""
-    driver.get("https://chatgpt.com/auth/login")
+def _submit_existing_account_totp(driver, totp_secret: str, timeout: int = 20) -> str:
+    """Submit the current authenticator code when account login asks for it."""
+    from core.browser_credential_login import classify_login_state
+    from core.codex_login_credentials import generate_totp_code
+
+    secret = str(totp_secret or "").strip()
+    if not secret:
+        raise RuntimeError("已有账号登录需要 current TOTP secret")
+
+    previous_code = None
+    end = time.monotonic() + max(1.0, float(timeout))
+    for attempt in range(2):
+        code = generate_totp_code(secret, previous_code=previous_code)
+        previous_code = code
+        _clear_otp_inputs(driver)
+        _type_otp(driver, code)
+        human_delay("otp_input")
+        _click_continue(driver)
+        while time.monotonic() < end:
+            if _has_access_token(driver, timeout_ms=1000):
+                return "logged_in"
+            state = classify_login_state(driver)
+            if state == "totp_invalid":
+                if attempt == 0:
+                    break
+                return state
+            if state == "totp" or (
+                state in {"email_otp", "unknown"}
+                and _is_email_verification_page(driver)
+            ):
+                # OpenAI can render the authenticator form with only a generic
+                # one-time-code input and no `/mfa` marker. Keep waiting for
+                # the supplied TOTP submission instead of classifying it as
+                # a mailbox OTP flow.
+                time.sleep(0.25)
+                continue
+            if state != "totp":
+                return state
+            time.sleep(0.25)
+        if attempt == 0:
+            end = time.monotonic() + max(1.0, float(timeout))
+    return "totp_invalid"
+
+
+def _finish_existing_account_totp(
+    driver,
+    email: str,
+    timeout: int,
+    totp_secret: str,
+) -> dict:
+    """Submit the supplied factor and fetch the authenticated browser session."""
+    state = _submit_existing_account_totp(driver, totp_secret)
+    if state in {"logged_in", "accepted", "unknown"}:
+        session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+        if not session_info.get("accessToken"):
+            if state == "unknown":
+                raise RuntimeError("已有账号登录 authenticator TOTP 后未建立 session")
+            raise RuntimeError("已有账号登录成功但未拿到 accessToken")
+        return session_info
+    if state == "totp_invalid":
+        raise RuntimeError("已有账号登录 authenticator TOTP 连续失败")
+    raise RuntimeError(
+        "已有账号登录 authenticator TOTP 未完成"
+        f"：state={state} email={email}"
+    )
+
+
+def _login_existing_account(
+    driver,
+    email: str,
+    password: str,
+    timeout: int = 120,
+    *,
+    totp_secret: str | None = None,
+) -> dict:
+    """Use email, password, and the supplied authenticator TOTP to log in."""
+    current_totp_secret = str(totp_secret or "").strip()
+    # Match the registration flow: tolerate renderer/navigation hiccups, give
+    # the auth SPA a short warm-up, and wait for any browser challenge before
+    # looking for the email control.  A direct one-shot ``driver.get`` often
+    # leaves Cloak with an empty DOM, which then incorrectly falls through to
+    # the HTTP OAuth path and its proxy-sensitive CSRF request.
+    _safe_get(
+        driver,
+        "https://chatgpt.com/auth/login",
+        timeout=min(45, max(1, int(timeout))),
+        attempts=2,
+        accept_hosts=("chatgpt.com", "auth.openai.com"),
+    )
     human_delay("navigate")
+    _page_warmup(driver, reason="twofa_login_page")
     _maybe_accept(driver)
+    _wait_for_browser_challenge(driver, timeout=min(45, max(1, int(timeout))))
+    current_url = str(getattr(driver, "current_url", "") or "").lower()
+    if "chatgpt.com" in current_url and "/auth/login" not in current_url:
+        # Cloak profiles can restore a previous ChatGPT page even after a
+        # navigation to /auth/login.  Do not try to type the new account into
+        # the application shell; clear that stale browser session first.
+        logger.info("[Browser 2FA] detected stale ChatGPT page; logging out before credential login")
+        _safe_get(
+            driver,
+            "https://chatgpt.com/auth/logout",
+            timeout=min(30, max(1, int(timeout))),
+            attempts=1,
+            accept_hosts=("chatgpt.com", "auth.openai.com"),
+        )
+        _clear_stale_browser_auth_state(driver)
+        _safe_get(
+            driver,
+            "https://chatgpt.com/auth/login",
+            timeout=min(45, max(1, int(timeout))),
+            attempts=2,
+            accept_hosts=("chatgpt.com", "auth.openai.com"),
+        )
+        human_delay("navigate")
+        _page_warmup(driver, reason="twofa_login_after_logout")
+        _maybe_accept(driver)
+        _wait_for_browser_challenge(driver, timeout=min(45, max(1, int(timeout))))
     if _has_access_token(driver):
         logger.info("[Browser 2FA] profile vẫn còn session đăng nhập, bỏ qua email login OTP")
         session_info = _fetch_chatgpt_session(driver, timeout=timeout)
         if not session_info.get("accessToken"):
             raise RuntimeError("已有账号登录成功但未拿到 accessToken")
         return session_info
-    otp_before_code = snapshot_verification_code(
-        email,
-        stage="twofa_login_email_request",
-    )
+    otp_before_code = None
+    if not current_totp_secret:
+        otp_before_code = snapshot_verification_code(
+            email,
+            stage="twofa_login_email_request",
+        )
     next_state = _submit_email_and_wait_next(
         driver,
         email,
         attempts=3,
         allow_login_password=True,
     )
+    if current_totp_secret and next_state == "otp":
+        # Existing accounts with a supplied factor must never consume a
+        # mailbox code.  Auth pages sometimes expose only a generic
+        # `one-time-code` input, so use the caller-provided TOTP directly.
+        next_state = "totp"
+    if next_state in {"totp", "totp_invalid"}:
+        return _finish_existing_account_totp(
+            driver,
+            email,
+            timeout,
+            current_totp_secret,
+        )
     if next_state in ("login_password", "password"):
         password_state = _login_password(driver, password)
         if password_state == "logged_in":
@@ -208,6 +371,17 @@ def _login_existing_account(driver, email: str, password: str, timeout: int = 12
             if not session_info.get("accessToken"):
                 raise RuntimeError("已有账号登录成功但未拿到 accessToken")
             return session_info
+        if current_totp_secret and password_state == "otp":
+            password_state = "totp"
+        if current_totp_secret and password_state == "next" and _is_email_verification_page(driver):
+            password_state = "totp"
+        if password_state in {"totp", "totp_invalid"}:
+            return _finish_existing_account_totp(
+                driver,
+                email,
+                timeout,
+                current_totp_secret,
+            )
         if password_state != "otp" and not _is_email_verification_page(driver):
             raise RuntimeError(
                 "登录密码提交后未进入邮箱验证码页"
@@ -218,6 +392,11 @@ def _login_existing_account(driver, email: str, password: str, timeout: int = 12
         if not session_info.get("accessToken"):
             raise RuntimeError("已有账号登录成功但未拿到 accessToken")
         return session_info
+
+    if current_totp_secret:
+        raise RuntimeError(
+            "已有账号登录未进入 authenticator TOTP 页面；拒绝改用邮箱 OTP"
+        )
 
     otp_after_ts = time.time()
     current_otp = None

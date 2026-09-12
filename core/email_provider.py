@@ -456,7 +456,7 @@ def acquire_email(
             last_exc = exc
             logger.warning(f"[EmailProvider] 来源 {source} 领取邮箱失败: {type(exc).__name__}: {exc}")
             continue
-    raise RuntimeError(f"所有邮箱来源均领取失败: {sources}; last={last_exc}")
+    raise RuntimeError(f"所有邮箱来源均领取失败: {sources}; last={last_exc}") from last_exc
 
 
 def acquire_email_after_input(email: str | None = None) -> str:

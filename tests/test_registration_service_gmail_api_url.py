@@ -176,6 +176,101 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
             },
         )
 
+    def test_registration_retry_gets_a_fresh_gmail_api_url_batch(self):
+        store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
+        original_batch_id = store.create_empty_batch(
+            target_count=12,
+            aliases_per_source=12,
+            desired_sources=1,
+        )
+        source = db.create_job(
+            email_source="gmail_api_url",
+            provider_context={
+                "gmail_api_url_batch_id": original_batch_id,
+                "gmail_api_url_aliases_per_source": 12,
+                "gmail_api_url_lane_id": 0,
+                "gmail_api_url_lane_count": 1,
+            },
+        )
+        db.update_job(source["id"], status="failed")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(
+            registration_service, "get_executor_workers", return_value=1
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            result = registration_service.retry_job(source["id"], workers=1)
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        child_batch_id = child["provider_context"]["gmail_api_url_batch_id"]
+        self.assertNotEqual(child_batch_id, original_batch_id)
+        self.assertEqual(
+            store.batch_provision_plan(child_batch_id),
+            {
+                "target_count": 1,
+                "aliases_per_source": 12,
+                "desired_sources": 1,
+            },
+        )
+        self.assertEqual(
+            store.batch_provision_plan(original_batch_id),
+            {
+                "target_count": 12,
+                "aliases_per_source": 12,
+                "desired_sources": 1,
+            },
+        )
+        self.assertEqual(submitted[0][0], registration_service._run_one_job)
+
+    def test_registration_retry_keeps_a_non_exhausted_gmail_batch(self):
+        store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
+        original_batch_id = store.create_empty_batch(
+            target_count=1,
+            aliases_per_source=12,
+            desired_sources=1,
+        )
+        store.append_source_group(
+            original_batch_id,
+            "source@gmail.com",
+            "https://example.test/source",
+            ["alias@gmail.com"],
+        )
+        source = db.create_job(
+            email_source="gmail_api_url",
+            provider_context={
+                "gmail_api_url_batch_id": original_batch_id,
+                "gmail_api_url_aliases_per_source": 12,
+                "gmail_api_url_lane_id": 0,
+                "gmail_api_url_lane_count": 1,
+            },
+        )
+        db.update_job(source["id"], status="failed")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(
+            registration_service, "get_executor_workers", return_value=1
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            result = registration_service.retry_job(source["id"], workers=1)
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        self.assertEqual(
+            child["provider_context"]["gmail_api_url_batch_id"], original_batch_id
+        )
+        self.assertEqual(submitted[0][0], registration_service._run_one_job)
+
     def test_webui_count_means_source_groups_and_alias_input_is_ignored(self):
         service = MagicMock()
         service.submit_registration.return_value = [{"id": index} for index in range(36)]

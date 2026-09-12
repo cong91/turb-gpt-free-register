@@ -50,6 +50,21 @@ class RegistrationRetryPolicyTests(unittest.TestCase):
             )
         )
 
+    def test_does_not_retry_terminal_qan8_checkout_failures(self):
+        for error in (
+            "QAN8 HTTP 429: code=CHECKOUT_BLOCKED",
+            "QAN8 HTTP 409: code=OUT_OF_STOCK",
+        ):
+            with self.subTest(error=error):
+                self.assertFalse(
+                    should_auto_retry_registration_failure(
+                        error,
+                        email_source="gmail_api_url",
+                        retry_attempt=0,
+                        max_attempts=1,
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

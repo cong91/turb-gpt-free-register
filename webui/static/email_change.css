@@ -338,7 +338,7 @@
 
 .personal-info-summary {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   gap: 1px;
   margin: 14px 22px 18px;
   border: 1px solid #e2e8f0;
@@ -371,6 +371,14 @@
 
 .personal-info-summary .is-success strong {
   color: #15803d;
+}
+
+.personal-info-summary .is-running strong {
+  color: #1d4ed8;
+}
+
+.personal-info-summary .is-pending strong {
+  color: #a16207;
 }
 
 .personal-info-summary .is-failed strong {
@@ -447,6 +455,16 @@
   background: #dcfce7;
 }
 
+.personal-info-result-status.is-running {
+  color: #1d4ed8;
+  background: #dbeafe;
+}
+
+.personal-info-result-status.is-pending {
+  color: #92400e;
+  background: #fef3c7;
+}
+
 .personal-info-result-status.is-partial,
 .personal-info-result-status.is-failed {
   color: #b42318;
@@ -479,7 +497,11 @@
   .personal-info-twofa-layout { padding: 15px; }
   .personal-info-actionbar { align-items: stretch; flex-wrap: wrap; padding: 14px 15px; }
   .personal-info-primary { width: 100%; margin-left: 0; }
-  .personal-info-summary { margin-right: 15px; margin-left: 15px; }
+  .personal-info-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-right: 15px;
+    margin-left: 15px;
+  }
   .personal-info-status { margin-right: 15px; margin-left: 15px; }
   .personal-info-export { width: 100%; }
   .personal-info-sequence { gap: 8px; }

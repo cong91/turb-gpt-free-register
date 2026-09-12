@@ -15,6 +15,7 @@ class BrowserTwofaRetryTests(unittest.TestCase):
             "email": "user@example.com",
             "registration_password": "password",
             "access_token": "old-token",
+            "totp_secret": "CURRENT-TOTP-SECRET",
         }
 
         with (
@@ -22,7 +23,7 @@ class BrowserTwofaRetryTests(unittest.TestCase):
             patch(
                 "core.browser_twofa_retry._login_existing_account",
                 return_value={"accessToken": "new-token", "user": {}, "account": {}},
-            ),
+            ) as login,
             patch("core.browser_twofa_retry.setup_2fa_in_page", return_value="SECRET") as setup_2fa,
             patch("core.browser_twofa_retry.save_account_data", return_value=8) as save_account,
             patch("core.browser_twofa_retry.resolve_email_source", return_value="paymesh"),
@@ -35,6 +36,13 @@ class BrowserTwofaRetryTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["account_id"], 8)
         self.assertEqual(result["browser_provider"], "cloak")
+        login.assert_called_once_with(
+            driver,
+            "user@example.com",
+            "password",
+            timeout=90,
+            totp_secret="CURRENT-TOTP-SECRET",
+        )
         self.assertEqual(save_account.call_args.kwargs["proxy_used"], "http://proxy")
         self.assertEqual(save_account.call_args.kwargs["extra"]["registration_driver"], "cloak")
         setup_2fa.assert_called_once_with(

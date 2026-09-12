@@ -435,6 +435,37 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
         )
         wait_for_otp.assert_not_called()
 
+    @patch("core.chatgpt_bootstrap.authenticated_bootstrap")
+    @patch("core.account_export._open_twofa_action")
+    @patch("core.account_export.fetch_session")
+    @patch("core.account_export._enroll_totp", return_value=("SECRET", "session-id"))
+    @patch("core.account_export._activate_totp")
+    @patch("core.account_export.human_delay")
+    def test_setup_2fa_uses_explicit_token_without_fetching_stale_session(
+        self,
+        _human_delay,
+        activate_totp,
+        enroll_totp,
+        fetch_session,
+        open_action,
+        bootstrap,
+    ):
+        transport = Mock()
+
+        secret = setup_2fa(transport, "user@example.com", access_token="oauth-token")
+
+        self.assertEqual(secret, "SECRET")
+        bootstrap.assert_called_once_with(transport, "oauth-token", strict=False)
+        open_action.assert_called_once_with(transport)
+        fetch_session.assert_not_called()
+        enroll_totp.assert_called_once_with(transport, "oauth-token")
+        activate_totp.assert_called_once_with(
+            transport,
+            "oauth-token",
+            "SECRET",
+            "session-id",
+        )
+
     @patch("core.account_export.human_delay")
     @patch("core.account_export._activate_totp")
     @patch("core.account_export._enroll_totp", return_value=("SECRET", "session-id"))
