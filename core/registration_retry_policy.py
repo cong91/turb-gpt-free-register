@@ -8,6 +8,14 @@ _TERMINAL_MARKERS = (
     "invalid password",
     "code=602",
     "provider error code=602",
+    "checkout_blocked",
+    "checkout blocked",
+    "out_of_stock",
+    "out of stock",
+    "sold out",
+    "insufficient stock",
+    "stock unavailable",
+    "request blocked by security policy",
 )
 
 _TRANSIENT_MARKERS = (

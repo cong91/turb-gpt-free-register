@@ -253,12 +253,15 @@ class Qan8GmailApiClient:
             except (TypeError, ValueError):
                 error_payload = None
             if isinstance(error_payload, dict):
+                code = str(error_payload.get("code") or "").strip()
                 detail = str(
                     error_payload.get("message")
                     or error_payload.get("error")
                     or error_payload.get("msg")
                     or ""
                 ).strip()
+                if code:
+                    detail = f"code={code}; {detail}" if detail else f"code={code}"
             if not detail:
                 detail = str(getattr(response, "text", "") or "").strip()
             detail = detail.replace(self.api_key, "<redacted>")[:200]
@@ -277,7 +280,10 @@ class Qan8GmailApiClient:
         if not isinstance(payload, dict):
             return payload
         if payload.get("success") is False or payload.get("ok") is False:
+            code = str(payload.get("code") or "").strip()
             message = str(payload.get("message") or "QAN8 provider rejected the request")
+            if code:
+                message = f"code={code}; {message}"
             raise Qan8GmailApiError(f"QAN8 provider error: {message[:200]}")
         return payload.get("data", payload)
 
@@ -288,6 +294,9 @@ class Qan8GmailApiClient:
         order_no = str(data.get("order_no") or fallback_order_no).strip()
         status = str(data.get("status") or "processing").strip().lower()
         message = str(data.get("message") or "")[:200]
+        code = str(data.get("code") or "").strip()
+        if code:
+            message = f"code={code}; {message}"[:200]
         order_id = data.get("order_id")
         return Qan8Order(
             order_no=order_no,

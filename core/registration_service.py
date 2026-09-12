@@ -10,6 +10,7 @@
 """
 import logging
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -47,6 +48,17 @@ _MAINTENANCE_BARRIER = RegistrationMaintenanceBarrier()
 _rotation_pending = False
 _ROTATION_LOCK = threading.Lock()
 _SUPPORTED_BROWSER_TWOFA_DRIVERS = frozenset({"roxy", "cloak", "browser_use", "skyvern"})
+_PROVIDER_BATCH_STOP_MARKERS = (
+    "checkout_blocked",
+    "checkout blocked",
+    "out_of_stock",
+    "out of stock",
+    "sold out",
+    "insufficient stock",
+    "stock unavailable",
+    "库存不足",
+    "库存已售罄",
+)
 
 
 class StopRequested(RuntimeError):
@@ -317,6 +329,43 @@ def _ensure_gmail_api_url_canonical_batch(
     return batch_id
 
 
+def _assign_fresh_gmail_api_url_registration_batch(job: dict) -> dict:
+    """Give an exhausted Gmail registration retry its own lazy source budget."""
+    from core.app_state_db import APP_STATE_DB_PATH
+    from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
+
+    source_context = job.get("provider_context")
+    if not isinstance(source_context, dict):
+        source_context = {}
+    context = dict(source_context)
+    store = GmailApiUrlBatchStore(APP_STATE_DB_PATH)
+    current_batch_id = str(context.get("gmail_api_url_batch_id") or "").strip()
+    if current_batch_id and not store.batch_status(current_batch_id)["exhausted_batch"]:
+        return job
+    aliases_per_source = max(
+        1,
+        min(12, int(context.get("gmail_api_url_aliases_per_source") or 12)),
+    )
+    batch_id = store.create_empty_batch(
+        target_count=1,
+        aliases_per_source=aliases_per_source,
+        desired_sources=1,
+    )
+    context.update(
+        {
+            "gmail_api_url_batch_id": batch_id,
+            "gmail_api_url_target_count": 1,
+            "gmail_api_url_source_count": 1,
+            "gmail_api_url_lane_count": 1,
+            "gmail_api_url_lane_id": 0,
+        }
+    )
+    db.update_job(int(job["id"]), provider_context=context)
+    updated = dict(job)
+    updated["provider_context"] = context
+    return updated
+
+
 def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
@@ -380,7 +429,17 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
                     acquire_kwargs["paymesh_cdks"] = email_inputs["paymesh_cdks"]
             if source is not None:
                 acquire_kwargs["email_source"] = source
-            email = acquire_email(**acquire_kwargs)
+            try:
+                email = acquire_email(**acquire_kwargs)
+            except Exception as exc:
+                try:
+                    _stop_registration_batch_on_provider_failure(job_id, exc)
+                except Exception:
+                    logger.exception(
+                        "[Job %s] Failed to stop registration batch after provider failure",
+                        job_id,
+                    )
+                raise
         else:
             raise RuntimeError(
                 "手动模式未配置邮箱。请在 WebUI 配置页设置 REGISTER_EMAIL，"
@@ -388,6 +447,115 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
             )
 
     return email, name, birthday
+
+
+def _is_terminal_provider_batch_error(error: object, *, email_source: str | None) -> bool:
+    """Identify provider failures that make every job in this registration batch unusable."""
+    from core.email_provider import normalize_email_source
+
+    if normalize_email_source(str(email_source or "")) != "gmail_api_url":
+        return False
+    messages: list[str] = []
+    current: object | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        messages.append(str(current or "").casefold())
+        current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+    message = " ".join(messages)
+    return any(marker in message for marker in _PROVIDER_BATCH_STOP_MARKERS)
+
+
+def _stop_registration_batch_on_provider_failure(
+    job_id: int | None,
+    error: object,
+) -> dict[str, int | str | None]:
+    """Stop the submitted registration batch after a terminal QAN8 checkout failure."""
+    if job_id is None:
+        return {"matched": 0, "cancelled": 0, "stopping": 0}
+    current = db.get_job(int(job_id)) or {}
+    if not _is_terminal_provider_batch_error(
+        error,
+        email_source=str(current.get("email_source") or ""),
+    ):
+        return {"matched": 0, "cancelled": 0, "stopping": 0}
+
+    current_context = current.get("provider_context")
+    current_context = current_context if isinstance(current_context, dict) else {}
+    batch_id = str(current_context.get("registration_batch_id") or "").strip()
+    lane_batch_id = str(current_context.get("gmail_api_url_batch_id") or "").strip()
+    if not batch_id and not lane_batch_id:
+        return {"matched": 0, "cancelled": 0, "stopping": 0}
+
+    reason = f"邮箱供应商不可用，已停止本批任务: {str(error or '')[:240]}"
+    cancelled = 0
+    stopping = 0
+    stopped = 0
+    matched = 0
+    now_iso = _local_now().isoformat(timespec="seconds")
+    for job in db.list_jobs(limit=10_000):
+        context = job.get("provider_context") if isinstance(job, dict) else {}
+        context = context if isinstance(context, dict) else {}
+        same_batch = batch_id and str(context.get("registration_batch_id") or "").strip() == batch_id
+        same_lane = not batch_id and lane_batch_id and str(
+            context.get("gmail_api_url_batch_id") or ""
+        ).strip() == lane_batch_id
+        if not (same_batch or same_lane):
+            continue
+        matched += 1
+        target_id = int(job.get("id"))
+        # The worker that observed the terminal provider response will finish
+        # through its normal exception path and retain the provider reason.
+        if target_id == int(job_id):
+            continue
+        status = str(job.get("status") or "").strip().lower()
+        if status == "pending":
+            db.update_job(
+                target_id,
+                status="cancelled",
+                error=reason,
+                completed_at=now_iso,
+            )
+            cancelled += 1
+        elif status == "running":
+            with _STOP_LOCK:
+                event = _STOP_EVENTS.get(target_id)
+                active = target_id in _ACTIVE_JOBS
+                if event is not None and active:
+                    event.set()
+            if event is not None and active:
+                db.update_job(target_id, status="stopping", error=reason)
+                stopping += 1
+            else:
+                with _STOP_LOCK:
+                    _STOP_EVENTS.pop(target_id, None)
+                    _ACTIVE_JOBS.discard(target_id)
+                db.update_job(
+                    target_id,
+                    status="stopped",
+                    error=reason,
+                    completed_at=now_iso,
+                )
+                stopped += 1
+    logger.error(
+        "[Provider] Terminal QAN8 checkout failure stopped registration batch=%s lane=%s; "
+        "matched=%s cancelled=%s stopping=%s stopped=%s reason=%s",
+        batch_id or "-",
+        lane_batch_id or "-",
+        matched,
+        cancelled,
+        stopping,
+        stopped,
+        str(error or "")[:240],
+    )
+    return {
+        "batch_id": batch_id or None,
+        "lane_batch_id": lane_batch_id or None,
+        "matched": matched,
+        "cancelled": cancelled,
+        "stopping": stopping,
+        "stopped": stopped,
+    }
 
 
 def _release_unconsumed_job_email(
@@ -1487,12 +1655,17 @@ def submit_registration(
                 getattr(_email_cfg, "PAYMESH_ACCOUNTS_PER_CDK", 6) or 6
             ),
         )
-    provider_context = {}
+    registration_batch_id = uuid.uuid4().hex
+    provider_context = {
+        "registration_batch_id": registration_batch_id,
+    } if email_source == "gmail_api_url" else {}
     if gmail_batch_id:
-        provider_context = {
-            "gmail_batch_id": gmail_batch_id,
-            "gmail_routed_domains": list(gmail_routed_domains or []),
-        }
+        provider_context.update(
+            {
+                "gmail_batch_id": gmail_batch_id,
+                "gmail_routed_domains": list(gmail_routed_domains or []),
+            }
+        )
     if email_source == "gmail_api_url":
         provider_context["gmail_api_url_aliases_per_source"] = aliases_per_email
         provider_context["gmail_api_url_target_count"] = int(count)
@@ -1850,6 +2023,11 @@ def retry_job(
     try:
         if action == "codex":
             db.update_account_codex_status(email, "retrying", None)
+        elif action == "registration":
+            from core.email_provider import normalize_email_source
+
+            if normalize_email_source(str(job.get("email_source") or "")) == "gmail_api_url":
+                job = _assign_fresh_gmail_api_url_registration_batch(job)
         effective_workers = (
             workers if action in {"codex", "2fa"} else effective_registration_workers(workers)
         )

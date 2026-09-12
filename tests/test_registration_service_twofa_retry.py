@@ -361,7 +361,11 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         jobs = db.list_jobs(limit=10)
         child = next(job for job in jobs if job["id"] != source["id"])
         self.assertEqual(child["parent_job_id"], source["id"])
-        self.assertEqual(child["provider_context"], provider_context)
+        self.assertNotEqual(
+            child["provider_context"]["gmail_api_url_batch_id"],
+            provider_context["gmail_api_url_batch_id"],
+        )
+        self.assertEqual(child["provider_context"]["gmail_api_url_lane_id"], 0)
         self.assertEqual(len(submitted), 1)
         release_email.assert_called_once_with(
             "alias+one@gmail.com",

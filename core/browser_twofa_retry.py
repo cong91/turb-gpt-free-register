@@ -107,6 +107,7 @@ def _run_twofa_retry_in_profile(
                 email,
                 password,
                 timeout=profile.timeout,
+                totp_secret=str(account.get("totp_secret") or "").strip() or None,
             )
             secret = setup_2fa_in_page(profile.driver, email, reauth=True)
             if not secret:
@@ -288,7 +289,7 @@ def run_twofa_retry(
             last_error = f"{type(exc).__name__}: {str(exc)[:300]}"
         if browser_attempt < browser_attempts:
             logger.warning(
-                "[Browser 2FA] 浏览器内重试耗尽，关闭浏览器并重新执行 email OTP 登录（第 %s/%s 个浏览器）: %s",
+                "[Browser 2FA] 浏览器内重试耗尽，关闭浏览器并使用现有 authenticator TOTP 重新登录（第 %s/%s 个浏览器）: %s",
                 browser_attempt,
                 browser_attempts,
                 last_error,

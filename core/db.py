@@ -1938,17 +1938,23 @@ def update_account_2fa(
     status: str,
     totp_secret: str | None = None,
     error: str | None = None,
+    registration_password: str | None = None,
 ) -> bool:
-    """原子更新账号 2FA 字段。"""
+    """原子更新账号 2FA 字段，可同步保存本次验证使用的密码。"""
     with _LOCK:
-        return _mutate_account_row(
-            acc_id=acc_id,
-            email=email,
-            mutator=lambda row: row.update({
+        def mutate(row: dict) -> None:
+            row.update({
                 "totp_secret": str(totp_secret or "") or None,
                 "twofa_status": str(status or "failed").strip() or "failed",
                 "twofa_error": str(error or "").strip() or None,
-            }),
+            })
+            if registration_password is not None:
+                row["registration_password"] = str(registration_password or "")
+
+        return _mutate_account_row(
+            acc_id=acc_id,
+            email=email,
+            mutator=mutate,
         )
 
 

@@ -138,6 +138,38 @@ class AccountLivenessTests(unittest.TestCase):
         reauth.assert_called_once()
         self.assertTrue(session.session.closed)
 
+    def test_oauth_login_uses_supplied_credentials_and_returns_fresh_token(self):
+        session = _DummyBrowserSession(proxy="proxy://fresh")
+        session_info = {
+            "accessToken": "oauth-token",
+            "user": {"id": "user-1"},
+            "account": {"planType": "free"},
+        }
+        with (
+            patch.object(liveness, "_network_preflight_with_retry", return_value=(session, "authorize-url")),
+            patch.object(liveness, "follow_authorize", return_value="https://auth.openai.com/email-verification"),
+            patch.object(liveness, "_login_via_password_or_otp", return_value=session_info) as login,
+            patch.object(liveness, "human_delay"),
+        ):
+            result = liveness.login_account_via_oauth(
+                "user@example.com",
+                "password-from-form",
+                "TOTP-FROM-FORM",
+                proxy="proxy://fresh",
+                email_source="gmail_api_url",
+            )
+
+        self.assertEqual(result["access_token"], "oauth-token")
+        login.assert_called_once_with(
+            session,
+            "user@example.com",
+            unittest.mock.ANY,
+            email_source="gmail_api_url",
+            password="password-from-form",
+            totp_secret="TOTP-FROM-FORM",
+        )
+        self.assertTrue(session.session.closed)
+
     def test_service_403_fallback_really_uses_direct_connection(self):
         slot = _DummyQueueSlot()
         failed = {"ok": False, "status": "failed", "error": "HTTP Error 403: blocked"}

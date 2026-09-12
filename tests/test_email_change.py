@@ -550,6 +550,8 @@ class EmailChangeApiTests(unittest.TestCase):
         self.assertIn('data-personal-mode="twofa"', page)
         self.assertIn('data-personal-panel="twofa"', page)
         self.assertIn("personalResultBody", page)
+        self.assertIn("personalRunning", page)
+        self.assertIn("personalPending", page)
         self.assertIn('data-tab="email-change"', page)
         self.assertIn('id="tab-email-change"', page)
         self.assertNotIn('href="/email-change"', page)
@@ -565,6 +567,8 @@ class EmailChangeApiTests(unittest.TestCase):
         success_path = export_block.split("const blob = await response.blob();", 1)[0]
 
         self.assertNotIn("exportAccountIds", script)
+        self.assertIn("/api/accounts/change-twofa-status?batch_id=", script)
+        self.assertIn("pollTwofaProgress", script)
         self.assertIn("batch_id: exportBatchId", export_block)
         self.assertNotIn("account_ids", export_block)
         self.assertIn("if (!response.ok)", success_path)

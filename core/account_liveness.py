@@ -14,6 +14,7 @@ from core.account_export import (
     follow_oauth_callback,
 )
 from core.chatgpt_auth import get_csrf_token, signin_openai
+from core.codex_login_credentials import generate_totp_code
 from core.codex_oauth import (
     _account_registration_password,
     _account_totp_code,
@@ -397,9 +398,12 @@ def _login_via_password_or_otp(
     email: str,
     otp_after_ts: float,
     email_source: str | None = None,
+    *,
+    password: str | None = None,
+    totp_secret: str | None = None,
 ) -> dict:
     """优先密码登录；如进入 MFA challenge 则自动用 TOTP 完成。"""
-    password = _account_registration_password(email)
+    password = str(password or "").strip() or _account_registration_password(email)
     if not password:
         logger.info("[查活] 未找到注册密码，继续使用邮箱 OTP：%s", email)
         return _login_via_email_otp(
@@ -418,14 +422,14 @@ def _login_via_password_or_otp(
 
     if "/mfa-challenge/" in continue_url or page_type == "mfa_challenge":
         factor_id = _extract_factor_id(password_result, continue_url)
-        secret = _account_totp_secret(email)
+        secret = str(totp_secret or "").strip() or _account_totp_secret(email)
         if not factor_id:
             raise RuntimeError(f"密码登录后进入 MFA 但未拿到 factor_id: {password_result}")
         if not secret:
             raise RuntimeError(f"密码登录后进入 MFA，但账号没有 totp_secret：{email}")
         logger.info("[查活] 已进入 MFA challenge，开始提交 TOTP：%s factor_id=%s", email, factor_id)
         _mfa_issue_challenge(session, factor_id)
-        code = _account_totp_code(email)
+        code = generate_totp_code(secret) if totp_secret else _account_totp_code(email)
         if not code:
             raise RuntimeError(f"无法生成 TOTP 验证码：{email}")
         mfa_result = _mfa_verify(session, factor_id, code)
@@ -452,6 +456,57 @@ def _login_via_password_or_otp(
         return _follow_continue_and_fetch(session, continue_url, referer="https://auth.openai.com/log-in/password")
 
     raise RuntimeError(f"密码登录成功但没有可用 continue_url: {password_result}")
+
+
+def login_account_via_oauth(
+    email: str,
+    password: str,
+    totp_secret: str,
+    *,
+    proxy: str | None = None,
+    email_source: str | None = None,
+) -> dict:
+    """Authenticate with the supplied credentials and return a fresh ChatGPT session."""
+    email = str(email or "").strip()
+    password = str(password or "")
+    totp_secret = str(totp_secret or "").strip()
+    if not email or not password or not totp_secret:
+        raise ValueError("OAuth login requires email, password, and TOTP secret")
+
+    session: BrowserSession | None = None
+    try:
+        session, authorize_url = _network_preflight_with_retry(email, proxy)
+        human_delay("navigate")
+        otp_after_ts = time.time()
+        final_url = follow_authorize(session, authorize_url)
+        dead_code = detect_account_unusable_text(final_url)
+        if dead_code:
+            raise AccountUnusableError(
+                f"账号已废弃（{dead_code}）",
+                error_code=dead_code,
+            )
+        session_info = _login_via_password_or_otp(
+            session,
+            email,
+            otp_after_ts,
+            email_source=email_source,
+            password=password,
+            totp_secret=totp_secret,
+        )
+        access_token = str(session_info.get("accessToken") or "").strip()
+        if not access_token:
+            raise RuntimeError("OAuth login completed without accessToken")
+        return {
+            "ok": True,
+            "access_token": access_token,
+            "session": session_info,
+        }
+    finally:
+        if session is not None:
+            try:
+                session.session.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
 
 
 def log_path(email: str) -> Path:
