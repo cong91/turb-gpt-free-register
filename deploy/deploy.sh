@@ -21,8 +21,10 @@ if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
 fi
 
 git fetch --prune origin main
-git checkout main
-git pull --ff-only origin main
+git checkout --force main
+# The deployment checkout is only a source mirror. Reconcile stale or rewritten
+# local history after the clean-worktree guard instead of requiring fast-forward.
+git reset --hard origin/main
 
 docker compose config --quiet
 
