@@ -125,4 +125,4 @@ jobs:
             -o StrictHostKeyChecking=yes \
             -o UserKnownHostsFile="${RUNNER_TEMP}/turb-ssh/known_hosts" \
             "${OVH_USER}@${OVH_HOST}" \
-            "set -Eeuo pipefail; trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT; docker login ghcr.io --username '${{ github.actor }}' --password-stdin; TURB_IMAGE='${IMAGE_REF}' bash /srv/turb-gpt-free-register/deploy/deploy.sh"
+            "set -Eeuo pipefail; trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT; docker login ghcr.io --username '${{ github.actor }}' --password-stdin; app_dir='/srv/turb-gpt-free-register'; if [[ -n \"\$(git -C \"\${app_dir}\" status --porcelain=v1 --untracked-files=all)\" ]]; then echo 'Refusing deploy: server checkout has uncommitted changes' >&2; exit 1; fi; git -C \"\${app_dir}\" fetch --prune origin main; git -C \"\${app_dir}\" checkout --force main; git -C \"\${app_dir}\" reset --hard origin/main; TURB_IMAGE='${IMAGE_REF}' bash \"\${app_dir}/deploy/deploy.sh\""
