@@ -11,6 +11,7 @@ import re
 import sqlite3
 import threading
 import uuid
+from collections.abc import Iterator
 from contextlib import closing
 from datetime import datetime, timezone
 from html import escape
@@ -5377,6 +5378,21 @@ def job_status_counts() -> dict:
         }
     counts["active"] = sum(int(counts.get(status, 0) or 0) for status in ("pending", "running", "stopping"))
     return counts
+
+
+def iter_failed_job_errors(limit: int = 5000) -> Iterator[str]:
+    """逐条返回失败任务的 error_message（仅统计用途，不带其他字段）。"""
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn:
+        rows = conn.execute(
+            "SELECT COALESCE("
+            "json_extract(payload, '$.error_message'),"
+            "json_extract(payload, '$.error'),'') AS err "
+            "FROM registration_jobs WHERE status='failed' ORDER BY id DESC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+    for row in rows:
+        yield str(row["err"] or "")
 
 
 def list_jobs_for_automation_request(request_id: str) -> list[dict]:

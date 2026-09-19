@@ -7,6 +7,15 @@ from core import browser_twofa_retry
 
 
 class BrowserTwofaRetryTests(unittest.TestCase):
+    def test_default_retry_bounds_are_two_restarts_times_two_logins(self):
+        import inspect
+
+        self.assertEqual(browser_twofa_retry._TWOFA_BROWSER_RESTART_ATTEMPTS, 2)
+        self.assertEqual(browser_twofa_retry._TWOFA_LOGIN_ATTEMPTS, 2)
+        defaults = inspect.signature(browser_twofa_retry.run_twofa_retry).parameters
+        self.assertEqual(defaults["max_attempts"].default, 2)
+        self.assertEqual(defaults["browser_restart_attempts"].default, 2)
+
     def test_retry_uses_generic_browser_session_and_persists_provider(self):
         driver = Mock()
         profile = Mock(driver=driver, provider="cloak", timeout=90)
@@ -362,7 +371,6 @@ class BrowserTwofaRetryTests(unittest.TestCase):
         profiles = [
             Mock(driver=Mock(), provider="cloak", timeout=90),
             Mock(driver=Mock(), provider="cloak", timeout=90),
-            Mock(driver=Mock(), provider="cloak", timeout=90),
         ]
         account = {
             "id": 7,
@@ -390,18 +398,18 @@ class BrowserTwofaRetryTests(unittest.TestCase):
             result = browser_twofa_retry.run_twofa_retry(account, proxy="http://proxy")
 
         self.assertFalse(result["ok"])
-        self.assertEqual(open_profile.call_count, 3)
-        self.assertEqual(login.call_count, 9)
+        self.assertEqual(open_profile.call_count, 2)
+        self.assertEqual(login.call_count, 4)
         self.assertEqual(
             [call.kwargs["proxy"] for call in open_profile.call_args_list],
-            ["http://proxy", "http://proxy", "http://proxy"],
+            ["http://proxy", "http://proxy"],
         )
         for profile in profiles:
             profile.close.assert_called_once_with()
             profile.cleanup.assert_called_once_with()
 
     def test_retry_forces_browser_close_when_profile_is_configured_to_keep_open(self):
-        drivers = [Mock(), Mock(), Mock()]
+        drivers = [Mock(), Mock()]
         profiles = [
             Mock(driver=driver, provider="cloak", timeout=90, keep_open=True)
             for driver in drivers

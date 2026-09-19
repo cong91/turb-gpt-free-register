@@ -57,6 +57,10 @@ _PROVIDER_BATCH_STOP_MARKERS = (
     "sold out",
     "insufficient stock",
     "stock unavailable",
+    # 邮箱来源池耗尽：继续跑只会让剩余任务逐个失败，直接停批。
+    "no gmail api url source available",
+    "gmail api source pool exhausted",
+    "所有邮箱来源均领取失败",
     "insufficient_balance",
     "insufficient balance",
     "insufficient_funds",
@@ -1388,6 +1392,39 @@ def _automated_email_api_registration_lock(email: str):
     return registration_mailbox_lock(email)
 
 
+def _queue_twofa_auto_requeue(job_id: int) -> dict | None:
+    """账号已保存但 2FA 未完成时，自动入队一次有界的 2FA 补做任务。
+
+    retry_job 会按 get_retry_info 路由到 action="2fa"（job_type=twofa_retry），
+    走 TWOFA_RETRY 代理 scope（新 IP、新浏览器），且 create_retry_job 自带
+    同链路去重；2FA 补做任务自身失败不会再触发本函数（一次注册结果只补一次）。
+    """
+    result = retry_job(job_id)
+    if result.get("ok") and result.get("created"):
+        logger.warning(
+            "[Job %s] 2FA 未完成但账号已保存，已自动入队补做任务 #%s",
+            job_id,
+            (result.get("job") or {}).get("id"),
+        )
+    elif not result.get("ok"):
+        logger.warning(
+            "[Job %s] 2FA 自动补做未入队: %s",
+            job_id,
+            str(result.get("error") or "unknown")[:180],
+        )
+    return result
+
+
+def _registration_force_refresh_proxy(job: dict) -> bool:
+    """重试任务必须换新出口 IP：失败往往因为当前 IP 已被网关标记，
+    复用缓存 IP 只会把同样的失败原样再跑一遍。普通任务按全局配置。"""
+    if int(job.get("retry_attempt") or 0) > 0 or job.get("parent_job_id") is not None:
+        return True
+    from config import proxy as _proxy_cfg
+
+    return bool(getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False))
+
+
 def _run_one_job(job_id: int, log_file: str) -> None:
     """单任务入口（线程池里跑这个）。"""
     log_logger = logging.getLogger(__name__)
@@ -1453,17 +1490,13 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 mailbox_lock_acquired = True
             check_stop_requested()
             proxy_lane_id = provider_context.get("proxy_lane_id")
-            from config import proxy as _proxy_cfg
-
             result = run_registration(
                 email=email,
                 name=name,
                 birthday=birthday,
                 proxy_lane_id=proxy_lane_id,
                 lease_owner_id=f"registration-job:{job_id}",
-                force_refresh_proxy=bool(
-                    getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False)
-                ),
+                force_refresh_proxy=_registration_force_refresh_proxy(current),
             )
             if is_stop_requested(job_id):
                 result_dict = result if isinstance(result, dict) else {}
@@ -1577,10 +1610,9 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                         job_id,
                         (result or {}).get("account_id"),
                     )
-                if (
-                    not recoverable_twofa
-                    and _registration_cleanup_allows_retry(job_id, alias_discarded)
-                ):
+                if recoverable_twofa:
+                    _queue_twofa_auto_requeue(job_id)
+                elif _registration_cleanup_allows_retry(job_id, alias_discarded):
                     _queue_transient_registration_retry(job_id, err)
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
     except StopRequested as exc:
@@ -1640,10 +1672,9 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             error=f"{type(exc).__name__}: {exc}"[:500],
             completed_at=_local_now().isoformat(timespec="seconds"),
         )
-        if (
-            not recoverable_twofa
-            and _registration_cleanup_allows_retry(job_id, alias_discarded)
-        ):
+        if recoverable_twofa:
+            _queue_twofa_auto_requeue(job_id)
+        elif _registration_cleanup_allows_retry(job_id, alias_discarded):
             _queue_transient_registration_retry(job_id, err_text)
     finally:
         if mailbox_lock_acquired:
@@ -2414,7 +2445,7 @@ def retry_job(
         effective_workers = (
             workers if action in {"codex", "2fa"} else effective_registration_workers(workers)
         )
-        proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers))
+        proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers or 1))
         from core.rotating_proxy_runtime import (
             CODEX_RETRY_PROXY_SCOPE,
             REGISTRATION_PROXY_SCOPE,

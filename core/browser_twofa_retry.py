@@ -21,7 +21,10 @@ from core.rotating_proxy_runtime import TWOFA_RETRY_PROXY_SCOPE
 
 logger = logging.getLogger(__name__)
 
-_TWOFA_BROWSER_RESTART_ATTEMPTS = 3
+# 每次浏览器重启 = 新代理租约 + 新环境 + 完整重登，成本高；两次重启 × 两次登录
+# 已覆盖绝大多数临时失败（DB 统计 2FA 重试前两次成功率 ~70%），再多只是烧钱。
+_TWOFA_BROWSER_RESTART_ATTEMPTS = 2
+_TWOFA_LOGIN_ATTEMPTS = 2
 
 
 def _account_credentials(account: dict) -> tuple[int, str, str] | None:
@@ -246,7 +249,7 @@ def _run_twofa_retry_in_profile(
 def run_twofa_retry(
     account: dict,
     *,
-    max_attempts: int = 3,
+    max_attempts: int = _TWOFA_LOGIN_ATTEMPTS,
     browser_restart_attempts: int = _TWOFA_BROWSER_RESTART_ATTEMPTS,
     proxy: str | None = None,
     proxy_lane_id: int | None = None,

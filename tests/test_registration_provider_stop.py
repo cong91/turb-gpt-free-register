@@ -216,5 +216,91 @@ class RegistrationProviderStopTests(unittest.TestCase):
         self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
 
 
+    def test_gmail_source_pool_exhaustion_stops_pending_jobs(self):
+        current = {
+            "id": 61,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-pool"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 62,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-pool"},
+            },
+            {
+                "id": 63,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-pool"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                61,
+                "GmailApiUrlError: No Gmail API URL source available",
+            )
+
+        self.assertEqual(result["matched"], 3)
+        self.assertEqual(result["cancelled"], 2)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_email_source_alloc_failure_stops_pending_jobs(self):
+        current = {
+            "id": 71,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-alloc"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 72,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-alloc"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                71,
+                "RuntimeError: 所有邮箱来源均领取失败: ['gmail_api_url']; last=No Gmail API URL source available",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_transient_session_timeout_does_not_stop_batch(self):
+        current = {
+            "id": 81,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-session"},
+        }
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs") as list_jobs,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                81,
+                "RuntimeError: 等待 /api/auth/session accessToken 超时，最后响应: session 暂无 accessToken",
+            )
+
+        self.assertEqual(result, {"matched": 0, "cancelled": 0, "stopping": 0})
+        list_jobs.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
