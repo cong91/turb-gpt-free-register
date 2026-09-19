@@ -804,6 +804,26 @@ def _run_extract(
     try:
         if not db.mark_account_extract_running(account_id):
             return {"ok": False, "error": "账号已删除或提链状态已被重置"}
+        if link_type == "momo":
+            session_kind = str((db.get_account(account_id) or {}).get("pay153_checkout_session_kind") or "").strip().lower()
+            if session_kind == "cs_live":
+                # OpenAI pins the checkout processor on an account's first
+                # create: a cs_live registration never yields the OAICS momo
+                # route, so fail fast instead of burning the retry budget.
+                reason = (
+                    "MOMO_ACCOUNT_PINNED_STRIPE: account này đã bị server ghim checkout Stripe (cs_live) "
+                    "từ lần create đầu tiên — momo chỉ nhận được trên account có kind=oaics; chọn account khác"
+                )
+                result = {
+                    "ok": False,
+                    "status": "failed",
+                    "checked_at": local_now().isoformat(timespec="seconds"),
+                    "error": reason,
+                    "message": reason,
+                }
+                db.update_account_extract(account_id, result)
+                logger.info("[提链] %s: %s", email, reason)
+                return result
         if _mode() == "local":
             from core.pay153_provider_workflow import local_method_strategy
 

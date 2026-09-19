@@ -364,6 +364,28 @@ class LocalExtractLinkTests(unittest.TestCase):
         self.assertNotIn("retire", release.call_args_list[1].kwargs)
         sleep.assert_called_once_with(1.35)
 
+    def test_momo_skips_stripe_pinned_accounts_before_any_attempt(self):
+        with (
+            patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
+            patch.object(extract_link_service.db, "get_account", return_value={"pay153_checkout_session_kind": "cs_live"}),
+            patch.object(extract_link_service, "_mode", return_value="local"),
+            patch.object(extract_link_service, "_run_local_checkout") as checkout,
+            patch.object(extract_link_service.db, "update_account_extract"),
+            patch.object(extract_link_service._QUEUE_SLOTS, "release"),
+        ):
+            result = extract_link_service._run_extract(
+                account_id=8,
+                email="user@example.com",
+                access_token="token",
+                link_type="momo",
+                cdk="",
+                trigger="manual",
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("MOMO_ACCOUNT_PINNED_STRIPE", result["error"])
+        checkout.assert_not_called()
+
     def test_momo_rebuild_marker_retries_with_the_same_proxy_pair(self):
         with (
             patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
