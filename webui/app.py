@@ -3043,6 +3043,13 @@ def create_app(auth_code: str | None = None) -> Flask:
             row.update(svc.get_retry_info(row))
         return jsonify(rows)
 
+    @app.get("/api/jobs/failure-stats")
+    def api_jobs_failure_stats():
+        """注册失败分类统计：仅返回类别计数，用于快速定位批量失败原因。"""
+        from core.registration_failure_stats import failure_class_counts
+
+        return jsonify({"ok": True, "classes": failure_class_counts()})
+
     @app.post("/api/jobs")
     def api_jobs_create():
         """启动批量注册：body {count, workers, email_source?, gmail_cdks?, paymesh_cdks?}。"""

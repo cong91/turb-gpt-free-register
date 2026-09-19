@@ -14,6 +14,21 @@ class WebUiAuthTests(unittest.TestCase):
         self.assertEqual(r.status_code, 401)
         self.assertIn("未授权", r.get_json()["error"])
 
+    def test_failure_stats_requires_auth_code(self):
+        r = self.client.get("/api/jobs/failure-stats")
+        self.assertEqual(r.status_code, 401)
+
+    def test_failure_stats_returns_class_counts_with_auth(self):
+        with patch(
+            "core.registration_failure_stats.failure_class_counts",
+            return_value={"session_token_timeout": 3, "other": 1},
+        ):
+            r = self.client.get("/api/jobs/failure-stats", headers={"X-Auth-Code": "test-auth"})
+        self.assertEqual(r.status_code, 200)
+        payload = r.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["classes"], {"session_token_timeout": 3, "other": 1})
+
     def test_api_accepts_auth_header(self):
         r = self.client.get("/api/summary", headers={"X-Auth-Code": "test-auth"})
         self.assertEqual(r.status_code, 200)
