@@ -17,6 +17,12 @@ from core.account_export import (
     post_register_dwell,
     save_account_data,
 )
+from core.browser_challenge import (
+    browser_challenge_state as _browser_challenge_state,
+)
+from core.browser_challenge import (
+    wait_for_browser_challenge as _wait_for_browser_challenge,
+)
 from core.browser_traffic import SeleniumTrafficTracker
 from core.email_provider import (
     acquire_email_after_input,
@@ -547,6 +553,23 @@ def _wait_for_email_input(driver, timeout: int | None = None):
         if el:
             return el
         last_state = _email_entry_state(driver)
+        challenge_state = _browser_challenge_state(driver)
+        if isinstance(challenge_state, dict) and challenge_state.get("is_challenge"):
+            remaining = max(0.0, end - time.time())
+            logger.warning(
+                "%s 查找邮箱输入框期间检测到浏览器 challenge，等待 challenge 完成：url=%s title=%s reason=%s",
+                _log_prefix(driver),
+                str(challenge_state.get("url") or last_state.get("url") or "")[:180],
+                str(challenge_state.get("title") or last_state.get("title") or "")[:120],
+                str(challenge_state.get("reason") or "")[:120],
+            )
+            if remaining <= 0:
+                break
+            _wait_for_browser_challenge(
+                driver,
+                timeout=min(float(getattr(_cfg, "ROXY_SELENIUM_TIMEOUT", 90) or 90), remaining),
+            )
+            continue
         if not clicked_email_option and _click_email_entry_option(driver):
             clicked_email_option = True
             time.sleep(1.0)
@@ -1171,6 +1194,48 @@ def _clear_otp_inputs(driver) -> None:
         pass
 
 
+def _is_chrome_error_page(driver) -> bool:
+    """Trang hiện tại là trang lỗi trình duyệt/máy chủ (chrome-error://, HTTP 500)."""
+    try:
+        url = str(driver.current_url or "").lower()
+    except Exception:  # noqa: BLE001
+        url = ""
+    if url.startswith("chrome-error://") or "net::err_" in url:
+        return True
+    state = _email_otp_page_state(driver)
+    if not isinstance(state, dict):
+        return False
+    errors = state.get("errors")
+    if not isinstance(errors, (list, tuple)):
+        errors = []
+    text = f"{state.get('text') or ''} {' '.join(str(e) for e in errors)}".lower()
+    return "http error 500" in text or "isn't working" in text or "isn’t working" in text
+
+
+def _resend_or_restart_email_otp(driver, email: str) -> None:
+    """Trigger OTP mới.
+
+    Ưu tiên bấm nút resend; nhưng khi trang đã rơi vào chrome-error/HTTP 500
+    (auth.openai.com thỉnh thoảng trả 500 ngay sau khi submit OTP), trên trang lỗi
+    không bao giờ có nút resend — khi đó phải mở lại login page và submit lại email
+    (giống _restart_email_otp_flow bên browser_use) thay vì chờ 25s rồi fail cả job.
+    """
+    if _is_chrome_error_page(driver):
+        logger.warning(
+            "%s[OTP] Trang xác thực là trang lỗi (chrome-error/HTTP 500)，mở lại login page và submit lại email để trigger OTP mới",
+            _log_prefix(driver),
+        )
+        _reset_login_page_for_retry(driver)
+        _check_manual_stop()
+        next_state = _submit_email_and_wait_next(driver, email, attempts=2)
+        if next_state == "otp":
+            _click_continue_with_password_link(driver)
+            _check_manual_stop()
+            _fill_password_page_if_present(driver, email, timeout=25)
+        return
+    _click_resend_email_otp(driver, timeout=25)
+
+
 def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
     """点击重新发送邮箱验证码。优先按 DOM 属性识别，文本仅兜底。"""
     end = time.time() + timeout
@@ -1239,6 +1304,41 @@ def _wait_after_email_otp_submit(driver, timeout: int = 30) -> str:
     return 'accepted'
 
 
+def _ensure_email_otp_page_ready(driver, timeout: int = 12) -> None:
+    """提交验证码前必须真的在验证码页；否则页面错误会被误报成“找不到重发按钮”。
+
+    密码页被 OpenAI 拒绝（Failed to create account）时会一直停在密码页：没有
+    OTP 输入框、也没有重发按钮。先短等页面切换；超时就把页面真实错误抛出，
+    便于一眼看出是“验证码页没到”还是“创建账号被拒”。页面状态探测不了时
+    （驱动异常/测试桩）保持沉默，不改变原有流程。
+    """
+    def _otp_page_reachable() -> bool:
+        return bool(_is_email_verification_page(driver) or _has_access_token(driver))
+
+    try:
+        if _otp_page_reachable():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    end = time.time() + timeout
+    while time.time() < end:
+        _check_manual_stop()
+        try:
+            if _otp_page_reachable():
+                return
+        except Exception:  # noqa: BLE001
+            return
+        time.sleep(0.5)
+    state = _email_otp_page_state(driver)
+    if not isinstance(state, dict):
+        state = {}
+    errors = [str(err).strip() for err in (state.get("errors") or []) if str(err).strip()]
+    detail = "; ".join(errors[:3]) or str(state.get("text") or "")[:200]
+    raise RuntimeError(
+        f"当前页面不是邮箱验证码页，无法提交验证码: url={state.get('url')} 页面错误={detail}"
+    )
+
+
 def _complete_email_otp(
     driver,
     email: str,
@@ -1285,13 +1385,14 @@ def _complete_email_otp(
                     str(exc)[:180],
                 )
                 otp_after_ts = time.time()
-                _click_resend_email_otp(driver, timeout=25)
+                _resend_or_restart_email_otp(driver, email)
                 human_delay("api")
                 continue
 
         previous_submitted_otp = current_otp
         try:
             logger.info("%s[OTP] 收到验证码：%s", _log_prefix(driver), current_otp)
+            _ensure_email_otp_page_ready(driver)
             _clear_otp_inputs(driver)
             _type_otp(driver, current_otp)
             logger.info("%s[OTP] 已填写邮箱验证码", _log_prefix(driver))
@@ -1327,7 +1428,7 @@ def _complete_email_otp(
             attempts,
         )
         otp_after_ts = time.time()
-        _click_resend_email_otp(driver, timeout=25)
+        _resend_or_restart_email_otp(driver, email)
         human_delay("api")
         current_otp = None
 
@@ -1645,12 +1746,11 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
 
 
 def _generate_roxy_password() -> str:
-    """参考 FlowPilot 密码策略：8~64 位，含大小写、数字、符号。"""
+    """14 位密码，仅含大小写字母和数字，避免符号方便人工登录时手输。"""
     upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
     lower = 'abcdefghjkmnpqrstuvwxyz'
     digits = '23456789'
-    symbols = '!@#$%^&*?_-+=' 
-    groups = [upper, lower, digits, symbols]
+    groups = [upper, lower, digits]
     all_chars = ''.join(groups)
     chars = [random.choice(g) for g in groups]
     while len(chars) < 14:
@@ -1877,6 +1977,21 @@ def _click_continue_with_password_link(driver) -> bool:
         return False
 
 
+def _signup_create_rejection(state: dict) -> str | None:
+    """密码页上 OpenAI 明确拒绝创建账号的页面错误（如 Failed to create account）。
+
+    出现该错误说明 create-account 已被服务端拒绝（邮箱可能已注册或被风控），
+    继续等待/重发 OTP 都没有意义，应立刻把真实原因抛出。
+    """
+    if not isinstance(state, dict):
+        return None
+    for err in (state.get("errors") or []):
+        text = str(err or "").strip()
+        if text and "failed to create account" in text.lower():
+            return text
+    return None
+
+
 def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str | None:
     """邮箱提交后兼容 create-account/password。返回本次设置的 OpenAI 账号密码；未遇到密码页返回 None。"""
     end = time.time() + timeout
@@ -1901,8 +2016,12 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
         # Force password: không click passwordless OTP, luôn fill password (yêu cầu user).
         # _click_passwordless_signup_if_present đã bị bỏ để không bao giờ đi OTP-only.
         if is_login_password:
-            logger.info("%s 当前是登录密码页（已注册邮箱），跳过密码填写：state=%s", _log_prefix(driver), last)
-            return None
+            # 与 _wait_email_submit_next_state 的 login_password 分支同语义：邮箱已注册，
+            # 继续走 OTP 流程只会停在密码页，必须在进入取码前停用该邮箱。
+            raise RuntimeError(
+                f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: "
+                f"url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}"
+            )
         password = _registration_password()
         logger.info("%s 检测到 create-account/password，准备设置密码（%s 位）：email=%s", _log_prefix(driver), len(password), email)
         result = driver.execute_script(r"""
@@ -1985,6 +2104,14 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
             if _has_access_token(driver):
                 logger.info("%s 密码提交后已检测到登录态", _log_prefix(driver))
                 return password
+            if _is_signup_password_page(driver):
+                password_state = _password_page_state(driver)
+                rejected = _signup_create_rejection(password_state)
+                if rejected:
+                    raise RuntimeError(
+                        f"OpenAI 拒绝创建账号：{rejected}（邮箱可能已被注册或被风控，请更换邮箱重试）"
+                        f" url={password_state.get('url')}"
+                    )
             if not retried_submit and time.time() > wait_end - 15 and _is_signup_password_page(driver):
                 retried_submit = True
                 logger.info("%s 密码页点击后仍未跳转，等待后重试一次 Continue/Enter", _log_prefix(driver))
@@ -2212,22 +2339,34 @@ def _click_if_enabled_submit(driver) -> bool:
         return False
 
 
+# 连续多次仅返回 WARNING_BANNER 视为网关拦截：先刷新一次页面，刷新后仍拦截则快速失败。
+_SESSION_BANNER_REFRESH_AFTER = 5
+# 恢复流程（fast_fail=False）在主轮失败后继续等待重读的轮数，每轮独立短超时。
+_SESSION_RECOVERY_REPOLL_ROUNDS = 2
+
+
 def _read_chatgpt_session_once(driver) -> dict | None:
-    """当前页面必须在 chatgpt.com；读取 /api/auth/session，拿不到 token 返回 None。"""
+    """当前页面必须在 chatgpt.com；读取 /api/auth/session。
+
+    拿到 accessToken 返回 session；请求成功但没 token 时返回原始响应
+    （含 _http_status），供调用方识别 WARNING_BANNER 等网关拦截。
+    """
     script = r"""
     const done = arguments[0];
-    fetch('/api/auth/session', {credentials: 'include'})
-      .then(r => r.json())
-      .then(j => done({ok: true, data: j}))
+    fetch('/api/auth/session', {credentials: 'include', cache: 'no-store'})
+      .then(r => r.json().then(j => done({ok: true, status: r.status, data: j})))
       .catch(e => done({ok: false, error: String(e)}));
     """
     result = driver.execute_async_script(script)
     if result and result.get("ok"):
         data = result.get("data") or {}
-        if data.get("accessToken"):
-            logger.info("%s /api/auth/session 已返回 accessToken", _log_prefix(driver))
+        if isinstance(data, dict):
+            data.setdefault("_http_status", result.get("status"))
+            if data.get("accessToken"):
+                logger.info("%s /api/auth/session 已返回 accessToken", _log_prefix(driver))
+                return data
+            logger.info("%s 等待 ChatGPT session 写入 accessToken，当前响应 keys=%s", _log_prefix(driver), list(data.keys()))
             return data
-        logger.info("%s 等待 ChatGPT session 写入 accessToken，当前响应 keys=%s", _log_prefix(driver), list(data.keys()))
     return None
 
 
@@ -2258,17 +2397,23 @@ def _switch_to_chatgpt_window_if_any(driver) -> bool:
     return False
 
 
-def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) -> dict:
+def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15, fast_fail: bool = True) -> dict:
     """等待页面完成跳转并从 ChatGPT 页面内读取登录 session/accessToken。
 
     旧逻辑会在 auth.openai.com 上一直等到总超时，Cloak/部分 Chromium 场景下
     实际账号已创建成功但当前句柄 URL 没及时更新，导致白等 120 秒。现在只给
     自动跳转 `auto_jump_wait` 秒；超过后立即主动打开 chatgpt.com 读 session。
+
+    `fast_fail=False`（恢复轮询用）时，刷新后仍持续 WARNING_BANNER 也不提前
+    判死，继续轮询到本轮超时，由上层恢复链决定下一步。
     """
     end = time.time() + timeout
     auto_jump_end = time.time() + max(3, int(auto_jump_wait or 15))
     last_data = None
     forced_chatgpt_open = False
+    banner_hits = 0
+    banner_refreshed = False
+    banner_persist_logged = False
 
     while time.time() < end:
         _check_manual_stop()
@@ -2293,17 +2438,124 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15) 
                 time.sleep(1)
                 continue
 
+        banner_persist_fail = False
         if 'chatgpt.com' in current:
             try:
                 data = _read_chatgpt_session_once(driver)
-                if data:
+                if isinstance(data, dict) and data.get("accessToken"):
                     return data
-                last_data = "session 暂无 accessToken"
+                last_data = data if data is not None else "session 暂无 accessToken"
+                if isinstance(data, dict) and "WARNING_BANNER" in data:
+                    banner_hits += 1
+                    if banner_hits >= _SESSION_BANNER_REFRESH_AFTER:
+                        if not banner_refreshed:
+                            banner_refreshed = True
+                            banner_hits = 0
+                            logger.warning(
+                                "%s 连续 %s 次仅返回 WARNING_BANNER，刷新页面后重试",
+                                _log_prefix(driver),
+                                _SESSION_BANNER_REFRESH_AFTER,
+                            )
+                            try:
+                                driver.refresh()
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("%s 刷新失败，改为重新打开 ChatGPT：%s: %s", _log_prefix(driver), type(exc).__name__, exc)
+                                _safe_get(driver, "https://chatgpt.com/", timeout=35, attempts=1, accept_hosts=("chatgpt.com",))
+                            time.sleep(3)
+                            continue
+                        # 刷新后仍持续拦截：默认立即失败并把原始响应带进错误信息，
+                        # 供 registration_service 识别并停用邮箱池条目；恢复轮询
+                        # （fast_fail=False）则继续等到本轮超时，不在这里判死。
+                        if fast_fail:
+                            banner_persist_fail = True
+                        elif not banner_persist_logged:
+                            banner_persist_logged = True
+                            logger.warning(
+                                "%s 刷新后仍持续仅返回 WARNING_BANNER（恢复轮询不提前失败，继续等待）",
+                                _log_prefix(driver),
+                            )
+                else:
+                    banner_hits = 0
             except Exception as exc:  # noqa: BLE001
                 last_data = f"{type(exc).__name__}: {exc}"
+            if banner_persist_fail:
+                raise RuntimeError(f"等待 /api/auth/session accessToken 超时，最后响应: {str(last_data)[:800]}")
         time.sleep(2)
 
     raise RuntimeError(f"等待 /api/auth/session accessToken 超时，最后响应: {str(last_data)[:800]}")
+
+
+def _recover_chatgpt_session(driver, email: str, first_error: Exception) -> dict:
+    """session 拿不到 accessToken 时的恢复链（不能一次轮询失败就把 job 判死）。
+
+    1. 等待片刻后重读 /api/auth/session（_SESSION_RECOVERY_REPOLL_ROUNDS 次）；
+    2. 刷新 ChatGPT 页面后重读；
+    3. 仍拿不到 → 用 2FA 流程同款 re-auth 邮箱 OTP 重新登录，重建 session 后再读。
+
+    全部失败时抛出原始 first_error（保留 WARNING_BANNER / _http_status 200
+    marker，供 registration_service 的 retry 分类继续识别）。
+    """
+    last_error = first_error
+    for repoll in range(1, _SESSION_RECOVERY_REPOLL_ROUNDS + 1):
+        wait_seconds = random.uniform(8.0, 14.0)
+        logger.warning(
+            "%s session 恢复 %s/%s：等待 %.0fs 后重读 accessToken（上轮错误：%s）",
+            _log_prefix(driver),
+            repoll,
+            _SESSION_RECOVERY_REPOLL_ROUNDS,
+            wait_seconds,
+            str(last_error)[:160],
+        )
+        time.sleep(wait_seconds)
+        _check_manual_stop()
+        try:
+            return _fetch_chatgpt_session(driver, timeout=35, auto_jump_wait=8, fast_fail=False)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+
+    logger.warning("%s session 恢复：刷新 ChatGPT 页面后重读 accessToken", _log_prefix(driver))
+    try:
+        driver.refresh()
+        time.sleep(3)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "%s session 恢复：刷新失败，改为重新打开 ChatGPT：%s: %s",
+            _log_prefix(driver),
+            type(exc).__name__,
+            exc,
+        )
+        _safe_get(driver, "https://chatgpt.com/", timeout=35, attempts=1, accept_hosts=("chatgpt.com",))
+    try:
+        return _fetch_chatgpt_session(driver, timeout=35, auto_jump_wait=8, fast_fail=False)
+    except Exception as exc:  # noqa: BLE001
+        last_error = exc
+
+    logger.warning(
+        "%s session 恢复：按 2FA 登录方式发起 re-auth 邮箱 OTP 重新登录（email=%s）",
+        _log_prefix(driver),
+        email,
+    )
+    from core.account_export import reauth_login_after_session_timeout
+
+    try:
+        reauth_login_after_session_timeout(driver, email)
+    except Exception as reauth_exc:
+        logger.error(
+            "%s session 恢复：re-auth 重新登录失败：%s",
+            _log_prefix(driver),
+            str(reauth_exc)[:200],
+        )
+        raise first_error from reauth_exc
+    _check_manual_stop()
+    try:
+        return _fetch_chatgpt_session(driver, timeout=60, auto_jump_wait=8, fast_fail=False)
+    except Exception as final_exc:
+        logger.error(
+            "%s session 恢复：重新登录后仍未读到 accessToken：%s",
+            _log_prefix(driver),
+            str(final_exc)[:200],
+        )
+        raise first_error from final_exc
 
 
 def _check_manual_stop() -> None:
@@ -2471,7 +2723,14 @@ def run_roxy_registration(
 
         logger.info("[Roxy注册] 等待 ChatGPT 跳转并写入 session/accessToken")
         _check_manual_stop()
-        session_info = _fetch_chatgpt_session(driver, timeout=120)
+        try:
+            session_info = _fetch_chatgpt_session(driver, timeout=120)
+        except Exception as session_err:
+            logger.warning(
+                "[Roxy注册] 首轮未拿到 accessToken，进入恢复流程（等待重读→刷新重读→re-auth 重新登录）：%s",
+                str(session_err)[:200],
+            )
+            session_info = _recover_chatgpt_session(driver, email, session_err)
         _traffic_checkpoint()
         access_token = session_info["accessToken"]
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
@@ -2514,6 +2773,21 @@ def run_roxy_registration(
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
                 logger.error("[Roxy注册] 2FA 设置失败，账号已保留待重试：%s", twofa_error)
+                try:
+                    from core.registration_auto_pay153 import enqueue_registration_auto_pay153
+
+                    enqueue_registration_auto_pay153(
+                        account_id=account_id,
+                        email=email,
+                        access_token=access_token,
+                        proxy=proxy,
+                    )
+                except Exception as queue_exc:  # noqa: BLE001 - preserve the checkpointed account.
+                    logger.warning(
+                        "[PAY.153][Roxy注册] 2FA 失败后的自动任务未入队: %s: %s",
+                        type(queue_exc).__name__,
+                        str(queue_exc)[:180],
+                    )
                 return {
                     "success": False,
                     "email": email,
@@ -2572,6 +2846,7 @@ def run_roxy_registration(
             post_auth_automation_enabled = bool(
                 getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                 or free_codex_auto_enabled
+                or bool(getattr(_register_cfg, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False))
                 or codex_auto_enabled
             )
             if post_auth_automation_enabled:
@@ -2677,7 +2952,7 @@ def run_roxy_registration(
             "email": email,
             "network_traffic": network_traffic,
             "network_identity": network_identity,
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            "error": f"{type(exc).__name__}: {str(exc)[:800]}",
         }
     finally:
         if traffic_tracker is not None:

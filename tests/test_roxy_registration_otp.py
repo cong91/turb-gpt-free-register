@@ -27,7 +27,9 @@ class RoxyRegistrationOtpTests(unittest.TestCase):
     ):
         driver = Mock()
 
-        with patch("core.roxy_registration.human_delay"):
+        with patch("core.roxy_registration.human_delay"), patch.object(
+            roxy_registration, "_is_email_verification_page", return_value=True
+        ):
             roxy_registration._complete_email_otp(
                 driver,
                 "user@example.com",
@@ -67,7 +69,9 @@ class RoxyRegistrationOtpTests(unittest.TestCase):
     ):
         driver = Mock()
 
-        with patch("core.roxy_registration.human_delay"):
+        with patch("core.roxy_registration.human_delay"), patch.object(
+            roxy_registration, "_is_email_verification_page", return_value=True
+        ):
             roxy_registration._complete_email_otp(
                 driver,
                 "user@example.com",
@@ -105,7 +109,9 @@ class RoxyRegistrationOtpTests(unittest.TestCase):
         driver = Mock()
         _wait_submit.side_effect = ["invalid", "accepted"]
 
-        with patch("core.roxy_registration.human_delay"):
+        with patch("core.roxy_registration.human_delay"), patch.object(
+            roxy_registration, "_is_email_verification_page", return_value=True
+        ):
             roxy_registration._complete_email_otp(
                 driver,
                 "user@example.com",
@@ -117,6 +123,80 @@ class RoxyRegistrationOtpTests(unittest.TestCase):
         resend.assert_called_once_with(driver, timeout=25)
         self.assertEqual(wait_for_otp.call_args.kwargs["before_code"], "111111")
         self.assertEqual(wait_for_otp.call_args.kwargs["stage"], "registration_email_otp")
+
+    @patch("core.roxy_registration._wait_after_email_otp_submit")
+    @patch("core.roxy_registration._click_continue")
+    @patch("core.roxy_registration._type_otp")
+    @patch("core.roxy_registration._clear_otp_inputs")
+    @patch("core.roxy_registration._click_resend_email_otp")
+    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.roxy_registration._fill_password_page_if_present", return_value="pw")
+    @patch("core.roxy_registration._click_continue_with_password_link")
+    @patch("core.roxy_registration._reset_login_page_for_retry")
+    @patch("core.roxy_registration._is_chrome_error_page", return_value=True)
+    @patch("core.roxy_registration.wait_for_otp", return_value="222222")
+    @patch("core.roxy_registration.time.time", side_effect=[100.0, 200.0])
+    def test_otp_submit_lands_on_500_page_restarts_flow_instead_of_failing(
+        self,
+        _time,
+        wait_for_otp,
+        _is_error,
+        _reset,
+        _click_pwd_link,
+        _fill_pwd,
+        _resubmit,
+        resend,
+        _clear,
+        _type_otp,
+        _continue,
+        _wait_submit,
+    ):
+        """Job 2423: sau khi submit OTP, auth.openai.com trả HTTP 500 (chrome-error://).
+
+        Trước fix: _click_resend_email_otp tìm nút resend trên trang lỗi 25s rồi
+        RuntimeError làm chết cả job. Sau fix: phát hiện trang lỗi, mở lại login
+        page, submit lại email để trigger OTP mới và tiếp tục vòng retry.
+        """
+        driver = Mock()
+        _wait_submit.side_effect = ["invalid", "accepted"]
+
+        with patch("core.roxy_registration.human_delay"), patch.object(
+            roxy_registration, "_is_email_verification_page", return_value=True
+        ):
+            roxy_registration._complete_email_otp(
+                driver,
+                "user@example.com",
+                otp_after_ts=50.0,
+                otp_code="111111",
+                max_attempts=2,
+            )
+
+        resend.assert_not_called()
+        _reset.assert_called_once_with(driver)
+        _resubmit.assert_called_once()
+        self.assertEqual(_resubmit.call_args.args[1], "user@example.com")
+        _click_pwd_link.assert_called_once_with(driver)
+        self.assertEqual(wait_for_otp.call_args.kwargs["after_ts"], 100.0)
+
+    def test_is_chrome_error_page_detects_url_and_http_500_text(self):
+        driver = Mock()
+        driver.current_url = "chrome-error://chromewebdata/"
+        self.assertTrue(roxy_registration._is_chrome_error_page(driver))
+
+        driver = Mock()
+        driver.current_url = "https://auth.openai.com/log-in/otp"
+        state = {
+            "text": "This page isn’t working auth.openai.com is currently unable to handle this request. HTTP ERROR 500",
+            "errors": ["HTTP ERROR 500"],
+        }
+        with patch("core.roxy_registration._email_otp_page_state", return_value=state):
+            self.assertTrue(roxy_registration._is_chrome_error_page(driver))
+
+        driver = Mock()
+        driver.current_url = "https://auth.openai.com/log-in/otp"
+        state = {"text": "Enter code", "errors": []}
+        with patch("core.roxy_registration._email_otp_page_state", return_value=state):
+            self.assertFalse(roxy_registration._is_chrome_error_page(driver))
 
 
 if __name__ == "__main__":

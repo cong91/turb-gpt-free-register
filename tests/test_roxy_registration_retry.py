@@ -49,6 +49,7 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
             stack.enter_context(patch("config.twofa.ENABLE_2FA", False))
             stack.enter_context(patch("config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", False))
             stack.enter_context(patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False))
+            stack.enter_context(patch("config.register.AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False))
             stack.enter_context(patch("config.codex.ENABLE_CODEX_AUTO", False))
             stack.enter_context(patch("config.roxybrowser.ROXY_KEEP_BROWSER_OPEN", True))
 
@@ -192,6 +193,40 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
         maybe_accept.assert_called_once_with(driver)
         assert_not_external.assert_called_once_with(driver, "retry login page")
         self.assertEqual(type_email.calls, 2)
+
+    def test_email_input_wait_rechecks_late_browser_challenge(self):
+        driver = Mock(current_url="https://chatgpt.com/auth/login")
+        email_input = object()
+        with (
+            patch(
+                "core.roxy_registration._find_visible_email_input_js",
+                side_effect=[None, email_input],
+            ) as find_input,
+            patch(
+                "core.roxy_registration._email_entry_state",
+                return_value={
+                    "url": "https://chatgpt.com/auth/login",
+                    "title": "Chờ một chút...",
+                    "inputs": [],
+                    "actions": [],
+                },
+            ),
+            patch(
+                "core.roxy_registration._browser_challenge_state",
+                return_value={"is_challenge": True, "reason": "chờ một chút"},
+            ),
+            patch(
+                "core.roxy_registration._wait_for_browser_challenge",
+                return_value={"is_challenge": False},
+            ) as wait_for_challenge,
+            patch("core.roxy_registration._click_email_entry_option", return_value=False),
+            patch("core.roxy_registration.time.sleep"),
+        ):
+            result = roxy_registration._wait_for_email_input(driver, timeout=1)
+
+        self.assertIs(result, email_input)
+        self.assertEqual(find_input.call_count, 2)
+        wait_for_challenge.assert_called_once_with(driver, timeout=unittest.mock.ANY)
 
 
 if __name__ == "__main__":
