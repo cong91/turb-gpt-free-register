@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from core import registration_service
+from core.bamboommo_client import BambooMmoError
 
 
 class RegistrationProviderStopTests(unittest.TestCase):
@@ -118,6 +119,100 @@ class RegistrationProviderStopTests(unittest.TestCase):
         self.assertEqual(result["matched"], 2)
         self.assertEqual(result["cancelled"], 1)
         self.assertEqual(result["stopped"], 0)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_insufficient_balance_stops_pending_gmail_api_url_jobs(self):
+        current = {
+            "id": 31,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-balance"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 32,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-balance"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                31,
+                "QAN8 HTTP 409: {'code': 'INSUFFICIENT_BALANCE', 'message': 'Insufficient API member balance'}",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_insufficient_balance_stops_otpmail_batch(self):
+        current = {
+            "id": 41,
+            "status": "running",
+            "email_source": "otpmail",
+            "provider_context": {"registration_batch_id": "batch-otp"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 42,
+                "status": "pending",
+                "email_source": "otpmail",
+                "provider_context": {"registration_batch_id": "batch-otp"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                41,
+                "OTPGmail 请求失败: HTTP 400; Insufficient balance, please recharge",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_insufficient_balance_stops_bamboommo_batch(self):
+        current = {
+            "id": 51,
+            "status": "running",
+            "email_source": "bamboommo",
+            "provider_context": {"registration_batch_id": "batch-bamboo"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 52,
+                "status": "pending",
+                "email_source": "bamboommo",
+                "provider_context": {"registration_batch_id": "batch-bamboo"},
+            },
+        ]
+        error = BambooMmoError(
+            "BambooMMO API error ORDER_NOT_ENOUGH_MONEY: Tài khoản không đủ số dư",
+            resource_key="ORDER_NOT_ENOUGH_MONEY",
+        )
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                51,
+                error,
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
         self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
 
 

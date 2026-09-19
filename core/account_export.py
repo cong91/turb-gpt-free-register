@@ -603,6 +603,10 @@ def _follow_reauth(session: BrowserSession, auth_url: str) -> str:
         raise RuntimeError(
             f"re-auth 未进入 email-verification 页面: {final_url[:180]}"
         )
+    # BrowserPageTransport 会先 driver.get 再同源 fetch 一次 authorize；最后
+    # 一次 authorize 触发的 OTP 邮件可能比前一步的晚到。稍等让它落地，避免
+    # 调用方轮询到已被作废的上一步验证码（wrong_email_otp_code）。
+    time.sleep(random.uniform(3.0, 5.0))
     return final_url
 
 
@@ -991,12 +995,12 @@ def setup_2fa_for_registration(session: BrowserSession, email: str) -> str:
 
 
 def reauth_login_after_session_timeout(session, email: str, *, max_attempts: int = 2) -> None:
-    """注册后 session 未签发 accessToken 时，用 2FA 同款 re-auth 邮箱 OTP 重新登录。
+    """session 未签发 accessToken 时，用 2FA 同款 re-auth 邮箱 OTP 重新登录。
 
-    复用 setup_2fa(reauth=True) 的登录段：connection=password + login_hint 发起
-    re-auth，auth.openai.com 自己进入 email-verification 并发送邮箱 OTP；校验通过
-    后让浏览器真实导航 callback 重建 chatgpt.com session。只做登录，不 enroll
-    TOTP——注册流程随后会自己执行 2FA 设置。
+    此时 auth.openai.com 已有本轮注册留下的登录 cookie，connection=password +
+    login_hint 发起 re-auth，auth.openai.com 自己进入 email-verification 并发送
+    邮箱 OTP；校验通过后让浏览器真实导航 callback 重建 chatgpt.com session。
+    只做登录，不 enroll TOTP——注册流程随后会自己执行 2FA 设置。
     """
     if not callable(getattr(session, "get_auth_headers", None)) and callable(
         getattr(session, "execute_async_script", None),

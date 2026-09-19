@@ -397,6 +397,75 @@ class ForcePasswordFlowTests(unittest.TestCase):
         self.assertEqual(_save.call_args.kwargs["extra"]["registration_driver"], "roxy")
         self.assertFalse(_save.call_args.kwargs["auto_plan_check"])
 
+    @patch("core.registration_auto_pay153.enqueue_registration_auto_pay153")
+    @patch("core.db.update_account_2fa")
+    @patch(
+        "core.browser_twofa_retry.run_twofa_retry",
+        return_value={
+            "ok": True,
+            "status": "success",
+            "email": "user@example.com",
+            "account_id": 7,
+            "totp_secret": "TOTPSECRET",
+            "access_token": "tok",
+        },
+    )
+    @patch(
+        "core.account_export.setup_2fa_for_registration",
+        side_effect=RuntimeError("re-auth 未进入 email-verification 页面: rate_limit_exceeded"),
+    )
+    @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", True)
+    @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")
+    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.roxy_registration._build_driver")
+    @patch("core.roxy_registration.RoxyBrowserClient")
+    @patch("core.roxy_registration.human_delay")
+    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.roxy_registration._center_browser_window")
+    @patch("core.roxy_registration._check_manual_stop")
+    @patch("core.roxy_registration.save_account_data")
+    @patch("core.roxy_registration.resolve_email_source", return_value="paymesh")
+    @patch("core.roxy_registration.checkpoint_account_data", return_value=7)
+    @patch("core.roxy_registration._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
+    @patch("core.roxy_registration._complete_profile_page", return_value=True)
+    @patch("core.roxy_registration._wait_after_email_otp_submit", return_value="accepted")
+    @patch("core.roxy_registration.wait_for_otp", return_value="123456")
+    @patch("core.roxy_registration._click_continue")
+    @patch("core.roxy_registration._type_otp")
+    @patch("core.roxy_registration._clear_otp_inputs")
+    def test_twofa_setup_failure_recovers_via_browser_restart_retry(
+        self, _clear, _type, _click, _wait_otp, _wait_after, _profile, _fetch, _checkpoint,
+        _resolve, _save, _check_stop, _center, _maybe, _human, _client_cls, _build, _submit,
+        fill_pwd, _setup_2fa, twofa_retry, update_2fa, pay153_enqueue,
+    ):
+        """Job 2665：注册成功但 re-auth 连续失败（wrong OTP → rate_limit）时，
+        必须重启浏览器+轮换代理（TWOFA_RETRY scope）重新登录补做 2FA，而不是直接判死。"""
+        driver = Mock()
+        _build.return_value = driver
+        opened = Mock()
+        opened.profile_id = "test"
+        opened.debugger_address = "127.0.0.1:9999"
+        opened.raw = {}
+        client = Mock()
+        client.open_profile.return_value = opened
+        _client_cls.return_value = client
+
+        result = roxy_registration.run_roxy_registration(
+            email="user@example.com", name="Test", birthday="1990-01-01",
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["twofa_status"], "active")
+        self.assertEqual(result["totp_secret"], "TOTPSECRET")
+        twofa_retry.assert_called_once()
+        self.assertEqual(twofa_retry.call_args.args[0]["registration_password"], "Secret123!")
+        self.assertEqual(twofa_retry.call_args.kwargs.get("max_attempts"), 2)
+        self.assertEqual(twofa_retry.call_args.kwargs.get("browser_restart_attempts"), 2)
+        # 不传注册代理：run_twofa_retry 内部走 TWOFA_RETRY scope 轮换新 IP。
+        self.assertNotIn("proxy", twofa_retry.call_args.kwargs)
+        update_2fa.assert_called_once_with(7, status="active", totp_secret="TOTPSECRET")
+        pay153_enqueue.assert_not_called()
+
     @patch("core.roxy_registration._click_continue_with_password_link", return_value=True)
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", False)
     @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")

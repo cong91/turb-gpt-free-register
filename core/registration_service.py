@@ -48,6 +48,7 @@ _MAINTENANCE_BARRIER = RegistrationMaintenanceBarrier()
 _rotation_pending = False
 _ROTATION_LOCK = threading.Lock()
 _SUPPORTED_BROWSER_TWOFA_DRIVERS = frozenset({"roxy", "cloak", "browser_use", "skyvern"})
+_PROVIDER_BATCH_STOP_SOURCES = frozenset({"gmail_api_url", "otpmail", "bamboommo"})
 _PROVIDER_BATCH_STOP_MARKERS = (
     "checkout_blocked",
     "checkout blocked",
@@ -56,6 +57,15 @@ _PROVIDER_BATCH_STOP_MARKERS = (
     "sold out",
     "insufficient stock",
     "stock unavailable",
+    "insufficient_balance",
+    "insufficient balance",
+    "insufficient_funds",
+    "insufficient funds",
+    "not_enough_balance",
+    "not enough balance",
+    "not_enough_money",
+    "not enough money",
+    "余额不足",
     "库存不足",
     "库存已售罄",
 )
@@ -451,8 +461,11 @@ def _reattach_gmail_api_url_retry_alias(source: dict, job: dict) -> dict:
     - Job gốc chết trước khi nhận OTP → retry giữ nguyên batch gốc để runtime
       cấp một alias mới cho cùng record email; không mượn alias của job khác,
       không thuê email mới.
-    - Chỉ khi OpenAI từ chối hẳn mailbox (unsupported/banned/… có flag OTP)
-      hoặc code_url đã bị quarantine mới nhảy sang batch mới (email khác).
+    - OpenAI đã từ chối/burn mailbox sau khi nhận OTP (unsupported/banned/…
+      hoặc session terminal-timeout — account đã tạo phía server, đăng ký lại
+      alias đó chắc chắn gặp "Failed to create account") hoặc code_url đã bị
+      quarantine → retry nhận batch/alias mới, tuyệt không re-register alias
+      đã dùng.
     """
     alias = str(source.get("email") or "").strip()
     source_context = source.get("provider_context")
@@ -460,12 +473,11 @@ def _reattach_gmail_api_url_retry_alias(source: dict, job: dict) -> dict:
     otp_received = bool(source_context.get("gmail_api_url_otp_received"))
     error_text = str(source.get("error_message") or "")
     poisoned = _should_disable_failed_registration_email(error_text)
-    recoverable_poison = poisoned and _is_final_session_access_token_timeout(error_text)
 
     if not alias:
         return _assign_fresh_gmail_api_url_registration_batch(job)
 
-    if otp_received and poisoned and not recoverable_poison:
+    if otp_received and poisoned:
         # OpenAI tự từ chối mailbox này sau khi đã nhận OTP → email khác.
         return _assign_fresh_gmail_api_url_registration_batch(job, force=True)
 
@@ -606,7 +618,7 @@ def _is_terminal_provider_batch_error(error: object, *, email_source: str | None
     """Identify provider failures that make every job in this registration batch unusable."""
     from core.email_provider import normalize_email_source
 
-    if normalize_email_source(str(email_source or "")) != "gmail_api_url":
+    if normalize_email_source(str(email_source or "")) not in _PROVIDER_BATCH_STOP_SOURCES:
         return False
     messages: list[str] = []
     current: object | None = error
@@ -614,6 +626,10 @@ def _is_terminal_provider_batch_error(error: object, *, email_source: str | None
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         messages.append(str(current or "").casefold())
+        # Typed provider errors carry machine-readable codes outside the
+        # message text (BambooMMO resourceKey, OTPGmail error_code).
+        messages.append(str(getattr(current, "error_code", "") or "").casefold())
+        messages.append(str(getattr(current, "resource_key", "") or "").casefold())
         current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
     message = " ".join(messages)
     return any(marker in message for marker in _PROVIDER_BATCH_STOP_MARKERS)
@@ -623,7 +639,7 @@ def _stop_registration_batch_on_provider_failure(
     job_id: int | None,
     error: object,
 ) -> dict[str, int | str | None]:
-    """Stop the submitted registration batch after a terminal QAN8 checkout failure."""
+    """Stop the submitted registration batch after a terminal provider failure."""
     if job_id is None:
         return {"matched": 0, "cancelled": 0, "stopping": 0}
     current = db.get_job(int(job_id)) or {}
@@ -691,7 +707,7 @@ def _stop_registration_batch_on_provider_failure(
                 )
                 stopped += 1
     logger.error(
-        "[Provider] Terminal QAN8 checkout failure stopped registration batch=%s lane=%s; "
+        "[Provider] Terminal provider failure stopped registration batch=%s lane=%s; "
         "matched=%s cancelled=%s stopping=%s stopped=%s reason=%s",
         batch_id or "-",
         lane_batch_id or "-",
@@ -2010,9 +2026,9 @@ def submit_registration(
             ),
         )
     registration_batch_id = uuid.uuid4().hex
-    provider_context = {
+    provider_context: dict = {
         "registration_batch_id": registration_batch_id,
-    } if email_source == "gmail_api_url" else {}
+    }
     if gmail_batch_id:
         provider_context.update(
             {

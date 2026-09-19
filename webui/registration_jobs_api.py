@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from urllib.parse import urlparse
 
 from config import email as email_config
@@ -14,6 +15,8 @@ from core.gmail_batch_store_base import GmailBatchError
 from core.paymesh_aliases import PaymeshAliasError, normalize_paymesh_routed_domains
 from core.registration_limits import MAX_REGISTRATION_TASKS
 from webui.email_source_validation import validate_email_sources
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_cdks(value) -> list[str]:
@@ -179,6 +182,50 @@ def _qan8_purchase_config_error() -> str | None:
     return None
 
 
+def _balance_value(payload: object) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return float(payload.get("balance"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _qan8_balance_error() -> str | None:
+    """Kiểm tra số dư QAN8 trước khi tạo job; không kết nối được thì chỉ cảnh báo."""
+    from requests import RequestException
+
+    from core.qan8_gmail_api_client import Qan8GmailApiClient, Qan8GmailApiError
+
+    try:
+        balance = _balance_value(Qan8GmailApiClient().get_balance())
+    except (Qan8GmailApiError, RequestException) as exc:
+        logger.warning("QAN8 pre-flight balance check failed, bỏ qua: %s", exc)
+        return None
+    if balance is not None and balance <= 0:
+        return (
+            "Tài khoản shop.qan8.com không đủ số dư (balance=0). "
+            "Hãy nạp tiền rồi tạo job lại."
+        )
+    return None
+
+
+def _otpmail_balance_error() -> str | None:
+    """检查 OTPGmail 余额；余额接口不可用时仅告警，不拦截提交。"""
+    from requests import RequestException
+
+    from core import otpgmail_client
+
+    try:
+        balance = _balance_value(otpgmail_client.get_quota())
+    except (otpgmail_client.OtpGmailError, RequestException) as exc:
+        logger.warning("OTPGmail pre-flight balance check failed, bỏ qua: %s", exc)
+        return None
+    if balance is not None and balance <= 0:
+        return "已选择 otpmail 邮箱来源，但 OTPGmail 余额不足 (balance=0)，请先充值再提交任务。"
+    return None
+
+
 def create_registration_jobs(
     data: dict,
     *,
@@ -302,6 +349,14 @@ def create_registration_jobs(
                     "ok": False,
                     "error": purchase_error,
                 }, 400
+            if alias_available < requested_job_count:
+                balance_error = _qan8_balance_error()
+                if balance_error:
+                    return {"ok": False, "error": balance_error}, 400
+        if "otpmail" in sources:
+            balance_error = _otpmail_balance_error()
+            if balance_error:
+                return {"ok": False, "error": balance_error}, 400
     if automation_context:
         submit_kwargs["automation_context"] = automation_context
     try:

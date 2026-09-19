@@ -9,6 +9,7 @@ from config import register as register_config
 from core import app_state_db, db, registration_service
 from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 from core.gmail_batch_store_base import GmailBatchError
+from core.qan8_gmail_api_client import Qan8GmailApiClient, Qan8GmailApiError
 from webui.registration_jobs_api import create_registration_jobs
 
 
@@ -345,8 +346,10 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
         self.assertIsNone(child["email"])
         self.assertIsNone(store.find_active_assignment_for_job(str(child["id"])))
 
-    def test_session_timeout_with_otp_reuses_the_bound_alias(self):
-        """A post-OTP failure stays bound to its alias even when the old batch would drain."""
+    def test_final_session_timeout_with_otp_moves_retry_to_a_fresh_alias(self):
+        """Job 2639→2648：session terminal-timeout 说明账号已在服务端创建，
+        重注册同一 alias 必撞 "Failed to create account"。retry 必须拿全新
+        batch/alias，绝不 re-register 已用邮箱。"""
         store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
         batch_id = store.create_empty_batch(
             target_count=2,
@@ -395,11 +398,9 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         child = db.get_job(result["job"]["id"])
-        self.assertEqual(child["email"], "failed-alias@gmail.com")
-        self.assertEqual(child["provider_context"]["gmail_api_url_batch_id"], batch_id)
-        reactivated = store.find_active_assignment_for_job(str(child["id"]))
-        self.assertIsNotNone(reactivated)
-        self.assertEqual(reactivated.inventory_id, assignment.inventory_id)
+        self.assertIsNone(child["email"])
+        self.assertNotEqual(child["provider_context"]["gmail_api_url_batch_id"], batch_id)
+        self.assertIsNone(store.find_active_assignment_for_job(str(child["id"])))
         self.assertEqual(submitted[0][0], registration_service._run_one_job)
 
     def test_registration_retry_skips_alias_reuse_for_quarantined_code_url(self):
@@ -504,7 +505,9 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
             email_config, "EMAIL_SOURCE", "gmail_api_url"
         ), patch.object(email_config, "QAN8_API_BASE", "https://shop.qan8.com"), patch.object(
             email_config, "QAN8_API_KEY", "key"
-        ), patch.object(email_config, "QAN8_GMAIL_SKU_ID", "42"):
+        ), patch.object(email_config, "QAN8_GMAIL_SKU_ID", "42"), patch.object(
+            Qan8GmailApiClient, "get_balance", return_value={"balance": 9.5}
+        ):
             payload, status = create_registration_jobs(
                 {
                     "count": 3,
@@ -543,7 +546,9 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
             email_config, "EMAIL_SOURCE", "gmail_api_url"
         ), patch.object(email_config, "QAN8_API_BASE", "https://shop.qan8.com"), patch.object(
             email_config, "QAN8_API_KEY", "key"
-        ), patch.object(email_config, "QAN8_GMAIL_SKU_ID", "42"):
+        ), patch.object(email_config, "QAN8_GMAIL_SKU_ID", "42"), patch.object(
+            Qan8GmailApiClient, "get_balance", return_value={"balance": 9.5}
+        ):
             payload, status = create_registration_jobs(
                 {
                     "count": 30,
@@ -724,6 +729,92 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
 
         self.assertEqual(status, 400)
         self.assertIn("shop.qan8.com", payload["error"])
+        service.submit_registration.assert_not_called()
+
+    def test_webui_refuses_submission_when_qan8_balance_is_zero(self):
+        service = MagicMock()
+        database = MagicMock()
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 0,
+            "alias_available": 0,
+        }
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "gmail_api_url"
+        ), patch.object(
+            email_config, "QAN8_API_BASE", "https://shop.qan8.com"
+        ), patch.object(
+            email_config, "QAN8_API_KEY", "key"
+        ), patch.object(
+            email_config, "QAN8_GMAIL_SKU_ID", "42"
+        ), patch.object(
+            Qan8GmailApiClient, "get_balance", return_value={"balance": 0}
+        ):
+            payload, status = create_registration_jobs(
+                {"count": 1, "workers": 1, "email_source": "gmail_api_url"},
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 400)
+        self.assertIn("số dư", payload["error"])
+        service.submit_registration.assert_not_called()
+
+    def test_webui_allows_submission_when_qan8_balance_check_is_unreachable(self):
+        service = MagicMock()
+        service.submit_registration.return_value = [{"id": index} for index in range(12)]
+        service.effective_registration_workers.return_value = 1
+        database = MagicMock()
+        database.gmail_api_url_email_pool_summary.return_value = {
+            "available": 0,
+            "alias_available": 0,
+        }
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "gmail_api_url"
+        ), patch.object(
+            email_config, "QAN8_API_BASE", "https://shop.qan8.com"
+        ), patch.object(
+            email_config, "QAN8_API_KEY", "key"
+        ), patch.object(
+            email_config, "QAN8_GMAIL_SKU_ID", "42"
+        ), patch.object(
+            Qan8GmailApiClient,
+            "get_balance",
+            side_effect=Qan8GmailApiError("QAN8 HTTP 503: upstream unavailable"),
+        ):
+            _, status = create_registration_jobs(
+                {"count": 1, "workers": 1, "email_source": "gmail_api_url"},
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 200)
+        service.submit_registration.assert_called_once()
+
+    def test_webui_refuses_submission_when_otpgmail_balance_is_zero(self):
+        service = MagicMock()
+        database = MagicMock()
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "otpmail"
+        ), patch.object(
+            email_config, "OTPGMAIL_API_BASE", "https://otpgmail.example.test"
+        ), patch.object(
+            email_config, "OTPGMAIL_API_KEY", "key"
+        ), patch.object(
+            email_config, "OTPGMAIL_SERVICE_CODE", "dr"
+        ), patch(
+            "core.otpgmail_client.get_quota", return_value={"balance": 0}
+        ):
+            payload, status = create_registration_jobs(
+                {"count": 1, "workers": 1, "email_source": "otpmail"},
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 400)
+        self.assertIn("余额不足", payload["error"])
         service.submit_registration.assert_not_called()
 
     def test_webui_returns_batch_exhaustion_as_bad_request(self):
