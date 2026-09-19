@@ -21,6 +21,8 @@ _RETRYABLE_PROFILE_CREATE_MESSAGES = (
     "creating, please wait",
     "insufficient profile quota",
 )
+# 连续失败上限：Roxy 长时间不可用时不能无限占用注册 lane。
+_ROXY_CREATE_MAX_ATTEMPTS = 5
 
 
 @dataclass
@@ -422,6 +424,10 @@ class RoxyBrowserClient:
 
     @staticmethod
     def _is_retryable_profile_create_error(exc: Exception) -> bool:
+        if isinstance(exc, requests.ConnectionError):
+            # 连接阶段失败（本地 Roxy 服务未启动/连接被拒）不会到达服务端，
+            # 不可能已创建环境，可安全重试；响应超时仍视为不可判定，不重试。
+            return True
         text = str(exc or "").lower()
         return any(message in text for message in _RETRYABLE_PROFILE_CREATE_MESSAGES)
 
@@ -492,7 +498,8 @@ class RoxyBrowserClient:
         )
         attempt = 0
         base_delay = max(0.5, float(getattr(_cfg, "ROXY_API_RETRY_DELAY", 2) or 2))
-        while True:
+        last_error: Exception | None = None
+        while attempt < _ROXY_CREATE_MAX_ATTEMPTS:
             attempt += 1
             if stop_check is not None:
                 stop_check()
@@ -507,10 +514,14 @@ class RoxyBrowserClient:
                         _cfg.ROXY_CREATE_PATH,
                         json_body=body,
                     )
+                last_error = None
                 break
             except (RuntimeError, requests.RequestException) as exc:
+                last_error = exc
                 if not self._is_retryable_profile_create_error(exc):
                     raise
+                if attempt >= _ROXY_CREATE_MAX_ATTEMPTS:
+                    break
                 delay = min(30.0, base_delay * min(attempt, 5))
                 logger.warning(
                     "[Roxy] 创建环境暂不可用，保留当前任务并在 %.1fs 后重试：attempt=%s error=%s",
@@ -521,6 +532,11 @@ class RoxyBrowserClient:
                 if stop_check is not None:
                     stop_check()
                 time.sleep(delay)
+        if last_error is not None:
+            # 走到这里说明重试额度耗尽仍未创建成功。
+            raise RuntimeError(
+                f"Roxy 创建环境连续失败 {attempt} 次: {last_error}"
+            )
         profile_id = _first(result, [
             ("id",), ("dirId",), ("dir_id",), ("profile_id",), ("profileId",), ("browser_id",),
             ("data", "id"), ("data", "dirId"), ("data", "dir_id"),
