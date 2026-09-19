@@ -2485,236 +2485,6 @@ def _fetch_chatgpt_session(driver, timeout: int = 90, auto_jump_wait: int = 15, 
     raise RuntimeError(f"等待 /api/auth/session accessToken 超时，最后响应: {str(last_data)[:800]}")
 
 
-def _submit_login_password_on_page(driver, password: str) -> bool:
-    """Trang /log-in/password：điền mật khẩu đã đăng ký và submit. True nếu đã submit."""
-    result = driver.execute_script(r"""
-    const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
-      && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none'
-      && !el.disabled && !el.readOnly;
-    const input = [...document.querySelectorAll('input[type="password"],input[autocomplete="current-password"],input[name*="password" i]')]
-      .find(visible);
-    if (!input) return {ok:false, reason:'missing_password_input'};
-    const form = input.closest('form');
-    const scope = form || document;
-    const buttons = [...scope.querySelectorAll('button,input[type="submit"]')]
-      .filter(el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length) && !el.disabled && String(el.getAttribute('aria-disabled') || '').toLowerCase() !== 'true')
-      .map((el, idx) => {
-        const r = el.getBoundingClientRect();
-        const ir = input.getBoundingClientRect();
-        return {el, idx, below: r.top >= ir.bottom - 10, dist: Math.max(0, r.top - ir.bottom) + Math.abs((r.left+r.right-ir.left-ir.right)/2)/10};
-      })
-      .filter(x => x.below)
-      .sort((a,b) => a.dist - b.dist || a.idx - b.idx);
-    if (!buttons.length) return {ok:false, reason:'missing_submit'};
-    buttons[0].el.scrollIntoView({block:'center'});
-    return {ok:true, reason:'password_targets', input, button: buttons[0].el};
-    """) or {}
-    if not result.get("ok"):
-        logger.warning("%s[Re-login] 登录密码页未找到输入/提交按钮：%s", _log_prefix(driver), result)
-        return False
-    _human_type_text(driver, result.get("input"), password, clear=True)
-    human_delay("form", minimum=1.5, maximum=3.0)
-    _human_click(driver, result.get("button"), label="relogin_password_submit")
-    logger.info("%s[Re-login] 已填写并提交登录密码，等待跳转或验证码页", _log_prefix(driver))
-    return True
-
-
-def _relogin_existing_account(driver, email: str, openai_password: str | None) -> None:
-    """Đăng nhập lại trên trang login: nhập email → xử lý được cả hai nhánh kế tiếp.
-
-    Sau khi nhập email, OpenAI có thể đưa sang /log-in/password（điền mật khẩu
-    đã đặt trong lần đăng ký）或 email-verification（chờ mail OTP rồi填写提交）；
-    hai nhánh có thể nối tiếp（password xong lại gặp OTP page）—vòng lặp xử lý
-    hết cho tới khi có登录态或 rời auth.openai.com hoàn tất callback。
-    """
-    _reset_login_page_for_retry(driver)
-    _check_manual_stop()
-    if _has_access_token(driver):
-        logger.info("%s[Re-login] 打开登录页即已有登录态，无需重新登录", _log_prefix(driver))
-        return
-    _type_email_address(driver, email, timeout=20)
-    human_delay("form")
-    _submit_email_step(driver, email)
-    logger.info("%s[Re-login] 已重新提交邮箱，等待登录密码页或验证码页", _log_prefix(driver))
-    password_submitted = False
-    end = time.time() + 60
-    while time.time() < end:
-        _check_manual_stop()
-        if _has_access_token(driver):
-            logger.info("%s[Re-login] 重新登录已检测到登录态", _log_prefix(driver))
-            return
-        if _is_email_verification_page(driver):
-            logger.info("%s[Re-login] 进入邮箱验证码页，等待 mail OTP 并填写提交", _log_prefix(driver))
-            _complete_email_otp(driver, email, otp_after_ts=time.time(), max_attempts=2)
-            return
-        if _is_login_password_page(driver):
-            if not openai_password:
-                raise RuntimeError(
-                    "[Re-login] 登录密码页需要密码，但没有本次注册设置的密码可填"
-                )
-            if not password_submitted:
-                if _submit_login_password_on_page(driver, openai_password):
-                    password_submitted = True
-                    time.sleep(2.0)
-            time.sleep(0.8)
-            continue
-        time.sleep(0.8)
-    raise RuntimeError(
-        "[Re-login] 重新提交邮箱后未完成登录：无登录态，也未进入密码页/验证码页"
-    )
-
-
-def _restart_roxy_browser(client, opened, driver, proxy=None):
-    """关闭当前浏览器窗口并重新打开同一 Profile（磁盘 cookie 保留），返回 (opened, driver)。"""
-    profile_id = str(getattr(opened, "profile_id", "") or "")
-    if not profile_id:
-        raise RuntimeError("无法重启浏览器：当前 profile_id 为空")
-    try:
-        driver.quit()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[Roxy] 重启浏览器：关闭旧窗口失败（忽略）：%s: %s", type(exc).__name__, exc)
-    client.close_profile(profile_id)
-    time.sleep(2.0)
-    reopened = client.reopen_profile(profile_id, proxy=proxy)
-    new_driver = _build_driver(reopened)
-    _center_browser_window(new_driver)
-    new_driver.set_page_load_timeout(int(_cfg.ROXY_SELENIUM_TIMEOUT))
-    try:
-        new_driver.set_script_timeout(12)
-    except Exception:  # noqa: BLE001, S110
-        pass
-    logger.info("[Roxy] 已重启浏览器（同一 Profile，cookie 保留）：profile=%s", profile_id)
-    return reopened, new_driver
-
-
-def _relogin_after_browser_restart(client, opened, driver, proxy, email: str, openai_password: str | None):
-    """re-auth 失败后的兜底：重启浏览器（同 Profile），从登录页重新登录并取回 session。
-
-    返回 (opened_mới, driver_mới, session_info)；失败时关闭新窗口后抛出，
-    调用方转成原始 session 错误。
-    """
-    reopened, new_driver = _restart_roxy_browser(client, opened, driver, proxy=proxy)
-    try:
-        _relogin_existing_account(new_driver, email, openai_password)
-        session_info = _fetch_chatgpt_session(
-            new_driver, timeout=90, auto_jump_wait=8, fast_fail=False
-        )
-    except Exception:
-        try:
-            new_driver.quit()
-        except Exception:  # noqa: BLE001, S110
-            pass
-        raise
-    return reopened, new_driver, session_info
-
-
-def _relogin_with_fresh_ip_and_browser(client, opened, driver, email: str, openai_password: str | None):
-    """恢复链最后一层：轮换新出口 IP + 创建全新 Roxy 环境，从登录页重新登录。
-
-    走到这里说明同一出口 IP 上等待/刷新/re-auth/同 Profile 重登全部失败——
-    注册代理的 IP 大概率已被网关持续拦截。这里在 TWOFA_RETRY scope 里领取
-    新代理租约（= 新出口 IP），创建全新环境（新指纹，不依赖旧 Profile），
-    从登录页输入邮箱重新登录：密码页/邮箱 OTP 页两个分支都处理。
-
-    返回 (opened_mới, driver_mới, session_info)；失败时清理新环境后抛出。
-    """
-    if not openai_password:
-        raise RuntimeError("缺少注册密码，无法在全新浏览器里重新登录取回 session")
-    from core.rotating_proxy_runtime import (
-        TWOFA_RETRY_PROXY_SCOPE,
-        release_rotating_proxy,
-        resolve_rotating_proxy,
-    )
-
-    try:
-        driver.quit()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("[Roxy] 换 IP 重登：关闭旧窗口失败（忽略）：%s: %s", type(exc).__name__, exc)
-    if getattr(opened, "profile_id", None):
-        client.cleanup_profile(opened)
-
-    proxy_url = resolve_rotating_proxy(None, scope=TWOFA_RETRY_PROXY_SCOPE)
-    if proxy_url:
-        logger.info("[Roxy] 换 IP 重登：已在 %s scope 轮换新代理租约", TWOFA_RETRY_PROXY_SCOPE)
-    else:
-        logger.warning("[Roxy] 换 IP 重登：未取得新代理租约，将按直连方式重登")
-    reopened = None
-    new_driver = None
-    try:
-        _check_manual_stop()
-        reopened = client.open_profile(proxy=proxy_url, stop_check=_check_manual_stop)
-        new_driver = _build_driver(reopened)
-        _center_browser_window(new_driver)
-        new_driver.set_page_load_timeout(int(_cfg.ROXY_SELENIUM_TIMEOUT))
-        try:
-            new_driver.set_script_timeout(12)
-        except Exception:  # noqa: BLE001, S110
-            pass
-        logger.info(
-            "[Roxy] 换 IP 重登：已创建全新环境 profile=%s，从登录页重新登录",
-            reopened.profile_id,
-        )
-        _relogin_existing_account(new_driver, email, openai_password)
-        session_info = _fetch_chatgpt_session(
-            new_driver, timeout=90, auto_jump_wait=8, fast_fail=False
-        )
-        return reopened, new_driver, session_info
-    except Exception:
-        if new_driver is not None:
-            try:
-                new_driver.quit()
-            except Exception:  # noqa: BLE001, S110
-                pass
-        if reopened is not None:
-            client.cleanup_profile(reopened)
-        raise
-    finally:
-        if proxy_url:
-            release_rotating_proxy(
-                scope=TWOFA_RETRY_PROXY_SCOPE,
-                proxy_url=proxy_url,
-            )
-
-
-def _recover_twofa_with_browser_restart(
-    *,
-    account_id: int,
-    email: str,
-    openai_password: str | None,
-    access_token: str | None,
-    proxy_used: str | None,
-) -> tuple[str, str | None, str | None]:
-    """2FA 首次激活失败后的恢复：交给 run_twofa_retry 完成整套兜底。
-
-    run_twofa_retry 不接收注册代理（proxy 不传）→ preferred_account_proxy 会在
-    TWOFA_RETRY 代理 scope 里轮换一个新 IP、新开浏览器，用已保存的注册密码从
-    登录页重新登录（密码页/邮箱 OTP 页都能处理），再激活 2FA 并落库。
-
-    返回 (twofa_status, totp_secret, error)；成功 status="active"。
-    """
-    if not openai_password:
-        return "failed", None, "缺少注册密码，无法重启浏览器重新登录补做 2FA"
-    from core.browser_twofa_retry import run_twofa_retry
-
-    try:
-        result = run_twofa_retry(
-            {
-                "id": account_id,
-                "email": email,
-                "registration_password": openai_password,
-                "access_token": access_token or "",
-                "proxy_used": proxy_used,
-            },
-            max_attempts=2,
-            browser_restart_attempts=2,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return "failed", None, f"{type(exc).__name__}: {str(exc)[:300]}"
-    if result.get("ok") and result.get("totp_secret"):
-        return "active", str(result.get("totp_secret")), None
-    return "failed", None, str(result.get("message") or "2FA 补做失败")
-
-
 def _recover_chatgpt_session(
     driver,
     email: str,
@@ -2962,45 +2732,15 @@ def run_roxy_registration(
         _check_manual_stop()
         try:
             session_info = _fetch_chatgpt_session(driver, timeout=120)
-        except Exception as session_err:
+        except Exception as session_err:  # noqa: BLE001
             logger.warning(
                 "[Roxy注册] 首轮未拿到 accessToken，进入恢复流程（等待重读→刷新重读→re-auth 重新登录）：%s",
                 str(session_err)[:200],
             )
-            try:
-                session_info = _recover_chatgpt_session(driver, email, session_err, openai_password)
-            except Exception as recover_exc:
-                # re-auth 也失败：关闭浏览器重启（同 Profile，cookie 保留），
-                # 从登录页从头重新登录（密码页/验证码页两个分支都处理）。
-                logger.warning(
-                    "[Roxy注册] re-auth 恢复未成功，关闭浏览器后从头重新登录：%s",
-                    str(recover_exc)[:200],
-                )
-                _traffic_checkpoint()
-                try:
-                    reopened, driver, session_info = _relogin_after_browser_restart(
-                        client, opened, driver, proxy, email, openai_password
-                    )
-                except Exception as restart_exc:
-                    # 同 Profile 重登也失败：出口 IP 大概率已被网关拉黑，换新 IP
-                    # 并创建全新环境做最后一次重新登录。
-                    logger.warning(
-                        "[Roxy注册] 同 Profile 重新登录未成功，轮换新 IP 并创建全新环境重新登录：%s",
-                        str(restart_exc)[:200],
-                    )
-                    _traffic_checkpoint()
-                    reopened, driver, session_info = _relogin_with_fresh_ip_and_browser(
-                        client, opened, driver, email, openai_password
-                    )
-                opened = reopened
-                try:
-                    traffic_tracker = SeleniumTrafficTracker(driver, label="Roxy")
-                except Exception as tracker_exc:  # noqa: BLE001
-                    logger.warning(
-                        "[Roxy注册] 重启后初始化流量统计失败，继续注册：%s: %s",
-                        type(tracker_exc).__name__,
-                        str(tracker_exc)[:180],
-                    )
+            _traffic_checkpoint()
+            # S1 恢复（重读/刷新/re-auth）失败即判死：出口 IP 或会话层面的问题
+            # 交给上层自动重试任务换新 IP 处理，不再在任务内重启浏览器。
+            session_info = _recover_chatgpt_session(driver, email, session_err, openai_password)
         _traffic_checkpoint()
         access_token = session_info["accessToken"]
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)
@@ -3039,39 +2779,19 @@ def run_roxy_registration(
                 twofa_status = "active"
                 db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
             except Exception as exc:  # noqa: BLE001
+                twofa_status = "failed"
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 logger.error(
-                    "[Roxy注册] 2FA 设置失败，重启浏览器+轮换代理重新登录补做：%s",
+                    "[Roxy注册] 2FA 设置失败，账号已保存，交由队列自动补做 2FA：%s",
                     twofa_error,
                 )
-                recovery_status, recovery_secret, recovery_error = (
-                    _recover_twofa_with_browser_restart(
-                        account_id=account_id,
-                        email=email,
-                        openai_password=openai_password,
-                        access_token=access_token,
-                        proxy_used=str(proxy) if proxy else None,
-                    )
-                )
-                if recovery_status == "active":
-                    twofa_status = "active"
-                    totp_secret = recovery_secret
-                    twofa_error = None
-                    db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
-                    logger.info(
-                        "[Roxy注册] 2FA 已通过重启浏览器+轮换代理重新登录补做成功：account_id=%s",
-                        account_id,
-                    )
-                else:
-                    twofa_status = "failed"
-                    twofa_error = (
-                        f"{twofa_error} | 重启浏览器补做 2FA 仍失败：{recovery_error}"
-                    )
             if twofa_status == "failed":
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
                 logger.error("[Roxy注册] 2FA 设置失败，账号已保留待重试：%s", twofa_error)
                 try:
-                    from core.registration_auto_pay153 import enqueue_registration_auto_pay153
+                    from core.registration_auto_pay153 import (
+                        enqueue_registration_auto_pay153,
+                    )
 
                     enqueue_registration_auto_pay153(
                         account_id=account_id,

@@ -433,13 +433,14 @@ class ForcePasswordFlowTests(unittest.TestCase):
     @patch("core.roxy_registration._click_continue")
     @patch("core.roxy_registration._type_otp")
     @patch("core.roxy_registration._clear_otp_inputs")
-    def test_twofa_setup_failure_recovers_via_browser_restart_retry(
+    def test_twofa_setup_failure_keeps_account_for_queue_retry(
         self, _clear, _type, _click, _wait_otp, _wait_after, _profile, _fetch, _checkpoint,
         _resolve, _save, _check_stop, _center, _maybe, _human, _client_cls, _build, _submit,
         fill_pwd, _setup_2fa, twofa_retry, update_2fa, pay153_enqueue,
     ):
-        """Job 2665：注册成功但 re-auth 连续失败（wrong OTP → rate_limit）时，
-        必须重启浏览器+轮换代理（TWOFA_RETRY scope）重新登录补做 2FA，而不是直接判死。"""
+        """注册成功但 re-auth 连续失败（wrong OTP → rate_limit）时，
+        任务内不再重启浏览器补做（S4 已删除）：账号保留 twofa=failed，
+        由上层队列自动入队一次有界 2FA 补做。"""
         driver = Mock()
         _build.return_value = driver
         opened = Mock()
@@ -454,17 +455,17 @@ class ForcePasswordFlowTests(unittest.TestCase):
             email="user@example.com", name="Test", birthday="1990-01-01",
         )
 
-        self.assertTrue(result["success"])
-        self.assertEqual(result["twofa_status"], "active")
-        self.assertEqual(result["totp_secret"], "TOTPSECRET")
-        twofa_retry.assert_called_once()
-        self.assertEqual(twofa_retry.call_args.args[0]["registration_password"], "Secret123!")
-        self.assertEqual(twofa_retry.call_args.kwargs.get("max_attempts"), 2)
-        self.assertEqual(twofa_retry.call_args.kwargs.get("browser_restart_attempts"), 2)
-        # 不传注册代理：run_twofa_retry 内部走 TWOFA_RETRY scope 轮换新 IP。
-        self.assertNotIn("proxy", twofa_retry.call_args.kwargs)
-        update_2fa.assert_called_once_with(7, status="active", totp_secret="TOTPSECRET")
-        pay153_enqueue.assert_not_called()
+        # 2FA 失败的 job 按失败返回（错误信息带"账号已保存"），但账号已 checkpoint。
+        self.assertFalse(result["success"])
+        self.assertIn("2FA 设置失败，账号已保存", result["error"])
+        self.assertEqual(result["twofa_status"], "failed")
+        self.assertIsNone(result["totp_secret"])
+        # 任务内不重启浏览器；换 IP 补做交给队列层的自动 2FA 重试。
+        twofa_retry.assert_not_called()
+        update_2fa.assert_called_once()
+        self.assertEqual(update_2fa.call_args.kwargs.get("status"), "failed")
+        # 2FA 失败的账号仍进入 pay153 自动任务排队。
+        pay153_enqueue.assert_called_once()
 
     @patch("core.roxy_registration._click_continue_with_password_link", return_value=True)
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", False)
