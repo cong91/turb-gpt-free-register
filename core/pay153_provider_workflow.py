@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Callable
 from typing import Any
 
+from core import pay153_momo_oaics as momo_oaics
 from core import pay153_provider_checkout as provider_checkout
 from core import pay153_stripe_checkout as stripe_checkout
 from core.pay153_checkout_extractor import checkout_amount_minor, checkout_currency
@@ -21,7 +22,10 @@ from core.pay153_provider_policy import (
 PAY153_LOCAL_LINK_TYPES = frozenset(PROVIDER_POLICIES)
 _LOCAL_METHOD_STRATEGIES = {
     "pix": ("standalone", "late_promo", "inline"),
-    "momo": ("late_promo", "inline", "standalone"),
+    # MoMo alternates promo timing across fresh checkouts: late_promo creates
+    # the OAICS without a campaign and applies it after the method publishes;
+    # standalone attaches it at creation (PAY.153 reference mixing).
+    "momo": ("late_promo", "standalone"),
 }
 _PROVIDER_LABELS = {
     "hosted": "Official Checkout",
@@ -201,7 +205,14 @@ def _sentinel_headers(proxy: str | None, flow: str, device_id: str, did: str) ->
     return headers
 
 
-def _checkout_payload(provider: str, country: str, currency: str, campaign_id: str) -> dict[str, Any]:
+def _checkout_payload(
+    provider: str,
+    country: str,
+    currency: str,
+    campaign_id: str,
+    *,
+    promo_on_create: bool = False,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "entry_point": "all_plans_pricing_modal",
         "plan_name": "chatgptplusplan",
@@ -210,7 +221,10 @@ def _checkout_payload(provider: str, country: str, currency: str, campaign_id: s
         "checkout_ui_mode": "redirect" if provider == "hosted" else "custom",
         "check_card_proxy": True,
     }
-    if provider not in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"}:
+    attach_promo = provider not in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"} or (
+        provider == "momo" and promo_on_create
+    )
+    if attach_promo:
         payload["promo_campaign"] = {
             "promo_campaign_id": campaign_id,
             "is_coupon_from_query_param": False,
@@ -536,10 +550,27 @@ def _custom_confirm_and_start(
         },
         timeout=50,
     )
+    json_error: Exception | None = None
+    try:
+        value = confirm.json()
+        confirmed = value if isinstance(value, dict) else {}
+    except Exception as exc:  # noqa: BLE001 - classified after blocked detection
+        confirmed = {}
+        json_error = exc
+    # Blocked markers are classified before HTTP status: the reference treats a
+    # blocked confirm as a rebuildable condition even on a 4xx/5xx response.
+    if momo_oaics.checkout_confirmation_is_blocked(confirmed, getattr(confirm, "text", "") or ""):
+        raise RuntimeError(
+            "CUSTOM_CONFIRM_BLOCKED: payment method confirm was blocked upstream"
+        )
     if confirm.status_code != 200:
-        raise RuntimeError(f"Custom checkout confirm HTTP {confirm.status_code}: {(confirm.text or '')[:300]}")
-    confirmed = confirm.json()
-    if not isinstance(confirmed, dict) or str(confirmed.get("status") or "").lower() != "success":
+        raise RuntimeError(
+            f"Custom checkout confirm HTTP {confirm.status_code}: "
+            f"{momo_oaics.redact_payment_error(confirm.text or '')}"
+        )
+    if json_error is not None:
+        raise TypeError("Custom checkout confirm returned an invalid payload") from json_error
+    if str(confirmed.get("status") or confirmed.get("result") or "").lower() != "success":
         raise RuntimeError("Custom checkout payment method was not accepted")
     start = http.post(
         "https://chatgpt.com/backend-api/payments/checkout/custom_payment_method/start",
@@ -558,7 +589,10 @@ def _custom_confirm_and_start(
         timeout=60,
     )
     if start.status_code != 200:
-        raise RuntimeError(f"Custom checkout start HTTP {start.status_code}: {(start.text or '')[:300]}")
+        raise RuntimeError(
+            f"Custom checkout start HTTP {start.status_code}: "
+            f"{momo_oaics.redact_payment_error(start.text or '')}"
+        )
     payload = start.json()
     action = payload.get("next_action") if isinstance(payload, dict) else {}
     if str(payload.get("status") or "").lower() != "requires_action" or not isinstance(action, dict):
@@ -566,17 +600,284 @@ def _custom_confirm_and_start(
     return {"confirmed": confirmed, "started": payload}
 
 
-def _custom_momo_methods(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return the MoMo custom method without selecting another local rail."""
-    methods = [
-        item
-        for item in state.get("custom_payment_methods") or []
-        if isinstance(item, dict) and str(item.get("id") or "").startswith("cpmt_")
-    ]
-    matched = [item for item in methods if "momo" in json.dumps(item).lower()]
-    if matched:
-        return matched
-    return methods if len(methods) == 1 else []
+def _momo_promotion_incompatible(error: Any) -> bool:
+    message = str(error or "").lower()
+    return "promotion is not compatible with the checkout's payment methods" in message
+
+
+def _run_momo_custom_provider(
+    token: str,
+    session_id: str,
+    processor: str,
+    country: str,
+    currency: str,
+    checkout_proxy: str | None,
+    device_id: str,
+    did: str,
+    http: Any,
+    promo_http: Any,
+    campaign_id: str,
+    checkout_data: dict[str, Any],
+    local_method_strategy: str,
+    email: str,
+    log: Callable[[str], None],
+) -> dict[str, Any]:
+    """Run PAY.153's OAICS MoMo chain: native confirmation_token with cpmt fallback."""
+    promo_on_create = str(local_method_strategy or "").strip().lower() == "standalone"
+    promo_requested = True
+    state = momo_oaics.fetch_native_ready_state(
+        http, token, session_id, processor, device_id,
+        preserve_from=checkout_data, log=log,
+    )
+    decision = momo_oaics.momo_route_decision(state, checkout_data)
+    amount = checkout_amount_minor(state)
+    if amount is None:
+        amount = checkout_amount_minor(checkout_data)
+    actual_currency = checkout_currency(state) or checkout_currency(checkout_data) or currency
+    if promo_requested and not promo_on_create and decision["route"] != "rebuild":
+        state = momo_oaics.fetch_stable_state(
+            http, token, session_id, processor, device_id, state, log=log,
+        )
+        decision = momo_oaics.momo_route_decision(state, checkout_data)
+        stable_amount = checkout_amount_minor(state)
+        if stable_amount is not None:
+            amount = stable_amount
+        actual_currency = checkout_currency(state) or actual_currency
+    action = momo_oaics.momo_promotion_action(
+        decision["native_methods"],
+        decision["custom_method_id"],
+        amount,
+        actual_currency,
+        promo_requested,
+        promo_on_create,
+    )
+    log(
+        f"[momo] OAICS state: available={decision['native_methods'] or decision['diagnostic']}, "
+        f"amount={amount if amount is not None else '?'} {actual_currency}, "
+        f"campaign={campaign_id}, promo_on_create={promo_on_create}, action={action}"
+    )
+    promo_state: dict[str, Any] = {}
+    if action == "rebuild":
+        raise RuntimeError(
+            "MOMO_CHECKOUT_REBUILD_REQUIRED: OAICS first response and details published no "
+            f"MoMo payment method; available={decision['native_methods']}; "
+            f"custom={decision['diagnostic']}"
+        )
+    if action == "already_discounted":
+        log("[momo] amount already inside 0..50 VND; skipping a checkout/update that could break method compatibility")
+    elif action == "rebuild_late":
+        settled = momo_oaics.fetch_discounted_state(
+            http, token, session_id, processor, device_id, state, log=log,
+        )
+        settled_amount = checkout_amount_minor(settled)
+        settled_currency = checkout_currency(settled) or actual_currency
+        settled_decision = momo_oaics.momo_route_decision(settled, state)
+        if (
+            settled_decision["route"] != "rebuild"
+            and momo_oaics.is_momo_promo_amount(settled_amount, settled_currency)
+        ):
+            state = settled
+            amount = settled_amount if settled_amount is not None else amount
+            actual_currency = settled_currency
+            decision = settled_decision
+            action = "already_discounted"
+            log("[momo] create-time promotion settled inside the polling window; keeping this OAICS")
+        else:
+            raise RuntimeError(
+                "MOMO_CREATE_PROMOTION_NOT_APPLIED_REBUILD_REQUIRED: the create-with-promo "
+                "OAICS published MoMo but the amount did not settle into 0..50 VND; "
+                "discard the session and use the late-update timing"
+            )
+    elif action == "refresh":
+        try:
+            promo_state = _update_promotion(promo_http, token, session_id, processor, campaign_id, device_id, log)
+        except RuntimeError as exc:
+            if _momo_promotion_incompatible(exc):
+                strategy = "create_with_promo" if promo_on_create else "late_update"
+                raise RuntimeError(
+                    "MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED: the OAICS published MoMo but the "
+                    f"server rejected the promotion for this method set; strategy={strategy}, "
+                    f"available={decision['native_methods']}; discard the session and rebuild "
+                    "with the other promotion timing"
+                ) from exc
+            raise
+        state = momo_oaics.fetch_native_ready_state(
+            http, token, session_id, processor, device_id,
+            preserve_from=promo_state or state, log=log,
+        )
+        promo_amount = checkout_amount_minor(state)
+        if promo_amount is None and promo_state:
+            promo_amount = checkout_amount_minor(promo_state)
+        if promo_amount is not None:
+            amount = promo_amount
+        actual_currency = checkout_currency(state) or actual_currency
+        decision = momo_oaics.momo_route_decision(state, promo_state or state)
+        if decision["route"] == "rebuild":
+            raise RuntimeError(
+                "MOMO_METHOD_REMOVED_REBUILD_REQUIRED: the refreshed OAICS state withdrew the "
+                f"MoMo payment method; available={decision['native_methods']}; "
+                f"custom={decision['diagnostic']}"
+            )
+        if not momo_oaics.is_momo_promo_amount(amount, actual_currency):
+            raise RuntimeError(
+                "MOMO_PROMO_AMOUNT_REQUIRED: the MoMo amount is still outside 0..50 VND after the "
+                f"promotion update; amount={amount} {actual_currency}"
+            )
+    billing = provider_checkout.default_billing(country, email)
+    taxed = _custom_checkout_taxes(http, token, session_id, processor, billing, actual_currency, device_id)
+    if taxed:
+        state = taxed
+        taxed_amount = checkout_amount_minor(state)
+        if taxed_amount is not None:
+            amount = taxed_amount
+        actual_currency = checkout_currency(state) or actual_currency
+    state = momo_oaics.fetch_native_ready_state(
+        http, token, session_id, processor, device_id,
+        preserve_from=taxed or state, log=log,
+    )
+    refreshed_amount = checkout_amount_minor(state)
+    if refreshed_amount is not None:
+        amount = refreshed_amount
+    actual_currency = checkout_currency(state) or actual_currency
+    decision = momo_oaics.momo_route_decision(state, taxed or state)
+    if decision["route"] == "rebuild":
+        raise RuntimeError(
+            "MOMO_METHOD_REMOVED_REBUILD_REQUIRED: the latest OAICS state after VN taxes published "
+            f"no MoMo payment method; available={decision['native_methods']}; "
+            f"custom={decision['diagnostic']}"
+        )
+    if promo_requested and not momo_oaics.is_momo_promo_amount(amount, actual_currency):
+        raise RuntimeError(
+            "MOMO_PROMO_AMOUNT_REQUIRED: the MoMo promotion did not take effect or the amount is "
+            f"unknown; expected 0 <= amount <= 50 VND, got amount={amount} {actual_currency}"
+        )
+    log(
+        f"[momo] route={decision['route']}: available={decision['native_methods']}, "
+        f"amount={amount} {actual_currency}"
+    )
+    stripe_http = None
+    redirect = ""
+    payment_material: dict[str, Any] = {}
+    payment_method_id = ""
+    generation_kind = "custom_payment_method"
+    try:
+        if decision["route"] == "native":
+            generation_kind = "momo_oaics_checkout"
+            log("[momo] creating the OAICS native momo confirmation_token")
+            pk_keys = ("publishable_key", "stripe_publishable_key", "public_key")
+            publishable_key = (
+                momo_oaics.nested_scalar(state, pk_keys)
+                or momo_oaics.nested_scalar(taxed, pk_keys)
+                or momo_oaics.nested_scalar(promo_state, pk_keys)
+                or momo_oaics.nested_scalar(checkout_data, pk_keys)
+            )
+            momo_ctx = {
+                "checkout_amount": amount,
+                "currency": str(actual_currency or "VND").lower(),
+                "payment_method_types": decision["native_methods"],
+                "runtime_version": momo_oaics.nested_scalar(
+                    state, ("runtime_version", "stripe_js_version")
+                ) or stripe_checkout.DEFAULT_STRIPE_RUNTIME_VERSION,
+                "config_id": momo_oaics.nested_scalar(state, ("config_id", "checkout_config_id")),
+                "elements_session_id": momo_oaics.nested_scalar(
+                    state, ("elements_session_id", "elementsSessionId")
+                ),
+                "elements_session_config_id": momo_oaics.nested_scalar(
+                    state, ("elements_session_config_id", "elementsSessionConfigId")
+                ),
+            }
+            stripe_http = stripe_checkout.build_http(checkout_proxy)
+            payment_method_id = provider_checkout.create_provider_payment_method(
+                stripe_http,
+                publishable_key,
+                session_id,
+                "momo",
+                stripe_checkout.STRIPE_VERSION_FULL,
+                momo_ctx,
+                billing,
+                log,
+            )
+            confirmation_token_id = momo_oaics.create_oaics_confirmation_token(
+                stripe_http, publishable_key, payment_method_id,
+            )
+            confirmed = momo_oaics.confirm_oaics_native_momo(
+                http, token, session_id, processor, confirmation_token_id,
+                device_id, did, _sentinel_headers(checkout_proxy, "checkout_session_approval", device_id, did),
+                log=log,
+            )
+            redirect = momo_oaics.momo_authorization_url(confirmed)
+            intent_result: dict[str, Any] = {}
+            if not redirect:
+                log("[momo] confirm returned no redirect action; confirming the returned Stripe intent")
+                intent_result = momo_oaics.confirm_oaics_momo_intent(
+                    stripe_http, publishable_key, payment_method_id, confirmed, session_id, processor,
+                )
+                redirect = momo_oaics.momo_authorization_url(intent_result, confirmed)
+            if not redirect:
+                log("[momo] intent has no redirect action; submitting approval and polling")
+                approved = _approve_checkout(
+                    token, session_id, processor, checkout_proxy, device_id, did, http, log,
+                )
+                redirect = momo_oaics.momo_authorization_url(approved, intent_result, confirmed)
+                if not redirect:
+                    polled = momo_oaics.poll_oaics_momo_intent(
+                        stripe_http, publishable_key, approved, intent_result, confirmed,
+                    )
+                    redirect = momo_oaics.momo_authorization_url(polled, approved, intent_result, confirmed)
+        else:
+            log("[momo] OAICS published no native momo; falling back to the cpmt_* momo protocol")
+            method_id = decision["custom_method_id"]
+            custom: dict[str, Any] = {}
+            for attempt in range(3):
+                try:
+                    custom = _custom_confirm_and_start(
+                        http, token, session_id, processor, method_id, checkout_proxy, device_id, did,
+                    )
+                    break
+                except RuntimeError as exc:
+                    if "custom_confirm_blocked" not in str(exc).lower() or attempt == 2:
+                        raise
+                    log(f"[momo] confirm blocked upstream (attempt {attempt + 1}); retrying with a fresh sentinel proof")
+                    time.sleep(1.2 * (attempt + 1))
+            action_payload = custom.get("started", {}).get("next_action") or {}
+            payment_material = _custom_action_material(action_payload, "momo")
+            redirect = str(payment_material.get("provider_redirect_url") or "")
+            redirect = redirect or momo_oaics.momo_authorization_url(
+                custom.get("confirmed") or {}, custom.get("started") or {},
+            )
+        if not redirect and not any(
+            payment_material.get(key) for key in ("qr_data", "qr_image_png", "qr_image_svg")
+        ):
+            raise RuntimeError(
+                "MOMO_REDIRECT_MISSING: the OAICS momo confirmation chain returned neither a "
+                "pm-redirects.stripe.com authorization link nor QR payment material"
+            )
+    finally:
+        if stripe_http is not None:
+            try:
+                stripe_http.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
+    discounted = momo_oaics.is_momo_promo_amount(amount, actual_currency)
+    result: dict[str, Any] = {
+        "provider": "momo",
+        "provider_redirect_url": redirect,
+        "checkout_url": redirect,
+        "short_link": redirect,
+        "custom_payment_method_id": str(decision["custom_method_id"] or ""),
+        "payment_method_id": payment_method_id,
+        "payment_method_type": "momo",
+        "generation_kind": generation_kind,
+        "checkout_amount": amount,
+        "checkout_currency": actual_currency,
+        "amount_verification": "verified_discounted" if discounted else "nonzero",
+        "promo_applied": discounted if promo_requested else None,
+        "expires_at": int(time.time()) + 600,
+    }
+    for key in ("qr_data", "qr_image_png", "qr_image_svg"):
+        if payment_material.get(key):
+            result[key] = payment_material[key]
+    return result
 
 
 def _custom_action_material(action: dict[str, Any], provider: str) -> dict[str, Any]:
@@ -603,7 +904,7 @@ def _run_custom_provider(
     campaign_id: str,
     email: str,
 ) -> dict[str, Any]:
-    if provider not in {"gcash", "paypal", "momo"}:
+    if provider not in {"gcash", "paypal"}:
         raise RuntimeError(f"CUSTOM_CHECKOUT_REBUILD_REQUIRED: received {session_id}; {provider} requires a Stripe cs_* checkout")
     state = _custom_checkout_state(http, token, session_id, processor, device_id)
     amount = checkout_amount_minor(state)
@@ -628,14 +929,6 @@ def _run_custom_provider(
     if provider == "paypal":
         methods.sort(key=lambda item: 0 if "paypal" in json.dumps(item).lower() else 1)
     methods = [item for item in methods if str(item.get("id") or "").startswith("cpmt_")]
-    if provider == "momo":
-        methods = _custom_momo_methods(state)
-        for method_poll in range(1, 4):
-            if methods:
-                break
-            time.sleep(0.8 * method_poll)
-            state = _custom_checkout_state(http, token, session_id, processor, device_id)
-            methods = _custom_momo_methods(state)
     if not methods:
         raise RuntimeError(f"{provider.upper()} custom payment method is not available")
     selected_method = methods[0]
@@ -649,16 +942,11 @@ def _run_custom_provider(
         payment_material = _custom_action_material(action, provider)
         candidate = str(payment_material.get("provider_redirect_url") or "")
         action_type = str(action.get("paymentMethodType") or "").lower()
-        has_qr = any(payment_material.get(key) for key in ("qr_data", "qr_image_png", "qr_image_svg"))
-        if provider == "momo" and not (candidate or has_qr):
-            continue
         if provider != "paypal" or "paypal" in candidate.lower() or "paypal" in action_type:
             selected_method = method
             redirect = candidate
             break
-    if provider == "momo" and not (redirect or any(payment_material.get(key) for key in ("qr_data", "qr_image_png", "qr_image_svg"))):
-        raise RuntimeError("MOMO custom checkout returned no redirect or QR payment material")
-    if provider != "momo" and not redirect:
+    if not redirect:
         raise RuntimeError(f"{provider.upper()} custom checkout returned no redirect")
     if amount not in {None, 0}:
         raise RuntimeError(f"{provider.upper()} promotion is not applied: amount={amount} {actual_currency}")
@@ -755,14 +1043,26 @@ def run_provider_checkout(
     campaign_id = _preflight_campaign(token, str(metadata.get("account_id") or ""), promotion_proxy or entry_proxy, device_id, did, log)
     campaign_id = campaign_id or "plus-1-month-free"
     checkout_proxy = payment_proxy if provider in {"paypal", "upi", "ideal", "twint"} else entry_proxy
-    checkout, chatgpt_http = _create_checkout(
-        token,
-        _checkout_payload(provider, country, currency, campaign_id),
-        checkout_proxy,
-        device_id,
-        did,
-        log,
-    )
+    momo_promo_on_create = provider == "momo" and local_method_strategy == "standalone"
+    try:
+        checkout, chatgpt_http = _create_checkout(
+            token,
+            _checkout_payload(provider, country, currency, campaign_id, promo_on_create=momo_promo_on_create),
+            checkout_proxy,
+            device_id,
+            did,
+            log,
+        )
+    except RuntimeError as exc:
+        # Some OAICS deployments reject the whole create request when the
+        # campaign is incompatible with the published method set.
+        if momo_promo_on_create and _momo_promotion_incompatible(exc):
+            raise RuntimeError(
+                "MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED: the server rejected the "
+                "create-with-promo MoMo checkout before returning a session; "
+                "strategy=create_with_promo; discard the request and rebuild with the late-update timing"
+            ) from exc
+        raise
     session_id = str(checkout.get("checkout_session_id") or "")
     processor = str(checkout.get("processor_entity") or "openai_llc")
     result: dict[str, Any] = {
@@ -790,6 +1090,25 @@ def run_provider_checkout(
             return result
         if session_id.startswith("oaics_"):
             promo_http = stripe_checkout.build_http(promotion_proxy or entry_proxy)
+            if provider == "momo":
+                result.update(_run_momo_custom_provider(
+                    token,
+                    session_id,
+                    processor,
+                    country,
+                    currency,
+                    checkout_proxy,
+                    device_id,
+                    did,
+                    chatgpt_http,
+                    promo_http,
+                    campaign_id,
+                    checkout,
+                    local_method_strategy,
+                    str(metadata.get("email") or ""),
+                    log,
+                ))
+                return result
             result.update(_run_custom_provider(provider, token, session_id, processor, country, currency, checkout_proxy, device_id, did, chatgpt_http, promo_http, campaign_id, str(metadata.get("email") or "")))
             return result
         if provider == "upi":
@@ -819,27 +1138,37 @@ def run_provider_checkout(
             str(metadata.get("email") or ""),
             real_random=provider in {"paypal", "gcash"},
         )
-        provider_result = provider_checkout.stripe_to_provider(
-            provider_http,
-            session_id,
-            provider,
-            billing=billing,
-            country=country,
-            chatgpt_http=chatgpt_http,
-            access_token=token,
-            stage1=checkout,
-            approve_callback=None if provider == "paypal" else approve,
-            # PAY.153 carries Kakao's Plus campaign on Checkout creation;
-            # its original workflow does not issue a second checkout/update.
-            apply_promo_callback=(
-                apply_promo
-                if provider in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"}
-                else None
-            ),
-            require_zero_due=True,
-            local_method_strategy=local_method_strategy,
-            log=log,
-        )
+        try:
+            provider_result = provider_checkout.stripe_to_provider(
+                provider_http,
+                session_id,
+                provider,
+                billing=billing,
+                country=country,
+                chatgpt_http=chatgpt_http,
+                access_token=token,
+                stage1=checkout,
+                approve_callback=None if provider == "paypal" else approve,
+                # PAY.153 carries Kakao's Plus campaign on Checkout creation;
+                # its original workflow does not issue a second checkout/update.
+                apply_promo_callback=(
+                    apply_promo
+                    if provider in {"pix", "momo", "gcash", "paypal", "upi", "ideal", "twint"}
+                    else None
+                ),
+                require_zero_due=True,
+                local_method_strategy=local_method_strategy,
+                log=log,
+            )
+        except RuntimeError as exc:
+            # The cs_ fallback for momo must not abort the attempt budget on a
+            # recoverable promotion/method-set conflict.
+            if provider == "momo" and _momo_promotion_incompatible(exc):
+                raise RuntimeError(
+                    "MOMO_PROMOTION_INCOMPATIBLE_REBUILD_REQUIRED: the Stripe cs_ fallback rejected "
+                    "the MoMo promotion update; discard the session and rebuild with the other promo timing"
+                ) from exc
+            raise
         result.update(provider_result)
         if provider_result.get("checkout_currency"):
             result["currency"] = str(provider_result["checkout_currency"]).upper()

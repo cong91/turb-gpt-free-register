@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ class LocalExtractLinkTests(unittest.TestCase):
         for name in ("index.html", "index_legacy.html"):
             source = (root / "webui" / "templates" / name).read_text(encoding="utf-8")
             self.assertIn("const planLabel = acc.plus_trial_eligible ? 'Free Plus'", source)
+            self.assertIn("pay153_checkout_session_kind", source)
             self.assertIn("$('#btnExtractWorkspaceRun').disabled", source)
             self.assertIn("$('#btnExtractWorkspaceRefresh')?.addEventListener", source)
             self.assertIn("$('#btnExtractWorkspaceSelectAll')?.addEventListener", source)
@@ -75,6 +77,130 @@ class LocalExtractLinkTests(unittest.TestCase):
         self.assertEqual(result["result"]["long_url"], fake_result.long_url)
         self.assertEqual(result["result"]["copy_paste"], fake_result.long_url)
         self.assertEqual(result["result"]["payment_method"], "ph_short")
+
+    def test_local_checkout_can_run_through_existing_browser_transport(self):
+        fake_result = SimpleNamespace(
+            long_url="https://chatgpt.com/checkout/openai_ie/cs_live_browser",
+            cs_id="cs_live_browser",
+            processor_entity="openai_ie",
+            billing_country="PH",
+            currency="PHP",
+            amount_verification="verified_zero",
+            amount_minor=0,
+            amount_currency="PHP",
+        )
+        fake_extractor = SimpleNamespace(extract=lambda: fake_result)
+        browser_transport = SimpleNamespace()
+        with (
+            patch.object(extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: default),
+            patch("core.pay153_checkout_extractor.parse_credentials", return_value=SimpleNamespace()),
+            patch("core.pay153_checkout_extractor.CheckoutExtractor", return_value=fake_extractor) as extractor,
+        ):
+            result = extract_link_service._run_local_checkout(
+                token="token",
+                link_type="ph_short",
+                proxy="http://registration-proxy:8080",
+                browser_transport=browser_transport,
+                verify_proxy_country=False,
+                log=lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertIs(extractor.call_args.kwargs["session_factory"]().browser_transport, browser_transport)
+
+    def test_local_checkout_derives_billing_country_from_proxy_exit(self):
+        fake_result = SimpleNamespace(
+            long_url="https://chatgpt.com/checkout/openai_ie/oaics_vn",
+            cs_id="oaics_vn",
+            processor_entity="openai_ie",
+            billing_country="VN",
+            currency="VND",
+            amount_verification="verified_zero",
+            amount_minor=0,
+            amount_currency="VND",
+        )
+        fake_extractor = SimpleNamespace(extract=lambda: fake_result)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: default),
+            patch.object(extract_link_service, "_probe_proxy_exit_country", return_value="VN") as probe,
+            patch("core.pay153_checkout_extractor.parse_credentials", return_value=SimpleNamespace()),
+            patch("core.pay153_checkout_extractor.CheckoutExtractor", return_value=fake_extractor) as extractor,
+        ):
+            result = extract_link_service._run_local_checkout(
+                token="token", link_type="ph_short", proxy="http://vn-proxy:8080", log=lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        probe.assert_called_once_with("http://vn-proxy:8080")
+        config = extractor.call_args.kwargs["config"]
+        self.assertEqual(config.billing_country, "VN")
+        self.assertEqual(config.currency, "VND")
+        # Fresh accounts have no saved cards; a missing CustomerSession must not
+        # discard an already-created checkout.
+        self.assertTrue(config.allow_missing_customer_session)
+
+    def test_local_checkout_keeps_explicit_billing_country_without_probe(self):
+        fake_result = SimpleNamespace(
+            long_url="https://chatgpt.com/checkout/openai_ie/oaics_ph",
+            cs_id="oaics_ph",
+            processor_entity="openai_ie",
+            billing_country="PH",
+            currency="PHP",
+            amount_verification="verified_zero",
+            amount_minor=0,
+            amount_currency="PHP",
+        )
+        fake_extractor = SimpleNamespace(extract=lambda: fake_result)
+        with (
+            patch.dict(
+                os.environ,
+                {"EXTRACT_LINK_LOCAL_BILLING_COUNTRY": "PH", "EXTRACT_LINK_LOCAL_CURRENCY": "PHP"},
+                clear=True,
+            ),
+            patch.object(extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: default),
+            patch.object(extract_link_service, "_probe_proxy_exit_country") as probe,
+            patch("core.pay153_checkout_extractor.parse_credentials", return_value=SimpleNamespace()),
+            patch("core.pay153_checkout_extractor.CheckoutExtractor", return_value=fake_extractor) as extractor,
+        ):
+            result = extract_link_service._run_local_checkout(
+                token="token", link_type="ph_short", proxy="http://vn-proxy:8080", log=lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        probe.assert_not_called()
+        config = extractor.call_args.kwargs["config"]
+        self.assertEqual(config.billing_country, "PH")
+        self.assertEqual(config.currency, "PHP")
+
+    def test_local_checkout_falls_back_to_configured_country_when_probe_fails(self):
+        fake_result = SimpleNamespace(
+            long_url="https://chatgpt.com/checkout/openai_ie/oaics_ph",
+            cs_id="oaics_ph",
+            processor_entity="openai_ie",
+            billing_country="PH",
+            currency="PHP",
+            amount_verification="verified_zero",
+            amount_minor=0,
+            amount_currency="PHP",
+        )
+        fake_extractor = SimpleNamespace(extract=lambda: fake_result)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(extract_link_service, "_runtime_setting", side_effect=lambda name, default=None: default),
+            patch.object(extract_link_service, "_probe_proxy_exit_country", return_value="") as probe,
+            patch("core.pay153_checkout_extractor.parse_credentials", return_value=SimpleNamespace()),
+            patch("core.pay153_checkout_extractor.CheckoutExtractor", return_value=fake_extractor) as extractor,
+        ):
+            result = extract_link_service._run_local_checkout(
+                token="token", link_type="ph_short", proxy="http://vn-proxy:8080", log=lambda _message: None,
+            )
+
+        self.assertTrue(result["ok"])
+        probe.assert_called_once()
+        config = extractor.call_args.kwargs["config"]
+        self.assertEqual(config.billing_country, "PH")
+        self.assertEqual(config.currency, "PHP")
 
     def test_local_checkout_uses_selected_pay153_provider_workflow(self):
         provider_result = {
@@ -231,12 +357,64 @@ class LocalExtractLinkTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(resolve.call_count, 2)
         self.assertEqual(checkout.call_args_list[0].kwargs["local_method_strategy"], "late_promo")
-        self.assertEqual(checkout.call_args_list[1].kwargs["local_method_strategy"], "inline")
+        self.assertEqual(checkout.call_args_list[1].kwargs["local_method_strategy"], "standalone")
         self.assertEqual(checkout.call_args_list[0].kwargs["proxy"], "http://proxy.one:8080")
         self.assertEqual(checkout.call_args_list[1].kwargs["proxy"], "http://proxy.two:8080")
         self.assertEqual(release.call_args_list[0].kwargs["retire"], True)
         self.assertNotIn("retire", release.call_args_list[1].kwargs)
         sleep.assert_called_once_with(1.35)
+
+    def test_momo_rebuild_marker_retries_with_the_same_proxy_pair(self):
+        with (
+            patch.object(extract_link_service.db, "mark_account_extract_running", return_value=True),
+            patch.object(extract_link_service, "_mode", return_value="local"),
+            patch.object(extract_link_service, "_local_provider_attempts", return_value=2),
+            patch.object(
+                extract_link_service,
+                "resolve_rotating_proxy",
+                side_effect=["http://proxy.one:8080", "http://proxy.two:8080"],
+            ),
+            patch.object(
+                extract_link_service,
+                "_run_local_checkout",
+                side_effect=[
+                    RuntimeError("MOMO_CHECKOUT_REBUILD_REQUIRED: no MoMo method published"),
+                    {"ok": True, "status": "success", "result": {"copy_paste": "momo-url"}},
+                ],
+            ) as checkout,
+            patch.object(extract_link_service, "release_rotating_proxy") as release,
+            patch.object(extract_link_service.db, "update_account_extract") as update,
+            patch.object(extract_link_service.time, "sleep"),
+            patch.object(extract_link_service._QUEUE_SLOTS, "release"),
+        ):
+            result = extract_link_service._run_extract(
+                account_id=8,
+                email="user@example.com",
+                access_token="token",
+                link_type="momo",
+                cdk="",
+                trigger="manual",
+                proxy_lane_id=7,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(checkout.call_args_list[1].kwargs["local_method_strategy"], "standalone")
+        self.assertEqual(release.call_args_list[0].kwargs["retire"], False)
+        retry_messages = [
+            call.args[1].get("message", "")
+            for call in update.call_args_list
+            if len(call.args) > 1 and isinstance(call.args[1], dict)
+        ]
+        self.assertTrue(any("rebuild attempt 1/2" in message for message in retry_messages))
+
+    def test_momo_rebuild_markers_are_momo_only_and_keep_the_proxy_pair(self):
+        blocked = RuntimeError("CUSTOM_CONFIRM_BLOCKED: blocked upstream")
+        self.assertTrue(extract_link_service._retryable_local_checkout_error("momo", blocked))
+        self.assertFalse(extract_link_service._retryable_local_checkout_error("gcash", blocked))
+        self.assertFalse(extract_link_service._retryable_local_checkout_error("paypal", blocked))
+        self.assertTrue(extract_link_service._retryable_local_checkout_error(
+            "momo", RuntimeError("MOMO_CHECKOUT_REBUILD_REQUIRED: no MoMo method published"),
+        ))
 
     def test_pay153_high_variance_rails_default_to_ten_attempts(self):
         with patch.object(
@@ -330,7 +508,7 @@ class LocalExtractLinkTests(unittest.TestCase):
             proxy="http://proxy.after-cooldown:8080",
             payment_proxy="http://proxy.after-cooldown:8080",
             promotion_proxy="http://proxy.after-cooldown:8080",
-            local_method_strategy="inline",
+            local_method_strategy="standalone",
             log=checkout.call_args.kwargs["log"],
         )
         sleep.assert_called_once_with(13)
