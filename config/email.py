@@ -12,7 +12,7 @@ from config.env_loader import apply_env_overrides, env_str
 # False: 走人工输入邮箱 + 人工填 OTP 的流程
 USE_EMAIL_SERVICE = False
 
-# 可选值（也可以用英文逗号配置多个，按顺序兜底，例如 "outlook,generic_api,mailnest,remail"）：
+# 可选值（也可以用英文逗号配置多个，按顺序兜底，例如 "outlook,generic_api,mailnest,remail,otpmail,bamboommo"）：
 #   "outlook"           — 外购 Outlook 账号池 + mail.chatai.codes 远端取信
 #   "cloudflare_domain" — Cloudflare 域名邮箱（转发到 QQ 邮箱），通过 IMAP 取信
 #   "cloudflare" — Cloudflare Worker 临时邮箱（cloudflare_temp_email），API 创建并取码
@@ -24,7 +24,36 @@ USE_EMAIL_SERVICE = False
 #   "tinyhost"          — TinyHost 临时邮箱 API（全量 domain + user 并自动收码）
 #   "gmail_api_url"     — Gmail API URL；需要补充时通过 shop.qan8.com 购买 source
 #   "remail"            — Remail 开放 API（按项目购买邮箱并自动收码）
+#   "automated_email_api" — Automated Email API Gmail（每个 mailbox 最多 12 个双域 alias）
+#   "otpmail"           — OTPGmail.net 公共 API（每个 order 返回一个 Gmail mailbox，展开 12 个 alias 共享取码）
+#   "bamboommo"         — BambooMMO 租 mail API（每个 rental 最多 12 个双域 Gmail alias）
 EMAIL_SOURCE = "outlook,generic_api,mailnest"
+
+# Automated Email API Gmail provider. The API key is only appended to outbound
+# requests by the dedicated client; it is never logged or embedded in source.
+EMAIL_API_BASE_URL = env_str("EMAIL_API_BASE_URL", "")
+EMAIL_API_KEY = env_str("EMAIL_API_KEY", "")
+EMAIL_API_REQUEST_TIMEOUT = 20
+EMAIL_API_POLL_INTERVAL = 3
+
+# OTPGmail.net public API. The service code must match GET /v1/services;
+# ``dr`` is the current code for ChatGPT/OpenAI registration.
+OTPGMAIL_API_BASE = env_str("OTPGMAIL_API_BASE", "https://otpgmail.net")
+OTPGMAIL_API_KEY = env_str("OTPGMAIL_API_KEY", "")
+OTPGMAIL_SERVICE_CODE = env_str("OTPGMAIL_SERVICE_CODE", "dr")
+OTPGMAIL_REQUEST_TIMEOUT = 15
+OTPGMAIL_POLL_INTERVAL = 3
+OTPGMAIL_OTP_MAX_WAIT = 120
+
+# BambooMMO rented Gmail provider. Secrets are loaded from .env/runtime settings.
+BAMBOOMMO_API_BASE = env_str("BAMBOOMMO_API_BASE", "https://api.bamboommo.com")
+BAMBOOMMO_API_KEY = env_str("BAMBOOMMO_API_KEY", "")
+BAMBOOMMO_SERVER = 2
+BAMBOOMMO_MAIL_TYPE = "GM"
+BAMBOOMMO_SERVICE = "OP"
+BAMBOOMMO_REQUEST_TIMEOUT = 20
+BAMBOOMMO_POLL_INTERVAL = 3
+BAMBOOMMO_OTP_MAX_WAIT = 120
 
 
 # ============================================================
@@ -230,4 +259,5 @@ REMAIL_ORDER_WAIT_SECONDS = 30
 REMAIL_REQUEST_TIMEOUT = 20
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'IMAP_MAILBOX': 'str', 'QAN8_API_BASE': 'str', 'QAN8_API_KEY': 'str', 'QAN8_GMAIL_SKU_ID': 'str', 'QAN8_API_PROXY': 'str', 'QAN8_REQUEST_TIMEOUT': 'int', 'QAN8_ORDER_TIMEOUT': 'int', 'GMAIL_123452026_API_BASE': 'str', 'GMAIL_123452026_REQUEST_TIMEOUT': 'int', 'GMAIL_123452026_ACCOUNTS_PER_CDK': 'int', 'GMAIL_123452026_ALLOW_INSECURE_HTTP': 'bool', 'PAYMESH_API_BASE': 'str', 'PAYMESH_REQUEST_TIMEOUT': 'int', 'PAYMESH_OTP_MAX_WAIT': 'int', 'PAYMESH_ACCOUNTS_PER_CDK': 'int', 'PAYMESH_ROUTED_DOMAINS': 'list_str_multiline', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'CLOUDMAIL_NAME_LENGTH': 'int', 'TINYHOST_API_BASE': 'str', 'TINYHOST_REQUEST_TIMEOUT': 'int', 'TINYHOST_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'USE_EMAIL_SERVICE': 'bool', 'OTP_MAX_WAIT': 'int', 'OTP_POLL_INTERVAL': 'int', 'EMAIL_SOURCE': 'str', 'EMAIL_API_BASE_URL': 'str', 'EMAIL_API_KEY': 'str', 'EMAIL_API_REQUEST_TIMEOUT': 'int', 'EMAIL_API_POLL_INTERVAL': 'int', 'OTPGMAIL_API_BASE': 'str', 'OTPGMAIL_API_KEY': 'str', 'OTPGMAIL_SERVICE_CODE': 'str', 'OTPGMAIL_REQUEST_TIMEOUT': 'int', 'OTPGMAIL_POLL_INTERVAL': 'int', 'OTPGMAIL_OTP_MAX_WAIT': 'int', 'IMAP_MAILBOX': 'str', 'QAN8_API_BASE': 'str', 'QAN8_API_KEY': 'str', 'QAN8_GMAIL_SKU_ID': 'str', 'QAN8_API_PROXY': 'str', 'QAN8_REQUEST_TIMEOUT': 'int', 'QAN8_ORDER_TIMEOUT': 'int', 'GMAIL_123452026_API_BASE': 'str', 'GMAIL_123452026_REQUEST_TIMEOUT': 'int', 'GMAIL_123452026_ACCOUNTS_PER_CDK': 'int', 'GMAIL_123452026_ALLOW_INSECURE_HTTP': 'bool', 'PAYMESH_API_BASE': 'str', 'PAYMESH_REQUEST_TIMEOUT': 'int', 'PAYMESH_OTP_MAX_WAIT': 'int', 'PAYMESH_ACCOUNTS_PER_CDK': 'int', 'PAYMESH_ROUTED_DOMAINS': 'list_str_multiline', 'EMAIL_DOMAIN': 'str', 'QQ_EMAIL': 'str', 'QQ_IMAP_PASSWORD': 'str', 'GPTMAIL_API_KEY': 'str', 'OUTLOOK_FETCH_MODE': 'str', 'MAIL_NEST_API_KEY': 'str', 'MAIL_NEST_PROJECT_CODE': 'str', 'CLOUDFLARE_API_BASE': 'str', 'CLOUDFLARE_API_KEY': 'str', 'CLOUDFLARE_AUTH_MODE': 'str', 'CLOUDFLARE_CUSTOM_AUTH': 'str', 'CLOUDFLARE_PATH_DOMAINS': 'str', 'CLOUDFLARE_PATH_ACCOUNTS': 'str', 'CLOUDFLARE_PATH_TOKEN': 'str', 'CLOUDFLARE_PATH_MESSAGES': 'str', 'CLOUDFLARE_DEFAULT_DOMAINS': 'list_str_multiline', 'CLOUDFLARE_REQUEST_TIMEOUT': 'int', 'CLOUDFLARE_NAME_LENGTH': 'int', 'CLOUDMAIL_API_BASE': 'str', 'CLOUDMAIL_ADMIN_EMAIL': 'str', 'CLOUDMAIL_PASSWORD': 'str', 'CLOUDMAIL_TOKEN_PATH': 'str', 'CLOUDMAIL_AUTH_TOKEN': 'str', 'CLOUDMAIL_DOMAINS': 'list_str_multiline', 'CLOUDMAIL_AUTO_ADD_USER': 'bool', 'CLOUDMAIL_RANDOM_LOCAL_LENGTH': 'int', 'CLOUDMAIL_NAME_LENGTH': 'int', 'TINYHOST_API_BASE': 'str', 'TINYHOST_REQUEST_TIMEOUT': 'int', 'TINYHOST_RANDOM_LOCAL_LENGTH': 'int', 'REMAIL_API_BASE': 'str', 'REMAIL_API_KEY': 'str', 'REMAIL_PROJECT_ID': 'int', 'REMAIL_EMAIL_SUFFIX': 'str', 'REMAIL_SERVICE_MODE': 'str', 'REMAIL_SUPPLY_POLICY': 'str', 'REMAIL_ORDER_WAIT_SECONDS': 'int', 'REMAIL_REQUEST_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'BAMBOOMMO_API_BASE': 'str', 'BAMBOOMMO_API_KEY': 'str', 'BAMBOOMMO_SERVER': 'int', 'BAMBOOMMO_MAIL_TYPE': 'str', 'BAMBOOMMO_SERVICE': 'str', 'BAMBOOMMO_REQUEST_TIMEOUT': 'int', 'BAMBOOMMO_POLL_INTERVAL': 'int', 'BAMBOOMMO_OTP_MAX_WAIT': 'int'})

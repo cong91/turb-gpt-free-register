@@ -107,6 +107,39 @@ class EmailSourceValidationTests(unittest.TestCase):
         config = SimpleNamespace(TINYHOST_API_BASE="https://tinyhost.shop")
         self.assertIsNone(validate_email_sources(["tinyhost"], config))
 
+    def test_automated_email_api_requires_valid_url_and_key(self):
+        config = SimpleNamespace(
+            EMAIL_API_BASE_URL="https://mail.example.test",
+            EMAIL_API_KEY="test-key",
+        )
+        self.assertIsNone(validate_email_sources(["automated_email_api"], config))
+
+        config.EMAIL_API_KEY = ""
+        self.assertIn("EMAIL_API_KEY", validate_email_sources(["automated_email_api"], config))
+
+        config.EMAIL_API_KEY = "test-key"
+        config.EMAIL_API_BASE_URL = "ftp://mail.example.test"
+        self.assertIn("không hợp lệ", validate_email_sources(["automated_email_api"], config))
+
+    def test_otpmail_requires_valid_url_key_and_service_code(self):
+        config = SimpleNamespace(
+            OTPGMAIL_API_BASE="https://otpgmail.net",
+            OTPGMAIL_API_KEY="test-key",
+            OTPGMAIL_SERVICE_CODE="openai",
+        )
+        self.assertIsNone(validate_email_sources(["otpmail"], config))
+
+        config.OTPGMAIL_API_KEY = ""
+        self.assertIn("OTPGMAIL_API_KEY", validate_email_sources(["otpmail"], config))
+
+        config.OTPGMAIL_API_KEY = "test-key"
+        config.OTPGMAIL_SERVICE_CODE = ""
+        self.assertIn("OTPGMAIL_SERVICE_CODE", validate_email_sources(["otpmail"], config))
+
+        config.OTPGMAIL_SERVICE_CODE = "openai"
+        config.OTPGMAIL_API_BASE = "ftp://otpgmail.net"
+        self.assertIn("không hợp lệ", validate_email_sources(["otpmail"], config))
+
 
 if __name__ == "__main__":
     unittest.main()
