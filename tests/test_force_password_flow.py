@@ -24,6 +24,9 @@ class ForcePasswordFlowTests(unittest.TestCase):
         self._config_patches.enter_context(
             patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
         )
+        self._config_patches.enter_context(
+            patch("config.register.AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False)
+        )
         self._config_patches.enter_context(patch("config.codex.ENABLE_CODEX_AUTO", False))
         self._config_patches.enter_context(
             patch("core.browser_registration.post_register_dwell")
@@ -499,6 +502,57 @@ class ForcePasswordFlowTests(unittest.TestCase):
             )
 
         self.assertFalse(result["success"])
+        release_email.assert_called_once()
+        self.assertEqual(release_email.call_args.kwargs["status"], "failed")
+
+    def test_fill_password_page_raises_on_login_password_page(self):
+        """登录密码页在 _fill_password_page_if_present 内出现时必须立刻停用邮箱（job 2421）。"""
+        driver = Mock()
+        for module in (roxy_registration, browser_registration):
+            with self.subTest(module=module.__name__):
+                with (
+                    patch(f"{module.__name__}._is_email_verification_page", return_value=False),
+                    patch(f"{module.__name__}._has_access_token", return_value=False),
+                    patch(f"{module.__name__}._is_login_password_page", return_value=True),
+                    patch(f"{module.__name__}._is_signup_password_page", return_value=False),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "已注册/不可用邮箱"):
+                        module._fill_password_page_if_present(driver, "user@example.com", timeout=0.5)
+
+    @patch("core.roxy_registration._cfg.ROXY_KEEP_BROWSER_OPEN", False)
+    @patch(
+        "core.roxy_registration._fill_password_page_if_present",
+        side_effect=RuntimeError("邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url=https://auth.openai.com/log-in/password"),
+    )
+    @patch("core.roxy_registration._click_continue_with_password_link", return_value=True)
+    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.roxy_registration._build_driver")
+    @patch("core.roxy_registration.RoxyBrowserClient")
+    @patch("core.roxy_registration.human_delay")
+    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.roxy_registration._center_browser_window")
+    @patch("core.roxy_registration._check_manual_stop")
+    def test_otp_path_login_password_failure_releases_email_failed(
+        self, _check_stop, _center, _maybe, _human, _client_cls, _build, _submit, _click_link, _fill_pwd,
+    ):
+        """next_state=otp 后停在登录密码页：不得再进入 OTP 重发循环，必须按已注册邮箱停用。"""
+        driver = Mock()
+        _build.return_value = driver
+        opened = Mock()
+        opened.profile_id = "test"
+        opened.debugger_address = "127.0.0.1:9999"
+        opened.raw = {}
+        client = Mock()
+        client.open_profile.return_value = opened
+        _client_cls.return_value = client
+
+        with patch("core.email_provider.release_email") as release_email:
+            result = roxy_registration.run_roxy_registration(
+                email="user@example.com", name="Test", birthday="1990-01-01",
+            )
+
+        self.assertFalse(result["success"])
+        self.assertIn("已注册", str(result.get("message") or result))
         release_email.assert_called_once()
         self.assertEqual(release_email.call_args.kwargs["status"], "failed")
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", True)

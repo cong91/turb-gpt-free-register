@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from config import proxy as proxy_cfg
 from core import db
-from core.account_network import preferred_account_proxy
+from core.account_network import required_account_proxy
 from core.chatgpt_plan import check_account_plan
 from core.rotating_proxy_runtime import (
     PLAN_CHECK_PROXY_SCOPE,
@@ -50,6 +50,13 @@ def _run_auto_codex_oauth_for_free_account(
     )
 
     account = db.get_account(int(account_id)) or {}
+    twofa_status = str(account.get("twofa_status") or "").strip().lower()
+    if twofa_status == "failed":
+        return {
+            "accepted": False,
+            "reason": "twofa_required",
+            "message": "2FA 设置失败，禁止后台启动 Codex OAuth",
+        }
     registration_driver = account_registration_driver(account)
 
     if registration_driver_uses_live_browser(registration_driver):
@@ -189,7 +196,7 @@ def _run_plan_check(
         if not db.mark_account_plan_check_running(account_id):
             return {"ok": False, "error": "账号已删除或套餐查询状态已被重置"}
 
-        with preferred_account_proxy(
+        with required_account_proxy(
             proxy,
             rotating_scope=PLAN_CHECK_PROXY_SCOPE,
             lane_id=proxy_lane_id,
@@ -197,11 +204,11 @@ def _run_plan_check(
         ) as (active_proxy, network_mode):
             logger.info("[Plan] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
             _wait_for_rate_slot()
-            result = check_account_plan(
-                access_token,
-                proxy=active_proxy,
-                timezone_offset_min=timezone_offset_min,
-            )
+            plan_kwargs = {
+                "proxy": active_proxy,
+                "timezone_offset_min": timezone_offset_min,
+            }
+            result = check_account_plan(access_token, **plan_kwargs)
             recheck_delay = _registration_recheck_delay()
             transient_failure = not bool(result.get("ok")) and bool(result.get("retryable"))
             free_without_plus_trial = (
@@ -235,6 +242,59 @@ def _run_plan_check(
                     )
 
             db.update_account_plan_check(acc_id=account_id, result=result)
+            from config import register as register_cfg
+
+            if trigger == "manual_pay153_promotion":
+                from core.account_pay153_promotion import run_account_pay153_promotion_probe
+
+                promotion_result = run_account_pay153_promotion_probe(
+                    account_id=account_id,
+                    email=email,
+                    access_token=access_token,
+                    plan_result=result,
+                )
+                if promotion_result.get("status") == "success" and promotion_result.get("ok"):
+                    _wait_for_rate_slot()
+                    promotion_recheck = check_account_plan(
+                        access_token,
+                        proxy=active_proxy,
+                        timezone_offset_min=timezone_offset_min,
+                        max_attempts=1,
+                    )
+                    if promotion_recheck.get("ok"):
+                        result = promotion_recheck
+                        db.update_account_plan_check(acc_id=account_id, result=result)
+                    promotion_result = dict(promotion_result)
+                    promotion_result["plus_trial_eligible_after"] = result.get("plus_trial_eligible")
+                    try:
+                        db.update_account_pay153_promotion(account_id, promotion_result)
+                    except Exception:
+                        logger.exception(
+                            "[PAY.153][Promotion] 保存复查结果失败: account_id=%s",
+                            account_id,
+                        )
+
+            pay153_trigger = trigger in {"registration_auto", "manual_pay153_retry"}
+            if (
+                pay153_trigger
+                and (
+                    trigger == "manual_pay153_retry"
+                    or bool(getattr(register_cfg, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False))
+                )
+            ):
+                from core.registration_auto_pay153 import run_registration_auto_pay153
+
+                pay153_kwargs = {
+                    "account_id": account_id,
+                    "email": email,
+                    "access_token": access_token,
+                    "plan_result": result,
+                }
+                if trigger == "manual_pay153_retry":
+                    pay153_kwargs["allow_recovery"] = True
+                run_registration_auto_pay153(
+                    **pay153_kwargs,
+                )
             auto_codex = _run_auto_codex_oauth_for_free_account(
                 account_id=account_id,
                 email=email,
