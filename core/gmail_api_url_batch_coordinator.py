@@ -323,36 +323,27 @@ def _create_registration_batch(
     return batch_id
 
 
-def materialize_next_available_source(
+def ensure_batch_alias(
     batch_id: str,
     *,
     aliases_per_source: int = 12,
-    exclude_code_urls: set[str] | None = None,
     store: GmailApiUrlBatchStore | None = None,
 ) -> bool:
-    """Move one raw Gmail API source into the canonical batch ledger.
+    """Cấp đúng MỘT alias khả dụng cho ``batch_id`` (provisioning per-job).
 
-    Imported Gmail API records predate the batch tables and can still have
-    usable aliases even when no canonical batch item exists.  The lazy
-    coordinator calls this bridge before purchasing: one source is claimed
-    from the raw pool,
-    all currently unallocated aliases for that source are appended to the
-    requested canonical batch, and workers then claim them through the normal
-    Gmail assignment table.
+    Alias được tạo theo job, không pre-create cả nhóm 12. Thứ tự ưu tiên:
+        1. Mở rộng nhóm nguồn batch này đang sở hữu (sinh biến thể alias mới
+           của cùng record email) — không tốn source budget.
+        2. Mở rộng record khác còn alias chưa materialize, kể cả record đang
+           thuộc batch khác — không tốn source budget.
+        3. Bridge một record mới từ kho (trừ vào source budget của batch).
 
-    Returns ``True`` when a source was materialized, or when an already
-    canonicalized source was observed and should be retried after a concurrent
-    transaction.  ``False`` means the raw pool has no source left to bridge.
+    Record mà mọi alias đều terminal mới được đánh dấu exhausted thật; record
+    còn alias pending cho batch khác được giữ nguyên để batch đó tiêu.
     """
     normalized_batch = str(batch_id or "").strip()
     if not normalized_batch:
         raise GmailApiUrlBatchError("Gmail API URL batch ID is required")
-    limit = max(1, min(12, int(aliases_per_source or 12)))
-    excluded_urls = {
-        str(url or "").strip()
-        for url in (exclude_code_urls or set())
-        if str(url or "").strip()
-    }
     target_store = store or _batch_store()
 
     from core.gmail_aliases import (
@@ -363,80 +354,41 @@ def materialize_next_available_source(
 
     from . import db
 
-    with _BATCH_BUILD_LOCK:
-        attempted: set[str] = set()
-        while True:
-            record = db.claim_next_gmail_api_url_email(
-                include_used=True,
-                exclude_emails=attempted,
-                sqlite_path=target_store.path,
-            )
-            if not record:
-                return False
+    plan = target_store.batch_provision_plan(normalized_batch)
+    desired_sources = plan.get("desired_sources")
 
+    def _source_budget_exhausted() -> bool:
+        return (
+            isinstance(desired_sources, (int, str))
+            and not isinstance(desired_sources, bool)
+            and target_store.count_source_groups(normalized_batch)
+            >= int(desired_sources)
+        )
+
+    with _BATCH_BUILD_LOCK:
+        records = db.gmail_api_url_email_records(sqlite_path=target_store.path)
+        own_urls = target_store.list_code_urls_for_batch(normalized_batch)
+
+        def _free_aliases_for(record) -> list[str]:
             source_email = str(record.get("email") or "").strip()
             code_url = str(record.get("code_url") or "").strip()
-            source_key = source_email.casefold()
-            if source_key:
-                attempted.add(source_key)
             if not source_email or not code_url:
-                continue
-            if code_url in excluded_urls:
-                if bool(record.get("_claimed_from_available")):
-                    db.release_gmail_api_url_email(
-                        source_email,
-                        "available",
-                        "Gmail API source is already owned by an active Gmail batch",
-                        sqlite_path=target_store.path,
-                    )
-                continue
-            owned_batches = {
-                str(owner or "").strip()
-                for owner in (target_store.list_batch_ids_for_code_urls({code_url}) or [])
-                if str(owner or "").strip()
-            }
-            if owned_batches:
-                if bool(record.get("_claimed_from_available")):
-                    db.release_gmail_api_url_email(
-                        source_email,
-                        "exhausted",
-                        "Gmail API source đã thuộc canonical batch khác",
-                        sqlite_path=target_store.path,
-                    )
-                continue
-            if db.is_gmail_api_url_code_url_failed(
-                code_url,
-                sqlite_path=target_store.path,
-            ):
-                # claim_next_gmail_api_url_email() marks a newly selected
-                # available row as used.  A sibling row for an already
-                # quarantined URL must not be left in that misleading state.
-                db.fail_gmail_api_url_sources_for_code_url(
-                    code_url,
-                    note="Gmail API URL đã bị quarantine sau lỗi code=602",
-                    sqlite_path=target_store.path,
-                )
-                continue
-
+                return []
+            if str(record.get("status") or "").strip().lower() in {"disabled", "failed", "exhausted"}:
+                return []
+            if record.get("quarantined"):
+                return []
             try:
                 candidates = generate_gmail_dual_domain_aliases(
                     source_email,
                     limit=MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
                 )
             except GmailAliasError:
-                if bool(record.get("_claimed_from_available")):
-                    db.release_gmail_api_url_email(
-                        source_email,
-                        "failed",
-                        "Gmail source email is not a valid alias root",
-                        sqlite_path=target_store.path,
-                    )
-                continue
-
+                return []
             _reconcile_source_alias_ownership(target_store, code_url)
             usage = target_store.alias_usage_for_code_urls({code_url}).get(
                 code_url,
-                {"allocated": set()},
+                {"allocated": set(), "consumed": set(), "failed": set()},
             )
             allocated = {
                 str(alias or "").strip().casefold()
@@ -450,9 +402,8 @@ def materialize_next_available_source(
                 str(alias or "").strip().casefold()
                 for alias in usage.get("failed", set())
             }
-            reusable = allocated - consumed - failed
             unavailable = target_store.list_globally_unavailable_aliases()
-            aliases = [
+            return [
                 alias
                 for alias in candidates
                 if alias.strip().casefold() not in allocated
@@ -460,50 +411,124 @@ def materialize_next_available_source(
                 and not target_store.has_alias_for_other_code_url(
                     alias, code_url
                 )
-            ][:limit]
-            if not aliases:
-                # Existing canonical rows may be temporarily locked or may
-                # have been appended by another worker.  Leave the root row
-                # untouched and let the caller re-check the shared ledger.
-                if reusable:
-                    return True
-                db.release_gmail_api_url_email(
-                    source_email,
-                    "exhausted",
-                    "Record đã dùng hết alias Gmail khả dụng",
-                    sqlite_path=target_store.path,
-                )
-                continue
+            ]
 
+        def _pending_aliases_for(record) -> set[str]:
+            code_url = str(record.get("code_url") or "").strip()
+            usage = target_store.alias_usage_for_code_urls({code_url}).get(
+                code_url,
+                {"allocated": set(), "consumed": set(), "failed": set()},
+            )
+            allocated = {
+                str(alias or "").strip().casefold()
+                for alias in usage.get("allocated", set())
+            }
+            consumed = {
+                str(alias or "").strip().casefold()
+                for alias in usage.get("consumed", set())
+            }
+            failed = {
+                str(alias or "").strip().casefold()
+                for alias in usage.get("failed", set())
+            }
+            return allocated - consumed - failed
+
+        def _owned_batches_for(record) -> set[str]:
+            code_url = str(record.get("code_url") or "").strip()
+            return {
+                str(owner or "").strip()
+                for owner in (target_store.list_batch_ids_for_code_urls({code_url}) or [])
+                if str(owner or "").strip()
+            }
+
+        def _append_alias(record, alias: str, *, exclusive: bool) -> bool:
+            source_email = str(record.get("email") or "").strip()
+            code_url = str(record.get("code_url") or "").strip()
             try:
                 target_store.append_source_group(
                     normalized_batch,
                     source_email,
                     code_url,
-                    aliases,
-                    exclusive_code_url=True,
+                    [alias],
+                    exclusive_code_url=exclusive,
                 )
             except GmailApiUrlBatchConflict:
-                if bool(record.get("_claimed_from_available")):
-                    db.release_gmail_api_url_email(
-                        source_email,
-                        "exhausted",
-                        "Gmail API source was claimed by another canonical batch",
-                        sqlite_path=target_store.path,
-                    )
-                continue
+                return False
+            if str(record.get("status") or "").strip().lower() == "available":
+                db.release_gmail_api_url_email(
+                    source_email,
+                    "used",
+                    f"Gmail API alias cấp cho batch {normalized_batch[:8]}",
+                    sqlite_path=target_store.path,
+                )
+            logger.info(
+                "Batch %s nhận alias %s của record %s (owner batches: %d)",
+                normalized_batch[:8],
+                alias,
+                source_email,
+                len(_owned_batches_for(record)),
+            )
             return True
 
+        # Ưu tiên 1: mở rộng nhóm nguồn batch này đang sở hữu.
+        own_records = [r for r in records if str(r.get("code_url") or "").strip() in own_urls]
+        for record in own_records:
+            free = _free_aliases_for(record)
+            if free and _append_alias(record, free[0], exclusive=False):
+                return True
 
-def provision_next_gmail_api_url_source(
+        # Ưu tiên 2: bridge một record chưa thuộc batch nào (trừ source budget).
+        unowned_records = [
+            r for r in records
+            if not _owned_batches_for(r)
+            and str(r.get("code_url") or "").strip() not in own_urls
+        ]
+        for record in unowned_records:
+            if _source_budget_exhausted():
+                break
+            free = _free_aliases_for(record)
+            if free and _append_alias(record, free[0], exclusive=True):
+                return True
+
+        # Ưu tiên 3: mở rộng record đang thuộc batch khác còn biến thể trống.
+        for record in records:
+            if str(record.get("code_url") or "").strip() in own_urls:
+                continue
+            owned = _owned_batches_for(record)
+            if not owned:
+                continue
+            free = _free_aliases_for(record)
+            if free and _append_alias(record, free[0], exclusive=False):
+                return True
+            if not free and not _pending_aliases_for(record):
+                # Mọi alias của record đã terminal → exhausted thật.
+                db.release_gmail_api_url_email(
+                    str(record.get("email") or ""),
+                    "exhausted",
+                    "Record đã dùng hết alias Gmail khả dụng",
+                    sqlite_path=target_store.path,
+                )
+    return False
+
+
+def purchase_next_gmail_api_url_source(
     batch_id: str,
     *,
     aliases_per_source: int = 12,
     store: GmailApiUrlBatchStore | None = None,
     stop_check=None,
 ) -> bool:
-    """Materialize one raw source, then purchase one source if needed."""
+    """Mua thêm một source từ QAN8 khi mọi inventory local đã cạn (budget-gated)."""
     target_store = store or _batch_store()
+
+    if stop_check is None:
+        try:
+            from core.registration_service import check_stop_requested
+
+            stop_check = check_stop_requested
+        except (ImportError, AttributeError):
+            stop_check = None
+
     plan = target_store.batch_provision_plan(batch_id)
     desired_sources = plan.get("desired_sources")
     if (
@@ -517,20 +542,6 @@ def provision_next_gmail_api_url_source(
             desired_sources,
         )
         return False
-    if materialize_next_available_source(
-        batch_id,
-        aliases_per_source=aliases_per_source,
-        store=target_store,
-    ):
-        return True
-
-    if stop_check is None:
-        try:
-            from core.registration_service import check_stop_requested
-
-            stop_check = check_stop_requested
-        except (ImportError, AttributeError):
-            stop_check = None
 
     from core.qan8_gmail_api_purchaser import Qan8GmailApiPurchaser
 
@@ -541,6 +552,29 @@ def provision_next_gmail_api_url_source(
             store=target_store,
             stop_check=stop_check,
         )
+    )
+
+
+def provision_next_gmail_api_url_source(
+    batch_id: str,
+    *,
+    aliases_per_source: int = 12,
+    store: GmailApiUrlBatchStore | None = None,
+    stop_check=None,
+) -> bool:
+    """Cấp một alias cho batch (mở rộng/bridge) rồi mới mua thêm nếu cần."""
+    target_store = store or _batch_store()
+    if ensure_batch_alias(
+        batch_id,
+        aliases_per_source=aliases_per_source,
+        store=target_store,
+    ):
+        return True
+    return purchase_next_gmail_api_url_source(
+        batch_id,
+        aliases_per_source=aliases_per_source,
+        store=target_store,
+        stop_check=stop_check,
     )
 
 
@@ -636,6 +670,43 @@ def _reconcile_batch_queue(store: GmailApiUrlBatchStore, batch_id: str) -> None:
             store.cancel_waiter(batch_id, waiting_job_id, "terminal job reconciliation")
 
 
+def _claim_shared_alias_for_job(
+    store: GmailApiUrlBatchStore,
+    batch_id: str,
+    job_id: str,
+    numeric_job_id: int | None,
+) -> Assignment | None:
+    """Job mới được nhận lại alias pending mồ côi của batch khác.
+
+    Retry job không bao giờ mượn alias: chuỗi của nó hoặc reactivate alias
+    đã gắn (job gốc đã nhận OTP) hoặc tự cấp alias mới cho record của mình.
+    """
+    if numeric_job_id is not None:
+        try:
+            from . import db
+
+            job = db.get_job(numeric_job_id) or {}
+            context = job.get("provider_context")
+            context = context if isinstance(context, dict) else {}
+            if int(context.get("retry_attempt") or 0) > 0 or context.get("parent_job_id"):
+                return None
+        except (TypeError, ValueError):
+            return None
+    shared = store.claim_any_available(
+        str(job_id),
+        exclude_batch_id=batch_id,
+        require_source_provenance=True,
+    )
+    if shared is not None:
+        logger.info(
+            "Job %s nhận alias mồ côi %s từ ledger dùng chung (batch %s)",
+            job_id,
+            str(shared.inventory_id or "").split("----", 1)[0],
+            shared.batch_id,
+        )
+    return shared
+
+
 def get_email_from_batch(
     batch_id: str,
     job_id: str,
@@ -705,18 +776,65 @@ def get_email_from_batch(
                 provision_owner,
                 batch_id=batch_id,
             ):
+                extended = False
+                shared = None
+                purchased = False
+                busy_pending = False
                 try:
-                    provisioned = provision_next_gmail_api_url_source(
+                    extended = ensure_batch_alias(
                         batch_id,
                         aliases_per_source=source_capacity,
                         store=store,
                     )
+                    if not extended:
+                        shared = _claim_shared_alias_for_job(
+                            store, batch_id, job_id, numeric_job_id,
+                        )
+                    if not extended and shared is None:
+                        if store.has_pending_item(
+                            exclude_batch_id=batch_id,
+                            require_source_provenance=True,
+                        ):
+                            if store.has_available_item(
+                                exclude_batch_id=batch_id,
+                                require_source_provenance=True,
+                            ):
+                                # Alias đang claim được nhưng job này là retry —
+                                # retry không mượn alias của batch khác.
+                                store.cancel_waiter(
+                                    batch_id,
+                                    job_id,
+                                    "Gmail API source pool exhausted",
+                                )
+                                raise GmailApiUrlBatchConflict(
+                                    "No Gmail API URL source available"
+                                )
+                            busy_pending = True
+                        else:
+                            purchased = purchase_next_gmail_api_url_source(
+                                batch_id,
+                                aliases_per_source=source_capacity,
+                                store=store,
+                            )
                 finally:
                     store.release_provision_lease(
                         provision_owner,
                         batch_id=batch_id,
                     )
-                if provisioned:
+                if shared is not None:
+                    assignment = shared
+                    break
+                if extended or purchased:
+                    continue
+                if busy_pending:
+                    # URL duy nhất còn khả dụng đang do job khác giữ; xếp hàng
+                    # chờ thay vì thuê thêm source.
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise GmailApiUrlBatchConflict(
+                            "Gmail API URL batch đang bận; job đã được lưu vào hàng đợi"
+                        )
+                    if retry_delay:
+                        time.sleep(retry_delay)
                     continue
                 store.cancel_waiter(batch_id, job_id, "Gmail API source pool exhausted")
                 raise GmailApiUrlBatchConflict("No Gmail API URL source available")
@@ -785,7 +903,7 @@ def get_batch_account_context(
         result = store.find_item_by_alias_for_batch(alias, str(batch_id))
     if result is None and job_id is None and not batch_id:
         result = store.find_item_by_alias(alias)
-    if not result:
+    if not result or not isinstance(result, (tuple, list)) or len(result) < 2:
         return None
     found_alias, code_url = result
     return _account(found_alias, code_url)
@@ -794,6 +912,57 @@ def get_batch_account_context(
 def has_active_batch_assignment(job_id: int | str) -> bool:
     """Return whether a registration job still owns a Gmail API URL alias."""
     return _batch_store().find_active_assignment_for_job(str(job_id)) is not None
+
+
+def reactivate_registration_assignment(
+    source_job_id: int | str,
+    retry_job_id: int | str,
+    *,
+    alias: str | None = None,
+) -> GmailApiUrlAccount | None:
+    """Rebind the exact alias a terminal job used onto its retry job.
+
+    A transient registration failure discards the alias so unrelated jobs
+    cannot claim it.  The retry of the same chain is the one caller allowed to
+    take it back: this revives the batch item and binds a fresh active
+    assignment to the retry job, keeping the original ``code_url`` instead of
+    materializing or purchasing another Gmail source.
+    """
+    # Function-level import keeps the store on the current app-state path
+    # (tests/WebUI may repoint it after this module was first imported).
+    from core.app_state_db import APP_STATE_DB_PATH
+
+    store = GmailApiUrlBatchStore(APP_STATE_DB_PATH)
+    assignment = store.find_latest_assignment_for_job(str(source_job_id))
+    if assignment is None:
+        return None
+    if assignment.state == "active":
+        # The terminal source job may not have been reconciled yet; resolve its
+        # orphaned assignment first so alias ownership is unambiguous.
+        _reconcile_batch_queue(store, assignment.batch_id)
+        assignment = store.find_latest_assignment_for_job(str(source_job_id))
+        if assignment is None or assignment.state == "active":
+            return None
+    expected_alias = str(alias or "").strip()
+    assignment_alias = str(assignment.inventory_id or "").split("----", 1)[0]
+    if expected_alias and assignment_alias.casefold() != expected_alias.casefold():
+        return None
+    reactivated = store.reactivate_assignment(
+        assignment.batch_id,
+        assignment.inventory_id,
+        str(retry_job_id),
+    )
+    if reactivated is None:
+        return None
+    parts = reactivated.inventory_id.split("----", 1)
+    if len(parts) != 2:
+        return None
+    revived_alias, code_url = parts
+    logger.info(
+        "Job %s đã gắn lại alias %s của job %s để retry (code_url giữ nguyên)",
+        retry_job_id, revived_alias, source_job_id,
+    )
+    return _account(revived_alias, code_url)
 
 
 def complete_batch_assignment(batch_id: str, job_id: str) -> bool:

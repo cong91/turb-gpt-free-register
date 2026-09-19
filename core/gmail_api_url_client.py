@@ -560,17 +560,17 @@ def create_registration_batch(
     return create(count, aliases_per_email=aliases_per_email, allow_partial=allow_partial)
 
 
-def materialize_next_available_source(
+def ensure_batch_alias(
     batch_id: str,
     *,
     aliases_per_source: int = 12,
     store: GmailApiUrlBatchStore | None = None,
 ) -> bool:
     from core.gmail_api_url_batch_coordinator import (
-        materialize_next_available_source as materialize,
+        ensure_batch_alias as ensure_alias,
     )
 
-    return materialize(batch_id, aliases_per_source=aliases_per_source, store=store)
+    return ensure_alias(batch_id, aliases_per_source=aliases_per_source, store=store)
 
 
 def provision_next_gmail_api_url_source(

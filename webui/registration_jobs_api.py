@@ -96,6 +96,33 @@ def _provider_error(
             return "Remail 服务模式只能填写 code 或 purchase（配置 → 邮箱 / OTP）。"
     if "tinyhost" in sources and not str(getattr(email_config, "TINYHOST_API_BASE", "") or "").strip():
         return "已选择 tinyhost 邮箱来源，请填写 TinyHost API 地址（配置 → 邮箱 / OTP）。"
+    if "automated_email_api" in sources:
+        api_base = str(getattr(email_config, "EMAIL_API_BASE_URL", "") or "").strip()
+        api_key = str(getattr(email_config, "EMAIL_API_KEY", "") or "").strip()
+        parsed = urlparse(api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "已选择 automated_email_api 邮箱来源，请填写有效的 Automated Email API 地址。"
+        if not api_key:
+            return "已选择 automated_email_api 邮箱来源，请填写 Automated Email API Key（配置 → 邮箱 / OTP）。"
+    if "otpmail" in sources:
+        api_base = str(getattr(email_config, "OTPGMAIL_API_BASE", "https://otpgmail.net") or "").strip()
+        api_key = str(getattr(email_config, "OTPGMAIL_API_KEY", "") or "").strip()
+        service_code = str(getattr(email_config, "OTPGMAIL_SERVICE_CODE", "dr") or "").strip()
+        parsed = urlparse(api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "已选择 otpmail 邮箱来源，请填写有效的 OTPGmail API 地址。"
+        if not api_key:
+            return "已选择 otpmail 邮箱来源，请填写 OTPGMAIL_API_KEY（配置 → 邮箱 / OTP）。"
+        if not service_code:
+            return "已选择 otpmail 邮箱来源，请填写 OTPGMAIL_SERVICE_CODE（来自 /v1/services）。"
+    if "bamboommo" in sources:
+        api_base = str(getattr(email_config, "BAMBOOMMO_API_BASE", "https://api.bamboommo.com") or "").strip()
+        api_key = str(getattr(email_config, "BAMBOOMMO_API_KEY", "") or "").strip()
+        parsed = urlparse(api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "已选择 bamboommo 邮箱来源，请填写有效的 BambooMMO API 地址。"
+        if not api_key:
+            return "已选择 bamboommo 邮箱来源，请填写 BAMBOOMMO_API_KEY（配置 → 邮箱 / OTP）。"
     return None
 
 
@@ -107,7 +134,7 @@ def _pool_warning(
     gmail_api_url_aliases_per_email: int = 12,
 ) -> str:
     if any(source in sources for source in (
-        "gptmail", "mailnest", "cloudmail", "tinyhost", "cloudflare", "gmail_123452026", "paymesh", "remail",
+        "gptmail", "mailnest", "cloudmail", "tinyhost", "cloudflare", "gmail_123452026", "paymesh", "remail", "automated_email_api", "otpmail", "bamboommo",
     )):
         return ""
     if sources == ["gmail_api_url"]:
@@ -225,8 +252,8 @@ def create_registration_jobs(
 
     submit_kwargs = {"count": count, "workers": workers}
     # Automation callers already provide the number of account jobs required
-    # by Sub2API. The manual WebUI form enters source-group count and expands
-    # each source to the fixed twelve-alias registration capacity.
+    # by Sub2API. Manual WebUI counts are source/order counts for providers
+    # whose one mailbox is exposed as twelve local aliases, including OTPGmail.
     automation_registration = (
         isinstance(automation_context, dict)
         and automation_context.get("sub2api_automation_kind") == "registration"
@@ -241,12 +268,14 @@ def create_registration_jobs(
         submit_kwargs["paymesh_cdks"] = paymesh_cdks
         if paymesh_routed_domains:
             submit_kwargs["paymesh_routed_domains"] = paymesh_routed_domains
-    if "gmail_api_url" in sources:
+    aliases_per_email = 12
+    alias_expanding_sources = {"gmail_api_url", "automated_email_api", "otpmail", "bamboommo"}
+    expands_aliases = bool(alias_expanding_sources.intersection(sources))
+    if expands_aliases:
         # Manual WebUI count is the number of source purchases/groups. Each
         # source contributes up to 12 aliases, so the service receives the
         # expanded registration-job count. Automation already sends account
         # count and must never be multiplied here.
-        aliases_per_email = 12
         requested_job_count = (
             count if automation_registration else count * aliases_per_email
         )
@@ -254,24 +283,25 @@ def create_registration_jobs(
             return {
                 "ok": False,
                 "error": (
-                    f"Gmail API URL: {count} source × {aliases_per_email} alias = "
+                    f"{', '.join(sources)}: {count} source × {aliases_per_email} alias = "
                     f"{requested_job_count} task, vượt {MAX_REGISTRATION_TASKS}"
                 ),
             }, 400
-        summary = database.gmail_api_url_email_pool_summary()
-        alias_available = int(summary.get("alias_available", 0) or 0)
         submit_kwargs["count"] = requested_job_count
-        submit_kwargs["gmail_api_url_aliases_per_email"] = aliases_per_email
-        purchase_error = (
-            _qan8_purchase_config_error()
-            if alias_available < requested_job_count
-            else None
-        )
-        if purchase_error:
-            return {
-                "ok": False,
-                "error": purchase_error,
-            }, 400
+        if "gmail_api_url" in sources:
+            submit_kwargs["gmail_api_url_aliases_per_email"] = aliases_per_email
+            summary = database.gmail_api_url_email_pool_summary()
+            alias_available = int(summary.get("alias_available", 0) or 0)
+            purchase_error = (
+                _qan8_purchase_config_error()
+                if alias_available < requested_job_count
+                else None
+            )
+            if purchase_error:
+                return {
+                    "ok": False,
+                    "error": purchase_error,
+                }, 400
     if automation_context:
         submit_kwargs["automation_context"] = automation_context
     try:
@@ -288,7 +318,7 @@ def create_registration_jobs(
             sources,
             count,
             gmail_api_url_aliases_per_email=aliases_per_email
-            if "gmail_api_url" in sources
+            if expands_aliases
             else 1,
         ),
         "workers": effective_workers,

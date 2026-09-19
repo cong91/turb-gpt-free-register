@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from config import email as email_config
 from config import proxy as proxy_config
+from config import register as register_config
 from core import app_state_db, db, registration_service
 from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 from core.gmail_batch_store_base import GmailBatchError
@@ -271,6 +272,224 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
         )
         self.assertEqual(submitted[0][0], registration_service._run_one_job)
 
+    def _retry_a_discarded_alias_job(self, *, error: str, otp_received: bool = False):
+        store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
+        batch_id = store.create_empty_batch(
+            target_count=1,
+            aliases_per_source=12,
+            desired_sources=1,
+        )
+        store.append_source_group(
+            batch_id,
+            "source@gmail.com",
+            "https://example.test/source",
+            ["alias@gmail.com"],
+        )
+        source_context = {
+            "gmail_api_url_batch_id": batch_id,
+            "gmail_api_url_aliases_per_source": 12,
+        }
+        if otp_received:
+            source_context["gmail_api_url_otp_received"] = True
+        source = db.create_job(
+            email_source="gmail_api_url",
+            provider_context=source_context,
+        )
+        assignment = store.claim_waiting(batch_id, str(source["id"]))
+        self.assertIsNotNone(assignment)
+        store.discard(assignment.assignment_id, reason="transient failure")
+        db.update_job(
+            source["id"],
+            status="failed",
+            email="alias@gmail.com",
+            error=error,
+        )
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(
+            registration_service, "get_executor_workers", return_value=1
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            result = registration_service.retry_job(source["id"], workers=1)
+        return store, batch_id, assignment, result, submitted
+
+    def test_registration_retry_reuses_the_discarded_gmail_api_url_alias(self):
+        store, batch_id, assignment, result, submitted = self._retry_a_discarded_alias_job(
+            error="RuntimeError: 等待 /api/auth/session accessToken 超时，最后响应: session timeout",
+            otp_received=True,
+        )
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        self.assertEqual(child["email"], "alias@gmail.com")
+        self.assertEqual(child["provider_context"]["gmail_api_url_batch_id"], batch_id)
+        reactivated = store.find_active_assignment_for_job(str(child["id"]))
+        self.assertIsNotNone(reactivated)
+        self.assertEqual(reactivated.inventory_id, assignment.inventory_id)
+        self.assertEqual(submitted[0][0], registration_service._run_one_job)
+
+    def test_registration_retry_inherits_batch_for_pre_otp_failures(self):
+        """Pre-OTP retry keeps the parent batch to receive a new alias of the same record."""
+        store, batch_id, _assignment, result, _submitted = self._retry_a_discarded_alias_job(
+            error="RuntimeError: 邮箱提交后进入登录密码页 auth.openai.com/log-in/password"
+        )
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        self.assertEqual(child["provider_context"]["gmail_api_url_batch_id"], batch_id)
+        self.assertIsNone(child["email"])
+        self.assertIsNone(store.find_active_assignment_for_job(str(child["id"])))
+
+    def test_session_timeout_with_otp_reuses_the_bound_alias(self):
+        """A post-OTP failure stays bound to its alias even when the old batch would drain."""
+        store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
+        batch_id = store.create_empty_batch(
+            target_count=2,
+            aliases_per_source=12,
+            desired_sources=1,
+        )
+        store.append_source_group(
+            batch_id,
+            "source@gmail.com",
+            "https://example.test/source",
+            ["failed-alias@gmail.com", "unused-alias@gmail.com"],
+        )
+        source = db.create_job(
+            email_source="gmail_api_url",
+            email="failed-alias@gmail.com",
+            provider_context={
+                "gmail_api_url_batch_id": batch_id,
+                "gmail_api_url_aliases_per_source": 12,
+                "gmail_api_url_otp_received": True,
+            },
+        )
+        assignment = store.claim_waiting(batch_id, str(source["id"]))
+        self.assertIsNotNone(assignment)
+        store.discard(assignment.assignment_id, reason="session timeout")
+        db.update_job(
+            source["id"],
+            status="failed",
+            email="failed-alias@gmail.com",
+            error=(
+                "RuntimeError: 等待 /api/auth/session accessToken 超时，最后响应: "
+                "{'WARNING_BANNER': 'sensitive', '_http_status': 200}"
+            ),
+        )
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(
+            registration_service, "get_executor_workers", return_value=1
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            result = registration_service.retry_job(source["id"], workers=1)
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        self.assertEqual(child["email"], "failed-alias@gmail.com")
+        self.assertEqual(child["provider_context"]["gmail_api_url_batch_id"], batch_id)
+        reactivated = store.find_active_assignment_for_job(str(child["id"]))
+        self.assertIsNotNone(reactivated)
+        self.assertEqual(reactivated.inventory_id, assignment.inventory_id)
+        self.assertEqual(submitted[0][0], registration_service._run_one_job)
+
+    def test_registration_retry_skips_alias_reuse_for_quarantined_code_url(self):
+        store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
+        batch_id = store.create_empty_batch(
+            target_count=1,
+            aliases_per_source=12,
+            desired_sources=1,
+        )
+        store.append_source_group(
+            batch_id,
+            "source@gmail.com",
+            "https://example.test/source",
+            ["alias@gmail.com"],
+        )
+        source = db.create_job(
+            email_source="gmail_api_url",
+            provider_context={
+                "gmail_api_url_batch_id": batch_id,
+                "gmail_api_url_aliases_per_source": 12,
+            },
+        )
+        assignment = store.claim_waiting(batch_id, str(source["id"]))
+        self.assertIsNotNone(assignment)
+        store.discard(assignment.assignment_id, reason="transient failure")
+        db.update_job(
+            source["id"],
+            status="failed",
+            email="alias@gmail.com",
+            error="RuntimeError: 等待 /api/auth/session accessToken 超时，最后响应: session timeout",
+        )
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            db, "is_gmail_api_url_code_url_failed", return_value=True
+        ), patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(
+            registration_service, "get_executor_workers", return_value=1
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            result = registration_service.retry_job(source["id"], workers=1)
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        self.assertNotEqual(child["provider_context"]["gmail_api_url_batch_id"], batch_id)
+        self.assertIsNone(child["email"])
+        self.assertIsNone(store.find_active_assignment_for_job(str(child["id"])))
+        self.assertEqual(submitted[0][0], registration_service._run_one_job)
+
+    def test_gmail_otp_receipt_persists_binding_flag(self):
+        """Nhận OTP từ code_url gắn vĩnh viễn job với alias của nó."""
+        from core import email_provider
+
+        job = db.create_job(email_source="gmail_api_url", provider_context={})
+        token_job_id = int(job["id"])
+        registration_service._THREAD_CTX.job_id = token_job_id
+        try:
+            email_provider._mark_job_gmail_otp_received()
+            email_provider._mark_job_gmail_otp_received()
+        finally:
+            try:
+                delattr(registration_service._THREAD_CTX, "job_id")
+            except AttributeError:
+                pass
+
+        stored = db.get_job(token_job_id)
+        self.assertTrue(
+            stored["provider_context"].get("gmail_api_url_otp_received")
+        )
+
+    def test_gmail_api_url_retry_prepare_reuses_persisted_alias(self):
+        job = db.create_job(email_source="gmail_api_url", provider_context={})
+        db.update_job(job["id"], email="alias@gmail.com")
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            registration_service, "_random_display_name", return_value="Test User"
+        ), patch(
+            "core.profile_utils.generate_random_birthday", return_value="1990-01-01"
+        ), patch(
+            "core.email_provider.acquire_email"
+        ) as acquire_email:
+            result = registration_service._prepare_registration_args(job["id"])
+
+        self.assertEqual(result[0], "alias@gmail.com")
+        acquire_email.assert_not_called()
+
     def test_webui_count_means_source_groups_and_alias_input_is_ignored(self):
         service = MagicMock()
         service.submit_registration.return_value = [{"id": index} for index in range(36)]
@@ -344,6 +563,144 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
             email_source="gmail_api_url",
             gmail_api_url_aliases_per_email=12,
             automation_context=automation_context,
+        )
+
+    def test_automated_email_api_webui_count_expands_to_twelve_alias_jobs(self):
+        service = MagicMock()
+        service.submit_registration.return_value = [{"id": index} for index in range(24)]
+        service.effective_registration_workers.return_value = 3
+        database = MagicMock()
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "automated_email_api"
+        ), patch.object(
+            email_config, "EMAIL_API_BASE_URL", "https://mail.example.test"
+        ), patch.object(email_config, "EMAIL_API_KEY", "key"):
+            payload, status = create_registration_jobs(
+                {"count": 2, "workers": 3, "email_source": "automated_email_api"},
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["submitted"], 24)
+        service.submit_registration.assert_called_once_with(
+            count=24,
+            workers=3,
+            email_source="automated_email_api",
+        )
+
+    def test_otpmail_webui_count_expands_to_twelve_alias_jobs(self):
+        service = MagicMock()
+        service.submit_registration.return_value = [{"id": index} for index in range(24)]
+        service.effective_registration_workers.return_value = 3
+        database = MagicMock()
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "otpmail"
+        ), patch.object(
+            email_config, "OTPGMAIL_API_BASE", "https://otpgmail.example.test"
+        ), patch.object(email_config, "OTPGMAIL_API_KEY", "key"), patch.object(
+            email_config, "OTPGMAIL_SERVICE_CODE", "openai"
+        ):
+            payload, status = create_registration_jobs(
+                {"count": 2, "workers": 3, "email_source": "otpmail"},
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["submitted"], 24)
+        service.submit_registration.assert_called_once_with(
+            count=24,
+            workers=3,
+            email_source="otpmail",
+        )
+
+    def test_otpmail_prepare_reuses_persisted_alias_after_runtime_context_clear(self):
+        job = db.create_job(
+            email_source="otpmail",
+            email="alias@gmail.com",
+            provider_context={
+                "otpmail_order_id": "ord-parent",
+                "otpmail_query_email": "root@gmail.com",
+                "otpmail_aliases": ["alias@gmail.com"],
+            },
+        )
+        registration_service._JOB_EMAIL_INPUTS.clear()
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            register_config, "REGISTER_EMAIL", ""
+        ), patch.object(
+            register_config, "REGISTER_NAME", "Alice"
+        ), patch(
+            "core.profile_utils.generate_random_birthday", return_value="1990-01-01"
+        ), patch(
+            "core.email_provider.acquire_email"
+        ) as acquire_email:
+            result = registration_service._prepare_registration_args(job_id=job["id"])
+
+        self.assertEqual(result, ("alias@gmail.com", "Alice", "1990-01-01"))
+        acquire_email.assert_not_called()
+
+    def test_otpmail_registration_retry_copies_alias_and_parent_order(self):
+        provider_context = {
+            "otpmail_order_id": "ord-parent",
+            "otpmail_query_email": "root@gmail.com",
+            "otpmail_aliases": ["alias@gmail.com"],
+        }
+        source = db.create_job(
+            email_source="otpmail",
+            email="alias@gmail.com",
+            provider_context=provider_context,
+        )
+        db.update_job(source["id"], status="failed", error="transient failure")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(
+            registration_service, "get_executor_workers", return_value=1
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            result = registration_service.retry_job(source["id"], workers=1)
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        self.assertEqual(child["email"], "alias@gmail.com")
+        self.assertEqual(child["provider_context"], provider_context)
+        self.assertEqual(submitted[0][0], registration_service._run_one_job)
+
+    def test_bamboommo_webui_count_expands_to_twelve_alias_jobs(self):
+        service = MagicMock()
+        service.submit_registration.return_value = [{"id": index} for index in range(24)]
+        service.effective_registration_workers.return_value = 3
+        database = MagicMock()
+
+        with patch.object(email_config, "USE_EMAIL_SERVICE", True), patch.object(
+            email_config, "EMAIL_SOURCE", "bamboommo"
+        ), patch.object(
+            email_config, "BAMBOOMMO_API_BASE", "https://bamboommo.example.test"
+        ), patch.object(email_config, "BAMBOOMMO_API_KEY", "key"), patch.object(
+            email_config, "BAMBOOMMO_SERVER", 2
+        ), patch.object(email_config, "BAMBOOMMO_MAIL_TYPE", "GM"), patch.object(
+            email_config, "BAMBOOMMO_SERVICE", "OP"
+        ):
+            payload, status = create_registration_jobs(
+                {"count": 2, "workers": 3, "email_source": "bamboommo"},
+                service=service,
+                database=database,
+            )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["submitted"], 24)
+        service.submit_registration.assert_called_once_with(
+            count=24,
+            workers=3,
+            email_source="bamboommo",
         )
 
     def test_webui_requires_purchase_configuration_when_local_aliases_are_insufficient(self):
