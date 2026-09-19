@@ -601,10 +601,12 @@ def _run_registration_impl(
                 )
             human_delay("post_auth")
 
+        from core.email_provider import resolve_email_source
+
         account_id = checkpoint_account_data(
             email=email,
             access_token=access_token,
-            email_source=None,
+            email_source=resolve_email_source(email),
             proxy_used=session.proxy or None,
             registration_ip=(getattr(session, "exit_geo", {}) or {}).get("ip"),
             extra={
@@ -633,6 +635,21 @@ def _run_registration_impl(
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 logger.error(f"2FA 设置失败: {twofa_error}")
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
+                try:
+                    from core.registration_auto_pay153 import enqueue_registration_auto_pay153
+
+                    enqueue_registration_auto_pay153(
+                        account_id=account_id,
+                        email=email,
+                        access_token=access_token,
+                        proxy=session.proxy or None,
+                    )
+                except Exception as queue_exc:  # noqa: BLE001 - preserve the checkpointed account.
+                    logger.warning(
+                        "[PAY.153][注册后] 2FA 失败后的自动任务未入队: %s: %s",
+                        type(queue_exc).__name__,
+                        str(queue_exc)[:180],
+                    )
                 return {
                     "success": False,
                     "email": email,

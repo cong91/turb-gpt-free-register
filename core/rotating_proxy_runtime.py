@@ -56,8 +56,13 @@ def resolve_rotating_proxy(
     scope: str,
     lane_id: int | None = None,
     force_refresh: bool | None = None,
+    exclude_proxy_url: str | None = None,
 ) -> str | None:
-    """Return an explicit proxy or acquire one rotating lease for this workflow lane."""
+    """Return an explicit proxy or acquire one rotating lease for this workflow lane.
+
+    exclude_proxy_url 配合 force_refresh 用于换出口：要求新租约不得返回该
+    已被封的地址（如查活 403 后轮换 IP）。
+    """
     if proxy is not None:
         return proxy
 
@@ -81,7 +86,12 @@ def resolve_rotating_proxy(
         else:
             lease = manager.acquire(effective_lane)
     else:
-        lease = manager.acquire(effective_lane, scope=scope)
+        lease = manager.acquire(
+            effective_lane,
+            scope=scope,
+            force_refresh=force_refresh,
+            exclude_proxy_url=exclude_proxy_url,
+        )
     return lease.proxy_url
 
 

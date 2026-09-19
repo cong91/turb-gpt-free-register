@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from contextlib import closing
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -32,6 +33,7 @@ class HeroSmsCountryStoreError(RuntimeError):
 
 DEFAULT_MIN_ATTEMPTS = 4
 DEFAULT_HIGH_FAILURE_RATE = 0.75
+DEFAULT_RECOVERY_SECONDS = 3600
 
 
 def _clean(value: object) -> str:
@@ -92,6 +94,33 @@ def _number_reject_threshold() -> int:
         return 3
 
 
+def _recovery_cooldown_seconds() -> int:
+    try:
+        return max(
+            0,
+            int(getattr(_cfg, "HERO_SMS_COUNTRY_RECOVERY_SECONDS", DEFAULT_RECOVERY_SECONDS)),
+        )
+    except (TypeError, ValueError):
+        return DEFAULT_RECOVERY_SECONDS
+
+
+def _recovery_due(updated_at: object) -> bool:
+    """Return whether a high-risk country is due for a warm probe."""
+    cooldown = _recovery_cooldown_seconds()
+    if cooldown <= 0:
+        return True
+    raw = _clean(updated_at)
+    if not raw:
+        return False
+    try:
+        recorded_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if recorded_at.tzinfo is None:
+            recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return False
+    return (datetime.now(timezone.utc) - recorded_at).total_seconds() >= cooldown
+
+
 def _is_high_failure(
     success_count: int,
     failure_count: int,
@@ -141,7 +170,8 @@ class HeroSmsCountryStore:
         try:
             with closing(self._connect()) as connection:
                 rows = connection.execute(
-                    "SELECT country_id, success_count, failure_count, number_rejected_count, verified_price "
+                    "SELECT country_id, success_count, failure_count, number_rejected_count, "
+                    "verified_price, updated_at "
                     "FROM hero_sms_country_records WHERE profile_key = ?",
                     (key,),
                 ).fetchall()
@@ -158,6 +188,7 @@ class HeroSmsCountryStore:
                     "number_rejected_count": number_rejected_count,
                     "failure_rate": failure_count / total if total else 0.0,
                     "verified_price": str(row[4] or ""),
+                    "recovery_due": _recovery_due(row[5]),
                     "high_failure": _is_high_failure(
                         success_count,
                         failure_count,
@@ -215,6 +246,7 @@ class HeroSmsCountryStore:
                 failure_count = int(item["failure_count"])
                 total = success_count + failure_count
                 item["failure_rate"] = failure_count / total if total else 0.0
+                item["recovery_due"] = _recovery_due(item["updated_at"])
                 item["high_failure"] = _is_high_failure(
                     success_count,
                     failure_count,
@@ -230,7 +262,7 @@ class HeroSmsCountryStore:
         return {
             country
             for country, health in self.country_health(profile_key).items()
-            if health["high_failure"]
+            if health["high_failure"] and not health["recovery_due"]
         }
 
     def verified_countries(self, profile_key: str) -> dict[str, str]:
@@ -277,7 +309,7 @@ class HeroSmsCountryStore:
         return {
             country
             for country, health in self.country_health_for_provider(api_base, service).items()
-            if health["high_failure"]
+            if health["high_failure"] and not health["recovery_due"]
         }
 
     def verified_countries_for_provider(self, api_base: object, service: object) -> dict[str, str]:
@@ -408,7 +440,6 @@ class HeroSmsCountryStore:
         if not key or not country:
             return False
         normalized_price = _normalize_price(price)
-        min_attempts, high_failure_rate = _failure_policy()
         try:
             with closing(self._connect()) as connection:
                 connection.execute("BEGIN IMMEDIATE")
@@ -418,24 +449,22 @@ class HeroSmsCountryStore:
                     (key, country),
                 ).fetchone()
                 success_count = (int(row[0] or 0) if row is not None else 0) + 1
-                failure_count = int(row[1] or 0) if row is not None else 0
-                state = "blocked" if _is_high_failure(
-                    success_count,
-                    failure_count,
-                    min_attempts=min_attempts,
-                    high_failure_rate=high_failure_rate,
-                ) else "verified"
+                # A successful warm probe starts a fresh failure window. Keeping
+                # the old failures would make a country re-block immediately
+                # after the first recovery success.
+                state = "verified"
                 if row is None:
                     connection.execute(
                         "INSERT INTO hero_sms_country_records "
                         "(profile_key, country_id, state, verified_price, success_count, "
-                        "number_rejected_count) VALUES (?, ?, ?, ?, ?, 0)",
+                        "failure_count, number_rejected_count) VALUES (?, ?, ?, ?, ?, 0, 0)",
                         (key, country, state, normalized_price, success_count),
                     )
                 else:
                     connection.execute(
                         "UPDATE hero_sms_country_records SET state = ?, verified_price = ?, "
-                        "success_count = ?, number_rejected_count = 0, last_failure_reason = '', "
+                        "success_count = ?, failure_count = 0, number_rejected_count = 0, "
+                        "last_failure_reason = '', "
                         "updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
                         "WHERE profile_key = ? AND country_id = ?",
                         (state, normalized_price, success_count, key, country),

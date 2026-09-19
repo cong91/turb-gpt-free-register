@@ -95,6 +95,18 @@ class _CooldownRotatingProxyClient(_FakeRotatingProxyClient):
         )
 
 
+class _PinnedIpPerKeyClient(_FakeRotatingProxyClient):
+    """Provider that returns a fixed proxy address per key (IP pinned per key)."""
+
+    def get_proxy(self, key):
+        self.get_calls.append(key)
+        index = int(str(key).rsplit("-", 1)[-1])
+        return {
+            "proxy_url": f"http://198.51.100.{10 + index}:8080",
+            "ttl_seconds": 60,
+        }
+
+
 class _CooldownAfterHealthFailureClient(_FakeRotatingProxyClient):
     def __init__(self, keys):
         super().__init__(keys)
@@ -113,6 +125,46 @@ class _CooldownAfterHealthFailureClient(_FakeRotatingProxyClient):
         if len(self.get_calls) == 2:
             raise RotatingProxyApiError(
                 "proxy.vn API status=101: Con 23s moi co the doi proxy"
+            )
+        return {
+            "proxy_url": f"http://198.51.100.{len(self.get_calls)}:8080",
+            "ttl_seconds": 60,
+        }
+
+
+class _CooldownOnHotKeysClient(_FakeRotatingProxyClient):
+    """Hot key chỉ cooldown ở lần xoay đầu tiên, giống giới hạn xoay ~60s của provider."""
+
+    def __init__(self, keys, hot_keys):
+        super().__init__({"key": key, "expires_at": 1000.0} for key in keys)
+        self.hot_keys = set(hot_keys)
+
+    def check_proxy(self, proxy_url):
+        return True
+
+    def get_proxy(self, key):
+        self.get_calls.append(key)
+        if key in self.hot_keys and self.get_calls.count(key) == 1:
+            raise RotatingProxyApiError(
+                "proxy.vn API status=101: Con 53s moi co the doi proxy"
+            )
+        return {
+            "proxy_url": f"http://198.51.100.{len(self.get_calls)}:8080",
+            "ttl_seconds": 60,
+        }
+
+
+class _PersistentCooldownClient(_FakeRotatingProxyClient):
+    """Provider trả cooldown ở 5 lần xoay đầu tiên (kịch bản job 2543) rồi mới sẵn sàng."""
+
+    def check_proxy(self, proxy_url):
+        return True
+
+    def get_proxy(self, key):
+        self.get_calls.append(key)
+        if len(self.get_calls) <= 5:
+            raise RotatingProxyApiError(
+                "proxy.vn API status=101: Con 53s moi co the doi proxy"
             )
         return {
             "proxy_url": f"http://198.51.100.{len(self.get_calls)}:8080",
@@ -240,6 +292,29 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertNotEqual(first.proxy_url, second.proxy_url)
         self.assertEqual(client.get_calls, ["key-1", "key-1"])
 
+    def test_exclude_proxy_url_switches_key_when_provider_pins_ip_per_key(self):
+        # Provider gán IP cố định theo key：chỉ đổi lease/key mới truly đổi được出口.
+        client = _PinnedIpPerKeyClient(
+            [
+                {"key": "key-1", "expires_at": 1000.0},
+                {"key": "key-2", "expires_at": 1000.0},
+            ]
+        )
+        manager = self._manager(client)
+
+        first = manager.acquire(0)
+        manager.retire(0, proxy_url=first.proxy_url)
+        second = manager.acquire(
+            0,
+            force_refresh=True,
+            exclude_proxy_url=first.proxy_url,
+        )
+
+        self.assertNotEqual(first.proxy_url, second.proxy_url)
+        # key-1 的出口被排除后必须换 key-2，而不是重新拿 key-1 的同一地址。
+        self.assertEqual(client.get_calls, ["key-1", "key-1", "key-2"])
+        self.assertEqual(second.key, "key-2")
+
     def test_force_refresh_waits_for_provider_cooldown_instead_of_reusing_previous_proxy(self):
         client = _CooldownAfterHealthFailureClient(
             [{"key": "key-1", "expires_at": 1000.0}]
@@ -258,6 +333,31 @@ class RotatingProxyManagerTests(unittest.TestCase):
             ["purchased-1", "purchased-1", "purchased-1", "purchased-1"],
         )
 
+    def test_force_refresh_cooldown_switches_to_another_available_key_instead_of_waiting(self):
+        client = _CooldownOnHotKeysClient(
+            ["key-1", "key-2", "key-3"], hot_keys={"key-1", "key-2"}
+        )
+        manager = self._manager(client)
+
+        with patch("core.rotating_proxy_manager.time.sleep") as sleep:
+            lease = manager.acquire(0, force_refresh=True)
+
+        self.assertEqual(lease.key, "key-3")
+        self.assertEqual(client.get_calls, ["key-1", "key-2", "key-3"])
+        sleep.assert_not_called()
+        self.assertEqual(client.purchase_calls, 0)
+
+    def test_force_refresh_cooldown_waits_when_the_held_key_is_the_only_one(self):
+        client = _CooldownOnHotKeysClient(["key-1"], hot_keys={"key-1"})
+        manager = self._manager(client)
+
+        with patch("core.rotating_proxy_manager.time.sleep") as sleep:
+            lease = manager.acquire(0, force_refresh=True)
+
+        self.assertEqual(lease.key, "key-1")
+        sleep.assert_called_once_with(53)
+        self.assertEqual(client.purchase_calls, 0)
+
     def test_provider_cooldown_waits_and_reuses_key_without_purchase(self):
         client = _CooldownAfterHealthFailureClient(
             [{"key": "key-1", "expires_at": 1000.0}]
@@ -273,6 +373,25 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertEqual(client.get_calls, ["key-1", "key-1", "key-1"])
         self.assertEqual(client.list_calls, 0)
         sleep.assert_called_once_with(23)
+
+    def test_repeated_cooldown_waits_do_not_exhaust_the_retry_budget(self):
+        """Job 2543: countdown cooldown của provider là thời gian chờ, không phải lần thử.
+
+        Trước fix: mỗi lần chờ cooldown tiêu tốn 1 trong 3 lượt của range(3),
+        2 lần chờ + 1 lần health-check fail làm job raise RotatingProxyError.
+        Sau fix: lượt chờ cooldown được miễn trừ; lần acquire kế tiếp bắt đầu
+        ngay sau đúng thời gian countdown provider yêu cầu.
+        """
+        client = _PersistentCooldownClient([{"key": "key-1", "expires_at": 1000.0}])
+        manager = self._manager(client)
+
+        with patch("core.rotating_proxy_manager.time.sleep") as sleep:
+            lease = manager.acquire(0, force_refresh=True)
+
+        self.assertEqual(lease.key, "key-1")
+        self.assertEqual(client.get_calls, ["key-1"] * 6)
+        self.assertEqual(sleep.call_count, 5)
+        self.assertEqual(client.purchase_calls, 0)
 
     def test_status_key_assignments_expose_scope_for_ui(self):
         client = _FakeRotatingProxyClient(

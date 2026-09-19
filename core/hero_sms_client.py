@@ -87,17 +87,32 @@ def _number_candidates(
     prices: object,
     *,
     service: str,
+    min_price: str = "",
     max_price: str = "",
     limit: int | None = None,
 ) -> list[tuple[str, Decimal]]:
     if not isinstance(prices, dict):
         raise HeroSmsClientError("HeroSMS getPrices 响应不是对象")
+    price_floor = None
+    if min_price:
+        try:
+            price_floor = Decimal(str(min_price))
+        except InvalidOperation as exc:
+            raise HeroSmsClientError(f"HERO_SMS_MIN_PRICE 无效：{min_price}") from exc
+        if not price_floor.is_finite() or price_floor < 0:
+            raise HeroSmsClientError(f"HERO_SMS_MIN_PRICE 无效：{min_price}")
     price_limit = None
     if max_price:
         try:
             price_limit = Decimal(str(max_price))
         except InvalidOperation as exc:
             raise HeroSmsClientError(f"SMS_MAX_PRICE 无效：{max_price}") from exc
+        if not price_limit.is_finite() or price_limit < 0:
+            raise HeroSmsClientError(f"SMS_MAX_PRICE 无效：{max_price}")
+    if price_floor is not None and price_limit is not None and price_floor > price_limit:
+        raise HeroSmsClientError(
+            f"HERO_SMS_MIN_PRICE 不能高于 HERO_SMS_MAX_PRICE：{min_price} > {max_price}"
+        )
     candidates: list[tuple[Decimal, str]] = []
     for country, country_prices in prices.items():
         if not isinstance(country_prices, dict):
@@ -110,7 +125,12 @@ def _number_candidates(
             count = Decimal(str(offer.get("count", 0)))
         except (InvalidOperation, TypeError):
             continue
-        if count <= 0 or cost < 0 or (price_limit is not None and cost > price_limit):
+        if (
+            count <= 0
+            or cost < 0
+            or (price_floor is not None and cost < price_floor)
+            or (price_limit is not None and cost > price_limit)
+        ):
             continue
         candidates.append((cost, str(country)))
     candidates.sort(key=lambda item: (item[0], item[1]))
@@ -187,10 +207,12 @@ def acquire_number_with_metadata(
     service: object,
     country: object,
     max_price: object = "",
+    min_price: object = "0.01",
     lane_key: object = "",
 ) -> tuple[str, str, dict]:
     service_code = _require(service, "HERO_SMS_SERVICE")
     country_code = str(country or "").strip()
+    minimum_price = str(min_price or "").strip()
     price = str(max_price or "").strip()
     normalized_lane_key = str(lane_key or "").strip()
     profile_key = make_profile_key(
@@ -210,6 +232,7 @@ def acquire_number_with_metadata(
         all_countries = _number_candidates(
             prices,
             service=service_code,
+            min_price=minimum_price,
             max_price=price,
             limit=None,
         )
@@ -257,8 +280,9 @@ def acquire_number_with_metadata(
             ]
         ordered_countries = [*primary_selected, *fallback_countries]
         logger.info(
-            "[SMS:HeroSMS] auto 国家候选：lane=%s maxPrice=%s pool=%s sticky=%s stickyMode=%s primary=%s fallback=%s selected=%s",
+            "[SMS:HeroSMS] auto 国家候选：lane=%s minPrice=%s maxPrice=%s pool=%s sticky=%s stickyMode=%s primary=%s fallback=%s selected=%s",
             normalized_lane_key or "-",
+            minimum_price or "-",
             price or "-",
             len(all_countries),
             sticky_candidate[0] if sticky_candidate is not None else "-",
@@ -340,6 +364,7 @@ def acquire_number(
     service: object,
     country: object,
     max_price: object = "",
+    min_price: object = "0.01",
     lane_key: object = "",
 ) -> tuple[str, str]:
     """Acquire a number while preserving the original two-value API."""
@@ -350,6 +375,7 @@ def acquire_number(
         service=service,
         country=country,
         max_price=max_price,
+        min_price=min_price,
         lane_key=lane_key,
     )
     return activation_id, phone

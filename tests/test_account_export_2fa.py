@@ -21,6 +21,15 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
     def test_rate_limit_reauth_error_is_retryable(self):
         self.assertTrue(_is_reauth_retryable_error(RuntimeError("HTTP 429: rate_limit_exceeded")))
 
+    def test_reauth_script_timeout_is_retryable(self):
+        from selenium.common.exceptions import TimeoutException
+
+        self.assertTrue(
+            _is_reauth_retryable_error(
+                TimeoutException("Message: script timeout\n  (Session info: chrome=153.0.8010.27)")
+            )
+        )
+
     @patch("core.account_export.human_delay")
     @patch("core.account_export._activate_totp")
     @patch(
@@ -286,6 +295,47 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
         enroll_totp.assert_called_once_with(transport, "reauth-token")
         activate_totp.assert_called_once_with(transport, "reauth-token", "SECRET", "session-id")
 
+    def test_reauth_retries_once_on_selenium_script_timeout(self):
+        from selenium.common.exceptions import TimeoutException
+
+        transport = Mock()
+        with (
+            patch("core.account_export.time.time", side_effect=[100.0, 200.0]),
+            patch("core.account_export.human_delay"),
+            patch("core.account_export.time.sleep"),
+            patch(
+                "core.account_export._trigger_reauth",
+                side_effect=[TimeoutException("Message: script timeout"), "second-auth-url"],
+            ) as trigger_reauth,
+            patch("core.account_export._follow_reauth"),
+            patch("core.account_export._validate_reauth_otp", return_value="continue-url") as validate_otp,
+            patch("core.account_export._exchange_new_token", return_value="reauth-token") as exchange_token,
+            patch("core.account_export._enroll_totp", return_value=("SECRET", "session-id")) as enroll_totp,
+            patch("core.account_export._activate_totp") as activate_totp,
+            patch("core.email_provider.wait_for_otp", return_value="222222") as wait_for_otp,
+            patch("core.openai_auth.send_email_otp"),
+        ):
+            secret = setup_2fa(transport, "user@example.com", reauth=True)
+
+        self.assertEqual(secret, "SECRET")
+        self.assertEqual(trigger_reauth.call_count, 2)
+        self.assertEqual(
+            wait_for_otp.call_args_list,
+            [
+                call(
+                    "user@example.com",
+                    after_ts=200.0,
+                    before_code=None,
+                    max_wait=EXPECTED_TWOFA_OTP_MAX_WAIT,
+                    stage="twofa_reauth_email_otp",
+                ),
+            ],
+        )
+        self.assertEqual(validate_otp.call_args_list, [call(transport, "222222")])
+        exchange_token.assert_called_once_with(transport, "continue-url")
+        enroll_totp.assert_called_once_with(transport, "reauth-token")
+        activate_totp.assert_called_once_with(transport, "reauth-token", "SECRET", "session-id")
+
     def test_reauth_retries_when_provider_does_not_publish_a_new_otp(self):
         transport = Mock()
         with (
@@ -339,7 +389,7 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
     def test_reauth_rate_limit_uses_long_exponential_backoff(self):
         transport = Mock()
         rate_limit_error = RuntimeError(
-            "re-auth 未进入 email-verification 页面: "
+            "re-auth rate_limit_exceeded: OpenAI 限制了认证请求频率: "
             "https://auth.openai.com/error?errorCode=rate_limit_exceeded"
         )
         with (
@@ -562,6 +612,28 @@ class AccountExportTwofaTransportTests(unittest.TestCase):
             BrowserPageTransport(driver).get("https://chatgpt.com/api/test")
 
         self.assertEqual(driver.set_script_timeout.call_args_list[-1].args, (47,))
+
+    def test_browser_request_falls_back_to_configured_script_timeout(self):
+        from config import roxybrowser
+
+        driver = Mock(spec=["current_url", "set_script_timeout", "execute_async_script"])
+        driver.current_url = "https://chatgpt.com/"
+        driver.execute_async_script.return_value = {
+            "status": 200,
+            "url": "https://chatgpt.com/api/test",
+            "text": "{\"ok\":true}",
+            "json": {"ok": True},
+        }
+
+        response = BrowserPageTransport(driver).get("https://chatgpt.com/api/test")
+
+        self.assertIsInstance(response, _ScriptResponse)
+        self.assertEqual(response.status_code, 200)
+        expected_timeout = int(getattr(roxybrowser, "ROXY_SCRIPT_TIMEOUT", 90) or 90)
+        self.assertEqual(driver.set_script_timeout.call_args_list, [call(expected_timeout)])
+        script = driver.execute_async_script.call_args.args[0]
+        self.assertIn("AbortController", script)
+        self.assertIn("setTimeout", script)
 
 
 if __name__ == "__main__":

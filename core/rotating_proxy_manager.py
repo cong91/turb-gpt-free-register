@@ -327,8 +327,13 @@ class RotatingProxyManager:
         *,
         scope: str = "registration",
         force_refresh: bool = False,
+        exclude_proxy_url: str | None = None,
     ) -> RotatingProxyLease:
-        """Acquire a lease, optionally requiring a fresh provider IP."""
+        """Acquire a lease, optionally requiring a fresh provider IP.
+
+        exclude_proxy_url 要求返回一个不同出口（例如该出口已被 Cloudflare 拦截）：
+        命中该地址时作废当前 key 并换下一个 key，避免“换租约却拿到同一个 IP”。
+        """
         lane = self._lane_id(lane_id)
         lane_scope = self._scope(scope)
         with self._lock:
@@ -400,7 +405,15 @@ class RotatingProxyManager:
             excluded_keys: set[str] = set()
             failed_attempts: dict[str, int] = {}
             last_error: Exception | None = None
-            for _ in range(3):
+            attempts_left = 3
+            # Lượt “chờ cooldown rồi thử lại” không tiêu tốn budget retry:
+            # countdown của provider là thời gian chờ hợp lệ, không phải failure.
+            cooldown_wait_free = False
+            while attempts_left > 0:
+                if cooldown_wait_free:
+                    cooldown_wait_free = False
+                else:
+                    attempts_left -= 1
                 key_info = self._key_for_lane(
                     existing,
                     excluded=excluded_keys,
@@ -486,7 +499,7 @@ class RotatingProxyManager:
                         alternative = self._choose_available_key(
                             used_keys | excluded_keys | {key}
                         )
-                        if alternative is not None and not force_refresh:
+                        if alternative is not None:
                             excluded_keys.add(key)
                             existing = None
                             logger.warning(
@@ -511,6 +524,7 @@ class RotatingProxyManager:
                         now = self.clock()
                         excluded_keys.clear()
                         existing = None
+                        cooldown_wait_free = True
                         continue
                     failed_attempts[key] = failed_attempts.get(key, 0) + 1
                     if failed_attempts[key] >= 2:
@@ -530,6 +544,19 @@ class RotatingProxyManager:
                     if failed_attempts[key] >= 2:
                         excluded_keys.add(key)
                     existing = None
+                    continue
+                if exclude_proxy_url and proxy_url == str(exclude_proxy_url).strip():
+                    # 该出口已被调用方判定为被封（如 Cloudflare 403），换下一个 key。
+                    last_error = RotatingProxyError(
+                        "proxy.vn trả lại đúng proxy đã bị loại trừ"
+                    )
+                    excluded_keys.add(key)
+                    existing = None
+                    logger.warning(
+                        "[RotatingProxy] excluded blocked proxy re-returned; switching key: scope=%s lane=%s",
+                        lane_scope,
+                        lane,
+                    )
                     continue
                 if not self._proxy_healthy(proxy_url):
                     last_error = RotatingProxyError(

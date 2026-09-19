@@ -2226,11 +2226,33 @@ def mark_account_plan_check_running(acc_id: int) -> bool:
         return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
-def recover_interrupted_plan_checks() -> int:
-    """服务启动时把上次进程遗留的内存队列状态恢复为可重试失败。"""
+def _plan_check_token_requeueable(row: dict) -> bool:
+    """判断账号是否仍持有重启后可用于复查的 access_token。"""
+    if not str(row.get("access_token") or "").strip():
+        return False
+    expires_at = str(row.get("token_expires_at") or "").strip()
+    if not expires_at:
+        return True
+    try:
+        parsed = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed > datetime.now(tz=timezone.utc)
+
+
+def recover_interrupted_plan_checks() -> dict:
+    """服务启动时把上次进程遗留的内存队列状态恢复为可重试失败。
+
+    返回 {"recovered": [账号 id], "requeueable": [账号 id]}；requeueable 是
+    中断账号中仍持有未过期 access_token 的子集，供调用方自动重新入队复查。
+    token 已本地过期的账号保持 failed，等待人工查活刷新后再查。
+    """
     with _LOCK:
         accounts = _load_accounts()
-        recovered = 0
+        recovered: list[int] = []
+        requeueable: list[int] = []
         now = _now()
         for row in accounts:
             if row.get("plan_check_status") not in {"queued", "running"}:
@@ -2240,10 +2262,13 @@ def recover_interrupted_plan_checks() -> int:
             row["plan_check_error"] = "WebUI 重启导致套餐查询中断，请重新查询"
             row["plan_check_completed_at"] = now
             row["updated_at"] = now
-            recovered += 1
+            account_id = int(row.get("id") or 0)
+            recovered.append(account_id)
+            if _plan_check_token_requeueable(row):
+                requeueable.append(account_id)
         if recovered:
             _save_accounts(accounts)
-        return recovered
+        return {"recovered": recovered, "requeueable": requeueable}
 
 
 def update_account_plan_check(acc_id: int | None = None, email: str | None = None, result: dict | None = None) -> bool:
@@ -2418,6 +2443,126 @@ def update_account_extract(acc_id: int, result: dict | None = None) -> bool:
         return _mutate_account_row(acc_id=acc_id, mutator=mutate)
 
 
+def update_account_pay153(acc_id: int, result: dict | None = None) -> bool:
+    """Persist the registration-time PAY.153 checkout classification."""
+    result = result or {}
+    with _LOCK:
+        def mutate(row: dict) -> None:
+            status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
+            ok = bool(result.get("ok")) and status == "success"
+            payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+            session_id = result.get("checkout_session_id")
+            if session_id is None:
+                session_id = payload.get("checkout_session_id")
+            checkout_url = (
+                payload.get("long_url")
+                or payload.get("checkout_url")
+                or result.get("checkout_url")
+            )
+            row.update({
+                "pay153_status": status,
+                "pay153_ok": ok,
+                "pay153_checked_at": result.get("checked_at") or _now(),
+                "pay153_error": None if ok or status in {"running", "skipped"} else result.get("error"),
+                "pay153_message": result.get("message"),
+                "pay153_link_type": result.get("link_type"),
+                "pay153_checkout_session_id": session_id,
+                "pay153_checkout_session_kind": result.get("checkout_session_kind") or "unknown",
+                "pay153_checkout_url": checkout_url,
+                "pay153_result_json": json.dumps(result, ensure_ascii=False),
+                "pay153_recovery_required": False,
+            })
+            if status in {"success", "failed", "stopped", "skipped"}:
+                row["pay153_completed_at"] = _now()
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
+
+
+def update_account_pay153_promotion(acc_id: int, result: dict | None = None) -> bool:
+    """Persist the account-workspace PAY.153 promotion probe."""
+    result = result or {}
+    with _LOCK:
+        def mutate(row: dict) -> None:
+            status = str(result.get("status") or ("success" if result.get("ok") else "failed"))
+            ok = bool(result.get("ok")) and status == "success"
+            session_id = result.get("checkout_session_id")
+            payload = result.get("result") if isinstance(result.get("result"), dict) else {}
+            if session_id is None:
+                session_id = payload.get("checkout_session_id")
+            row.update({
+                "pay153_promotion_status": status,
+                "pay153_promotion_ok": ok,
+                "pay153_promotion_checked_at": result.get("checked_at") or _now(),
+                "pay153_promotion_error": None if ok or status == "skipped" else result.get("error"),
+                "pay153_promotion_message": result.get("message"),
+                "pay153_promotion_proxy_country": result.get("promotion_proxy_country") or "VN",
+                "pay153_promotion_proxy_mode": result.get("promotion_proxy_mode"),
+                "pay153_promotion_checkout_session_id": session_id,
+                "pay153_promotion_checkout_session_kind": result.get("checkout_session_kind") or "unknown",
+                "pay153_promotion_amount_verification": result.get("amount_verification"),
+                "pay153_promotion_plus_trial_eligible_before": result.get("plus_trial_eligible_before"),
+                "pay153_promotion_plus_trial_eligible_after": result.get("plus_trial_eligible_after"),
+                "pay153_promotion_result_json": json.dumps(result, ensure_ascii=False),
+            })
+            if status in {"success", "failed", "stopped", "skipped"}:
+                row["pay153_promotion_completed_at"] = _now()
+
+        return _mutate_account_row(acc_id=acc_id, mutator=mutate)
+
+
+def claim_account_pay153(acc_id: int, *, allow_recovery: bool = False) -> str:
+    """Atomically reserve the one automatic PAY.153 attempt for an account."""
+    with _LOCK:
+        _ensure_sqlite()
+        with closing(_sqlite_conn()) as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                stored = conn.execute(
+                    "SELECT id, payload FROM accounts WHERE id=? LIMIT 1", (int(acc_id),)
+                ).fetchone()
+                if stored is None:
+                    conn.rollback()
+                    return "missing"
+                row = json.loads(stored["payload"])
+                if not isinstance(row, dict):
+                    conn.rollback()
+                    return "missing"
+                status = str(row.get("pay153_status") or "").strip().lower()
+                if status == "success":
+                    conn.rollback()
+                    return "completed"
+                if status in {"queued", "running"}:
+                    conn.rollback()
+                    return "busy"
+                if bool(row.get("pay153_recovery_required")) and not allow_recovery:
+                    conn.rollback()
+                    return "recovery_required"
+                now = _now()
+                row.update({
+                    "pay153_status": "running",
+                    "pay153_ok": False,
+                    "pay153_checked_at": now,
+                    "pay153_error": None,
+                    "pay153_message": "PAY.153 checkout đang được thực hiện",
+                    "pay153_checkout_session_id": None,
+                    "pay153_checkout_session_kind": "unknown",
+                    "pay153_checkout_url": None,
+                    "pay153_recovery_required": False,
+                    "pay153_result_json": json.dumps({
+                        "status": "running",
+                        "ok": False,
+                        "checked_at": now,
+                    }, ensure_ascii=False),
+                    "pay153_completed_at": None,
+                })
+                _persist_account_row(conn, row, int(stored["id"]))
+                conn.commit()
+                return "claimed"
+            except Exception:
+                conn.rollback()
+                raise
+
+
 def recover_interrupted_extract_links() -> int:
     """服务启动时恢复上次进程中断的提链状态。"""
     with _LOCK:
@@ -2431,6 +2576,28 @@ def recover_interrupted_extract_links() -> int:
             row["extract_link_ok"] = False
             row["extract_link_error"] = "WebUI 重启导致提链任务中断，请重新提链"
             row["extract_link_completed_at"] = now
+            row["updated_at"] = now
+            recovered += 1
+        if recovered:
+            _save_accounts(accounts)
+        return recovered
+
+
+def recover_interrupted_pay153() -> int:
+    """服务启动时恢复上次进程中断的 PAY.153 状态，等待显式重试。"""
+    with _LOCK:
+        accounts = _load_accounts()
+        recovered = 0
+        now = _now()
+        for row in accounts:
+            if row.get("pay153_status") not in {"queued", "running"}:
+                continue
+            row["pay153_status"] = "failed"
+            row["pay153_ok"] = False
+            row["pay153_error"] = "WebUI 重启导致 PAY.153 checkout 中断，请确认后重试"
+            row["pay153_message"] = "PAY.153 checkout 状态不明确，未自动重试"
+            row["pay153_completed_at"] = now
+            row["pay153_recovery_required"] = True
             row["updated_at"] = now
             recovered += 1
         if recovered:
@@ -2537,6 +2704,17 @@ def _account_matches_locale_filter(row: dict, locale_filter: str | None = None) 
     return value in candidates
 
 
+def _account_matches_pay153_kind_filter(row: dict, pay153_kind_filter: str | None = None) -> bool:
+    """Lọc tài khoản theo loại link PAY.153 đã tạo (cs_live / oaics / unknown)."""
+    kind = str(pay153_kind_filter or "").strip().lower()
+    if not kind:
+        return True
+    row_kind = str(row.get("pay153_checkout_session_kind") or "").strip().lower()
+    if kind == "unknown":
+        return row_kind in {"", "unknown"}
+    return row_kind == kind
+
+
 def _filtered_decorated_accounts(
     archived: str | bool | None = False,
     plan_filter: str | None = None,
@@ -2551,6 +2729,7 @@ def _filtered_decorated_accounts(
     email_domain_filter: str | None = None,
     registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
+    pay153_kind_filter: str | None = None,
 ) -> list[dict]:
     rows = _load_accounts()
     if archived in (True, "1", "true", "yes", "only"):
@@ -2561,6 +2740,7 @@ def _filtered_decorated_accounts(
         rows = [r for r in rows if not bool(r.get("archived"))]
     decorated = [_decorate_account(r) for r in rows]
     decorated = [r for r in decorated if _account_matches_plan_filter(r, plan_filter)]
+    decorated = [r for r in decorated if _account_matches_pay153_kind_filter(r, pay153_kind_filter)]
     decorated = [r for r in decorated if _matches_codex_status_filter(r, codex_filter)]
     decorated = [r for r in decorated if _account_matches_twofa_filter(r, twofa_filter)]
     decorated = [r for r in decorated if _matches_totp_status_filter(r, totp_filter)]
@@ -2605,6 +2785,7 @@ def list_account_plan_check_statuses(
     email_domain_filter: str | None = None,
     registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
+    pay153_kind_filter: str | None = None,
 ) -> dict:
     """返回不含 Token/邮箱密码的套餐查询轻量状态快照。"""
     fields = (
@@ -2625,6 +2806,14 @@ def list_account_plan_check_statuses(
         "extract_link_long_url", "extract_link_copy_paste",
         "extract_link_image_url_png", "extract_link_image_url_svg",
         "extract_link_expires_at",
+        "pay153_status", "pay153_ok", "pay153_link_type", "pay153_message", "pay153_error",
+        "pay153_recovery_required",
+        "pay153_checkout_url", "pay153_checkout_session_kind", "pay153_checked_at", "pay153_completed_at",
+        "pay153_promotion_status", "pay153_promotion_ok", "pay153_promotion_message",
+        "pay153_promotion_error", "pay153_promotion_proxy_country", "pay153_promotion_proxy_mode",
+        "pay153_promotion_checkout_session_kind", "pay153_promotion_amount_verification",
+        "pay153_promotion_plus_trial_eligible_before", "pay153_promotion_plus_trial_eligible_after",
+        "pay153_promotion_checked_at", "pay153_promotion_completed_at",
         "free_plus_exported_at", "free_plus_export_count", "free_plus_export_format", "free_plus_export_source",
         "codex_status", "codex_error",
         "codex_agent_status", "codex_agent_message",
@@ -2639,7 +2828,7 @@ def list_account_plan_check_statuses(
         offset = max(0, int(offset or 0))
         extended_filters = any(
             str(value or "").strip()
-            for value in (twofa_filter, account_locale_filter, email_source_filter, email_domain_filter, registration_driver_filter, totp_filter)
+            for value in (twofa_filter, account_locale_filter, email_source_filter, email_domain_filter, registration_driver_filter, totp_filter, pay153_kind_filter)
         )
         if extended_filters:
             all_rows = _filtered_decorated_accounts(
@@ -2656,6 +2845,7 @@ def list_account_plan_check_statuses(
                 email_domain_filter=email_domain_filter,
                 registration_driver_filter=registration_driver_filter,
                 totp_filter=totp_filter,
+                pay153_kind_filter=pay153_kind_filter,
             )
             total = len(all_rows)
             latest = max((str(row.get("updated_at") or "") for row in all_rows), default="")
@@ -2713,6 +2903,21 @@ def list_account_plan_check_statuses(
                     "twofa_status": row.get("twofa_status") or ("active" if row.get("totp_secret") else "disabled"),
                     "twofa_error": row.get("twofa_error"),
                     "extract_link_status": row.get("extract_link_status"),
+                    "pay153_status": row.get("pay153_status"),
+                    "pay153_ok": row.get("pay153_ok"),
+                    "pay153_checkout_session_kind": row.get("pay153_checkout_session_kind"),
+                    "pay153_recovery_required": row.get("pay153_recovery_required"),
+                    "pay153_checked_at": row.get("pay153_checked_at"),
+                    "pay153_promotion_status": row.get("pay153_promotion_status"),
+                    "pay153_promotion_ok": row.get("pay153_promotion_ok"),
+                    "pay153_promotion_error": row.get("pay153_promotion_error"),
+                    "pay153_promotion_message": row.get("pay153_promotion_message"),
+                    "pay153_promotion_proxy_country": row.get("pay153_promotion_proxy_country"),
+                    "pay153_promotion_proxy_mode": row.get("pay153_promotion_proxy_mode"),
+                    "pay153_promotion_checkout_session_kind": row.get("pay153_promotion_checkout_session_kind"),
+                    "pay153_promotion_amount_verification": row.get("pay153_promotion_amount_verification"),
+                    "pay153_promotion_plus_trial_eligible_after": row.get("pay153_promotion_plus_trial_eligible_after"),
+                    "pay153_promotion_checked_at": row.get("pay153_promotion_checked_at"),
                     "codex_status": row.get("codex_status"),
                     "codex_agent_status": row.get("codex_agent_status"),
                     "totp_setup_status": row.get("totp_setup_status"),
@@ -2750,9 +2955,10 @@ def list_accounts(
     email_domain_filter: str | None = None,
     registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
+    pay153_kind_filter: str | None = None,
 ) -> list[dict]:
     with _LOCK:
-        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter, registration_driver_filter=registration_driver_filter, totp_filter=totp_filter)
+        rows = _filtered_decorated_accounts(archived=archived, plan_filter=plan_filter, codex_filter=codex_filter, q=q, free_plus_export_filter=free_plus_export_filter, date_from=date_from, date_to=date_to, twofa_filter=twofa_filter, account_locale_filter=account_locale_filter, email_source_filter=email_source_filter, email_domain_filter=email_domain_filter, registration_driver_filter=registration_driver_filter, totp_filter=totp_filter, pay153_kind_filter=pay153_kind_filter)
         return rows[max(0, int(offset or 0)): max(0, int(offset or 0)) + max(1, int(limit))]
 
 
@@ -2772,6 +2978,7 @@ def list_accounts_page(
     email_domain_filter: str | None = None,
     registration_driver_filter: str | None = None,
     totp_filter: str | None = None,
+    pay153_kind_filter: str | None = None,
 ) -> dict:
     with _LOCK:
         limit = max(1, int(limit))
@@ -2785,6 +2992,7 @@ def list_accounts_page(
                 email_domain_filter,
                 registration_driver_filter,
                 totp_filter,
+                pay153_kind_filter,
             )
         )
         if extended_filters:
@@ -2802,6 +3010,7 @@ def list_accounts_page(
                 email_domain_filter=email_domain_filter,
                 registration_driver_filter=registration_driver_filter,
                 totp_filter=totp_filter,
+                pay153_kind_filter=pay153_kind_filter,
             )
             total = len(rows)
             items = rows[offset: offset + limit]
@@ -4311,6 +4520,9 @@ def gmail_api_url_source_keys(
     a separate provenance snapshot before it can trust a row as a real Gmail
     API source.  The optional SQLite path keeps isolated test ledgers from
     consulting the process-wide runtime pool.
+
+    Caller must already hold ``_LOCK``: the only caller runs inside the Gmail
+    batch store's runtime transaction, and this Lock is not re-entrant.
     """
     if sqlite_path is not None:
         try:
@@ -4322,17 +4534,16 @@ def gmail_api_url_source_keys(
             return set()
 
     keys: set[tuple[str, str]] = set()
-    with _LOCK:
-        for row in _load_gmail_api_url_emails():
-            email = str(row.get("email") or "").strip()
-            code_url = str(row.get("code_url") or "").strip()
-            if not email or not code_url:
-                continue
-            try:
-                root = canonical_gmail(email)
-            except GmailAliasError:
-                continue
-            keys.add((root, code_url))
+    for row in _load_gmail_api_url_emails():
+        email = str(row.get("email") or "").strip()
+        code_url = str(row.get("code_url") or "").strip()
+        if not email or not code_url:
+            continue
+        try:
+            root = canonical_gmail(email)
+        except GmailAliasError:
+            continue
+        keys.add((root, code_url))
     return keys
 
 
@@ -4480,6 +4691,30 @@ def list_gmail_api_url_email_pool(status: str | None = None, limit: int = 500) -
         rows = sorted(rows, key=lambda x: int(x.get("id") or 0), reverse=True)
         decorated = [_decorate_gmail_api_url_email(r, account_by_email) for r in rows[:limit]]
         return _attach_gmail_api_url_alias_stats(decorated)
+
+
+def gmail_api_url_email_records(
+    *, sqlite_path: str | Path | None = None,
+) -> list[dict]:
+    """Return raw Gmail API URL pool rows (id ascending) for per-job provisioning.
+
+    ``sqlite_path`` scopes the snapshot to the data directory that owns the
+    canonical ledger, matching the claim/release helpers; isolated test or
+    fixture stores must not read the process-wide pool.
+    """
+    if sqlite_path is not None:
+        try:
+            raw_parent = Path(_GMAIL_API_URL_EMAIL_JSON).resolve().parent
+            db_parent = Path(sqlite_path).resolve().parent
+        except (OSError, TypeError, ValueError):
+            return []
+        if raw_parent != db_parent:
+            return []
+    with _LOCK:
+        return sorted(
+            _load_gmail_api_url_emails(),
+            key=lambda row: int(row.get("id") or 0),
+        )
 
 
 def generic_api_email_pool_summary() -> dict:

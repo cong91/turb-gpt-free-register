@@ -5,6 +5,17 @@ from unittest.mock import Mock, call, patch
 
 
 class RegistrationAutoCodexTests(unittest.TestCase):
+    def setUp(self):
+        # Keep non-PAY tests independent from a developer's .env. PAY tests
+        # explicitly enable the feature with a method-level patch.
+        self._auto_pay_patch = patch(
+            "config.register.AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER",
+            False,
+            create=True,
+        )
+        self._auto_pay_patch.start()
+        self.addCleanup(self._auto_pay_patch.stop)
+
     def test_protocol_registration_forces_codex_after_serialized_plan_flow(self):
         import main
 
@@ -28,6 +39,12 @@ class RegistrationAutoCodexTests(unittest.TestCase):
             stack.enter_context(patch.object(main._protocol_cfg, "CHATGPT_ANON_BOOTSTRAP_ENABLED", False))
             stack.enter_context(patch.object(main._protocol_cfg, "CHATGPT_AUTH_BOOTSTRAP_ENABLED", False))
             stack.enter_context(patch.object(main, "BrowserSession", return_value=session))
+            stack.enter_context(
+                patch(
+                    "core.rotating_proxy_runtime.resolve_rotating_proxy",
+                    return_value="http://proxy.example",
+                )
+            )
             stack.enter_context(patch.object(main, "network_preflight"))
             stack.enter_context(patch.object(main, "get_providers", return_value=[]))
             stack.enter_context(patch.object(main, "get_csrf_token", return_value="csrf"))
@@ -51,7 +68,9 @@ class RegistrationAutoCodexTests(unittest.TestCase):
                     return_value={"accessToken": "access-token", "user": {}, "account": {}},
                 )
             )
-            stack.enter_context(patch.object(main, "checkpoint_account_data", return_value=7))
+            checkpoint_account_data = stack.enter_context(
+                patch.object(main, "checkpoint_account_data", return_value=7)
+            )
             stack.enter_context(patch.object(main, "setup_2fa_for_registration", return_value="TOTPSECRET"))
             stack.enter_context(
                 patch(
@@ -66,7 +85,7 @@ class RegistrationAutoCodexTests(unittest.TestCase):
                 )
             )
             stack.enter_context(patch.object(main, "save_account_data", return_value=8))
-            stack.enter_context(patch("core.email_provider.resolve_email_source", return_value="outlook"))
+            stack.enter_context(patch("core.email_provider.resolve_email_source", return_value="otpmail"))
             stack.enter_context(patch("core.flow_trigger.trigger_flow", return_value={"status": "skipped", "ok": False}))
             stack.enter_context(patch.object(main, "human_delay"))
 
@@ -78,6 +97,11 @@ class RegistrationAutoCodexTests(unittest.TestCase):
             )
 
         self.assertTrue(result["success"])
+        checkpoint_account_data.assert_called_once()
+        self.assertEqual(
+            checkpoint_account_data.call_args.kwargs["email_source"],
+            "otpmail",
+        )
         self.assertEqual(auto_codex_kwargs["twofa_status"], "active")
         run_codex_oauth.assert_called_once_with(
             "user@example.com",
@@ -144,7 +168,11 @@ class RegistrationAutoCodexTests(unittest.TestCase):
         mark_running.assert_called_once_with(7)
         update_plan.assert_called_once()
         check_plan.assert_called_once_with(
-            "token", proxy="http://proxy.example", timezone_offset_min="-"
+            "token",
+            proxy=None,
+            browser_transport=None,
+            require_proxy=True,
+            timezone_offset_min="-",
         )
 
     @patch("core.registration_auto_codex.db.claim_account_plan_check", return_value=False)
@@ -217,6 +245,54 @@ class RegistrationAutoCodexTests(unittest.TestCase):
         claim_plan.assert_not_called()
         run_codex.assert_not_called()
 
+    @patch("core.registration_auto_codex.run_registration_auto_pay153")
+    @patch("core.registration_auto_codex.db.update_account_plan_check")
+    @patch("core.registration_auto_codex.db.mark_account_plan_check_running", return_value=True)
+    @patch("core.registration_auto_codex.db.claim_account_plan_check", return_value=True)
+    @patch("core.registration_auto_codex.check_account_plan")
+    def test_pay153_only_does_not_require_active_twofa(
+        self, check_plan, _claim_plan, _mark_running, update_plan, run_pay153
+    ):
+        from config import codex as codex_config
+        from config import register as register_config
+        from core.registration_auto_codex import run_registration_auto_codex
+
+        check_plan.return_value = {
+            "ok": True,
+            "current_plan_type": "free",
+            "plus_trial_eligible": True,
+        }
+        run_pay153.return_value = {
+            "status": "success",
+            "ok": True,
+            "checkout_session_kind": "oaics",
+        }
+
+        with (
+            patch.object(register_config, "AUTO_PLAN_CHECK_AFTER_REGISTER", False),
+            patch.object(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False),
+            patch.object(register_config, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", True),
+            patch.object(codex_config, "ENABLE_CODEX_AUTO", False),
+        ):
+            outcome = run_registration_auto_codex(
+                account_id=7,
+                email="free-trial@example.com",
+                access_token="token",
+                run_codex=Mock(),
+                twofa_status="disabled",
+            )
+
+        self.assertEqual(outcome["pay153"]["checkout_session_kind"], "oaics")
+        run_pay153.assert_called_once_with(
+            account_id=7,
+            email="free-trial@example.com",
+            access_token="token",
+            proxy=None,
+            browser_transport=None,
+            plan_result=check_plan.return_value,
+        )
+        update_plan.assert_called_once_with(acc_id=7, result=check_plan.return_value)
+
     @patch("core.registration_auto_codex.db.update_account_plan_check")
     @patch("core.registration_auto_codex.db.mark_account_plan_check_running", return_value=True)
     @patch("core.registration_auto_codex.db.claim_account_plan_check", return_value=True)
@@ -280,8 +356,9 @@ class RegistrationAutoCodexTests(unittest.TestCase):
         self.assertEqual(outcome["codex"]["status"], "success")
         check_plan.assert_called_once_with(
             "token",
-            proxy="http://registration-proxy:1",
-            browser_transport=browser_transport,
+            proxy=None,
+            browser_transport=None,
+            require_proxy=True,
             timezone_offset_min="-",
         )
         update_plan.assert_called_once_with(acc_id=7, result=outcome["plan"])
@@ -314,6 +391,93 @@ class RegistrationAutoCodexTests(unittest.TestCase):
         self.assertEqual(outcome["codex"]["status"], "skipped")
         self.assertIn("Plus", outcome["codex"]["message"])
         update_plan.assert_called_once()
+
+    @patch("core.registration_auto_codex.run_registration_auto_pay153")
+    @patch("core.registration_auto_codex.db.update_account_plan_check")
+    @patch("core.registration_auto_codex.db.mark_account_plan_check_running", return_value=True)
+    @patch("core.registration_auto_codex.db.claim_account_plan_check", return_value=True)
+    @patch("core.registration_auto_codex.check_account_plan")
+    @patch("config.register.AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", True, create=True)
+    def test_free_trial_runs_pay153_after_plan_is_persisted(
+        self, check_plan, _claim_plan, _mark_running, update_plan, run_pay153
+    ):
+        from core.registration_auto_codex import run_registration_auto_codex
+
+        plan_result = {
+            "ok": True,
+            "current_plan_type": "free",
+            "plus_trial_eligible": True,
+        }
+        check_plan.return_value = plan_result
+        run_pay153.return_value = {
+            "ok": True,
+            "status": "success",
+            "checkout_session_id": "cs_live_123",
+            "checkout_session_kind": "cs_live",
+        }
+
+        outcome = run_registration_auto_codex(
+            account_id=7,
+            email="free-plus@example.com",
+            access_token="token",
+            proxy="http://proxy.example",
+            run_codex=Mock(),
+        )
+
+        self.assertEqual(outcome["pay153"]["checkout_session_kind"], "cs_live")
+        check_plan.assert_called_once_with(
+            "token",
+            proxy=None,
+            browser_transport=None,
+            require_proxy=True,
+            timezone_offset_min="-",
+        )
+        run_pay153.assert_called_once_with(
+            account_id=7,
+            email="free-plus@example.com",
+            access_token="token",
+            proxy="http://proxy.example",
+            browser_transport=None,
+            plan_result=plan_result,
+        )
+        update_plan.assert_called_once_with(acc_id=7, result=plan_result)
+
+    @patch("core.registration_auto_codex.run_registration_auto_pay153")
+    @patch("core.registration_auto_codex.db.update_account_plan_check")
+    @patch("core.registration_auto_codex.db.mark_account_plan_check_running", return_value=True)
+    @patch("core.registration_auto_codex.db.claim_account_plan_check", return_value=True)
+    @patch("core.registration_auto_codex.check_account_plan")
+    @patch("config.register.AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", True, create=True)
+    def test_non_trial_free_account_skips_pay153(
+        self, check_plan, _claim_plan, _mark_running, update_plan, run_pay153
+    ):
+        from core.registration_auto_codex import run_registration_auto_codex
+
+        plan_result = {
+            "ok": True,
+            "current_plan_type": "free",
+            "plus_trial_eligible": False,
+        }
+        check_plan.return_value = plan_result
+        run_pay153.return_value = {"status": "skipped", "ok": True}
+
+        outcome = run_registration_auto_codex(
+            account_id=7,
+            email="free@example.com",
+            access_token="token",
+            run_codex=Mock(),
+        )
+
+        self.assertEqual(outcome["pay153"]["status"], "skipped")
+        run_pay153.assert_called_once_with(
+            account_id=7,
+            email="free@example.com",
+            access_token="token",
+            proxy=None,
+            browser_transport=None,
+            plan_result=plan_result,
+        )
+        update_plan.assert_called_once_with(acc_id=7, result=plan_result)
 
     @patch("time.sleep")
     @patch("core.registration_auto_codex.db.update_account_plan_check")
@@ -349,14 +513,16 @@ class RegistrationAutoCodexTests(unittest.TestCase):
             [
                 call(
                     "token",
-                    proxy="http://broken-proxy.example",
-                    browser_transport=browser_transport,
+                    proxy=None,
+                    browser_transport=None,
+                    require_proxy=True,
                     timezone_offset_min="-",
                 ),
                 call(
                     "token",
-                    proxy="http://broken-proxy.example",
-                    browser_transport=browser_transport,
+                    proxy=None,
+                    browser_transport=None,
+                    require_proxy=True,
                     timezone_offset_min="-",
                 ),
             ],

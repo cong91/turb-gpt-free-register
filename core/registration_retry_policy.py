@@ -33,6 +33,7 @@ _TRANSIENT_MARKERS = (
     "waiting for new otp",
     "等待新 otp",
     "等待邮箱验证码超时",
+    "找不到可点击的重新发送验证码按钮",
 )
 
 
@@ -47,11 +48,6 @@ def should_auto_retry_registration_failure(
     if int(max_attempts or 0) <= int(retry_attempt or 0):
         return False
     message = str(error or "").strip().lower()
-    from core.email_provider import normalize_email_source
-
-    source = normalize_email_source(str(email_source or ""))
-    if "code=602" in message and source == "gmail_api_url":
-        return True
     if not message or any(marker in message for marker in _TERMINAL_MARKERS):
         return False
     return any(marker in message for marker in _TRANSIENT_MARKERS)

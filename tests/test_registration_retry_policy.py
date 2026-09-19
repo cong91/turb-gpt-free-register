@@ -32,8 +32,8 @@ class RegistrationRetryPolicyTests(unittest.TestCase):
             )
         )
 
-    def test_retries_602_only_for_gmail_api_url_source(self):
-        self.assertTrue(
+    def test_does_not_retry_602_for_gmail_api_url_source(self):
+        self.assertFalse(
             should_auto_retry_registration_failure(
                 "Provider error code=602",
                 email_source="gmail_api_url",
@@ -45,6 +45,18 @@ class RegistrationRetryPolicyTests(unittest.TestCase):
             should_auto_retry_registration_failure(
                 "Provider error code=602",
                 email_source="outlook",
+                retry_attempt=0,
+                max_attempts=1,
+            )
+        )
+
+    def test_retries_resend_button_not_found_failure_once(self):
+        # Job 2423: lỗi "找不到可点击的重新发送验证码按钮" xuất phát từ trang 500
+        # tạm thời của auth.openai.com — được xếp loại transient để nhận một job mới.
+        self.assertTrue(
+            should_auto_retry_registration_failure(
+                "RuntimeError: 找不到可点击的重新发送验证码按钮: last=None",
+                email_source="gmail_api_url",
                 retry_attempt=0,
                 max_attempts=1,
             )
