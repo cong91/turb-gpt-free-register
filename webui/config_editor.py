@@ -57,6 +57,10 @@ EDITABLE_FIELDS = [
         "key": "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", "file": "register.py", "type": "bool", "group": "注册方式",
         "label": "Free无Plus试用自动 Codex OAuth", "help": "注册后先查套餐；仅明确为 Free 且没有 Free Plus 试用资格时，直接执行 Codex OAuth。浏览器驱动复用当前注册浏览器。",
     },
+    {
+        "key": "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", "file": "register.py", "type": "bool", "group": "注册方式",
+        "label": "Free Trial自动运行 PAY.153", "help": "注册后先查套餐；仅明确为 Free 且有 Plus 试用资格时运行 PAY.153，并记录 checkout session 类型（oaics/cs_live/cs_test）。",
+    },
 
     # ---- CloakBrowser ----
     {
@@ -389,7 +393,81 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "EMAIL_SOURCE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
-        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,tinyhost,gmail_123452026,paymesh,gmail_api_url；QAN8 仅用于按需购买 Gmail API URL source",
+        "label": "邮箱来源", "help": "可填单个或多个，逗号分隔并按顺序兜底：outlook,generic_api,imap,cloudflare_domain,cloudflare,gptmail,mailnest,cloudmail,tinyhost,gmail_123452026,paymesh,gmail_api_url,automated_email_api,otpmail,bamboommo",
+    },
+    {
+        "key": "EMAIL_API_BASE_URL", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Automated Email API 地址", "help": "填写 Automated Email API 的服务根地址，例如 https://mail.example.com；不要填写 /api/user/email",
+        "storage": "env",
+    },
+    {
+        "key": "EMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "Automated Email API Key", "help": "API Key 保存在 .env，不会写入 config 源码；选择 automated_email_api 时必填",
+        "storage": "env", "secret": True,
+    },
+    {
+        "key": "EMAIL_API_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Automated Email API 请求超时", "help": "单次 API 请求超时秒数",
+    },
+    {
+        "key": "EMAIL_API_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "Automated Email API 轮询间隔", "help": "查询最新邮件的间隔秒数，建议 3-5 秒",
+    },
+    {
+        "key": "OTPGMAIL_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "OTPGmail API 地址", "help": "默认 https://otpgmail.net；填写服务根地址，不要填写 /v1/orders", "storage": "env",
+    },
+    {
+        "key": "OTPGMAIL_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "OTPGmail API Key", "help": "API Key 保存在 .env，不会写入 config 源码；选择 otpmail 时必填", "storage": "env", "secret": True,
+    },
+    {
+        "key": "OTPGMAIL_SERVICE_CODE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "OTPGmail 服务代码", "help": "订单 service 字段；从 GET /v1/services 返回的 code 中选择，当前 OpenAI/ChatGPT 通常为 dr", "storage": "env",
+    },
+    {
+        "key": "OTPGMAIL_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "OTPGmail 请求超时", "help": "单次 OTPGmail HTTP 请求超时秒数",
+    },
+    {
+        "key": "OTPGMAIL_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "OTPGmail 轮询间隔", "help": "查询订单 OTP 的间隔秒数，建议 3-5 秒",
+    },
+    {
+        "key": "OTPGMAIL_OTP_MAX_WAIT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "OTPGmail OTP 最长等待", "help": "每轮等待 OTPGmail 验证码的最长秒数",
+    },
+    {
+        "key": "BAMBOOMMO_API_BASE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "BambooMMO API 地址", "help": "默认 https://api.bamboommo.com；不要填写具体接口路径", "storage": "env",
+    },
+    {
+        "key": "BAMBOOMMO_API_KEY", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "BambooMMO API Key", "help": "选择 bamboommo 时必填，保存在 .env", "storage": "env", "secret": True,
+    },
+    {
+        "key": "BAMBOOMMO_SERVER", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "BambooMMO Server", "help": "只能是 1 或 2；Server 2 支持同一 rental 免费请求后续 OTP",
+    },
+    {
+        "key": "BAMBOOMMO_MAIL_TYPE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "BambooMMO 邮箱类型", "help": "Gmail 固定填写 GM",
+    },
+    {
+        "key": "BAMBOOMMO_SERVICE", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
+        "label": "BambooMMO 服务代码", "help": "Open AI 固定填写 OP",
+    },
+    {
+        "key": "BAMBOOMMO_REQUEST_TIMEOUT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "BambooMMO 请求超时", "help": "单次 API 请求超时秒数",
+    },
+    {
+        "key": "BAMBOOMMO_POLL_INTERVAL", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "BambooMMO 轮询间隔", "help": "查询 OTP 的间隔秒数",
+    },
+    {
+        "key": "BAMBOOMMO_OTP_MAX_WAIT", "file": "email.py", "type": "int", "group": "邮箱 / OTP",
+        "label": "BambooMMO OTP 最长等待", "help": "每轮等待 OTP 的最长秒数",
     },
     {
         "key": "IMAP_MAILBOX", "file": "email.py", "type": "str", "group": "邮箱 / OTP",
@@ -869,8 +947,16 @@ EDITABLE_FIELDS = [
         "label": "HeroSMS 国家", "help": "auto=按实时 cost 从低到高扫描；sticky country 只在同价位优先，较贵 sticky 等低价候选失败后再试；也可填固定 country ID", "storage": "env",
     },
     {
+        "key": "HERO_SMS_MIN_PRICE", "file": "codex.py", "type": "str", "group": "接码平台",
+        "label": "HeroSMS 最低价", "help": "实时 offer 的最低 cost，默认 0.01；仅选择 cost >= 此值且不超过最高价的国家", "storage": "env",
+    },
+    {
         "key": "HERO_SMS_MAX_PRICE", "file": "codex.py", "type": "str", "group": "接码平台",
         "label": "HeroSMS 最高价", "help": "可选硬上限；先尝试低价 offer，逐级升到该价格，绝不超过它；留空不限", "storage": "env",
+    },
+    {
+        "key": "HERO_SMS_COUNTRY_RECOVERY_SECONDS", "file": "codex.py", "type": "int", "group": "接码平台",
+        "label": "HeroSMS 国家恢复探测间隔", "help": "高失败 country 被暂时排除后，经过多少秒重新作为 warm probe 尝试；0 表示每次都允许探测", "storage": "env",
     },
     {
         "key": "HERO_SMS_NUMBER_REJECT_THRESHOLD", "file": "codex.py", "type": "int", "group": "接码平台",

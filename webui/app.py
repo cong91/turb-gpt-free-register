@@ -43,7 +43,7 @@ def _pool_source_arg(default: str = "outlook") -> str:
     if not src and request.method == "POST":
         data = request.get_json(silent=True) or {}
         src = (data.get("source") or data.get("type") or "").strip()
-    return src if src in ("all", "outlook", "generic_api", "imap", "gmail_api_url", "cloudflare_domain") else default
+    return src if src in ("all", "outlook", "generic_api", "imap", "gmail_api_url", "automated_email_api", "otpmail", "bamboommo", "cloudflare_domain") else default
 
 
 
@@ -129,6 +129,7 @@ def _compact_account_for_list(row: dict) -> dict:
         "plan_type", "current_plan_type", "plus_trial_eligible",
         "plan_check_status", "codex_status", "codex_agent_status",
         "totp_setup_status",
+        "pay153_status", "pay153_checkout_session_kind",
         "free_plus_exported_at", "free_plus_export_count", "free_plus_export_format",
         "free_plus_export_source",
     ):
@@ -140,8 +141,10 @@ def _compact_account_for_list(row: dict) -> dict:
 
     # 下面字段仅在有值时返回，避免每行堆满 null/空字符串/内部状态。
     optional_keys = (
-        # 套餐展示补充：付费到期/折扣/失败原因。
-        "plan_check_error", "plan_expires_at", "plan_renews_at", "renews_at",
+        # 套餐展示补充：付费到期/折扣/失败原因，以及上次成功查询时间（供套餐列在
+        # 查询失败时仍能展示已知套餐）。
+        "plan_check_error", "plan_checked_at", "plan_last_success_at",
+        "plan_expires_at", "plan_renews_at", "renews_at",
         "billing_period", "billing_currency", "discount_amount", "discount_type",
         "discount_expires_at", "discount_promo_campaign_id",
         "token_expired", "token_expires_at",
@@ -152,6 +155,17 @@ def _compact_account_for_list(row: dict) -> dict:
         "extract_link_status", "extract_link_type", "extract_link_message", "extract_link_error",
         "extract_link_long_url", "extract_link_copy_paste", "extract_link_image_url_png",
         "extract_link_image_url_svg", "extract_link_expires_at",
+        # PAY.153 registration-time classification; raw session id stays server-side.
+        "pay153_status", "pay153_checkout_session_kind", "pay153_message", "pay153_error",
+        "pay153_recovery_required",
+        "pay153_checkout_url", "pay153_checked_at", "pay153_completed_at",
+        # PAY.153 promotion probe; never expose the raw checkout session id.
+        "pay153_promotion_status", "pay153_promotion_ok", "pay153_promotion_message",
+        "pay153_promotion_error", "pay153_promotion_proxy_country", "pay153_promotion_proxy_mode",
+        "pay153_promotion_checkout_session_kind", "pay153_promotion_amount_verification",
+        "pay153_promotion_plus_trial_eligible_before", "pay153_promotion_plus_trial_eligible_after",
+        "pay153_promotion_checked_at",
+        "pay153_promotion_completed_at",
         # Codex / Agent 状态提示。
         "codex_error", "codex_agent_message", "codex_agent_runtime_id",
         "twofa_status", "twofa_error",
@@ -250,6 +264,34 @@ def _read_log_tail(path, *, max_bytes: int, default_running: bool = False, runni
             pass
     return {"ok": True, "log": content, "running": running}
 
+def _reenqueue_recovered_plan_checks(account_ids: list[int]) -> None:
+    """重启后自动重新入队 token 仍可用的套餐查询，替代人工重新查询。"""
+    from core.plan_check_service import enqueue_account_plan_check
+
+    for acc_id in account_ids:
+        try:
+            account = db.get_account(int(acc_id))
+            if not isinstance(account, dict):
+                continue
+            queued = enqueue_account_plan_check(
+                account_id=int(acc_id),
+                email=str(account.get("email") or ""),
+                access_token=str(account.get("access_token") or ""),
+                trigger="startup_recovery",
+            )
+        except Exception:
+            logger.exception("[Plan] 启动恢复重新入队套餐查询异常: id=%s", acc_id)
+            continue
+        if queued.get("accepted"):
+            logger.info("[Plan] 启动恢复已重新入队套餐查询: id=%s", acc_id)
+        elif queued.get("error"):
+            logger.warning(
+                "[Plan] 启动恢复重新入队套餐查询失败: id=%s, error=%s",
+                acc_id,
+                queued.get("error"),
+            )
+
+
 def create_app(auth_code: str | None = None) -> Flask:
     app = Flask(__name__, template_folder="templates")
     _prepared_downloads: dict[str, dict] = {}
@@ -337,12 +379,17 @@ def create_app(auth_code: str | None = None) -> Flask:
     from webui.sub2api_automation_api import register_sub2api_automation_routes
 
     register_sub2api_automation_routes(app)
-    recovered_plan_checks = db.recover_interrupted_plan_checks()
+    plan_check_recovery = db.recover_interrupted_plan_checks()
+    recovered_plan_checks = plan_check_recovery.get("recovered") or []
     if recovered_plan_checks:
-        logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", recovered_plan_checks)
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的套餐查询状态", len(recovered_plan_checks))
+        _reenqueue_recovered_plan_checks(plan_check_recovery.get("requeueable") or [])
     recovered_extract_links = db.recover_interrupted_extract_links()
     if recovered_extract_links:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的提链状态", recovered_extract_links)
+    recovered_pay153 = db.recover_interrupted_pay153()
+    if recovered_pay153:
+        logger.warning("已恢复 %s 个因 WebUI 重启中断的 PAY.153 状态，请确认后重试", recovered_pay153)
     recovered_live_checks = db.recover_interrupted_live_checks()
     if recovered_live_checks:
         logger.warning("已恢复 %s 个因 WebUI 重启中断的查活状态", recovered_live_checks)
@@ -374,13 +421,26 @@ def create_app(auth_code: str | None = None) -> Flask:
             if src in ("gptmail", "mailnest", "cloudmail", "cloudflare"):
                 continue
             if src not in summaries:
-                summaries[src] = (
-                    db.generic_api_email_pool_summary() if src == "generic_api"
-                    else db.imap_email_pool_summary() if src == "imap"
-                    else db.gmail_api_url_email_pool_summary() if src == "gmail_api_url"
-                    else db.domain_email_pool_summary() if src == "cloudflare_domain"
-                    else db.outlook_pool_summary()
-                )
+                if src == "automated_email_api":
+                    from core.automated_email_api_client import pool_summary
+
+                    summaries[src] = pool_summary()
+                elif src == "otpmail":
+                    from core.otpgmail_client import pool_summary
+
+                    summaries[src] = pool_summary()
+                elif src == "bamboommo":
+                    from core.bamboommo_client import pool_summary
+
+                    summaries[src] = pool_summary()
+                else:
+                    summaries[src] = (
+                        db.generic_api_email_pool_summary() if src == "generic_api"
+                        else db.imap_email_pool_summary() if src == "imap"
+                        else db.gmail_api_url_email_pool_summary() if src == "gmail_api_url"
+                        else db.domain_email_pool_summary() if src == "cloudflare_domain"
+                        else db.outlook_pool_summary()
+                    )
             one = summaries[src]
             for k in pool:
                 pool[k] += int(one.get(k, 0) or 0)
@@ -411,6 +471,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=500, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        pay153_kind = str(request.args.get("pay153_kind", default="") or "").strip().lower()
         twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
         codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
         totp_filter = str(
@@ -439,6 +500,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 "offset": offset,
                 "archived": archived,
                 "plan_filter": plan_filter,
+                "pay153_kind_filter": pay153_kind or None,
                 "twofa_filter": twofa_filter,
                 "codex_filter": codex_filter,
                 "q": q,
@@ -460,6 +522,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             "limit": limit,
             "archived": archived,
             "plan_filter": plan_filter,
+            "pay153_kind_filter": pay153_kind or None,
             "twofa_filter": twofa_filter,
             "codex_filter": codex_filter,
             "q": q,
@@ -481,6 +544,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=5001, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        pay153_kind = str(request.args.get("pay153_kind", default="") or "").strip().lower()
         twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
         codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
         q = str(request.args.get("q", default="") or "").strip()
@@ -497,6 +561,7 @@ def create_app(auth_code: str | None = None) -> Flask:
             "limit": normalized_limit,
             "archived": archived,
             "plan_filter": plan_filter,
+            "pay153_kind_filter": pay153_kind or None,
             "twofa_filter": twofa_filter,
             "codex_filter": codex_filter,
             "q": q,
@@ -543,6 +608,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         limit = request.args.get("limit", default=5000, type=int)
         archived = str(request.args.get("archived", default="0") or "0").lower()
         plan_filter = str(request.args.get("plan", default="") or "").lower()
+        pay153_kind = str(request.args.get("pay153_kind", default="") or "").strip().lower()
         twofa_filter = str(request.args.get("twofa_status", default="") or "").strip().lower()
         codex_filter = str(request.args.get("codex_status", default="") or "").strip().lower()
         totp_filter = str(
@@ -571,6 +637,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 "offset": offset,
                 "archived": archived,
                 "plan_filter": plan_filter,
+                "pay153_kind_filter": pay153_kind or None,
                 "twofa_filter": twofa_filter,
                 "codex_filter": codex_filter,
                 "q": q,
@@ -591,6 +658,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 "limit": max(1, min(5000, limit)),
                 "archived": archived,
                 "plan_filter": plan_filter,
+                "pay153_kind_filter": pay153_kind or None,
                 "twofa_filter": twofa_filter,
                 "codex_filter": codex_filter,
                 "q": q,
@@ -1038,6 +1106,59 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not queued.get("accepted"):
             return jsonify({"ok": False, **queued}), 503
         return jsonify({"ok": True, "started": True, **queued}), 202
+
+    @app.post("/api/accounts/<int:acc_id>/pay153/retry")
+    def api_account_pay153_retry(acc_id: int):
+        """显式重试 PAY.153；中断状态必须由操作者确认后才会再次 checkout。"""
+        data = request.get_json(silent=True) or {}
+        from core.registration_auto_pay153 import enqueue_registration_pay153_retry
+
+        queued = enqueue_registration_pay153_retry(
+            account_id=acc_id,
+            proxy=data.get("proxy") if "proxy" in data else None,
+            confirm_ambiguous_checkout=data.get("confirm_ambiguous_checkout") is True,
+        )
+        if queued.get("recovery_required"):
+            return jsonify({"ok": False, **queued}), 409
+        if queued.get("busy"):
+            return jsonify({"ok": False, **queued}), 409
+        if not queued.get("accepted"):
+            status = 404 if queued.get("error") == "账号不存在" else 503
+            return jsonify({"ok": False, **queued}), status
+        return jsonify({"ok": True, "started": True, **queued}), 202
+
+    @app.post("/api/accounts/<int:acc_id>/pay153/promotion")
+    def api_account_pay153_promotion(acc_id: int):
+        """使用越南代理把 Free 账号的 PAY.153 promotion probe 加入后台队列。"""
+        acc = db.get_account(acc_id)
+        if not acc:
+            return jsonify({"ok": False, "error": "账号不存在"}), 404
+        token = str(acc.get("access_token") or "").strip()
+        if not token:
+            return jsonify({"ok": False, "error": "该账号没有 access_token"}), 400
+
+        raw_data = request.get_json(silent=True)
+        data = raw_data if isinstance(raw_data, dict) else {}
+        queued = plan_check_service.enqueue_account_plan_check(
+            account_id=int(acc.get("id") or acc_id),
+            email=acc.get("email") or "",
+            access_token=token,
+            trigger="manual_pay153_promotion",
+            # The worker owns route selection and must use rotating/proxy-pool
+            # policy; do not accept a direct or browser-supplied route here.
+            proxy=None,
+            timezone_offset_min=str(data.get("timezone_offset_min") or "-"),
+        )
+        if queued.get("busy"):
+            return jsonify({"ok": False, **queued}), 409
+        if not queued.get("accepted"):
+            return jsonify({"ok": False, **queued}), 503
+        return jsonify({
+            "ok": True,
+            "started": True,
+            "message": "Promotion VN đã được đưa vào hàng đợi PAY.153",
+            **queued,
+        }), 202
 
     @app.post("/api/accounts/check-plan-bulk")
     def api_accounts_check_plan_bulk():
@@ -1834,7 +1955,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         page_size_arg = request.args.get("page_size", default=None, type=int)
         # Gmail API URL remains a legacy JSON-backed pool; the all-source view
         # merges it with the SQLite-backed pools until that store is migrated.
-        if source in ("all", "gmail_api_url"):
+        if source in ("all", "gmail_api_url", "automated_email_api", "otpmail", "bamboommo"):
             fetch_limit = 1_000_000 if (paged or q) else limit
             if source == "all":
                 rows = []
@@ -1842,10 +1963,34 @@ def create_app(auth_code: str | None = None) -> Flask:
                 rows += _with_pool_source(db.list_generic_api_email_pool(status=status, limit=fetch_limit), "generic_api")
                 rows += _with_pool_source(db.list_imap_email_pool(status=status, limit=fetch_limit), "imap")
                 rows += _with_pool_source(db.list_gmail_api_url_email_pool(status=status, limit=fetch_limit), "gmail_api_url")
+                from core.automated_email_api_client import (
+                    list_accounts as list_automated_email_accounts,
+                )
+                rows += list_automated_email_accounts(status=status, limit=fetch_limit)
+                from core.otpgmail_client import list_accounts as list_otpmail_accounts
+
+                rows += list_otpmail_accounts(status=status, limit=fetch_limit)
+                from core.bamboommo_client import list_accounts as list_bamboommo_accounts
+
+                rows += list_bamboommo_accounts(status=status, limit=fetch_limit)
                 rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
                 rows = sorted(rows, key=lambda x: str(x.get("created_at") or x.get("imported_at") or x.get("used_at") or ""), reverse=True)
-            else:
+            elif source == "gmail_api_url":
                 rows = _with_pool_source(db.list_gmail_api_url_email_pool(status=status, limit=fetch_limit), "gmail_api_url")
+            elif source == "automated_email_api":
+                from core.automated_email_api_client import (
+                    list_accounts as list_automated_email_accounts,
+                )
+                rows = list_automated_email_accounts(status=status, limit=fetch_limit)
+            else:
+                if source == "bamboommo":
+                    from core.bamboommo_client import list_accounts as list_bamboommo_accounts
+
+                    rows = list_bamboommo_accounts(status=status, limit=fetch_limit)
+                else:
+                    from core.otpgmail_client import list_accounts as list_otpmail_accounts
+
+                    rows = list_otpmail_accounts(status=status, limit=fetch_limit)
             if q:
                 rows = [r for r in rows if _matches_query(r, q)]
             if paged or page_arg is not None or page_size_arg is not None:
@@ -1989,6 +2134,15 @@ def create_app(auth_code: str | None = None) -> Flask:
             db.release_imap_email(email, status=status, note=data.get("note"))
         elif source == "gmail_api_url":
             db.release_gmail_api_url_email(email, status=status, note=data.get("note"))
+        elif source == "automated_email_api":
+            from core.automated_email_api_client import release_account
+            release_account(email, status=status, note=data.get("note"))
+        elif source == "otpmail":
+            from core.otpgmail_client import release_account
+            release_account(email, status=status, note=data.get("note"))
+        elif source == "bamboommo":
+            from core.bamboommo_client import release_account
+            release_account(email, status=status, note=data.get("note"))
         elif source == "cloudflare_domain":
             db.release_domain_email(email, status=status, note=data.get("note"))
         else:
@@ -2051,6 +2205,15 @@ def create_app(auth_code: str | None = None) -> Flask:
                     db.release_imap_email(email, status=status, note=note)
                 elif item_source == "gmail_api_url":
                     db.release_gmail_api_url_email(email, status=status, note=note)
+                elif item_source == "automated_email_api":
+                    from core.automated_email_api_client import release_account
+                    release_account(email, status=status, note=note)
+                elif item_source == "otpmail":
+                    from core.otpgmail_client import release_account
+                    release_account(email, status=status, note=note)
+                elif item_source == "bamboommo":
+                    from core.bamboommo_client import release_account
+                    release_account(email, status=status, note=note)
                 elif item_source == "cloudflare_domain":
                     db.release_domain_email(email, status=status, note=note)
                 else:
@@ -2073,11 +2236,22 @@ def create_app(auth_code: str | None = None) -> Flask:
         if not email:
             return jsonify({"ok": False, "error": "email 为空"}), 400
         source = (data.get("source") or _pool_source_arg()).strip()
-        deleted = (
-            db.delete_gmail_api_url_email(email)
-            if source == "gmail_api_url"
-            else db.delete_email_pool(email, source=source)
-        )
+        if source == "gmail_api_url":
+            deleted = db.delete_gmail_api_url_email(email)
+        elif source == "automated_email_api":
+            from core.automated_email_api_client import delete_account
+
+            deleted = delete_account(email)
+        elif source == "otpmail":
+            from core.otpgmail_client import delete_account
+
+            deleted = delete_account(email)
+        elif source == "bamboommo":
+            from core.bamboommo_client import delete_account
+
+            deleted = delete_account(email)
+        else:
+            deleted = db.delete_email_pool(email, source=source)
         return jsonify({"ok": True, "deleted": deleted})
 
     @app.post("/api/outlook/delete-bulk")
@@ -2108,11 +2282,22 @@ def create_app(auth_code: str | None = None) -> Flask:
             if key in seen:
                 continue
             seen.add(key)
-            deleted_ok = (
-                db.delete_gmail_api_url_email(email)
-                if item_source == "gmail_api_url"
-                else db.delete_email_pool(email, source=item_source)
-            )
+            if item_source == "gmail_api_url":
+                deleted_ok = db.delete_gmail_api_url_email(email)
+            elif item_source == "automated_email_api":
+                from core.automated_email_api_client import delete_account
+
+                deleted_ok = delete_account(email)
+            elif item_source == "otpmail":
+                from core.otpgmail_client import delete_account
+
+                deleted_ok = delete_account(email)
+            elif item_source == "bamboommo":
+                from core.bamboommo_client import delete_account
+
+                deleted_ok = delete_account(email)
+            else:
+                deleted_ok = db.delete_email_pool(email, source=item_source)
             if deleted_ok:
                 deleted.append({"email": email, "source": item_source})
             else:

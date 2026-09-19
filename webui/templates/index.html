@@ -2364,6 +2364,9 @@
             <option value="">Theo cấu hình hiện tại</option>
             <option value="gmail_123452026">Gmail CDK</option>
             <option value="gmail_api_url">Gmail API URL (shop.qan8.com)</option>
+            <option value="automated_email_api">Automated Email API Gmail</option>
+            <option value="otpmail">OTPGmail</option>
+            <option value="bamboommo">BambooMMO Gmail</option>
             <option value="paymesh">Paymesh (MAIL card)</option>
             <option value="tinyhost">TinyHost email tạm</option>
           </select>
@@ -2469,6 +2472,9 @@
             <select id="accountSourceFilterV2">
               <option value="">Tất cả nguồn</option>
               <option value="gmail_api_url">Gmail API URL (shop.qan8.com)</option>
+              <option value="automated_email_api">Automated Email API Gmail</option>
+              <option value="otpmail">OTPGmail</option>
+              <option value="bamboommo">BambooMMO Gmail</option>
               <option value="paymesh">Paymesh</option>
               <option value="gmail_123452026">Gmail CDK</option>
               <option value="outlook">Outlook</option>
@@ -2504,6 +2510,15 @@
               <option value="team">Team</option>
               <option value="go">Go</option>
               <option value="unknown">Chưa kiểm tra</option>
+            </select>
+          </label>
+          <label class="acc-v2-field">
+            <span>Link PAY.153</span>
+            <select id="accountPay153KindFilterV2" title="Lọc theo loại link thanh toán PAY.153 đã tạo">
+              <option value="">Tất cả loại link</option>
+              <option value="cs_live">cs_live</option>
+              <option value="oaics">oaics</option>
+              <option value="unknown">Chưa có link</option>
             </select>
           </label>
         </div>
@@ -2777,7 +2792,7 @@
       </div>
       <div class="table-wrap">
         <table class="accounts-table extract-workspace-table">
-          <thead><tr><th class="col-check"><input type="checkbox" id="extractWorkspaceAll"></th><th>ID</th><th>Email</th><th>Plan</th><th>Extract status</th><th>Result</th></tr></thead>
+          <thead><tr><th class="col-check"><input type="checkbox" id="extractWorkspaceAll"></th><th>ID</th><th>Email</th><th>Plan</th><th>Extract status</th><th>PAY.153 type</th><th>Result</th></tr></thead>
           <tbody id="extractWorkspaceBody"></tbody>
         </table>
       </div>
@@ -2875,6 +2890,7 @@
             <button type="button" class="outlook-v2-select-item" data-value="outlook" role="option">Outlook 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="generic_api" role="option">通用 API 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="gmail_api_url" role="option">Gmail API URL 邮箱池</button>
+            <button type="button" class="outlook-v2-select-item" data-value="bamboommo" role="option">BambooMMO Gmail 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="imap" role="option">通用 IMAP 邮箱池</button>
             <button type="button" class="outlook-v2-select-item" data-value="cloudflare_domain" role="option">域名邮箱池</button>
           </div>
@@ -3787,6 +3803,9 @@ async function loadAccountDomainOptions(force = false) {
 function getAccountsPlanFilter() {
   return ($('#accountPlanFilterV2')?.value || '').trim();
 }
+function getAccountsPay153KindFilter() {
+  return ($('#accountPay153KindFilterV2')?.value || '').trim();
+}
 function getAccountsTwofaFilter() {
   return ($('#accountTwofaFilterV2')?.value || '').trim();
 }
@@ -3808,6 +3827,7 @@ function getAccountFilterParams() {
   return {
     archived: SHOW_ARCHIVED_ACCOUNTS ? 'only' : '0',
     plan: getAccountsPlanFilter(),
+    pay153_kind: getAccountsPay153KindFilter(),
     twofa_status: getAccountsTwofaFilter(),
     email_source: getAccountSourceFilter(),
     email_domain: getAccountDomainFilter(),
@@ -3829,6 +3849,7 @@ function getActiveAccountFilterLabels() {
     ['accountRegistrationDriverFilterV2', 'Provider'],
     ['accountDomainFilterV2', 'Đuôi mail'],
     ['accountPlanFilterV2', 'Gói'],
+    ['accountPay153KindFilterV2', 'Link PAY.153'],
     ['accountTwofaFilterV2', '2FA'],
     ['totpStatusFilterV2', 'TOTP'],
     ['codexStatusFilterV2', 'Codex'],
@@ -4031,6 +4052,28 @@ function _discountLabel(r) {
   if (!Number.isNaN(n)) return `${n}折扣`;
   return `${amount}折扣`;
 }
+function _pay153PromotionStatus(r) {
+  const status = String(r.pay153_promotion_status || '').toLowerCase();
+  if (!status) return '';
+  if (status === 'queued' || status === 'running') return 'Promotion VN: đang xử lý';
+  if (status === 'success' || r.pay153_promotion_ok === true) {
+    return r.pay153_promotion_plus_trial_eligible_after === true
+      ? 'Promotion VN: có thể Free Trial'
+      : 'Promotion VN: đã kiểm tra';
+  }
+  if (status === 'skipped') return 'Promotion VN: đã bỏ qua';
+  if (status === 'failed') return 'Promotion VN: thất bại';
+  return `Promotion VN: ${esc(status)}`;
+}
+function _pay153KindLine(r) {
+  const kind = String(r.pay153_checkout_session_kind || '').toLowerCase();
+  if (!kind || kind === 'unknown') return '';
+  const url = String(r.pay153_checkout_url || '');
+  const actions = url
+    ? ` · <a href="${esc(url)}" target="_blank" rel="noopener">Thanh toán</a> · <button type="button" class="extract-link-btn" onclick="copyText('${esc(url)}'); return false;">Copy link</button>`
+    : '';
+  return `<div class="acc-v2-sub">Link: ${esc(kind)}${actions}</div>`;
+}
 function _planCell(r) {
   const ok = r.plan_check_ok;
   const err = r.plan_check_error || '';
@@ -4049,25 +4092,38 @@ function _planCell(r) {
     const detail = stamp ? `${queued ? '入队' : '开始'}: ${esc(stamp)}` : '';
     return `<span class="pill status-running" title="${detail}">${label}</span>`;
   }
-  if (err || r.plan_check_status === 'failed') {
+  const planFailed = Boolean(err) || r.plan_check_status === 'failed';
+  const knownPlan = Boolean(plan) && plan !== '-';
+  const retryLoginBtn = planFailed
+    ? ` <button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this); return false;" title="Login lại để lấy AT mới; thành công sẽ tự động kiểm tra lại gói">Login lại lấy AT</button>`
+    : '';
+  if (planFailed && !knownPlan) {
     const reason = err || '套餐查询失败，未返回具体原因';
     const hasLastSuccess = Boolean(r.plan_last_success_at);
     const lastPlan = hasLastSuccess ? `${plan}${r.plus_trial_eligible ? '/可Plus试用' : ''}` : '';
     const lastText = lastPlan ? `（上次: ${lastPlan}）` : '';
     const lastTitle = hasLastSuccess ? `上次成功: ${esc(r.plan_last_success_at)}` : '';
-    return `<div class="extract-link-cell"><span class="pill status-failed" title="${[esc(reason), lastTitle].filter(Boolean).join('；')}">查询失败${esc(lastText)}</span><div class="extract-link-error" title="${esc(reason)}">${esc(reason)}</div></div>`;
+    return `<div class="extract-link-cell"><span class="pill status-failed" title="${[esc(reason), lastTitle].filter(Boolean).join('；')}">查询失败${esc(lastText)}</span><div class="extract-link-error" title="${esc(reason)}">${esc(reason)}${retryLoginBtn}</div></div>`;
   }
+  const failureNote = planFailed
+    ? (err || '套餐查询失败，未返回具体原因')
+    : '';
   const lower = plan.toLowerCase();
 
   if (lower === 'free') {
     const checkedOk = ok === true || r.plan_check_status === 'success';
-    if (!checkedOk) {
+    if (!checkedOk && !failureNote) {
       return `<span class="pill status-running" title="${title}">${esc(plan)}（待查资格）</span>`;
     }
     const text = r.plus_trial_eligible ? 'free(可Plus试用)' : 'free';
     const cls = r.plus_trial_eligible ? 'status-success' : 'status-used';
-    const t = r.plus_trial_eligible ? `${title}；Plus 试用资格可用` : title;
-    return `<span class="pill ${cls}" title="${t}">${esc(text)}</span>`;
+    const promotion = _pay153PromotionStatus(r);
+    const promotionDetail = r.pay153_promotion_error || r.pay153_promotion_message || '';
+    const t = [
+      r.plus_trial_eligible ? `${title}；Plus 试用资格可用` : title,
+      promotionDetail ? `Promotion VN: ${esc(promotionDetail)}` : '',
+    ].filter(Boolean).join('；');
+    return `<div class="extract-link-cell"><span class="pill ${cls}" title="${t}">${esc(text)}</span>${promotion ? `<div class="acc-v2-sub" title="${t}">${promotion}</div>` : ''}${failureNote ? `<div class="extract-link-error" title="${esc(failureNote)}">查询失败: ${esc(failureNote)}${retryLoginBtn}</div>` : ''}${_pay153KindLine(r)}</div>`;
   }
 
   const cls = 'status-success';
@@ -4086,7 +4142,10 @@ function _planCell(r) {
   if (r.plan_renews_at) detail.push(`续费时间: ${r.plan_renews_at}`);
   if (r.discount_expires_at) detail.push(`折扣结束: ${r.discount_expires_at}`);
   if (r.discount_promo_campaign_id) detail.push(`优惠: ${r.discount_promo_campaign_id}`);
-  return `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
+  const planPill = `<span class="pill ${cls}" title="${esc(detail.join('；'))}">${esc(text)}</span>`;
+  const kindLine = _pay153KindLine(r);
+  if (!failureNote && !kindLine) return planPill;
+  return `<div class="extract-link-cell">${planPill}${kindLine}${failureNote ? `<div class="extract-link-error" title="${esc(failureNote)}">查询失败: ${esc(failureNote)}${retryLoginBtn}</div>` : ''}</div>`;
 }
 function _planAction(r) {
   if (['queued','running'].includes(r.plan_check_status)) {
@@ -4096,6 +4155,17 @@ function _planAction(r) {
     return `<button data-plan-check="${esc(r.id)}" disabled title="套餐查询正在执行，完成后可再次查询">${label}</button>`;
   }
   return `<button data-plan-check="${esc(r.id)}" title="查询当前套餐；free 账号会检查 Plus 试用资格">查套餐</button>`;
+}
+function _pay153PromotionAction(r) {
+  const plan = (r.current_plan_type || r.plan_type || '').toString().toLowerCase();
+  if (plan !== 'free') return '';
+  if (['queued', 'running'].includes(r.plan_check_status)) {
+    const ownTask = r.plan_check_trigger === 'manual_pay153_promotion';
+    return `<button type="button" data-account-pay153-promotion="${esc(r.id)}" disabled title="Promotion VN 必须等当前套餐查询任务完成">${ownTask ? 'Promotion VN处理中…' : '等待套餐查询…'}</button>`;
+  }
+  const status = String(r.pay153_promotion_status || '').toLowerCase();
+  const label = status === 'success' || r.pay153_promotion_ok === true ? '重试 Promotion VN' : '应用 Promotion VN';
+  return `<button type="button" data-account-pay153-promotion="${esc(r.id)}" title="使用越南代理通过 PAY.153 检查 promotion，并复查 Free Trial 资格">${label}</button>`;
 }
 function _codexAction(r) {
   const s = r.codex_status || '';
@@ -4131,9 +4201,14 @@ function _accountsV2MoreMenu(r) {
     `<button type="button" data-account-copy-secret="copy_line" data-account-id="${esc(r.id)}">复制整行</button>`,
     `<button type="button" data-account-note="${esc(r.id)}" title="设置/清空该账号备注">备注</button>`,
     `<button type="button" onclick="checkSelectedLive([Number('${esc(r.id)}')], this); return false;" title="重新登录该账号，成功则刷新最新 AT/accessToken">查活刷新AT</button>`,
+    ...(r.pay153_checkout_url ? [
+      `<button type="button" onclick="window.open('${esc(r.pay153_checkout_url)}', '_blank'); return false;" title="Mở link thanh toán PAY.153 (${esc(r.pay153_checkout_session_kind || '')}) trong tab mới">Mở link PAY.153</button>`,
+      `<button type="button" onclick="copyText('${esc(r.pay153_checkout_url)}'); return false;" title="Copy link thanh toán PAY.153 (${esc(r.pay153_checkout_session_kind || '')})">Copy link PAY.153</button>`,
+    ] : []),
     `<button type="button" data-account-live-log="${esc(r.email)}" title="查看该账号最近一次查活日志">查活日志</button>`,
     `<button type="button" data-account-totp-log="${esc(r.email)}" title="查看该账号最近一次 2FA 设置日志">2FA日志</button>`,
     _planAction(r),
+    _pay153PromotionAction(r),
     _codexAction(r),
     `<button type="button" data-codex-log="${esc(r.email)}" title="查看该账号最近一次 Codex 补跑日志">补跑日志</button>`,
     `<button type="button" data-account-archive="${esc(r.id)}" data-archived="${r.archived ? '0' : '1'}" title="${r.archived ? '恢复到默认账号列表' : '归档后默认账号列表不再显示'}">${r.archived ? '恢复' : '归档'}</button>`,
@@ -4760,6 +4835,12 @@ async function onAccountsBodyClick(e) {
     return;
   }
 
+  const promotionBtn = e.target.closest('[data-account-pay153-promotion]');
+  if (promotionBtn) {
+    await applyPay153Promotion(Number(promotionBtn.dataset.accountPay153Promotion), promotionBtn);
+    return;
+  }
+
   const twofaBtn = e.target.closest('[data-account-twofa-reactivate]');
   if (twofaBtn) {
     const id = Number(twofaBtn.dataset.accountTwofaReactivate);
@@ -4952,7 +5033,7 @@ async function applyAccountsArchivedFilter(on) {
 async function resetAccountFilters() {
   const ids = [
     'qAccountsV2', 'accountSourceFilterV2', 'accountRegistrationDriverFilterV2',
-    'accountDomainFilterV2', 'accountPlanFilterV2', 'accountTwofaFilterV2',
+    'accountDomainFilterV2', 'accountPlanFilterV2', 'accountPay153KindFilterV2', 'accountTwofaFilterV2',
     'totpStatusFilterV2', 'codexStatusFilterV2', 'freePlusExportFilterV2',
     'accountLocaleFilterV2', 'dateFromAccountsV2', 'dateToAccountsV2',
   ];
@@ -5000,7 +5081,7 @@ async function refreshAccountsList(btn) {
   if (localeV2) localeV2.addEventListener('input', debounce(refreshForFilter, 250));
   [
     'accountSourceFilterV2', 'accountRegistrationDriverFilterV2', 'accountDomainFilterV2',
-    'accountPlanFilterV2', 'accountTwofaFilterV2', 'totpStatusFilterV2',
+    'accountPlanFilterV2', 'accountPay153KindFilterV2', 'accountTwofaFilterV2', 'totpStatusFilterV2',
     'codexStatusFilterV2', 'freePlusExportFilterV2',
   ].forEach(id => document.getElementById(id)?.addEventListener('change', refreshForFilter));
 
@@ -5380,6 +5461,31 @@ async function checkOnePlan(id, btn) {
   }
 }
 
+async function applyPay153Promotion(id, btn) {
+  const account = ACCOUNTS.find(row => Number(row.id) === Number(id));
+  if (!account) { showToast('账号不存在'); return; }
+  const plan = (account.current_plan_type || account.plan_type || '').toString().toLowerCase();
+  if (plan !== 'free') { showToast('只有 Free 账号可以应用 Promotion VN'); return; }
+  if (!confirm(`使用越南代理应用 Promotion VN？\n\n${account.email || ('#' + id)}\n\n将通过 PAY.153 检查 promotion，并重新查询 Free Trial 资格。`)) return;
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '入队中…';
+  try {
+    const r = await api(`/api/accounts/${encodeURIComponent(id)}/pay153/promotion`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    showToast(r.message || 'Promotion VN 已加入 PAY.153 队列');
+    await loadAccounts();
+    await pollAccountPlanStatuses();
+  } catch (err) {
+    showToast('应用 Promotion VN 失败: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = old;
+  }
+}
+
 let EXTRACT_WORKSPACE_ACCOUNTS = [];
 let EXTRACT_WORKSPACE_SELECTED = new Set();
 let EXTRACT_WORKSPACE_METHODS = [];
@@ -5417,8 +5523,9 @@ function extractWorkspaceRender() {
     const status = acc.extract_link_status || '';
     const link = acc.extract_link_long_url || acc.extract_link_copy_paste || '';
     const planLabel = acc.plus_trial_eligible ? 'Free Plus' : (acc.current_plan_type || acc.plan_type || 'unknown');
-    return `<tr><td><input type="checkbox" data-extract-workspace-id="${esc(acc.id)}" ${checked ? 'checked' : ''}></td><td>${esc(acc.id)}</td><td title="${esc(acc.email || '')}">${esc(acc.email || '-')}</td><td>${esc(planLabel)}</td><td>${esc(status || 'ready')}${acc.extract_link_message ? `<div class="sub-cell">${esc(acc.extract_link_message)}</div>` : ''}</td><td class="wrap">${link ? `<button type="button" class="extract-link-btn extract-copy" data-copy-extract="${esc(link)}">复制链接</button>` : '-'}</td></tr>`;
-  }).join('') || '<tr><td colspan="6" class="muted">没有可用的 Free Plus 账号</td></tr>';
+    const pay153Type = acc.pay153_checkout_session_kind || '-';
+    return `<tr><td><input type="checkbox" data-extract-workspace-id="${esc(acc.id)}" ${checked ? 'checked' : ''}></td><td>${esc(acc.id)}</td><td title="${esc(acc.email || '')}">${esc(acc.email || '-')}</td><td>${esc(planLabel)}</td><td>${esc(status || 'ready')}${acc.extract_link_message ? `<div class="sub-cell">${esc(acc.extract_link_message)}</div>` : ''}</td><td>${esc(pay153Type)}${acc.pay153_status && acc.pay153_status !== 'success' ? `<div class="sub-cell">${esc(acc.pay153_status)}</div>` : ''}</td><td class="wrap">${link ? `<button type="button" class="extract-link-btn extract-copy" data-copy-extract="${esc(link)}">复制链接</button> <button type="button" class="extract-link-btn extract-qr" data-extract-qr="${esc(acc.id)}">QR/Mở link</button>` : '-'}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">没有可用的 Free Plus 账号</td></tr>';
   $('#btnExtractWorkspaceRun').disabled = EXTRACT_WORKSPACE_SELECTED.size === 0;
   $('#extractWorkspaceAll').checked = EXTRACT_WORKSPACE_ACCOUNTS.length > 0 && EXTRACT_WORKSPACE_SELECTED.size === EXTRACT_WORKSPACE_ACCOUNTS.length;
 }
@@ -5476,7 +5583,25 @@ $('#btnExtractWorkspaceRefresh')?.addEventListener('click', loadExtractWorkspace
 $('#btnExtractWorkspaceSelectAll')?.addEventListener('click', () => { EXTRACT_WORKSPACE_SELECTED = new Set(EXTRACT_WORKSPACE_ACCOUNTS.map(acc => Number(acc.id))); extractWorkspaceRender(); });
 $('#extractWorkspaceAll')?.addEventListener('change', e => { EXTRACT_WORKSPACE_SELECTED = e.target.checked ? new Set(EXTRACT_WORKSPACE_ACCOUNTS.map(acc => Number(acc.id))) : new Set(); extractWorkspaceRender(); });
 $('#extractWorkspaceBody')?.addEventListener('change', e => { const cb = e.target.closest('[data-extract-workspace-id]'); if (!cb) return; const id = Number(cb.dataset.extractWorkspaceId); if (cb.checked) EXTRACT_WORKSPACE_SELECTED.add(id); else EXTRACT_WORKSPACE_SELECTED.delete(id); extractWorkspaceRender(); });
-$('#extractWorkspaceBody')?.addEventListener('click', e => { const btn = e.target.closest('[data-copy-extract]'); if (btn) copyText(btn.dataset.copyExtract); });
+$('#extractWorkspaceBody')?.addEventListener('click', e => {
+  const btn = e.target.closest('[data-copy-extract]');
+  if (btn) copyText(btn.dataset.copyExtract);
+  const qrBtn = e.target.closest('[data-extract-qr]');
+  if (qrBtn) {
+    const account = EXTRACT_WORKSPACE_ACCOUNTS.find(row => Number(row.id) === Number(qrBtn.dataset.extractQr));
+    if (!account) return;
+    const link = account.extract_link_long_url || account.extract_link_copy_paste || '';
+    if (!link) return;
+    if (account.extract_link_image_url_png) {
+      openQrModal(account.extract_link_image_url_png);
+    } else if (/^https?:/i.test(link)) {
+      // MoMo OAICS returns a pm-redirects.stripe.com authorization page that renders the QR.
+      window.open(link, '_blank', 'noopener');
+    } else {
+      copyText(link);
+    }
+  }
+});
 $('#btnExtractWorkspaceRun')?.addEventListener('click', runExtractWorkspace);
 
 async function generateOneCodexAgent(id, btn) {
@@ -6029,6 +6154,7 @@ const POOL_SOURCE_LABELS = {
   outlook: 'Outlook 邮箱池',
   generic_api: '通用 API 邮箱池',
   gmail_api_url: 'Gmail API URL 邮箱池',
+  bamboommo: 'BambooMMO Gmail 邮箱池',
   imap: '通用 IMAP 邮箱池',
   cloudflare_domain: '域名邮箱池',
 };
@@ -6052,7 +6178,7 @@ function getOutlookQuery() {
 }
 function poolKey(r) { return `${r.source || getPoolSource() || 'outlook'}|${r.email || ''}`; }
 function poolLabel(src) {
-  return ({outlook:'Outlook', generic_api:'通用API', gmail_api_url:'Gmail API URL', imap:'通用IMAP', cloudflare_domain:'域名邮箱'})[src] || src || '-';
+  return ({outlook:'Outlook', generic_api:'通用API', gmail_api_url:'Gmail API URL', bamboommo:'BambooMMO Gmail', imap:'通用IMAP', cloudflare_domain:'域名邮箱'})[src] || src || '-';
 }
 async function loadOutlook() {
   try {
@@ -6094,7 +6220,7 @@ function _outlookTokenCell(r) {
   return `<span class="acc-v2-token-none">无Token</span>`;
 }
 function _outlookAliasCell(r) {
-  if (r.source !== 'gmail_api_url' || r.alias_total == null) {
+  if (!['gmail_api_url', 'bamboommo'].includes(r.source) || r.alias_total == null) {
     return '<span class="acc-v2-alias-count is-empty">-</span>';
   }
   const available = Number(r.alias_available || 0);
@@ -6910,6 +7036,9 @@ function emailConfigSectionForKey(key) {
   if (['USE_EMAIL_SERVICE','REGISTER_EMAIL','REGISTER_NAME','OTP_MAX_WAIT','TWOFA_OTP_MAX_WAIT','OTP_POLL_INTERVAL','EMAIL_SOURCE'].includes(key)) {
     return ['通用邮箱 / OTP', '邮箱来源选择、OTP 等待参数、手动邮箱等通用设置'];
   }
+  if (key.startsWith('EMAIL_API_')) return ['Automated Email API', 'Automated Email API Gmail mailbox、alias 和 OTP 收信配置'];
+  if (key.startsWith('OTPGMAIL_')) return ['OTPGmail', 'OTPGmail Gmail order、邮箱和 OTP 轮询配置'];
+  if (key.startsWith('BAMBOOMMO_')) return ['BambooMMO', 'BambooMMO Gmail rental、12 alias 和后续 OTP 配置'];
   if (key.startsWith('GMAIL_123452026_')) return ['Gmail CDK', 'Gmail provider API、quota 和 HTTP 安全设置；batch CDK 请在注册任务页输入'];
   if (key.startsWith('QAN8_')) return ['QAN8 Gmail API', 'QAN8 API、SKU 和 lazy source lane 配置'];
   if (key.startsWith('GPTMAIL_')) return ['GPTMail', 'GPTMail 临时邮箱 API 配置'];
@@ -7115,6 +7244,15 @@ function getAutoCodexForFreeValue() {
   const fv = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, f.key) ? CONFIG_PENDING_UPDATES[f.key] : f.value;
   return !!fv;
 }
+function getAutoPay153ForFreeTrialField() {
+  return (CONFIG || []).find(f => f.key === 'AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER') || null;
+}
+function getAutoPay153ForFreeTrialValue() {
+  const f = getAutoPay153ForFreeTrialField();
+  if (!f) return false;
+  const fv = Object.prototype.hasOwnProperty.call(CONFIG_PENDING_UPDATES, f.key) ? CONFIG_PENDING_UPDATES[f.key] : f.value;
+  return !!fv;
+}
 function registrationDriverLabel(value) {
   const cur = String(value || '').trim().toLowerCase();
   const hit = registrationDriverChoices().find(c => String(c.value) === cur);
@@ -7168,7 +7306,7 @@ function renderRegistrationDriverCard() {
     labelEl.textContent = label;
     labelEl.classList.toggle('is-placeholder', !label || label === '—');
   }
-  if (hintEl) hintEl.textContent = `驱动标识: ${cur} · 自动查套餐: ${getAutoPlanCheckValue() ? '开' : '关'} · Free无Plus自动Codex: ${getAutoCodexForFreeValue() ? '开' : '关'}`;
+  if (hintEl) hintEl.textContent = `驱动标识: ${cur} · 自动查套餐: ${getAutoPlanCheckValue() ? '开' : '关'} · Free无Plus自动Codex: ${getAutoCodexForFreeValue() ? '开' : '关'} · Free Trial自动PAY.153: ${getAutoPay153ForFreeTrialValue() ? '开' : '关'}`;
 }
 function renderRegistrationDriverField(f) {
   return `
@@ -7183,7 +7321,8 @@ function renderRegistrationSettingsSection(fields) {
   const driver = fields.find(f => f.key === 'REGISTRATION_DRIVER') || fields[0];
   const autoPlan = fields.find(f => f.key === 'AUTO_PLAN_CHECK_AFTER_REGISTER');
   const autoCodex = fields.find(f => f.key === 'AUTO_CODEX_FOR_FREE_AFTER_REGISTER');
-  const switches = [autoPlan, autoCodex].filter(Boolean);
+  const autoPay153 = fields.find(f => f.key === 'AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER');
+  const switches = [autoPlan, autoCodex, autoPay153].filter(Boolean);
   return `
     <div class="config-section-v2-body config-section-v2-body--single">
       ${driver ? renderRegistrationDriverField(driver) : '<div class="banner warn">未找到注册方式配置项</div>'}
@@ -7586,7 +7725,7 @@ function renderConfigSectionV2(name, fields) {
       name,
       fields,
       emailConfigSectionForKey,
-      ['通用邮箱 / OTP', 'Gmail CDK', 'GPTMail', 'MailNest', 'CloudMail', 'TinyHost', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
+      ['通用邮箱 / OTP', 'Gmail CDK', 'Automated Email API', 'OTPGmail', 'GPTMail', 'MailNest', 'CloudMail', 'TinyHost', 'Outlook 邮箱池', 'Cloudflare 临时邮箱', 'Cloudflare 域名邮箱', '其他邮箱配置'],
       { get: () => CONFIG_EMAIL_ACTIVE_SECTION_V2, set: v => { CONFIG_EMAIL_ACTIVE_SECTION_V2 = v; } },
       'email-section-v2'
     );
@@ -8108,7 +8247,7 @@ function trackConfigFieldChange(e) {
   const f = CONFIG.find(x => x.key === el.dataset.key);
   if (!f) return;
   CONFIG_PENDING_UPDATES[f.key] = readConfigElementValue(el, f);
-  if (['AUTO_PLAN_CHECK_AFTER_REGISTER', 'AUTO_CODEX_FOR_FREE_AFTER_REGISTER'].includes(f.key)) renderRegistrationDriverCard();
+  if (['AUTO_PLAN_CHECK_AFTER_REGISTER', 'AUTO_CODEX_FOR_FREE_AFTER_REGISTER', 'AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER'].includes(f.key)) renderRegistrationDriverCard();
 }
 $('#tab-config').addEventListener('input', trackConfigFieldChange);
 $('#tab-config').addEventListener('change', trackConfigFieldChange);

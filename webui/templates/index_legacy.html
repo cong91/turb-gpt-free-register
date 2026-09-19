@@ -609,7 +609,7 @@
         <div class="row"><button class="btn" id="btnExtractWorkspaceRefresh">刷新 Free Plus</button><button class="btn" id="btnExtractWorkspaceSelectAll">全选</button><button class="btn primary" id="btnExtractWorkspaceRun" disabled>生成 Checkout Link</button></div>
         <div id="extractWorkspaceStatus" class="banner info" hidden></div>
       </div>
-      <div class="table-wrap"><table class="accounts-table"><thead><tr><th><input type="checkbox" id="extractWorkspaceAll"></th><th>ID</th><th>邮箱</th><th>套餐</th><th>提链状态</th><th>结果</th></tr></thead><tbody id="extractWorkspaceBody"></tbody></table></div>
+      <div class="table-wrap"><table class="accounts-table"><thead><tr><th><input type="checkbox" id="extractWorkspaceAll"></th><th>ID</th><th>邮箱</th><th>套餐</th><th>提链状态</th><th>PAY.153 类型</th><th>结果</th></tr></thead><tbody id="extractWorkspaceBody"></tbody></table></div>
     </section>
   </div>
 
@@ -2070,8 +2070,9 @@ function extractWorkspaceRender() {
   body.innerHTML = EXTRACT_WORKSPACE_ACCOUNTS.map(acc => {
     const link = acc.extract_link_long_url || acc.extract_link_copy_paste || '';
     const planLabel = acc.plus_trial_eligible ? 'Free Plus' : (acc.current_plan_type || acc.plan_type || 'unknown');
-    return `<tr><td><input type="checkbox" data-extract-workspace-id="${esc(acc.id)}" ${EXTRACT_WORKSPACE_SELECTED.has(Number(acc.id)) ? 'checked' : ''}></td><td>${esc(acc.id)}</td><td>${esc(acc.email || '-')}</td><td>${esc(planLabel)}</td><td>${esc(acc.extract_link_status || 'ready')}${acc.extract_link_message ? `<div class="sub-cell">${esc(acc.extract_link_message)}</div>` : ''}</td><td>${link ? cbtn('复制链接', link) : '-'}</td></tr>`;
-  }).join('') || '<tr><td colspan="6" class="muted">没有可用的 Free Plus 账号</td></tr>';
+    const pay153Type = acc.pay153_checkout_session_kind || '-';
+    return `<tr><td><input type="checkbox" data-extract-workspace-id="${esc(acc.id)}" ${EXTRACT_WORKSPACE_SELECTED.has(Number(acc.id)) ? 'checked' : ''}></td><td>${esc(acc.id)}</td><td>${esc(acc.email || '-')}</td><td>${esc(planLabel)}</td><td>${esc(acc.extract_link_status || 'ready')}${acc.extract_link_message ? `<div class="sub-cell">${esc(acc.extract_link_message)}</div>` : ''}</td><td>${esc(pay153Type)}${acc.pay153_status && acc.pay153_status !== 'success' ? `<div class="sub-cell">${esc(acc.pay153_status)}</div>` : ''}</td><td>${link ? cbtn('复制链接', link) : '-'}</td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">没有可用的 Free Plus 账号</td></tr>';
   $('#btnExtractWorkspaceRun').disabled = EXTRACT_WORKSPACE_SELECTED.size === 0;
   $('#extractWorkspaceAll').checked = EXTRACT_WORKSPACE_ACCOUNTS.length > 0 && EXTRACT_WORKSPACE_SELECTED.size === EXTRACT_WORKSPACE_ACCOUNTS.length;
 }
