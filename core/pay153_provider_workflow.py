@@ -369,6 +369,70 @@ def _preflight_campaign(
             pass
 
 
+def _preflight_momo_processor(
+    token: str,
+    account_id: str,
+    proxy: str | None,
+    device_id: str,
+    did: str,
+    log: Callable[[str], None],
+) -> str:
+    """Return the account's billing processor entity before a MoMo checkout.
+
+    Live evidence (2026-09-19): accounts whose billing processor is openai_llc
+    get Stripe cs_live custom checkouts that publish only card/link, so the
+    OAICS MoMo route (native momo / cpmt_*) can never engage.  Returns "" when
+    the processor cannot be read, letting the flow proceed and fail with its
+    own diagnostics.
+    """
+    http = stripe_checkout.build_http(proxy)
+    try:
+        http.cookies.set("oai-did", did, domain="chatgpt.com")
+        response = http.get(
+            "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Origin": "https://chatgpt.com",
+                "Referer": "https://chatgpt.com/",
+                "OAI-Device-Id": device_id,
+                "ChatGPT-Account-ID": account_id or "",
+            },
+            timeout=35,
+        )
+        if response.status_code != 200:
+            log(f"MoMo processor pre-check HTTP {response.status_code}")
+            return ""
+        payload = response.json()
+        accounts = payload.get("accounts") if isinstance(payload, dict) else {}
+        if not isinstance(accounts, dict):
+            return ""
+        ordered = []
+        if account_id and isinstance(accounts.get(account_id), dict):
+            ordered.append(accounts[account_id])
+        ordered.extend(
+            value for key, value in accounts.items()
+            if key != account_id and isinstance(value, dict)
+        )
+        for entry in ordered:
+            account = entry.get("account") if isinstance(entry.get("account"), dict) else {}
+            processor = account.get("processor") if isinstance(account.get("processor"), dict) else {}
+            primary = processor.get("a001") if isinstance(processor.get("a001"), dict) else {}
+            entity = str(primary.get("processor_entity") or "").strip()
+            if entity:
+                return entity
+        log("MoMo processor pre-check found no billing processor entity")
+        return ""
+    except Exception as exc:  # noqa: BLE001
+        log(f"MoMo processor pre-check note: {type(exc).__name__}")
+        return ""
+    finally:
+        try:
+            http.close()
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+
 def _update_promotion(
     http: Any,
     token: str,
@@ -1042,6 +1106,24 @@ def run_provider_checkout(
     did = str(uuid.uuid4())
     campaign_id = _preflight_campaign(token, str(metadata.get("account_id") or ""), promotion_proxy or entry_proxy, device_id, did, log)
     campaign_id = campaign_id or "plus-1-month-free"
+    if provider == "momo":
+        processor_entity = _preflight_momo_processor(
+            token,
+            str(metadata.get("account_id") or ""),
+            promotion_proxy or entry_proxy,
+            device_id,
+            did,
+            log,
+        )
+        if processor_entity and processor_entity != "openai_ie":
+            # Terminal on purpose: the processor assignment is per account and
+            # will not change between checkout attempts, so fail fast instead
+            # of burning the retry budget on proxy rotations.
+            raise RuntimeError(
+                f"MOMO_PROCESSOR_UNSUPPORTED: tài khoản dùng billing processor {processor_entity} "
+                "(Stripe, cs_live) — MoMo chỉ được OpenAI phát hành trên nhánh OAICS openai_ie; "
+                "hãy chọn tài khoản openai_ie hoặc đổi rail khác"
+            )
     checkout_proxy = payment_proxy if provider in {"paypal", "upi", "ideal", "twint"} else entry_proxy
     momo_promo_on_create = provider == "momo" and local_method_strategy == "standalone"
     try:
