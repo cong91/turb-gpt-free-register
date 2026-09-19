@@ -273,14 +273,12 @@ def _generate_password(length: int = 14) -> str:
     upper = string.ascii_uppercase
     lower = string.ascii_lowercase
     digits = string.digits
-    symbols = "!@#$%^&*"
     chars = [
         random.choice(upper),
         random.choice(lower),
         random.choice(digits),
-        random.choice(symbols),
     ]
-    pool = upper + lower + digits + symbols
+    pool = upper + lower + digits
     chars.extend(random.choice(pool) for _ in range(max(0, length - len(chars))))
     random.shuffle(chars)
     return "".join(chars)
@@ -2966,6 +2964,22 @@ def run_browser_use_registration(
                     twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                     db.update_account_2fa(account_id, status="failed", error=twofa_error)
                     logger.error("[%s] 2FA 设置失败，账号已保留待重试：%s", provider_prefix, twofa_error)
+                    try:
+                        from core.registration_auto_pay153 import enqueue_registration_auto_pay153
+
+                        enqueue_registration_auto_pay153(
+                            account_id=account_id,
+                            email=email,
+                            access_token=access_token,
+                            proxy=proxy,
+                        )
+                    except Exception as queue_exc:  # noqa: BLE001 - preserve the checkpointed account.
+                        logger.warning(
+                            "[PAY.153][%s] 2FA 失败后的自动任务未入队: %s: %s",
+                            provider_prefix,
+                            type(queue_exc).__name__,
+                            str(queue_exc)[:180],
+                        )
                     return {"success": False, "email": email, "account_id": account_id, "access_token": access_token, "twofa_status": twofa_status, "twofa_error": twofa_error, "error": f"2FA 设置失败，账号已保存：{twofa_error}"}
 
             codex_result = {
@@ -3018,6 +3032,7 @@ def run_browser_use_registration(
                 post_auth_automation_enabled = bool(
                     getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                     or free_codex_auto_enabled
+                    or bool(getattr(_register_cfg, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False))
                     or codex_auto_enabled
                 )
                 if post_auth_automation_enabled:
@@ -3120,7 +3135,7 @@ def run_browser_use_registration(
             "success": False,
             "email": email,
             "network_traffic": network_traffic,
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            "error": f"{type(exc).__name__}: {str(exc)[:800]}",
         }
     finally:
         # 任务结束统一关闭连接，避免云浏览器/CDP 残留占用。

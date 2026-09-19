@@ -446,6 +446,21 @@ def run_cloak_registration(
                         f"{twofa_error}; 浏览器重启 3 次后仍无法完成 email OTP/2FA: "
                         f"{str(recovery.get('message') or 'unknown error')[:300]}"
                     )
+                try:
+                    from core.registration_auto_pay153 import enqueue_registration_auto_pay153
+
+                    enqueue_registration_auto_pay153(
+                        account_id=account_id,
+                        email=email,
+                        access_token=access_token,
+                        proxy=proxy,
+                    )
+                except Exception as queue_exc:  # noqa: BLE001 - preserve the checkpointed account.
+                    logger.warning(
+                        "[PAY.153][Cloak注册] 2FA 失败后的自动任务未入队: %s: %s",
+                        type(queue_exc).__name__,
+                        str(queue_exc)[:180],
+                    )
                 logger.error("[Cloak注册] 2FA 设置失败，账号已保留待重试：%s", twofa_error)
                 return {"success": False, "email": email, "account_id": account_id, "access_token": access_token, "twofa_status": twofa_status, "twofa_error": twofa_error, "error": f"2FA 设置失败，账号已保存：{twofa_error}"}
 
@@ -494,6 +509,7 @@ def run_cloak_registration(
             post_auth_automation_enabled = bool(
                 getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                 or free_codex_auto_enabled
+                or bool(getattr(_register_cfg, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False))
                 or codex_auto_enabled
             )
             if post_auth_automation_enabled:
@@ -569,7 +585,7 @@ def run_cloak_registration(
             "success": False,
             "email": email,
             "network_traffic": network_traffic,
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            "error": f"{type(exc).__name__}: {str(exc)[:800]}",
         }
     finally:
         if traffic_tracker is not None:

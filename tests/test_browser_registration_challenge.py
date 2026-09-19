@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from core import browser_registration
 from core.browser_challenge import (
     browser_challenge_state as _browser_challenge_state,
 )
@@ -461,6 +462,41 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
 
         self.assertEqual(result, "otp")
         wait_for_challenge.assert_called_once()
+
+    def test_email_input_wait_rechecks_late_browser_challenge(self):
+        driver = Mock(current_url="https://chatgpt.com/auth/login")
+        email_input = object()
+        with (
+            patch(
+                "core.browser_registration._find_any",
+                side_effect=[RuntimeError("email input is not mounted"), email_input],
+            ) as find_any,
+            patch(
+                "core.browser_registration._email_entry_state",
+                return_value={
+                    "url": "https://chatgpt.com/auth/login",
+                    "title": "Chờ một chút...",
+                    "inputs": [],
+                    "actions": [],
+                },
+            ),
+            patch(
+                "core.browser_registration._browser_challenge_state",
+                return_value={"is_challenge": True, "reason": "chờ một chút"},
+            ),
+            patch(
+                "core.browser_registration._wait_for_browser_challenge",
+                return_value={"is_challenge": False},
+            ) as wait_for_challenge,
+            patch("core.browser_registration._click_email_entry_option", return_value=False),
+            patch("core.browser_registration.time.sleep"),
+        ):
+            result = browser_registration._wait_for_email_input(driver, timeout=1)
+
+        self.assertIs(result, email_input)
+        self.assertEqual(find_any.call_count, 2)
+        wait_for_challenge.assert_called_once()
+        self.assertIs(wait_for_challenge.call_args.args[0], driver)
 
     def test_navigation_script_string_does_not_break_page_state_checks(self):
         driver = _StringStateDriver()

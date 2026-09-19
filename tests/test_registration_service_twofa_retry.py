@@ -321,7 +321,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertTrue(run_registration.call_args.kwargs["force_refresh_proxy"])
 
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
-    def test_provider_602_queues_fresh_gmail_api_url_job_on_same_lane(self):
+    def test_provider_602_does_not_queue_fresh_gmail_api_url_job(self):
         provider_context = {
             "gmail_api_url_batch_id": "batch-1",
             "gmail_api_url_lane_id": 0,
@@ -358,15 +358,8 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
             registration_service._run_one_job(source["id"], source["log_file"])
 
-        jobs = db.list_jobs(limit=10)
-        child = next(job for job in jobs if job["id"] != source["id"])
-        self.assertEqual(child["parent_job_id"], source["id"])
-        self.assertNotEqual(
-            child["provider_context"]["gmail_api_url_batch_id"],
-            provider_context["gmail_api_url_batch_id"],
-        )
-        self.assertEqual(child["provider_context"]["gmail_api_url_lane_id"], 0)
-        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(db.list_jobs(limit=10)), 1)
+        self.assertEqual(submitted, [])
         release_email.assert_called_once_with(
             "alias+one@gmail.com",
             "Provider error code=602",

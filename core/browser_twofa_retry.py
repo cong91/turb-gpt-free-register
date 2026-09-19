@@ -125,6 +125,7 @@ def _run_twofa_retry_in_profile(
                 post_auth_automation_enabled = bool(
                     getattr(register_config, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                     or getattr(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+                    or getattr(register_config, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False)
                     or getattr(codex_config, "ENABLE_CODEX_AUTO", False)
                 )
                 if post_auth_automation_enabled:

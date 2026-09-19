@@ -670,6 +670,31 @@ def _wait_for_email_input(driver, timeout: int | None = None):
         except Exception as exc:  # noqa: BLE001
             last_state = {"native_locator_error": f"{type(exc).__name__}: {exc}"}
         last_state = _email_entry_state(driver)
+        try:
+            challenge_state = _browser_challenge_state(driver)
+        except Exception as exc:  # noqa: BLE001 - a state probe must not hide the original lookup failure.
+            logger.debug(
+                "%s 浏览器 challenge 状态读取失败，继续等待邮箱输入框：%s",
+                _log_prefix(driver),
+                str(exc)[:160],
+            )
+            challenge_state = {}
+        if isinstance(challenge_state, dict) and challenge_state.get("is_challenge"):
+            remaining = max(0.0, end - time.time())
+            logger.warning(
+                "%s 查找邮箱输入框期间检测到浏览器 challenge，等待 challenge 完成：url=%s title=%s reason=%s",
+                _log_prefix(driver),
+                str(challenge_state.get("url") or last_state.get("url") or "")[:180],
+                str(challenge_state.get("title") or last_state.get("title") or "")[:120],
+                str(challenge_state.get("reason") or "")[:120],
+            )
+            if remaining <= 0:
+                break
+            _wait_for_browser_challenge(
+                driver,
+                timeout=min(float(_registration_timeout(driver)), remaining),
+            )
+            continue
         if not clicked_email_option and _click_email_entry_option(driver):
             clicked_email_option = True
             time.sleep(1.0)
@@ -1466,6 +1491,48 @@ def _clear_otp_inputs(driver) -> None:
         pass
 
 
+def _is_chrome_error_page(driver) -> bool:
+    """Trang hiện tại là trang lỗi trình duyệt/máy chủ (chrome-error://, HTTP 500)."""
+    try:
+        url = str(driver.current_url or "").lower()
+    except Exception:  # noqa: BLE001
+        url = ""
+    if url.startswith("chrome-error://") or "net::err_" in url:
+        return True
+    state = _email_otp_page_state(driver)
+    if not isinstance(state, dict):
+        return False
+    errors = state.get("errors")
+    if not isinstance(errors, (list, tuple)):
+        errors = []
+    text = f"{state.get('text') or ''} {' '.join(str(e) for e in errors)}".lower()
+    return "http error 500" in text or "isn't working" in text or "isn’t working" in text
+
+
+def _resend_or_restart_email_otp(driver, email: str) -> None:
+    """Trigger OTP mới.
+
+    Ưu tiên bấm nút resend; nhưng khi trang đã rơi vào chrome-error/HTTP 500
+    (auth.openai.com thỉnh thoảng trả 500 ngay sau khi submit OTP), trên trang lỗi
+    không bao giờ có nút resend — khi đó phải mở lại login page và submit lại email
+    (giống _restart_email_otp_flow bên browser_use) thay vì chờ 25s rồi fail cả job.
+    """
+    if _is_chrome_error_page(driver):
+        logger.warning(
+            "%s[OTP] Trang xác thực là trang lỗi (chrome-error/HTTP 500)，mở lại login page và submit lại email để trigger OTP mới",
+            _log_prefix(driver),
+        )
+        _reset_login_page_for_retry(driver)
+        _check_manual_stop()
+        next_state = _submit_email_and_wait_next(driver, email, attempts=2)
+        if next_state == "otp":
+            _click_continue_with_password_link(driver)
+            _check_manual_stop()
+            _fill_password_page_if_present(driver, email, timeout=25)
+        return
+    _click_resend_email_otp(driver, timeout=25)
+
+
 def _click_resend_email_otp(driver, timeout: int = 20) -> dict:
     """点击重新发送邮箱验证码。优先按 DOM 属性识别，文本仅兜底。"""
     end = time.time() + timeout
@@ -1594,7 +1661,7 @@ def _complete_email_otp(
                     email,
                     stage="registration_email_resend",
                 )
-                _click_resend_email_otp(driver, timeout=25)
+                _resend_or_restart_email_otp(driver, email)
                 human_delay("api")
                 continue
 
@@ -1647,7 +1714,7 @@ def _complete_email_otp(
         )
         if previous_submitted_otp and not otp_before_code:
             otp_before_code = current_otp
-        _click_resend_email_otp(driver, timeout=25)
+        _resend_or_restart_email_otp(driver, email)
         human_delay("api")
         current_otp = None
 
@@ -1988,12 +2055,11 @@ def _fill_birthday_or_age(driver, birthday: str, age: int) -> str | None:
 
 
 def _generate_roxy_password() -> str:
-    """参考 FlowPilot 密码策略：8~64 位，含大小写、数字、符号。"""
+    """14 位密码，仅含大小写字母和数字，避免符号方便人工登录时手输。"""
     upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ'
     lower = 'abcdefghjkmnpqrstuvwxyz'
     digits = '23456789'
-    symbols = '!@#$%^&*?_-+=' 
-    groups = [upper, lower, digits, symbols]
+    groups = [upper, lower, digits]
     all_chars = ''.join(groups)
     chars = [random.choice(g) for g in groups]
     while len(chars) < 14:
@@ -2242,8 +2308,12 @@ def _fill_password_page_if_present(driver, email: str, timeout: int = 25) -> str
         # Force password: không click passwordless OTP, luôn fill password (yêu cầu user).
         # _click_passwordless_signup_if_present đã bị bỏ để không bao giờ đi OTP-only.
         if is_login_password:
-            logger.info("%s 当前是登录密码页（已注册邮箱），跳过密码填写：state=%s", _log_prefix(driver), last)
-            return None
+            # 与 _wait_email_submit_next_state 的 login_password 分支同语义：邮箱已注册，
+            # 继续走 OTP 流程只会停在密码页，必须在进入取码前停用该邮箱。
+            raise RuntimeError(
+                f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: "
+                f"url={getattr(driver, 'current_url', '') or 'https://auth.openai.com/log-in/password'}"
+            )
         password = _registration_password()
         logger.info("%s 检测到 create-account/password，准备设置密码（%s 位）：email=%s", _log_prefix(driver), len(password), email)
         result = driver.execute_script(r"""
@@ -2811,6 +2881,21 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str | Non
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
                 logger.error("[Roxy注册] 2FA 设置失败，账号已保留待重试：%s", twofa_error)
+                try:
+                    from core.registration_auto_pay153 import enqueue_registration_auto_pay153
+
+                    enqueue_registration_auto_pay153(
+                        account_id=account_id,
+                        email=email,
+                        access_token=access_token,
+                        proxy=proxy,
+                    )
+                except Exception as queue_exc:  # noqa: BLE001 - preserve the checkpointed account.
+                    logger.warning(
+                        "[PAY.153][Roxy注册] 2FA 失败后的自动任务未入队: %s: %s",
+                        type(queue_exc).__name__,
+                        str(queue_exc)[:180],
+                    )
                 return {
                     "success": False,
                     "email": email,
@@ -2868,6 +2953,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str | Non
             post_auth_automation_enabled = bool(
                 getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                 or free_codex_auto_enabled
+                or bool(getattr(_register_cfg, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False))
                 or bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False))
             )
             if post_auth_automation_enabled:
@@ -2961,7 +3047,7 @@ def run_roxy_registration(email: str, name: str, birthday: str, proxy: str | Non
             "success": False,
             "email": email,
             "network_identity": network_identity,
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            "error": f"{type(exc).__name__}: {str(exc)[:800]}",
         }
     finally:
         if driver and not bool(_cfg.ROXY_KEEP_BROWSER_OPEN):

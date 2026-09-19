@@ -1,7 +1,8 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 from core import db, registration_service
 
@@ -55,6 +56,118 @@ class RegistrationNetworkIdentityPersistenceTests(unittest.TestCase):
 
         self.assertEqual(job["status"], "failed")
         self.assertEqual(job["network_identity"], identity)
+
+    def test_automated_alias_holds_mailbox_lock_through_failure_cleanup(self):
+        job = db.create_job(email_source="automated_email_api")
+        mailbox_lock = MagicMock()
+
+        def run_registration(**_kwargs):
+            self.assertTrue(mailbox_lock.acquire.called)
+            self.assertFalse(mailbox_lock.release.called)
+            return {"success": False, "email": "alias@gmail.com", "error": "failed"}
+
+        def release_email(*_args, **_kwargs):
+            self.assertTrue(mailbox_lock.acquire.called)
+            self.assertFalse(mailbox_lock.release.called)
+            return False
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "core.automated_email_api_client.get_account_context",
+            return_value=SimpleNamespace(query_email="source@gmail.com"),
+        ), patch(
+            "core.automated_email_api_client.registration_mailbox_lock",
+            return_value=mailbox_lock,
+        ), patch(
+            "main.run_registration", side_effect=run_registration
+        ), patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+            side_effect=release_email,
+        ):
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        mailbox_lock.acquire.assert_called_once_with()
+        mailbox_lock.release.assert_called_once_with()
+
+    def test_otpmail_alias_holds_order_lock_through_failure_cleanup(self):
+        job = db.create_job(email_source="otpmail")
+        order_lock = MagicMock()
+        released = []
+
+        def run_registration(**_kwargs):
+            self.assertTrue(order_lock.acquire.called)
+            self.assertFalse(order_lock.release.called)
+            return {"success": False, "email": "root@gmail.com", "error": "failed"}
+
+        def release_email(*_args, **_kwargs):
+            self.assertTrue(order_lock.acquire.called)
+            self.assertFalse(order_lock.release.called)
+            released.append((_args, _kwargs))
+            return False
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "core.automated_email_api_client.get_account_context",
+            return_value=None,
+        ), patch(
+            "core.otpgmail_client.get_account_context",
+            return_value=SimpleNamespace(order_id="order-1"),
+        ), patch(
+            "core.otpgmail_client.registration_order_lock",
+            return_value=order_lock,
+        ), patch(
+            "main.run_registration", side_effect=run_registration
+        ), patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+            side_effect=release_email,
+        ):
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        order_lock.acquire.assert_called_once_with()
+        order_lock.release.assert_called_once_with()
+        self.assertEqual(
+            released,
+            [(("alias@gmail.com", "failed"), {"discard_on_failure": True})],
+        )
+
+    def test_otpmail_stop_preserves_assigned_alias_when_driver_returns_parent_mailbox(self):
+        job = db.create_job(email_source="otpmail")
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias@gmail.com", "Test User", "1990-01-01"),
+        ), patch.object(
+            registration_service,
+            "_activate_job",
+            return_value=True,
+        ), patch.object(
+            registration_service,
+            "is_stop_requested",
+            side_effect=[False, True],
+        ), patch(
+            "core.otpgmail_client.get_account_context",
+            return_value=SimpleNamespace(order_id="order-1"),
+        ), patch(
+            "core.otpgmail_client.registration_order_lock",
+            return_value=MagicMock(),
+        ), patch(
+            "main.run_registration",
+            return_value={"success": False, "email": "root@gmail.com"},
+        ), patch.object(
+            registration_service,
+            "_release_unconsumed_job_email",
+        ):
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        self.assertEqual(db.get_job(job["id"])["email"], "alias@gmail.com")
 
 
 if __name__ == "__main__":

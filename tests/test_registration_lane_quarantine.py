@@ -17,7 +17,7 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
         registration_service._STOP_EVENTS.clear()
         registration_service._ACTIVE_JOBS.clear()
 
-    def test_gmail_api_url_602_does_not_cancel_jobs_sharing_proxy_lane(self):
+    def test_gmail_api_url_602_cancels_jobs_sharing_code_url_batch(self):
         jobs = [
             {
                 "id": 10,
@@ -25,6 +25,7 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
                 "email_source": "gmail_api_url",
                 "provider_context": {
                     "gmail_api_url_batch_id": "batch-1",
+                    "gmail_api_url_source_slot": 0,
                     "proxy_lane_id": 0,
                 },
             },
@@ -34,6 +35,7 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
                 "email_source": "gmail_api_url",
                 "provider_context": {
                     "gmail_api_url_batch_id": "batch-1",
+                    "gmail_api_url_source_slot": 0,
                     "proxy_lane_id": 0,
                 },
             },
@@ -43,6 +45,7 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
                 "email_source": "gmail_api_url",
                 "provider_context": {
                     "gmail_api_url_batch_id": "batch-1",
+                    "gmail_api_url_source_slot": 1,
                     "proxy_lane_id": 1,
                 },
             },
@@ -51,7 +54,14 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
         registration_service._STOP_EVENTS[10] = threading.Event()
 
         with (
-            patch.object(registration_service.db, "get_job", return_value=jobs[0]),
+            patch.object(
+                registration_service.db,
+                "get_job",
+                side_effect=lambda job_id: next(
+                    (job for job in jobs if int(job["id"]) == int(job_id)),
+                    None,
+                ),
+            ),
             patch.object(registration_service.db, "list_jobs", return_value=jobs),
             patch.object(registration_service.db, "update_job") as update_job,
             patch.object(
@@ -64,7 +74,14 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
                 "core.gmail_api_url_client.quarantine_code_url",
                 return_value=2,
             ) as quarantine_url,
+            patch(
+                "core.gmail_api_url_batch_store.GmailApiUrlBatchStore"
+            ) as store_class,
         ):
+            store_class.return_value.list_job_ids_for_code_url.return_value = ["10"]
+            store_class.return_value.list_batch_ids_for_code_urls.return_value = ["batch-1"]
+            store_class.return_value.source_slots_for_code_url.return_value = {0}
+            store_class.return_value.cancel_waiter.return_value = True
             result = registration_service.quarantine_provider_lane(
                 job_id=10,
                 source="gmail_api_url",
@@ -76,16 +93,25 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
             "https://mail.example/broken",
             reason="Provider error code=602",
         )
-        fail_source.assert_called_once_with(
-            "https://mail.example/broken",
-            note="Provider error code=602",
-        )
+        fail_source.assert_called_once()
+        self.assertEqual(fail_source.call_args.args[0], "https://mail.example/broken")
+        self.assertEqual(fail_source.call_args.kwargs["note"], "Provider error code=602")
         self.assertFalse(registration_service._STOP_EVENTS[10].is_set())
-        self.assertEqual(result["cancelled"], 0)
+        self.assertEqual(result["cancelled"], 1)
         self.assertEqual(result["stopping"], 0)
-        update_job.assert_not_called()
+        update_job.assert_called_once_with(
+            11,
+            status="cancelled",
+            error="邮箱来源已因 code_url 故障停止，取消同源任务: Provider error code=602",
+            completed_at=unittest.mock.ANY,
+        )
+        store_class.return_value.cancel_waiter.assert_called_once_with(
+            "batch-1",
+            "11",
+            "邮箱来源已因 code_url 故障停止，取消同源任务: Provider error code=602",
+        )
 
-    def test_gmail_api_url_without_batch_does_not_cancel_same_proxy_lane(self):
+    def test_gmail_api_url_602_does_not_cancel_unrelated_proxy_lane(self):
         jobs = [
             {
                 "id": 30,
@@ -105,7 +131,6 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
 
         with (
             patch.object(registration_service.db, "get_job", return_value=jobs[0]),
-            patch.object(registration_service.db, "list_jobs", return_value=jobs),
             patch.object(registration_service.db, "update_job") as update_job,
             patch.object(
                 registration_service.db,
@@ -117,7 +142,11 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
                 "core.gmail_api_url_client.quarantine_code_url",
                 return_value=0,
             ) as quarantine_url,
+            patch(
+                "core.gmail_api_url_batch_store.GmailApiUrlBatchStore"
+            ) as store_class,
         ):
+            store_class.return_value.list_job_ids_for_code_url.return_value = ["30"]
             result = registration_service.quarantine_provider_lane(
                 job_id=30,
                 source="gmail_api_url",
@@ -131,11 +160,227 @@ class RegistrationLaneQuarantineTests(unittest.TestCase):
             "https://mail.example/broken",
             reason="Provider error code=602",
         )
-        fail_source.assert_called_once_with(
-            "https://mail.example/broken",
-            note="Provider error code=602",
-        )
+        fail_source.assert_called_once()
+        self.assertEqual(fail_source.call_args.args[0], "https://mail.example/broken")
+        self.assertEqual(fail_source.call_args.kwargs["note"], "Provider error code=602")
         update_job.assert_not_called()
+
+    def test_gmail_api_url_602_requests_stop_for_other_running_source_job(self):
+        jobs = [
+            {
+                "id": 40,
+                "status": "running",
+                "email_source": "gmail_api_url",
+                "provider_context": {
+                    "gmail_api_url_batch_id": "batch-2",
+                    "gmail_api_url_source_slot": 0,
+                },
+            },
+            {
+                "id": 41,
+                "status": "running",
+                "email_source": "gmail_api_url",
+                "provider_context": {
+                    "gmail_api_url_batch_id": "batch-2",
+                    "gmail_api_url_source_slot": 0,
+                },
+            },
+        ]
+        registration_service._ACTIVE_JOBS.update({40, 41})
+        registration_service._STOP_EVENTS[40] = threading.Event()
+        registration_service._STOP_EVENTS[41] = threading.Event()
+
+        with (
+            patch.object(
+                registration_service.db,
+                "get_job",
+                side_effect=lambda job_id: next(
+                    (job for job in jobs if int(job["id"]) == int(job_id)),
+                    None,
+                ),
+            ),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+            patch.object(
+                registration_service.db,
+                "fail_gmail_api_url_sources_for_code_url",
+                create=True,
+                return_value=1,
+            ),
+            patch("core.gmail_api_url_client.quarantine_code_url", return_value=2),
+            patch("core.gmail_api_url_batch_store.GmailApiUrlBatchStore") as store_class,
+        ):
+            store_class.return_value.list_job_ids_for_code_url.return_value = ["40", "41"]
+            result = registration_service.quarantine_provider_lane(
+                job_id=40,
+                source="gmail_api_url",
+                code_url="https://mail.example/broken",
+                reason="Provider error code=602",
+            )
+
+        self.assertEqual(result["stopping"], 1)
+        self.assertTrue(registration_service._STOP_EVENTS[41].is_set())
+        update_job.assert_called_once_with(
+            41,
+            status="stopping",
+            error="邮箱来源已因 code_url 故障停止，取消同源任务: Provider error code=602",
+        )
+
+    def test_gmail_api_url_602_continues_cancelling_when_waiter_is_missing(self):
+        jobs = [
+            {
+                "id": 60,
+                "status": "running",
+                "email_source": "gmail_api_url",
+                "provider_context": {
+                    "gmail_api_url_batch_id": "batch-3",
+                    "gmail_api_url_source_slot": 0,
+                },
+            },
+            {
+                "id": 61,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {
+                    "gmail_api_url_batch_id": "batch-3",
+                    "gmail_api_url_source_slot": 0,
+                },
+            },
+            {
+                "id": 62,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {
+                    "gmail_api_url_batch_id": "batch-3",
+                    "gmail_api_url_source_slot": 0,
+                },
+            },
+        ]
+        registration_service._ACTIVE_JOBS.add(60)
+        registration_service._STOP_EVENTS[60] = threading.Event()
+
+        with (
+            patch.object(
+                registration_service.db,
+                "get_job",
+                side_effect=lambda job_id: next(
+                    (job for job in jobs if int(job["id"]) == int(job_id)),
+                    None,
+                ),
+            ),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+            patch.object(
+                registration_service.db,
+                "fail_gmail_api_url_sources_for_code_url",
+                create=True,
+                return_value=1,
+            ),
+            patch("core.gmail_api_url_client.quarantine_code_url", return_value=2),
+            patch("core.gmail_api_url_batch_store.GmailApiUrlBatchStore") as store_class,
+        ):
+            store_class.return_value.list_job_ids_for_code_url.return_value = ["60"]
+            store_class.return_value.list_batch_ids_for_code_urls.return_value = ["batch-3"]
+            store_class.return_value.source_slots_for_code_url.return_value = {0}
+            store_class.return_value.cancel_waiter.side_effect = RuntimeError(
+                "waiter was never registered"
+            )
+
+            result = registration_service.quarantine_provider_lane(
+                job_id=60,
+                source="gmail_api_url",
+                code_url="https://mail.example/broken",
+                reason="Provider error code=602",
+            )
+
+        self.assertEqual(result["cancelled"], 2)
+        self.assertEqual(
+            [call.args[0] for call in update_job.call_args_list],
+            [61, 62],
+        )
+        self.assertEqual(store_class.return_value.cancel_waiter.call_count, 2)
+
+    def test_gmail_api_url_602_uses_each_batch_alias_capacity_for_source_slots(self):
+        jobs = [
+            {
+                "id": 70,
+                "status": "running",
+                "email_source": "gmail_api_url",
+                "provider_context": {
+                    "gmail_api_url_batch_id": "batch-4",
+                    "gmail_api_url_source_slot": 0,
+                    "gmail_api_url_aliases_per_source": 12,
+                },
+            },
+            {
+                "id": 71,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {
+                    "gmail_api_url_batch_id": "batch-5",
+                    "gmail_api_url_source_slot": 1,
+                    "gmail_api_url_aliases_per_source": 6,
+                },
+            },
+        ]
+        registration_service._ACTIVE_JOBS.add(70)
+        registration_service._STOP_EVENTS[70] = threading.Event()
+
+        def source_slots(batch_id, _code_url, *, aliases_per_source):
+            if batch_id == "batch-4":
+                self.assertEqual(aliases_per_source, 12)
+                return {0}
+            self.assertEqual(batch_id, "batch-5")
+            self.assertEqual(aliases_per_source, 6)
+            return {1}
+
+        with (
+            patch.object(
+                registration_service.db,
+                "get_job",
+                side_effect=lambda job_id: next(
+                    (job for job in jobs if int(job["id"]) == int(job_id)),
+                    None,
+                ),
+            ),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+            patch.object(
+                registration_service.db,
+                "fail_gmail_api_url_sources_for_code_url",
+                create=True,
+                return_value=1,
+            ),
+            patch("core.gmail_api_url_client.quarantine_code_url", return_value=2),
+            patch("core.gmail_api_url_batch_store.GmailApiUrlBatchStore") as store_class,
+        ):
+            store_class.return_value.list_job_ids_for_code_url.return_value = ["70"]
+            store_class.return_value.list_batch_ids_for_code_urls.return_value = [
+                "batch-4",
+                "batch-5",
+            ]
+            store_class.return_value.batch_provision_plan.side_effect = (
+                lambda batch_id: {
+                    "aliases_per_source": 12 if batch_id == "batch-4" else 6
+                }
+            )
+            store_class.return_value.source_slots_for_code_url.side_effect = source_slots
+            store_class.return_value.cancel_waiter.return_value = True
+
+            result = registration_service.quarantine_provider_lane(
+                job_id=70,
+                source="gmail_api_url",
+                code_url="https://mail.example/broken",
+                reason="Provider error code=602",
+            )
+
+        self.assertEqual(result["cancelled"], 1)
+        update_job.assert_called_once_with(
+            71,
+            status="cancelled",
+            error="邮箱来源已因 code_url 故障停止，取消同源任务: Provider error code=602",
+            completed_at=unittest.mock.ANY,
+        )
 
     def test_snapshot_code_602_quarantines_the_provider_source(self):
         account = SimpleNamespace(
