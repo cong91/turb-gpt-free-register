@@ -22,12 +22,13 @@ class WebUiAuthTests(unittest.TestCase):
         with patch(
             "core.registration_failure_stats.failure_class_counts",
             return_value={"session_token_timeout": 3, "other": 1},
-        ):
+        ), patch("core.db.count_failed_jobs", return_value=4):
             r = self.client.get("/api/jobs/failure-stats", headers={"X-Auth-Code": "test-auth"})
         self.assertEqual(r.status_code, 200)
         payload = r.get_json()
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["classes"], {"session_token_timeout": 3, "other": 1})
+        self.assertEqual(payload["total_failed"], 4)
 
     def test_api_accepts_auth_header(self):
         r = self.client.get("/api/summary", headers={"X-Auth-Code": "test-auth"})

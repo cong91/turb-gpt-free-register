@@ -274,6 +274,68 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             1,
         )
 
+    def test_twofa_failure_result_dict_auto_requeues_one_twofa_retry_job(self):
+        """生产触发路径（result-dict 返回而非异常）也必须自动入队 2FA 补做。"""
+        account_id = db.insert_account(
+            email="dictpath@example.com",
+            access_token="token",
+            registration_password="password",
+            twofa_status="failed",
+            extra={"registration_driver": "roxy"},
+        )
+        job = db.create_job(email_source="paymesh")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("dictpath@example.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            return_value={
+                "success": False,
+                "error": "2FA 设置失败，账号已保存：RuntimeError: re-auth 未进入 email-verification",
+                "account_id": account_id,
+                "twofa_status": "failed",
+            },
+        ), patch.object(
+            registration_service, "_release_unconsumed_job_email"
+        ), patch.object(
+            registration_service,
+            "get_executor",
+            return_value=ImmediateExecutor(),
+        ), patch.object(
+            registration_service,
+            "get_executor_workers",
+            return_value=1,
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        requeues = [item for item in db.list_jobs(limit=10) if item["job_type"] == "twofa_retry"]
+        self.assertEqual(len(requeues), 1)
+        self.assertEqual(requeues[0]["retry_action"], "2fa")
+        self.assertEqual(requeues[0]["account_id"], account_id)
+        self.assertIs(submitted[0][0], registration_service._run_twofa_retry_job)
+
+    def test_auto_requeue_skipped_when_stop_requested(self):
+        """操作员停止后不得把 2FA 补做任务复活。"""
+        job = db.create_job(email_source="paymesh")
+        registration_service._STOP_EVENTS[job["id"]] = __import__("threading").Event()
+        registration_service._STOP_EVENTS[job["id"]].set()
+        registration_service._ACTIVE_JOBS.add(job["id"])
+        try:
+            with patch.object(registration_service, "retry_job") as retry_job:
+                result = registration_service._queue_twofa_auto_requeue(job["id"])
+            self.assertIsNone(result)
+            retry_job.assert_not_called()
+        finally:
+            registration_service._STOP_EVENTS.pop(job["id"], None)
+            registration_service._ACTIVE_JOBS.discard(job["id"])
+
     def test_registration_force_refresh_proxy_rotates_for_retry_jobs_only(self):
         from config import proxy as proxy_cfg
 
@@ -371,9 +433,11 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertEqual(len(submitted), 1)
         self.assertIs(submitted[0][0], registration_service._run_one_job)
 
-    @patch("config.proxy.ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True, create=True)
+    @patch("config.proxy.ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False, create=True)
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 0, create=True)
     def test_registration_retry_job_force_refreshes_proxy_for_new_child_job(self):
+        # 全局 one-account-per-ip 关闭时，重试任务仍必须换新 IP——这是本 bead
+        # 唯一的行为变更；旧实现（仅读配置）会让该测试失败。
         source = db.create_job(email_source="outlook")
         db.update_job(source["id"], status="failed")
         retry_job, created = db.create_retry_job(

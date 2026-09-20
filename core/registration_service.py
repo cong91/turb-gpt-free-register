@@ -1398,7 +1398,10 @@ def _queue_twofa_auto_requeue(job_id: int) -> dict | None:
     retry_job 会按 get_retry_info 路由到 action="2fa"（job_type=twofa_retry），
     走 TWOFA_RETRY 代理 scope（新 IP、新浏览器），且 create_retry_job 自带
     同链路去重；2FA 补做任务自身失败不会再触发本函数（一次注册结果只补一次）。
+    操作员已请求停止时不入队——不能把用户刚取消的工作复活成浏览器任务。
     """
+    if is_stop_requested(job_id):
+        return None
     result = retry_job(job_id)
     if result.get("ok") and result.get("created"):
         logger.warning(

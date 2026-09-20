@@ -3045,10 +3045,16 @@ def create_app(auth_code: str | None = None) -> Flask:
 
     @app.get("/api/jobs/failure-stats")
     def api_jobs_failure_stats():
-        """注册失败分类统计：仅返回类别计数，用于快速定位批量失败原因。"""
+        """注册失败分类统计：类别计数 + 失败总数，用于快速定位批量失败原因。"""
         from core.registration_failure_stats import failure_class_counts
 
-        return jsonify({"ok": True, "classes": failure_class_counts()})
+        return jsonify(
+            {
+                "ok": True,
+                "classes": failure_class_counts(),
+                "total_failed": db.count_failed_jobs(),
+            }
+        )
 
     @app.post("/api/jobs")
     def api_jobs_create():

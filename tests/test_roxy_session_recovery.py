@@ -83,7 +83,7 @@ class RecoverChatgptSessionTests(unittest.TestCase):
             "core.account_export.reauth_login_after_session_timeout"
         ) as reauth:
             result = roxy_registration._recover_chatgpt_session(
-                driver, "user@example.com", RuntimeError("original"), "Secret123456"
+                driver, "user@example.com", RuntimeError("original")
             )
 
         self.assertEqual(result, token)

@@ -282,6 +282,58 @@ class RegistrationProviderStopTests(unittest.TestCase):
         self.assertEqual(result["cancelled"], 1)
         self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
 
+    def test_alloc_wrap_alone_stops_batch_without_pool_marker(self):
+        """独立固定包装标记：last= 是其他原因（如 code=602 隔离）时仍必须停批。"""
+        current = {
+            "id": 75,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-wrap"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 76,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-wrap"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                75,
+                "RuntimeError: 所有邮箱来源均领取失败: ['gmail_api_url']; last=GmailApiUrlError: Provider error code=602: Account is unavailable",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        update_job.assert_called_once()
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_busy_queue_conflict_does_not_stop_batch(self):
+        """最接近的未命中：忙/排队冲突绝不能停批。"""
+        current = {
+            "id": 85,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-busy"},
+        }
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs") as list_jobs,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                85,
+                "GmailApiUrlBatchConflict: Gmail API URL batch đang bận; job đã được lưu vào hàng đợi",
+            )
+
+        self.assertEqual(result, {"matched": 0, "cancelled": 0, "stopping": 0})
+        list_jobs.assert_not_called()
+
     def test_transient_session_timeout_does_not_stop_batch(self):
         current = {
             "id": 81,

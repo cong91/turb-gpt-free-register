@@ -2489,7 +2489,6 @@ def _recover_chatgpt_session(
     driver,
     email: str,
     first_error: Exception,
-    openai_password: str | None = None,
 ) -> dict:
     """session 拿不到 accessToken 时的恢复链（不能一次轮询失败就把 job 判死）。
 
@@ -2499,8 +2498,7 @@ def _recover_chatgpt_session(
        本轮注册的 cookie），重建 session 后再读。
 
     全部失败时抛出原始 first_error（保留 WARNING_BANNER / _http_status 200
-    marker，供 registration_service 的 retry 分类继续识别）；调用方在收到
-    该失败后负责“重启浏览器 → 登录页从头重新登录”的兜底步骤。
+    marker，供 registration_service 的 retry 分类识别并换 IP 自动重试）。
     """
     last_error = first_error
     for repoll in range(1, _SESSION_RECOVERY_REPOLL_ROUNDS + 1):
@@ -2740,7 +2738,7 @@ def run_roxy_registration(
             _traffic_checkpoint()
             # S1 恢复（重读/刷新/re-auth）失败即判死：出口 IP 或会话层面的问题
             # 交给上层自动重试任务换新 IP 处理，不再在任务内重启浏览器。
-            session_info = _recover_chatgpt_session(driver, email, session_err, openai_password)
+            session_info = _recover_chatgpt_session(driver, email, session_err)
         _traffic_checkpoint()
         access_token = session_info["accessToken"]
         logger.info("[Roxy注册] 已拿到 accessToken：%s", email)

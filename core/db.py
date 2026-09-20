@@ -5385,14 +5385,22 @@ def iter_failed_job_errors(limit: int = 5000) -> Iterator[str]:
     _ensure_sqlite()
     with closing(_sqlite_conn()) as conn:
         rows = conn.execute(
-            "SELECT COALESCE("
-            "json_extract(payload, '$.error_message'),"
-            "json_extract(payload, '$.error'),'') AS err "
+            "SELECT COALESCE(json_extract(payload, '$.error_message'),'') AS err "
             "FROM registration_jobs WHERE status='failed' ORDER BY id DESC LIMIT ?",
             (max(1, int(limit)),),
         ).fetchall()
     for row in rows:
         yield str(row["err"] or "")
+
+
+def count_failed_jobs() -> int:
+    """失败任务总数（不受 iter_failed_job_errors 的 LIMIT 截断影响）。"""
+    _ensure_sqlite()
+    with closing(_sqlite_conn()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM registration_jobs WHERE status='failed'"
+        ).fetchone()
+    return int(row["n"] or 0)
 
 
 def list_jobs_for_automation_request(request_id: str) -> list[dict]:

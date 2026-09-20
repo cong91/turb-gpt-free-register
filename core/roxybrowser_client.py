@@ -536,7 +536,7 @@ class RoxyBrowserClient:
             # 走到这里说明重试额度耗尽仍未创建成功。
             raise RuntimeError(
                 f"Roxy 创建环境连续失败 {attempt} 次: {last_error}"
-            )
+            ) from last_error
         profile_id = _first(result, [
             ("id",), ("dirId",), ("dir_id",), ("profile_id",), ("profileId",), ("browser_id",),
             ("data", "id"), ("data", "dirId"), ("data", "dir_id"),
@@ -688,17 +688,6 @@ class RoxyBrowserClient:
             ws_endpoint=ws_endpoint,
             created_by_run=created_by_run,
         )
-
-    def reopen_profile(self, profile_id: str, proxy=None) -> RoxyOpenResult:
-        """重新打开本轮已创建的环境（关闭窗口后重启进程，cookie 保留），不新建 Profile。
-
-        与 open_profile 不同：不做 ROXY_ONE_PROFILE_PER_ACCOUNT 校验，因为这里
-        重开的是本轮自己刚创建的环境，属于同一账号的延续。
-        """
-        pid = self._normalize_profile_id(profile_id)
-        if not pid:
-            raise RuntimeError("reopen_profile 需要有效的 profile_id")
-        return self._open_profile_by_id(pid, proxy, created_by_run=True)
 
     def close_profile(self, profile_id: str) -> None:
         if not profile_id:

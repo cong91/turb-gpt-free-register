@@ -26,7 +26,7 @@ _FAILURE_CLASSIFIERS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("otp_timeout", re.compile(r"Timeout after \d+s waiting for new OTP|等待邮箱验证码超时|等待新 ?OTP")),
     ("twofa_reauth_no_otp_page", re.compile(r"re-auth 未进入 email-verification")),
     ("twofa_setup_failed_saved", re.compile(r"2FA 设置失败，账号已保存")),
-    ("provider_602", re.compile(r"provider error code=602|code=602", re.IGNORECASE)),
+    ("provider_602", re.compile(r"provider error code=602|code=602\b", re.IGNORECASE)),
     ("email_already_registered", re.compile(r"按已注册/不可用邮箱处理并停用")),
     ("email_input_missing", re.compile(r"找不到邮箱输入框")),
     ("password_page_stuck", re.compile(r"密码页提交后未进入邮箱验证码页|邮箱提交后未进入密码页")),
