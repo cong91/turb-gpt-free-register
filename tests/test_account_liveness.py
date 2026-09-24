@@ -87,11 +87,11 @@ class AccountLivenessTests(unittest.TestCase):
             patch.object(liveness, "get_csrf_token", side_effect=RuntimeError("HTTP Error 403")),
             patch.object(liveness, "signin_openai", return_value="authorize"),
             patch.object(liveness.time, "sleep"),
+            self.assertRaises(RuntimeError),
         ):
-            with self.assertRaises(RuntimeError):
-                liveness._network_preflight_with_retry(
-                    "user@example.com", None, max_attempts=4
-                )
+            liveness._network_preflight_with_retry(
+                "user@example.com", None, max_attempts=4
+            )
 
         self.assertEqual(len(_DummyBrowserSession.created), 1)
         self.assertTrue(_DummyBrowserSession.created[0].session.closed)

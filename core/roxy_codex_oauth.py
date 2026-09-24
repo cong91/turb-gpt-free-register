@@ -10,6 +10,26 @@ from urllib.parse import urlparse
 from config import roxybrowser as _roxy_cfg
 from core import codex_oauth as _codex_proto
 from core import sms_provider
+from core.browser_auth_actions import _click_passwordless_signup_if_present
+from core.browser_page_actions import (
+    _clear_otp_inputs,
+    _click_any,
+    _email_otp_page_state,
+    _find_any,
+    _human_click,
+    _human_type_text,
+    _is_email_verification_page,
+    _is_login_password_page,
+    _maybe_accept,
+    _type_otp,
+    _wait_after_email_otp_submit,
+)
+from core.browser_selenium_adapter import (
+    build_selenium_driver as _build_driver,
+)
+from core.browser_selenium_adapter import (
+    center_browser_window as _center_browser_window,
+)
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
 from core.openai_auth import (
@@ -18,24 +38,8 @@ from core.openai_auth import (
     account_unusable_message,
     detect_account_unusable_response_body,
 )
+from core.registration_flow import _submit_email_step, _type_email_address
 from core.roxy_phone_country import select_phone_country, select_vietnam_country
-from core.roxy_registration import (
-    _build_driver,
-    _center_browser_window,
-    _clear_otp_inputs,
-    _click_any,
-    _click_passwordless_signup_if_present,
-    _email_otp_page_state,
-    _find_any,
-    _human_click,
-    _human_type_text,
-    _is_email_verification_page,
-    _is_login_password_page,
-    _maybe_accept,
-    _submit_email_step,
-    _type_email_address,
-    _type_otp,
-)
 from core.roxybrowser_client import RoxyBrowserClient
 
 _base_logger = logging.getLogger(__name__)
@@ -634,63 +638,8 @@ def _read_email_otp_validate_dead_code(driver) -> str:
     return ""
 
 
-# 邮箱验证码页判断复用 roxy_registration 的强版本（URL + 输入框属性识别，
-# 且明确排除 /log-in/password），不使用本地弱化版，避免点完一次性验证码后
-# 页面已渲染 OTP 输入框却因 URL 不含 email-verification 而识别失败。
+# Shared page actions own OTP page detection and post-submit polling.
 
-def _wait_after_email_otp_submit(driver, timeout: int = 45) -> str:
-    """
-    提交邮箱 OTP 后等待页面离开 /email-verification。
-
-    返回：
-      - accepted：已离开邮箱验证码页 / 进入手机号页 / 进入 callback；
-      - invalid：页面明确报错、输入框标红，或长时间停留验证码页。
-    """
-    end = time.time() + timeout
-    last_url = ""
-    last_log = 0.0
-    while time.time() < end:
-        try:
-            dead_code = _read_email_otp_validate_dead_code(driver)
-            if dead_code:
-                return f"deactivated:{dead_code}"
-            url = str(driver.current_url or "")
-            if url != last_url:
-                logger.info("[Codex][Browser] 邮箱 OTP 后检测到页面跳转")
-                last_url = url
-            if _is_callback_url(url):
-                return "accepted"
-            if _has_strict_add_phone_form(driver) or _is_phone_code_page(driver):
-                return "accepted"
-            # 已经离开 email-verification，交给后续授权/手机号/consent 流程处理。
-            if "email-verification" not in url.lower():
-                return "accepted"
-
-            state = _email_otp_page_state(driver)
-            invalid = any(str(i.get("ariaInvalid") or "").lower() == "true" for i in (state.get("inputs") or []))
-            errors = [str(x) for x in (state.get("errors") or []) if str(x).strip()]
-            body_text = str(state.get("text") or "").lower()
-            error_hit = any(x in body_text for x in (
-                "invalid code", "incorrect code", "wrong code", "expired",
-                "验证码错误", "验证码无效", "验证码已过期", "コードが正しく", "無効", "期限",
-            ))
-            if invalid or errors or error_hit:
-                logger.warning(
-                    "[Codex][Browser] 邮箱 OTP 提交后检测到错误/仍需验证码：errors=%s invalid=%s url=%s",
-                    errors[:3],
-                    invalid,
-                    url,
-                )
-                return "invalid"
-
-            if time.time() - last_log > 6:
-                logger.info("[Codex][Browser] 邮箱 OTP 后仍在 email-verification，继续等待页面自动跳转")
-                last_log = time.time()
-        except Exception:  # noqa: BLE001, S110
-            pass
-        time.sleep(0.5)
-    logger.warning("[Codex][Browser] 邮箱 OTP 后等待跳转超时，按验证码无效/过期处理")
-    return "invalid"
 
 
 def _phone_page_state(driver) -> dict:

@@ -36,6 +36,36 @@ def _account_credentials(account: dict) -> tuple[int, str, str] | None:
     return account_id, email, password
 
 
+def _account_profile(account: dict) -> tuple[str, str]:
+    """(name, birthday) để điền lại about-you khi login bị OpenAI đẩy về profile.
+
+    Ưu tiên giá trị đã checkpoint lúc đăng ký; account cũ không có thì sinh
+    mới (OpenAI chỉ cần form hợp lệ, không đối chiếu giá trị cũ).
+    """
+    import json as _json
+
+    extra: dict = {}
+    raw = account.get("extra_json")
+    if raw:
+        try:
+            parsed = _json.loads(str(raw))
+            if isinstance(parsed, dict):
+                extra = parsed
+        except (TypeError, ValueError):
+            extra = {}
+    name = str(extra.get("registration_name") or "").strip()
+    birthday = str(extra.get("registration_birthday") or "").strip()
+    if not name:
+        from core.name_samples import random_display_name
+
+        name = random_display_name()
+    if not birthday:
+        from core.profile_utils import generate_random_birthday
+
+        birthday = generate_random_birthday()
+    return name, birthday
+
+
 def _failure_result(account_id: int, email: str, error: str) -> dict[str, object]:
     db.update_account_2fa(account_id, status="failed", error=error)
     return {
@@ -111,6 +141,7 @@ def _run_twofa_retry_in_profile(
                 password,
                 timeout=profile.timeout,
                 totp_secret=str(account.get("totp_secret") or "").strip() or None,
+                profile=_account_profile(account),
             )
             secret = setup_2fa_in_page(profile.driver, email, reauth=True)
             if not secret:

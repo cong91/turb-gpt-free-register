@@ -1,3 +1,4 @@
+import itertools
 import tempfile
 import unittest
 from pathlib import Path
@@ -103,6 +104,48 @@ class _PinnedIpPerKeyClient(_FakeRotatingProxyClient):
         index = int(str(key).rsplit("-", 1)[-1])
         return {
             "proxy_url": f"http://198.51.100.{10 + index}:8080",
+            "ttl_seconds": 60,
+        }
+
+
+class _ExpiredKeysClient(_FakeRotatingProxyClient):
+    """Provider trả status=102 (key het han) cho một số key, key còn lại OK."""
+
+    def __init__(self, keys, expired_keys):
+        super().__init__(keys)
+        self.expired_keys = set(expired_keys)
+
+    def check_proxy(self, proxy_url):
+        return True
+
+    def get_proxy(self, key):
+        self.get_calls.append(key)
+        if key in self.expired_keys:
+            raise RotatingProxyApiError("proxy.vn API status=102: key het han")
+        return {
+            "proxy_url": f"http://198.51.100.{len(self.get_calls)}:8080",
+            "ttl_seconds": 60,
+        }
+
+
+class _CooldownKeysThenGoodClient(_FakeRotatingProxyClient):
+    """Một loạt key đầu trả cooldown (101), key sau đó mới OK."""
+
+    def __init__(self, keys, hot_keys):
+        super().__init__({"key": key, "expires_at": 1000.0} for key in keys)
+        self.hot_keys = set(hot_keys)
+
+    def check_proxy(self, proxy_url):
+        return True
+
+    def get_proxy(self, key):
+        self.get_calls.append(key)
+        if key in self.hot_keys:
+            raise RotatingProxyApiError(
+                "proxy.vn API status=101: Con 53s moi co the doi proxy"
+            )
+        return {
+            "proxy_url": f"http://198.51.100.{len(self.get_calls)}:8080",
             "ttl_seconds": 60,
         }
 
@@ -313,6 +356,25 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertNotEqual(first.proxy_url, second.proxy_url)
         # key-1 的出口被排除后必须换 key-2，而不是重新拿 key-1 的同一地址。
         self.assertEqual(client.get_calls, ["key-1", "key-1", "key-2"])
+        self.assertEqual(second.key, "key-2")
+
+    def test_force_refresh_rotates_off_recently_released_ip_without_explicit_exclude(self):
+        # Retry flow thực tế: job thất bại release lease (cache còn sống) rồi job
+        # retry chạy force_refresh — provider pin IP theo key nên nếu không loại
+        # trừ IP vừa dùng trong cache, "đổi IP" sẽ trả lại đúng IP cũ (job 2715).
+        client = _PinnedIpPerKeyClient(
+            [
+                {"key": "key-1", "expires_at": 1000.0},
+                {"key": "key-2", "expires_at": 1000.0},
+            ]
+        )
+        manager = self._manager(client)
+
+        first = manager.acquire(0)
+        manager.release(0, proxy_url=first.proxy_url)
+        second = manager.acquire(0, force_refresh=True)
+
+        self.assertNotEqual(first.proxy_url, second.proxy_url)
         self.assertEqual(second.key, "key-2")
 
     def test_force_refresh_waits_for_provider_cooldown_instead_of_reusing_previous_proxy(self):
@@ -697,6 +759,45 @@ class RotatingProxyManagerTests(unittest.TestCase):
         self.assertEqual(client.purchase_calls, 1)
         self.assertEqual(client.get_calls, ["key-1", "purchased-1"])
 
+    def test_expired_key_is_marked_in_store_without_spending_retry_budget(self):
+        # Provider trả status=102 (key het han): key phải bị đánh dấu hết hạn
+        # ngay trong store và không tính vào retry budget — nếu không, vài
+        # key hết hạn là cả acquire chết trước khi chạm tới key còn sống
+        # (sự cố batch 07:00 ngày 2026-09-21).
+        client = _ExpiredKeysClient(
+            [
+                {"key": "key-1", "expires_at": 1000.0},
+                {"key": "key-2", "expires_at": 1000.0},
+            ],
+            expired_keys={"key-1"},
+        )
+        manager = self._manager(client)
+
+        lease = manager.acquire(0)
+
+        self.assertEqual(lease.key, "key-2")
+        self.assertTrue(manager._key_expired(self.store.get_key("key-1")))
+        self.assertEqual(client.purchase_calls, 0)
+
+    def test_cooldown_switch_spends_no_retry_budget_and_never_reuses_hot_key(self):
+        # 3 key đầu liên tục cooldown: switch key phải miễn phí (cooldown là
+        # thời gian chờ của provider, không phải failure của mình) và không
+        # được chọn lại key đang cooldown — nếu không cả acquire chết trong
+        # vài giây khi provider trục trặc.
+        client = _CooldownKeysThenGoodClient(
+            ["key-1", "key-2", "key-3", "key-4"],
+            hot_keys={"key-1", "key-2", "key-3"},
+        )
+        manager = self._manager(client)
+
+        with patch("core.rotating_proxy_manager.time.sleep") as sleep:
+            lease = manager.acquire(0)
+
+        self.assertEqual(lease.key, "key-4")
+        self.assertEqual(client.get_calls, ["key-1", "key-2", "key-3", "key-4"])
+        sleep.assert_not_called()
+        self.assertEqual(client.purchase_calls, 0)
+
     def test_status_masks_secret_material_and_reports_lane_assignments(self):
         client = _FakeRotatingProxyClient([{"key": "key-123456", "expires_at": 1000.0}])
         manager = self._manager(client)
@@ -745,6 +846,60 @@ class RotatingProxyClientTests(unittest.TestCase):
             result["proxy_url"],
             "socks5://user%20name:p%40ss@203.0.113.10:30836",
         )
+
+    def test_get_proxy_pinned_carrier_and_province_pass_through(self):
+        http = Mock()
+        http.get.return_value = _FakeResponse({
+            "status": 100,
+            "message": "proxy nay se die sau 60s",
+            "proxyhttp": "203.0.113.10:10836::",
+        })
+        client = RotatingProxyClient(http)
+
+        with patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"), patch.object(
+            proxy_config, "ROTATING_PROXY_NHAMANG", "viettel"
+        ), patch.object(proxy_config, "ROTATING_PROXY_TINHTHANH", "6"):
+            client.get_proxy("rotating-key")
+
+        params = http.get.call_args.kwargs["params"]
+        self.assertEqual(params["nhamang"], "viettel")
+        self.assertEqual(params["tinhthanh"], "6")
+
+    def test_get_proxy_random_mode_spreads_carrier_and_province_without_repeats(self):
+        # Provider-side "Random" dồn IP về cùng một /24 (sự cố 2026-09-21):
+        # client phải tự chọn nhamang/tỉnh cụ thể và không lặp giá trị liền
+        # trước để các lượt lấy IP phân tán qua nhiều nhà mạng/tỉnh.
+        http = Mock()
+        http.get.return_value = _FakeResponse({
+            "status": 100,
+            "message": "proxy nay se die sau 60s",
+            "proxyhttp": "203.0.113.10:10836::",
+        })
+        client = RotatingProxyClient(http)
+
+        seen: list[tuple[str, str]] = []
+        with patch.object(proxy_config, "ROTATING_PROXY_API_KEY", "configured-key"), patch.object(
+            proxy_config, "ROTATING_PROXY_NHAMANG", "random"
+        ), patch.object(proxy_config, "ROTATING_PROXY_TINHTHANH", "0"):
+            for _ in range(8):
+                client.get_proxy("rotating-key")
+                params = http.get.call_args.kwargs["params"]
+                self.assertIn(params["nhamang"], ("viettel", "fpt", "vnpt"))
+                self.assertTrue(params["tinhthanh"].isdigit())
+                self.assertTrue(1 <= int(params["tinhthanh"]) <= 31)
+                seen.append((params["nhamang"], params["tinhthanh"]))
+
+        for (prev_carrier, prev_province), (carrier, province) in itertools.pairwise(seen):
+            self.assertNotEqual(prev_carrier, carrier)
+            self.assertNotEqual(prev_province, province)
+
+    def test_pick_random_choice_never_returns_the_avoided_value(self):
+        from core.rotating_proxy_client import _pick_random_choice
+
+        for _ in range(30):
+            self.assertIn(_pick_random_choice(("viettel", "fpt", "vnpt"), "viettel"), ("fpt", "vnpt"))
+        # avoid=None hoặc giá trị ngoài danh sách: chọn tự do trong toàn bộ.
+        self.assertIn(_pick_random_choice(("viettel", "fpt", "vnpt"), None), ("viettel", "fpt", "vnpt"))
 
     def test_check_proxy_probes_without_requesting_a_new_ip(self):
         http = Mock()

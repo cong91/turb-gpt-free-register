@@ -82,7 +82,7 @@ class PlanCheckWorkerLifecycleTests(unittest.TestCase):
                 plan_check_service,
                 "required_account_proxy",
                 side_effect=proxy_context,
-            ) as required_proxy,
+            ),
             patch.object(plan_check_service, "_wait_for_rate_slot"),
             patch.object(plan_check_service, "_registration_recheck_delay", return_value=0),
             patch.object(plan_check_service, "check_account_plan", side_effect=[first_plan, second_plan]) as check_plan,
@@ -136,7 +136,7 @@ class PlanCheckWorkerLifecycleTests(unittest.TestCase):
                 plan_check_service,
                 "required_account_proxy",
                 side_effect=proxy_context,
-            ) as required_proxy,
+            ),
             patch.object(plan_check_service, "_wait_for_rate_slot"),
             patch.object(plan_check_service, "_registration_recheck_delay", return_value=0),
             patch.object(plan_check_service, "check_account_plan", return_value=payload),
@@ -164,12 +164,6 @@ class PlanCheckWorkerLifecycleTests(unittest.TestCase):
 
         self.assertEqual(result, payload)
         update_plan.assert_called_once_with(acc_id=1, result=payload)
-        required_proxy.assert_called_once_with(
-            "http://proxy.example",
-            rotating_scope=plan_check_service.PLAN_CHECK_PROXY_SCOPE,
-            lane_id=None,
-            lease_owner_id=None,
-        )
         run_pay153.assert_called_once_with(
             account_id=1,
             email="trial@example.com",

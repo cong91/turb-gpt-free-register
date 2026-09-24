@@ -3,7 +3,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from core import browser_registration
+from core import registration_flow
 from core.browser_challenge import (
     browser_challenge_state as _browser_challenge_state,
 )
@@ -13,16 +13,20 @@ from core.browser_challenge import (
     inspect_turnstile_response,
     run_owned_lab_challenge,
 )
-from core.browser_registration import (
-    _account_unusable_page_code,
+from core.browser_challenge import (
+    wait_for_browser_challenge as _wait_for_browser_challenge,
+)
+from core.browser_failure_policy import (
+    account_unusable_page_code as _account_unusable_page_code,
+)
+from core.browser_page_actions import (
     _has_access_token,
     _is_email_verification_page,
     _is_signup_password_page,
     _is_transient_email_submission_error,
-    _submit_email_and_wait_next,
     _wait_email_submit_next_state,
-    _wait_for_browser_challenge,
 )
+from core.registration_flow import _submit_email_and_wait_next
 
 
 class _Driver:
@@ -376,7 +380,7 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
             ]
         )
 
-        with patch("core.browser_registration.time.sleep") as sleep:
+        with patch("core.registration_flow.time.sleep") as sleep:
             state = _wait_for_browser_challenge(driver, timeout=2)
 
         self.assertFalse(state["is_challenge"])
@@ -404,7 +408,7 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
             ]
         )
 
-        with patch("core.browser_registration.time.sleep") as sleep:
+        with patch("core.registration_flow.time.sleep") as sleep:
             state = _wait_for_browser_challenge(driver, timeout=2)
 
         self.assertFalse(state["is_challenge"])
@@ -443,18 +447,18 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
 
         with (
             patch(
-                "core.browser_registration._wait_for_browser_challenge",
+                "core.registration_flow._wait_for_browser_challenge",
                 return_value={"is_challenge": False},
             ) as wait_for_challenge,
-            patch("core.browser_registration._type_email_address"),
+            patch("core.registration_flow._type_email_address"),
             patch(
-                "core.browser_registration._email_input_value_state",
+                "core.registration_flow._email_input_value_state",
                 return_value={"inputs": [{"value": "user@example.com"}]},
             ),
-            patch("core.browser_registration.human_delay"),
-            patch("core.browser_registration._submit_email_step"),
+            patch("core.registration_flow.human_delay"),
+            patch("core.registration_flow._submit_email_step"),
             patch(
-                "core.browser_registration._wait_email_submit_next_state",
+                "core.registration_flow._wait_email_submit_next_state",
                 return_value="otp",
             ),
         ):
@@ -468,11 +472,11 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
         email_input = object()
         with (
             patch(
-                "core.browser_registration._find_any",
+                "core.registration_flow._find_any",
                 side_effect=[RuntimeError("email input is not mounted"), email_input],
             ) as find_any,
             patch(
-                "core.browser_registration._email_entry_state",
+                "core.registration_flow._email_entry_state",
                 return_value={
                     "url": "https://chatgpt.com/auth/login",
                     "title": "Chờ một chút...",
@@ -481,17 +485,17 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
                 },
             ),
             patch(
-                "core.browser_registration._browser_challenge_state",
+                "core.registration_flow._browser_challenge_state",
                 return_value={"is_challenge": True, "reason": "chờ một chút"},
             ),
             patch(
-                "core.browser_registration._wait_for_browser_challenge",
+                "core.registration_flow._wait_for_browser_challenge",
                 return_value={"is_challenge": False},
             ) as wait_for_challenge,
-            patch("core.browser_registration._click_email_entry_option", return_value=False),
-            patch("core.browser_registration.time.sleep"),
+            patch("core.registration_flow._click_email_entry_option", return_value=False),
+            patch("core.registration_flow.time.sleep"),
         ):
-            result = browser_registration._wait_for_email_input(driver, timeout=1)
+            result = registration_flow._wait_for_email_input(driver, timeout=1)
 
         self.assertIs(result, email_input)
         self.assertEqual(find_any.call_count, 2)
@@ -515,14 +519,14 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
         driver = _SessionTimeoutDriver()
 
         with (
-            patch("core.browser_registration.time.monotonic", side_effect=[0.0, 0.0, 0.0, 21.0]),
-            patch("core.browser_registration._raise_if_account_unusable"),
-            patch("core.browser_registration._browser_challenge_state", return_value={"is_challenge": False}),
-            patch("core.browser_registration._is_email_verification_page", return_value=False),
-            patch("core.browser_registration._is_signup_password_page", return_value=False),
-            patch("core.browser_registration._is_login_password_page", return_value=False),
-            patch("core.browser_registration._email_input_value_state", return_value={"inputs": []}),
-            patch("core.browser_registration.time.sleep"),
+            patch("core.browser_page_actions.time.monotonic", side_effect=[0.0, 0.0, 0.0, 21.0]),
+            patch("core.registration_flow._raise_if_account_unusable"),
+            patch("core.browser_page_actions._browser_challenge_state", return_value={"is_challenge": False}),
+            patch("core.browser_page_actions._is_email_verification_page", return_value=False),
+            patch("core.browser_page_actions._is_signup_password_page", return_value=False),
+            patch("core.browser_page_actions._is_login_password_page", return_value=False),
+            patch("core.browser_page_actions._email_input_value_state", return_value={"inputs": []}),
+            patch("core.browser_page_actions.time.sleep"),
         ):
             result = _wait_email_submit_next_state(driver, "user@example.com", timeout=20)
 
@@ -549,14 +553,14 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
         driver = _StringStateDriver()
 
         with (
-            patch("core.browser_registration.time.monotonic", side_effect=[0.0, 0.0, 0.0, 21.0]),
-            patch("core.browser_registration._raise_if_account_unusable"),
+            patch("core.browser_page_actions.time.monotonic", side_effect=[0.0, 0.0, 0.0, 21.0]),
+            patch("core.registration_flow._raise_if_account_unusable"),
             patch(
-                "core.browser_registration._browser_challenge_state",
+                "core.browser_page_actions._browser_challenge_state",
                 return_value={"is_challenge": True},
             ),
-            patch("core.browser_registration._wait_for_browser_challenge") as wait_for_challenge,
-            patch("core.browser_registration.time.sleep"),
+            patch("core.browser_page_actions._wait_for_browser_challenge") as wait_for_challenge,
+            patch("core.browser_page_actions.time.sleep"),
         ):
             result = _wait_email_submit_next_state(driver, "user@example.com", timeout=20)
 
@@ -569,22 +573,22 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
 
         with (
             patch(
-                "core.browser_registration._wait_for_browser_challenge",
+                "core.registration_flow._wait_for_browser_challenge",
                 return_value={"is_challenge": False},
             ),
-            patch("core.browser_registration._type_email_address") as type_email,
+            patch("core.registration_flow._type_email_address") as type_email,
             patch(
-                "core.browser_registration._email_input_value_state",
+                "core.registration_flow._email_input_value_state",
                 return_value={"inputs": [{"value": email}]},
             ),
-            patch("core.browser_registration._submit_email_step") as submit_email,
+            patch("core.registration_flow._submit_email_step") as submit_email,
             patch(
-                "core.browser_registration._wait_email_submit_next_state",
+                "core.registration_flow._wait_email_submit_next_state",
                 side_effect=[AttributeError("'str' object has no attribute 'get'"), "otp"],
             ),
-            patch("core.browser_registration._maybe_accept") as maybe_accept,
-            patch("core.browser_registration._assert_not_external_idp"),
-            patch("core.browser_registration.human_delay"),
+            patch("core.registration_flow._maybe_accept") as maybe_accept,
+            patch("core.registration_flow._assert_not_external_idp"),
+            patch("core.registration_flow.human_delay"),
         ):
             result = _submit_email_and_wait_next(driver, email, attempts=2)
 
@@ -600,22 +604,22 @@ class BrowserRegistrationChallengeTests(unittest.TestCase):
 
         with (
             patch(
-                "core.browser_registration._wait_for_browser_challenge",
+                "core.registration_flow._wait_for_browser_challenge",
                 return_value={"is_challenge": False},
             ),
-            patch("core.browser_registration._type_email_address"),
+            patch("core.registration_flow._type_email_address"),
             patch(
-                "core.browser_registration._email_input_value_state",
+                "core.registration_flow._email_input_value_state",
                 return_value={"inputs": [{"value": email}]},
             ),
-            patch("core.browser_registration._submit_email_step"),
+            patch("core.registration_flow._submit_email_step"),
             patch(
-                "core.browser_registration._wait_email_submit_next_state",
+                "core.registration_flow._wait_email_submit_next_state",
                 side_effect=[TimeoutError("Page.wait_for_function: Timeout 20000ms exceeded"), "otp"],
             ),
-            patch("core.browser_registration._maybe_accept"),
-            patch("core.browser_registration._assert_not_external_idp"),
-            patch("core.browser_registration.human_delay"),
+            patch("core.registration_flow._maybe_accept"),
+            patch("core.registration_flow._assert_not_external_idp"),
+            patch("core.registration_flow.human_delay"),
         ):
             result = _submit_email_and_wait_next(driver, email, attempts=2)
 

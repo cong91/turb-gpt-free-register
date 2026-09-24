@@ -252,6 +252,62 @@ class RegistrationProviderStopTests(unittest.TestCase):
         self.assertEqual(result["cancelled"], 2)
         self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
 
+    def test_supply_exhaustion_stop_spares_account_bound_2fa_requeue(self):
+        # 2FA 补做（含 running）不领取新邮箱：批停止时必须保留，否则账号 981
+        # 这类已创建账号会永远卡在 2FA pending（2026-09-20 批次事故）。
+        current = {
+            "id": 2707,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-twofa"},
+        }
+        twofa_event = threading.Event()
+        registration_service._STOP_EVENTS[2714] = twofa_event
+        registration_service._ACTIVE_JOBS.add(2714)
+        jobs = [
+            current,
+            {
+                "id": 2708,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-twofa"},
+            },
+            {
+                "id": 2714,
+                "status": "running",
+                "retry_action": "2fa",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-twofa"},
+            },
+            {
+                "id": 2719,
+                "status": "pending",
+                "retry_action": "2fa",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-twofa"},
+            },
+        ]
+        try:
+            with (
+                patch.object(registration_service.db, "get_job", return_value=current),
+                patch.object(registration_service.db, "list_jobs", return_value=jobs),
+                patch.object(registration_service.db, "update_job") as update_job,
+            ):
+                result = registration_service._stop_registration_batch_on_provider_failure(
+                    2707,
+                    "GmailApiUrlError: No Gmail API URL source available",
+                )
+        finally:
+            registration_service._STOP_EVENTS.pop(2714, None)
+            registration_service._ACTIVE_JOBS.discard(2714)
+
+        self.assertEqual(result["matched"], 4)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(result["stopping"], 0)
+        # 只有普通注册任务 2708 被取消；2FA 补做任务保持原状。
+        self.assertEqual([call.args[0] for call in update_job.call_args_list], [2708])
+        self.assertFalse(twofa_event.is_set())
+
     def test_email_source_alloc_failure_stops_pending_jobs(self):
         current = {
             "id": 71,

@@ -15,6 +15,12 @@ from core.rotating_proxy_store import RotatingProxyStore
 logger = logging.getLogger(__name__)
 _PURCHASED_KEY_TTL_SECONDS = 24 * 60 * 60
 _COOLDOWN_SECONDS_RE = re.compile(r"\b(?:con|còn)\s+(\d+)\s*s\b", re.IGNORECASE)
+_EXPIRED_KEY_STATUS_RE = re.compile(r"status=102\b")
+
+
+def _is_expired_key_error(exc: Exception) -> bool:
+    """Provider trả status=102 (key het han): key đã chết, loại khỏi store."""
+    return bool(_EXPIRED_KEY_STATUS_RE.search(str(exc or "")))
 
 
 class RotatingProxyError(RuntimeError):
@@ -403,7 +409,23 @@ class RotatingProxyManager:
                 existing = None
 
             excluded_keys: set[str] = set()
+            cooldown_keys: set[str] = set()
             failed_attempts: dict[str, int] = {}
+            excluded_proxy_urls: set[str] = set()
+            if exclude_proxy_url:
+                excluded_proxy_urls.add(str(exclude_proxy_url).strip())
+            if force_refresh:
+                # force_refresh 的语义是“必须换新出口”。provider 按 key 固定 IP，
+                # release 只保留缓存；缓存里仍有效的地址就是最近用过的出口，
+                # 不排除的话换租约会原样拿回同一个 IP（retry 换 IP 失去意义）。
+                for cache_row in self.store.list_cached_proxies():
+                    cached_url = str(cache_row.get("proxy_url") or "").strip()
+                    try:
+                        cache_live = float(cache_row.get("proxy_expires_at") or 0) > now
+                    except (TypeError, ValueError):
+                        cache_live = False
+                    if cached_url and cache_live:
+                        excluded_proxy_urls.add(cached_url)
             last_error: Exception | None = None
             attempts_left = 3
             # Lượt “chờ cooldown rồi thử lại” không tiêu tốn budget retry:
@@ -463,6 +485,16 @@ class RotatingProxyManager:
                     proxy = self.client.get_proxy(key)
                 except Exception as exc:  # noqa: BLE001 - retry another rotating key.
                     last_error = exc
+                    if _is_expired_key_error(exc):
+                        # Provider xác nhận key hết hạn (status=102): đánh dấu
+                        # ngay trong store để không chọn lại, không tốn budget.
+                        self.store.set_key_expiration(key, now)
+                        existing = None
+                        logger.warning(
+                            "[RotatingProxy] provider expired key=%s; marked expired in store",
+                            _mask_key(key),
+                        )
+                        continue
                     cooldown = self._cooldown_seconds(exc)
                     if cooldown and fallback:
                         fallback_expiry = now + cooldown
@@ -491,17 +523,23 @@ class RotatingProxyManager:
                                 key_expires_at=fallback.get("key_expires_at"),
                             )
                     if cooldown:
+                        cooldown_keys.add(key)
                         used_keys = {
                             str(item.get("rotating_key") or "")
                             for item in self.store.list_leases()
                             if self._lease_active(item)
                         }
+                        # Không chọn lại key vừa báo cooldown; nếu mọi key còn
+                        # lại đều đang cooldown thì chờ — đừng đốt retry budget
+                        # (sự cố 07:00: 9 job chết trong 6 phút vì switch key
+                        # liên tục giữa các key đang cooldown).
                         alternative = self._choose_available_key(
-                            used_keys | excluded_keys | {key}
+                            used_keys | excluded_keys | cooldown_keys
                         )
                         if alternative is not None:
                             excluded_keys.add(key)
                             existing = None
+                            cooldown_wait_free = True
                             logger.warning(
                                 "[RotatingProxy] provider cooldown còn %ss; chuyển sang key dự phòng: scope=%s lane=%s",
                                 cooldown,
@@ -523,6 +561,7 @@ class RotatingProxyManager:
                             self._lock.acquire()
                         now = self.clock()
                         excluded_keys.clear()
+                        cooldown_keys.clear()
                         existing = None
                         cooldown_wait_free = True
                         continue
@@ -545,17 +584,19 @@ class RotatingProxyManager:
                         excluded_keys.add(key)
                     existing = None
                     continue
-                if exclude_proxy_url and proxy_url == str(exclude_proxy_url).strip():
-                    # 该出口已被调用方判定为被封（如 Cloudflare 403），换下一个 key。
+                if proxy_url and proxy_url in excluded_proxy_urls:
+                    # 该出口已被排除（调用方判定被封，或 force_refresh 禁止复用
+                    # 最近用过的 IP），换下一个 key。
                     last_error = RotatingProxyError(
                         "proxy.vn trả lại đúng proxy đã bị loại trừ"
                     )
                     excluded_keys.add(key)
                     existing = None
                     logger.warning(
-                        "[RotatingProxy] excluded blocked proxy re-returned; switching key: scope=%s lane=%s",
+                        "[RotatingProxy] excluded proxy re-returned; switching key: scope=%s lane=%s url=%s",
                         lane_scope,
                         lane,
+                        proxy_url,
                     )
                     continue
                 if not self._proxy_healthy(proxy_url):

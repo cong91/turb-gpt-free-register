@@ -1970,7 +1970,9 @@ def create_app(auth_code: str | None = None) -> Flask:
                 from core.otpgmail_client import list_accounts as list_otpmail_accounts
 
                 rows += list_otpmail_accounts(status=status, limit=fetch_limit)
-                from core.bamboommo_client import list_accounts as list_bamboommo_accounts
+                from core.bamboommo_client import (
+                    list_accounts as list_bamboommo_accounts,
+                )
 
                 rows += list_bamboommo_accounts(status=status, limit=fetch_limit)
                 rows += _with_pool_source(db.list_domain_email_pool(status=status, limit=fetch_limit), "cloudflare_domain")
@@ -1984,11 +1986,15 @@ def create_app(auth_code: str | None = None) -> Flask:
                 rows = list_automated_email_accounts(status=status, limit=fetch_limit)
             else:
                 if source == "bamboommo":
-                    from core.bamboommo_client import list_accounts as list_bamboommo_accounts
+                    from core.bamboommo_client import (
+                        list_accounts as list_bamboommo_accounts,
+                    )
 
                     rows = list_bamboommo_accounts(status=status, limit=fetch_limit)
                 else:
-                    from core.otpgmail_client import list_accounts as list_otpmail_accounts
+                    from core.otpgmail_client import (
+                        list_accounts as list_otpmail_accounts,
+                    )
 
                     rows = list_otpmail_accounts(status=status, limit=fetch_limit)
             if q:
@@ -2574,7 +2580,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 content, real_fname = db.read_codex_credential(fname)
                 parsed = _json.loads(content)
                 if not isinstance(parsed, dict):
-                    raise ValueError("Codex 凭证内容不是对象")
+                    raise TypeError("Codex 凭证内容不是对象")
                 bundle.append({"filename": real_fname, "data": parsed})
                 try:
                     email = str(parsed.get("email") or "").strip()
@@ -2618,7 +2624,7 @@ def create_app(auth_code: str | None = None) -> Flask:
                 zf.writestr(json_name, _json.dumps(result, ensure_ascii=False, indent=2) + "\n")
                 account_text = "\n".join(account_lines)
                 zf.writestr(accounts_name, account_text + ("\n" if account_text else ""))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("[Codex] 构建本地导出 ZIP 失败")
             return jsonify({"ok": False, "error": f"构建导出 ZIP 失败: {type(exc).__name__}: {exc}"}), 500
 
@@ -2630,7 +2636,7 @@ def create_app(auth_code: str | None = None) -> Flask:
         except ValueError as exc:
             logger.warning("[Codex] 本地导出状态冲突: %s", exc)
             return jsonify({"ok": False, "error": str(exc)}), 409
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("[Codex] 更新本地导出归档状态失败")
             return jsonify({"ok": False, "error": f"更新导出归档状态失败: {type(exc).__name__}: {exc}"}), 500
 

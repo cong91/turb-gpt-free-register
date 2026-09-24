@@ -1,14 +1,14 @@
 import string
 import unittest
 
-from core import browser_registration, browser_use_registration, roxy_registration
+from core import browser_use_registration, registration_flow
 
 
 class RegistrationPasswordTests(unittest.TestCase):
     """Mật khẩu đăng ký chỉ gồm chữ hoa/thường + số, không ký tự đặc biệt."""
 
     def test_roxy_password_is_alphanumeric_with_all_groups(self):
-        password = roxy_registration._generate_roxy_password()
+        password = registration_flow._generate_registration_password()
 
         self.assertEqual(len(password), 14)
         self.assertTrue(set(password) <= set(string.ascii_letters + string.digits))
@@ -17,7 +17,7 @@ class RegistrationPasswordTests(unittest.TestCase):
         self.assertTrue(any(c.isdigit() for c in password))
 
     def test_browser_password_is_alphanumeric_with_all_groups(self):
-        password = browser_registration._generate_roxy_password()
+        password = registration_flow._generate_registration_password()
 
         self.assertEqual(len(password), 14)
         self.assertTrue(set(password) <= set(string.ascii_letters + string.digits))

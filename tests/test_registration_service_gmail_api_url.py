@@ -403,6 +403,64 @@ class GmailApiUrlRegistrationServiceTests(unittest.TestCase):
         self.assertIsNone(store.find_active_assignment_for_job(str(child["id"])))
         self.assertEqual(submitted[0][0], registration_service._run_one_job)
 
+    def test_user_already_exists_error_moves_retry_to_a_fresh_alias(self):
+        """Owner report 2026-09-21: about-you submit xong OpenAI trả
+        error_code: user_already_exists (alias đã có account server-side từ
+        lần WARNING_BANNER trước) — retry tuyệt không dùng lại alias đó."""
+        store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
+        batch_id = store.create_empty_batch(
+            target_count=2,
+            aliases_per_source=12,
+            desired_sources=1,
+        )
+        store.append_source_group(
+            batch_id,
+            "source@gmail.com",
+            "https://example.test/source",
+            ["dup-alias@gmail.com", "unused-alias@gmail.com"],
+        )
+        source = db.create_job(
+            email_source="gmail_api_url",
+            email="dup-alias@gmail.com",
+            provider_context={
+                "gmail_api_url_batch_id": batch_id,
+                "gmail_api_url_aliases_per_source": 12,
+                "gmail_api_url_otp_received": True,
+            },
+        )
+        assignment = store.claim_waiting(batch_id, str(source["id"]))
+        self.assertIsNotNone(assignment)
+        store.discard(assignment.assignment_id, reason="user_already_exists")
+        db.update_job(
+            source["id"],
+            status="failed",
+            email="dup-alias@gmail.com",
+            error=(
+                "RuntimeError: about-you 提交失败：An account already exists for "
+                "this email address or phone number. Please log in instead. "
+                "error_code: user_already_exists"
+            ),
+        )
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service, "get_executor", return_value=ImmediateExecutor()
+        ), patch.object(
+            registration_service, "get_executor_workers", return_value=1
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            result = registration_service.retry_job(source["id"], workers=1)
+
+        self.assertTrue(result["ok"])
+        child = db.get_job(result["job"]["id"])
+        # Alias user_already_exists phải bị bỏ: retry nhận batch/alias mới.
+        self.assertIsNone(child["email"])
+        self.assertNotEqual(child["provider_context"]["gmail_api_url_batch_id"], batch_id)
+        self.assertEqual(submitted[0][0], registration_service._run_one_job)
+
     def test_registration_retry_skips_alias_reuse_for_quarantined_code_url(self):
         store = GmailApiUrlBatchStore(Path(self.temp_dir.name) / "turb.sqlite3")
         batch_id = store.create_empty_batch(

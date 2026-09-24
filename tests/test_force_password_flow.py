@@ -5,9 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from core import (
-    browser_registration,
     browser_use_registration,
     cloakbrowser_registration,
+    registration_flow,
     roxy_registration,
 )
 from core.account_export import BrowserPageTransport
@@ -29,7 +29,7 @@ class ForcePasswordFlowTests(unittest.TestCase):
         )
         self._config_patches.enter_context(patch("config.codex.ENABLE_CODEX_AUTO", False))
         self._config_patches.enter_context(
-            patch("core.browser_registration.post_register_dwell")
+            patch("core.account_export.post_register_dwell")
         )
         self.addCleanup(self._config_patches.close)
 
@@ -38,27 +38,27 @@ class ForcePasswordFlowTests(unittest.TestCase):
         driver = Mock(current_url="https://auth.openai.com/create-account/password")
         clock = iter((0.0, 0.0, 0.0, 21.0))
 
-        with patch("core.browser_registration._raise_if_account_unusable"), \
-            patch("core.browser_registration._is_email_verification_page", return_value=False), \
-            patch("core.browser_registration._password_page_state", return_value={  # noqa: SIM117
+        with patch("core.registration_flow._raise_if_account_unusable"), \
+            patch("core.registration_flow._is_email_verification_page", return_value=False), \
+            patch("core.registration_flow._password_page_state", return_value={  # noqa: SIM117
                 "url": "https://auth.openai.com/create-account/password",
             }), \
-            patch("core.browser_registration._is_signup_password_page", return_value=True), \
-            patch("core.browser_registration._registration_password", return_value="Secret123!"), \
-            patch("core.browser_registration._human_type_text"), \
-            patch("core.browser_registration.human_delay"), \
-            patch("core.browser_registration._human_click"), \
-            patch("core.browser_registration._wait_after_password_submit"), \
-            patch("core.browser_registration._has_access_token", return_value=False), \
-            patch("core.browser_registration._page_snapshot", return_value={
+            patch("core.registration_flow._is_signup_password_page", return_value=True), \
+            patch("core.registration_flow._registration_password", return_value="Secret123!"), \
+            patch("core.registration_flow._human_type_text"), \
+            patch("core.registration_flow.human_delay"), \
+            patch("core.registration_flow._human_click"), \
+            patch("core.registration_flow._wait_after_password_submit"), \
+            patch("core.registration_flow._has_access_token", return_value=False), \
+            patch("core.registration_flow._page_snapshot", return_value={
                 "url": "https://auth.openai.com/create-account/password",
                 "errors": ["Không tạo được tài khoản. Vui lòng thử lại."],
                 "text": "Tạo mật khẩu Không tạo được tài khoản. Vui lòng thử lại.",
             }), \
-            patch("core.browser_registration.time.time", side_effect=clock), \
-            patch("core.browser_registration.time.sleep"):
+            patch("core.registration_flow.time.time", side_effect=clock), \
+            patch("core.registration_flow.time.sleep"):
             with self.assertRaisesRegex(RuntimeError, "密码页提交失败"):
-                browser_registration._fill_password_page_if_present(
+                registration_flow._fill_password_page_if_present(
                     driver, "user@example.com", timeout=25,
                 )
 
@@ -78,15 +78,15 @@ class ForcePasswordFlowTests(unittest.TestCase):
             stack.enter_context(patch("core.cloakbrowser_registration._twofa_cfg.ENABLE_2FA", True))
             stack.enter_context(patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True))
             stack.enter_context(patch("config.codex.ENABLE_CODEX_AUTO", True))
-            stack.enter_context(patch("core.cloakbrowser_registration._safe_get"))
-            stack.enter_context(patch("core.cloakbrowser_registration._maybe_accept"))
-            stack.enter_context(patch("core.cloakbrowser_registration._check_manual_stop"))
-            stack.enter_context(patch("core.cloakbrowser_registration._submit_email_and_wait_next", return_value="password"))
-            stack.enter_context(patch("core.cloakbrowser_registration._fill_password_page_if_present", return_value="Secret123!"))
-            stack.enter_context(patch("core.cloakbrowser_registration._complete_profile_page", return_value=True))
+            stack.enter_context(patch("core.registration_flow._safe_get"))
+            stack.enter_context(patch("core.registration_flow._maybe_accept"))
+            stack.enter_context(patch("core.registration_flow._check_manual_stop"))
+            stack.enter_context(patch("core.registration_flow._submit_email_and_wait_next", return_value="password"))
+            stack.enter_context(patch("core.registration_flow._fill_password_page_if_present", return_value="Secret123!"))
+            stack.enter_context(patch("core.registration_flow._complete_profile_page", return_value=True))
             fetch_session = stack.enter_context(
                 patch(
-                    "core.cloakbrowser_registration._fetch_chatgpt_session",
+                    "core.registration_flow._fetch_chatgpt_session",
                     return_value={"accessToken": "tok", "user": {}, "account": {}},
                 )
             )
@@ -95,6 +95,9 @@ class ForcePasswordFlowTests(unittest.TestCase):
                     "core.cloakbrowser_registration.wait_for_otp",
                     side_effect=lambda *args, **kwargs: otp_events.append("otp") or "123456",
                 )
+            )
+            stack.enter_context(
+                patch("core.cloakbrowser_registration.snapshot_verification_code", return_value=None)
             )
             stack.enter_context(
                 patch(
@@ -106,7 +109,7 @@ class ForcePasswordFlowTests(unittest.TestCase):
             stack.enter_context(patch("core.cloakbrowser_registration._type_otp"))
             stack.enter_context(patch("core.cloakbrowser_registration._click_continue"))
             stack.enter_context(patch("core.cloakbrowser_registration._wait_after_email_otp_submit", return_value="accepted"))
-            stack.enter_context(patch("core.cloakbrowser_registration.checkpoint_account_data", return_value=7))
+            stack.enter_context(patch("core.registration_flow.checkpoint_account_data", return_value=7))
             setup_2fa = stack.enter_context(
                 patch("core.account_export.setup_2fa_for_registration", return_value="JBSWY3DPEHPK3PXP")
             )
@@ -116,9 +119,9 @@ class ForcePasswordFlowTests(unittest.TestCase):
                 patch("core.roxy_codex_oauth.run_roxy_codex_oauth", return_value={"ok": True, "status": "success"})
             )
             stack.enter_context(patch("core.cloakbrowser_registration.save_account_data", return_value=8))
-            stack.enter_context(patch("core.cloakbrowser_registration.resolve_email_source", return_value="outlook"))
-            stack.enter_context(patch("core.cloakbrowser_registration.post_register_dwell"))
-            stack.enter_context(patch("core.cloakbrowser_registration.human_delay"))
+            stack.enter_context(patch("core.registration_flow.resolve_email_source", return_value="outlook"))
+            stack.enter_context(patch("core.account_export.post_register_dwell"))
+            stack.enter_context(patch("core.registration_flow.human_delay"))
             stack.enter_context(patch("core.cloakbrowser_registration._cfg.CLOAK_KEEP_BROWSER_OPEN", True))
             result = cloakbrowser_registration.run_cloak_registration(
                 email="user@example.com", name="Test", birthday="1990-01-01",
@@ -197,23 +200,23 @@ class ForcePasswordFlowTests(unittest.TestCase):
 
         with patch("core.cloakbrowser_registration.build_cloak_driver", return_value=(driver, opened)), \
             patch("core.cloakbrowser_registration._twofa_cfg.ENABLE_2FA", False), \
-            patch("core.cloakbrowser_registration._submit_email_and_wait_next", return_value="otp"), \
-            patch("core.cloakbrowser_registration._click_continue_with_password_link", side_effect=click_password_link), \
-            patch("core.cloakbrowser_registration._fill_password_page_if_present", side_effect=fill_password), \
-            patch("core.cloakbrowser_registration._maybe_accept"), \
-            patch("core.cloakbrowser_registration._check_manual_stop"), \
-            patch("core.cloakbrowser_registration._complete_profile_page", return_value=True), \
-            patch("core.cloakbrowser_registration._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}}), \
+            patch("core.registration_flow._submit_email_and_wait_next", return_value="otp"), \
+            patch("core.registration_flow._click_continue_with_password_link", side_effect=click_password_link), \
+            patch("core.registration_flow._fill_password_page_if_present", side_effect=fill_password), \
+            patch("core.registration_flow._maybe_accept"), \
+            patch("core.registration_flow._check_manual_stop"), \
+            patch("core.registration_flow._complete_profile_page", return_value=True), \
+            patch("core.registration_flow._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}}), \
             patch("core.cloakbrowser_registration._wait_after_email_otp_submit", return_value="accepted"), \
-            patch("core.cloakbrowser_registration.wait_for_otp", return_value="123456"), \
+            patch("core.cloakbrowser_registration.wait_for_otp", return_value="123456"), patch("core.cloakbrowser_registration.snapshot_verification_code", return_value=None), \
             patch("core.cloakbrowser_registration._clear_otp_inputs"), \
             patch("core.cloakbrowser_registration._type_otp"), \
             patch("core.cloakbrowser_registration._click_continue"), \
-            patch("core.cloakbrowser_registration.checkpoint_account_data", return_value=7), \
+            patch("core.registration_flow.checkpoint_account_data", return_value=7), \
             patch("core.cloakbrowser_registration.save_account_data", return_value=7), \
-            patch("core.cloakbrowser_registration.resolve_email_source", return_value="paymesh"), \
-            patch("core.cloakbrowser_registration.post_register_dwell"), \
-            patch("core.cloakbrowser_registration.human_delay"), \
+            patch("core.registration_flow.resolve_email_source", return_value="paymesh"), \
+            patch("core.account_export.post_register_dwell"), \
+            patch("core.registration_flow.human_delay"), \
             patch("core.cloakbrowser_registration._cfg.CLOAK_KEEP_BROWSER_OPEN", True):
             result = cloakbrowser_registration.run_cloak_registration(
                 email="user@example.com", name="Test", birthday="1990-01-01",
@@ -236,27 +239,29 @@ class ForcePasswordFlowTests(unittest.TestCase):
             call_order.append(("fill_password", current_driver, email, timeout))
             return "Secret123!"
 
-        with patch("core.cloakbrowser_registration.build_cloak_driver", return_value=(driver, opened)), \
-            patch("core.cloakbrowser_registration._twofa_cfg.ENABLE_2FA", False), \
-            patch("core.cloakbrowser_registration._submit_email_and_wait_next", return_value="logged_in"), \
-            patch("core.cloakbrowser_registration._is_email_verification_page", return_value=True), \
-            patch("core.cloakbrowser_registration._click_continue_with_password_link", side_effect=click_password_link), \
-            patch("core.cloakbrowser_registration._fill_password_page_if_present", side_effect=fill_password), \
-            patch("core.cloakbrowser_registration._maybe_accept"), \
-            patch("core.cloakbrowser_registration._check_manual_stop"), \
-            patch("core.cloakbrowser_registration._complete_profile_page", return_value=True), \
-            patch("core.cloakbrowser_registration._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}}), \
-            patch("core.cloakbrowser_registration._wait_after_email_otp_submit", return_value="accepted"), \
-            patch("core.cloakbrowser_registration.wait_for_otp", return_value="123456"), \
-            patch("core.cloakbrowser_registration._clear_otp_inputs"), \
-            patch("core.cloakbrowser_registration._type_otp"), \
-            patch("core.cloakbrowser_registration._click_continue"), \
-            patch("core.cloakbrowser_registration.checkpoint_account_data", return_value=7), \
-            patch("core.cloakbrowser_registration.save_account_data", return_value=7), \
-            patch("core.cloakbrowser_registration.resolve_email_source", return_value="paymesh"), \
-            patch("core.cloakbrowser_registration.post_register_dwell"), \
-            patch("core.cloakbrowser_registration.human_delay"), \
-            patch("core.cloakbrowser_registration._cfg.CLOAK_KEEP_BROWSER_OPEN", True):
+        with ExitStack() as stack:
+            stack.enter_context(patch("core.cloakbrowser_registration.build_cloak_driver", return_value=(driver, opened)))
+            stack.enter_context(patch("core.cloakbrowser_registration._twofa_cfg.ENABLE_2FA", False))
+            stack.enter_context(patch("core.registration_flow._submit_email_and_wait_next", return_value="logged_in"))
+            stack.enter_context(patch("core.registration_flow._is_email_verification_page", return_value=True))
+            stack.enter_context(patch("core.registration_flow._click_continue_with_password_link", side_effect=click_password_link))
+            stack.enter_context(patch("core.registration_flow._fill_password_page_if_present", side_effect=fill_password))
+            stack.enter_context(patch("core.registration_flow._maybe_accept"))
+            stack.enter_context(patch("core.registration_flow._check_manual_stop"))
+            stack.enter_context(patch("core.registration_flow._complete_profile_page", return_value=True))
+            stack.enter_context(patch("core.registration_flow._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}}))
+            stack.enter_context(patch("core.cloakbrowser_registration._wait_after_email_otp_submit", return_value="accepted"))
+            stack.enter_context(patch("core.cloakbrowser_registration.wait_for_otp", return_value="123456"))
+            stack.enter_context(patch("core.cloakbrowser_registration.snapshot_verification_code", return_value=None))
+            stack.enter_context(patch("core.cloakbrowser_registration._clear_otp_inputs"))
+            stack.enter_context(patch("core.cloakbrowser_registration._type_otp"))
+            stack.enter_context(patch("core.cloakbrowser_registration._click_continue"))
+            stack.enter_context(patch("core.registration_flow.checkpoint_account_data", return_value=7))
+            stack.enter_context(patch("core.cloakbrowser_registration.save_account_data", return_value=7))
+            stack.enter_context(patch("core.registration_flow.resolve_email_source", return_value="paymesh"))
+            stack.enter_context(patch("core.account_export.post_register_dwell"))
+            stack.enter_context(patch("core.registration_flow.human_delay"))
+            stack.enter_context(patch("core.cloakbrowser_registration._cfg.CLOAK_KEEP_BROWSER_OPEN", True))
             result = cloakbrowser_registration.run_cloak_registration(
                 email="user@example.com", name="Test", birthday="1990-01-01",
             )
@@ -271,11 +276,11 @@ class ForcePasswordFlowTests(unittest.TestCase):
         error = AccountUnusableError("账号已废（account_deactivated）", error_code="account_deactivated")
 
         with patch("core.cloakbrowser_registration.build_cloak_driver", return_value=(driver, opened)), \
-            patch("core.cloakbrowser_registration._safe_get"), \
-            patch("core.cloakbrowser_registration._submit_email_and_wait_next", side_effect=error), \
-            patch("core.cloakbrowser_registration._maybe_accept"), \
-            patch("core.cloakbrowser_registration._check_manual_stop"), \
-            patch("core.cloakbrowser_registration.human_delay"), \
+            patch("core.registration_flow._safe_get"), \
+            patch("core.registration_flow._submit_email_and_wait_next", side_effect=error), \
+            patch("core.registration_flow._maybe_accept"), \
+            patch("core.registration_flow._check_manual_stop"), \
+            patch("core.registration_flow.human_delay"), \
             patch("core.cloakbrowser_registration._cfg.CLOAK_KEEP_BROWSER_OPEN", True), \
             patch("core.email_provider.release_email") as release_email:
             result = cloakbrowser_registration.run_cloak_registration(
@@ -301,24 +306,25 @@ class ForcePasswordFlowTests(unittest.TestCase):
         with ExitStack() as stack:
             stack.enter_context(patch("core.cloakbrowser_registration.build_cloak_driver", return_value=(driver, opened)))
             stack.enter_context(patch("core.cloakbrowser_registration._twofa_cfg.ENABLE_2FA", True))
-            stack.enter_context(patch("core.cloakbrowser_registration._safe_get"))
-            stack.enter_context(patch("core.cloakbrowser_registration._maybe_accept"))
-            stack.enter_context(patch("core.cloakbrowser_registration._check_manual_stop"))
-            stack.enter_context(patch("core.cloakbrowser_registration._submit_email_and_wait_next", return_value="password"))
-            stack.enter_context(patch("core.cloakbrowser_registration._fill_password_page_if_present", return_value="Secret123!"))
-            stack.enter_context(patch("core.cloakbrowser_registration._complete_profile_page", return_value=True))
+            stack.enter_context(patch("core.registration_flow._safe_get"))
+            stack.enter_context(patch("core.registration_flow._maybe_accept"))
+            stack.enter_context(patch("core.registration_flow._check_manual_stop"))
+            stack.enter_context(patch("core.registration_flow._submit_email_and_wait_next", return_value="password"))
+            stack.enter_context(patch("core.registration_flow._fill_password_page_if_present", return_value="Secret123!"))
+            stack.enter_context(patch("core.registration_flow._complete_profile_page", return_value=True))
             stack.enter_context(
                 patch(
-                    "core.cloakbrowser_registration._fetch_chatgpt_session",
+                    "core.registration_flow._fetch_chatgpt_session",
                     return_value={"accessToken": "tok", "user": {}, "account": {}},
                 )
             )
             stack.enter_context(patch("core.cloakbrowser_registration.wait_for_otp", return_value="123456"))
+            stack.enter_context(patch("core.cloakbrowser_registration.snapshot_verification_code", return_value=None))
             stack.enter_context(patch("core.cloakbrowser_registration._clear_otp_inputs"))
             stack.enter_context(patch("core.cloakbrowser_registration._type_otp"))
             stack.enter_context(patch("core.cloakbrowser_registration._click_continue"))
             stack.enter_context(patch("core.cloakbrowser_registration._wait_after_email_otp_submit", return_value="accepted"))
-            stack.enter_context(patch("core.cloakbrowser_registration.checkpoint_account_data", return_value=7))
+            stack.enter_context(patch("core.registration_flow.checkpoint_account_data", return_value=7))
             stack.enter_context(
                 patch(
                     "core.account_export.setup_2fa_for_registration",
@@ -329,9 +335,9 @@ class ForcePasswordFlowTests(unittest.TestCase):
             run_retry = stack.enter_context(
                 patch("core.browser_twofa_retry.run_twofa_retry", return_value=recovery)
             )
-            stack.enter_context(patch("core.cloakbrowser_registration.resolve_email_source", return_value="gmail_api_url"))
-            stack.enter_context(patch("core.cloakbrowser_registration.human_delay"))
-            stack.enter_context(patch("core.cloakbrowser_registration.post_register_dwell"))
+            stack.enter_context(patch("core.registration_flow.resolve_email_source", return_value="gmail_api_url"))
+            stack.enter_context(patch("core.registration_flow.human_delay"))
+            stack.enter_context(patch("core.account_export.post_register_dwell"))
             result = cloakbrowser_registration.run_cloak_registration(
                 email="user@example.com", name="Test", birthday="1990-01-01",
             )
@@ -353,24 +359,24 @@ class ForcePasswordFlowTests(unittest.TestCase):
         )
 
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", False)
-    @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")
-    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.registration_flow._fill_password_page_if_present", return_value="Secret123!")
+    @patch("core.registration_flow._submit_email_and_wait_next", return_value="otp")
     @patch("core.roxy_registration._build_driver")
     @patch("core.roxy_registration.RoxyBrowserClient")
     @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.registration_flow._maybe_accept")
     @patch("core.roxy_registration._center_browser_window")
     @patch("core.roxy_registration._check_manual_stop")
     @patch("core.roxy_registration.save_account_data")
     @patch("core.roxy_registration.resolve_email_source", return_value="paymesh")
-    @patch("core.roxy_registration.checkpoint_account_data", return_value=7)
-    @patch("core.roxy_registration._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
-    @patch("core.roxy_registration._complete_profile_page", return_value=True)
-    @patch("core.roxy_registration._wait_after_email_otp_submit", return_value="accepted")
-    @patch("core.roxy_registration.wait_for_otp", return_value="123456")
-    @patch("core.roxy_registration._click_continue")
-    @patch("core.roxy_registration._type_otp")
-    @patch("core.roxy_registration._clear_otp_inputs")
+    @patch("core.registration_flow.checkpoint_account_data", return_value=7)
+    @patch("core.registration_flow._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
+    @patch("core.registration_flow._complete_profile_page", return_value=True)
+    @patch("core.roxy_registration._complete_email_otp", return_value="accepted")
+    @patch("core.email_provider.wait_for_otp", return_value="123456")
+    @patch("core.browser_page_actions._click_continue")
+    @patch("core.browser_page_actions._type_otp")
+    @patch("core.browser_page_actions._clear_otp_inputs")
     def test_password_step_always_called_even_when_next_state_is_otp(
         self, _clear, _type, _click, _wait_otp, _wait_after, _profile, _fetch, _checkpoint, _resolve,
         _save, _check_stop, _center, _maybe, _human, _client_cls, _build, _submit, fill_pwd,
@@ -415,24 +421,24 @@ class ForcePasswordFlowTests(unittest.TestCase):
         side_effect=RuntimeError("re-auth 未进入 email-verification 页面: rate_limit_exceeded"),
     )
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", True)
-    @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")
-    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.registration_flow._fill_password_page_if_present", return_value="Secret123!")
+    @patch("core.registration_flow._submit_email_and_wait_next", return_value="otp")
     @patch("core.roxy_registration._build_driver")
     @patch("core.roxy_registration.RoxyBrowserClient")
     @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.registration_flow._maybe_accept")
     @patch("core.roxy_registration._center_browser_window")
     @patch("core.roxy_registration._check_manual_stop")
     @patch("core.roxy_registration.save_account_data")
     @patch("core.roxy_registration.resolve_email_source", return_value="paymesh")
-    @patch("core.roxy_registration.checkpoint_account_data", return_value=7)
-    @patch("core.roxy_registration._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
-    @patch("core.roxy_registration._complete_profile_page", return_value=True)
-    @patch("core.roxy_registration._wait_after_email_otp_submit", return_value="accepted")
-    @patch("core.roxy_registration.wait_for_otp", return_value="123456")
-    @patch("core.roxy_registration._click_continue")
-    @patch("core.roxy_registration._type_otp")
-    @patch("core.roxy_registration._clear_otp_inputs")
+    @patch("core.registration_flow.checkpoint_account_data", return_value=7)
+    @patch("core.registration_flow._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
+    @patch("core.registration_flow._complete_profile_page", return_value=True)
+    @patch("core.roxy_registration._complete_email_otp", return_value="accepted")
+    @patch("core.email_provider.wait_for_otp", return_value="123456")
+    @patch("core.browser_page_actions._click_continue")
+    @patch("core.browser_page_actions._type_otp")
+    @patch("core.browser_page_actions._clear_otp_inputs")
     def test_twofa_setup_failure_keeps_account_for_queue_retry(
         self, _clear, _type, _click, _wait_otp, _wait_after, _profile, _fetch, _checkpoint,
         _resolve, _save, _check_stop, _center, _maybe, _human, _client_cls, _build, _submit,
@@ -467,26 +473,26 @@ class ForcePasswordFlowTests(unittest.TestCase):
         # 2FA 失败的账号仍进入 pay153 自动任务排队。
         pay153_enqueue.assert_called_once()
 
-    @patch("core.roxy_registration._click_continue_with_password_link", return_value=True)
+    @patch("core.registration_flow._click_continue_with_password_link", return_value=True)
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", False)
-    @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")
-    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.registration_flow._fill_password_page_if_present", return_value="Secret123!")
+    @patch("core.registration_flow._submit_email_and_wait_next", return_value="otp")
     @patch("core.roxy_registration._build_driver")
     @patch("core.roxy_registration.RoxyBrowserClient")
     @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.registration_flow._maybe_accept")
     @patch("core.roxy_registration._center_browser_window")
     @patch("core.roxy_registration._check_manual_stop")
     @patch("core.roxy_registration.save_account_data")
     @patch("core.roxy_registration.resolve_email_source", return_value="paymesh")
-    @patch("core.roxy_registration.checkpoint_account_data", return_value=7)
-    @patch("core.roxy_registration._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
-    @patch("core.roxy_registration._complete_profile_page", return_value=True)
-    @patch("core.roxy_registration._wait_after_email_otp_submit", return_value="accepted")
-    @patch("core.roxy_registration.wait_for_otp", return_value="123456")
-    @patch("core.roxy_registration._click_continue")
-    @patch("core.roxy_registration._type_otp")
-    @patch("core.roxy_registration._clear_otp_inputs")
+    @patch("core.registration_flow.checkpoint_account_data", return_value=7)
+    @patch("core.registration_flow._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
+    @patch("core.registration_flow._complete_profile_page", return_value=True)
+    @patch("core.roxy_registration._complete_email_otp", return_value="accepted")
+    @patch("core.email_provider.wait_for_otp", return_value="123456")
+    @patch("core.browser_page_actions._click_continue")
+    @patch("core.browser_page_actions._type_otp")
+    @patch("core.browser_page_actions._clear_otp_inputs")
     def test_force_password_clicks_continue_with_password_before_otp(
         self, _clear, _type, _click, _wait_otp, _wait_after, _profile, _fetch, _checkpoint, _resolve,
         _save, _check_stop, _center, _maybe, _human, _client_cls, _build, _submit,
@@ -511,15 +517,15 @@ class ForcePasswordFlowTests(unittest.TestCase):
         click_pwd_link.assert_called_once_with(driver)
 
     @patch("core.roxy_registration._cfg.ROXY_KEEP_BROWSER_OPEN", False)
-    @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")
-    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="password")
+    @patch("core.registration_flow._fill_password_page_if_present", return_value="Secret123!")
+    @patch("core.registration_flow._submit_email_and_wait_next", return_value="password")
     @patch("core.roxy_registration._build_driver")
     @patch("core.roxy_registration.RoxyBrowserClient")
     @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.registration_flow._maybe_accept")
     @patch("core.roxy_registration._center_browser_window")
     @patch("core.roxy_registration._check_manual_stop")
-    @patch("core.roxy_registration.wait_for_otp", side_effect=RuntimeError("otp timeout"))
+    @patch("core.email_provider.wait_for_otp", side_effect=RuntimeError("otp timeout"))
     def test_password_submission_failure_does_not_reuse_email(
         self, _wait_otp, _check_stop, _center, _maybe, _human, _client_cls, _build, _submit, _fill_pwd,
     ):
@@ -544,13 +550,13 @@ class ForcePasswordFlowTests(unittest.TestCase):
 
     @patch("core.roxy_registration._cfg.ROXY_KEEP_BROWSER_OPEN", False)
     @patch(
-        "core.roxy_registration._submit_email_and_wait_next",
+        "core.registration_flow._submit_email_and_wait_next",
         side_effect=RuntimeError("邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url=https://auth.openai.com/log-in/password"),
     )
     @patch("core.roxy_registration._build_driver")
     @patch("core.roxy_registration.RoxyBrowserClient")
     @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.registration_flow._maybe_accept")
     @patch("core.roxy_registration._center_browser_window")
     @patch("core.roxy_registration._check_manual_stop")
     def test_login_password_failure_does_not_reuse_email(
@@ -572,34 +578,34 @@ class ForcePasswordFlowTests(unittest.TestCase):
             )
 
         self.assertFalse(result["success"])
+        self.assertEqual(
+            result["error"].split(": ", 1)[1].split(": url=", 1)[0],
+            "邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用",
+        )
         release_email.assert_called_once()
         self.assertEqual(release_email.call_args.kwargs["status"], "failed")
 
     def test_fill_password_page_raises_on_login_password_page(self):
-        """登录密码页在 _fill_password_page_if_present 内出现时必须立刻停用邮箱（job 2421）。"""
+        """登录密码页在共享 _fill_password_page_if_present 内必须立刻失败。"""
         driver = Mock()
-        for module in (roxy_registration, browser_registration):
-            with self.subTest(module=module.__name__):
-                with (
-                    patch(f"{module.__name__}._is_email_verification_page", return_value=False),
-                    patch(f"{module.__name__}._has_access_token", return_value=False),
-                    patch(f"{module.__name__}._is_login_password_page", return_value=True),
-                    patch(f"{module.__name__}._is_signup_password_page", return_value=False),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "已注册/不可用邮箱"):
-                        module._fill_password_page_if_present(driver, "user@example.com", timeout=0.5)
+        with patch("core.registration_flow._is_email_verification_page", return_value=False), \
+            patch("core.registration_flow._has_access_token", return_value=False), \
+            patch("core.registration_flow._is_login_password_page", return_value=True), \
+            patch("core.registration_flow._is_signup_password_page", return_value=False), \
+            self.assertRaisesRegex(RuntimeError, "已注册/不可用邮箱"):
+            registration_flow._fill_password_page_if_present(driver, "user@example.com", timeout=0.5)
 
     @patch("core.roxy_registration._cfg.ROXY_KEEP_BROWSER_OPEN", False)
     @patch(
-        "core.roxy_registration._fill_password_page_if_present",
+        "core.registration_flow._fill_password_page_if_present",
         side_effect=RuntimeError("邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url=https://auth.openai.com/log-in/password"),
     )
-    @patch("core.roxy_registration._click_continue_with_password_link", return_value=True)
-    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.registration_flow._click_continue_with_password_link", return_value=True)
+    @patch("core.registration_flow._submit_email_and_wait_next", return_value="otp")
     @patch("core.roxy_registration._build_driver")
     @patch("core.roxy_registration.RoxyBrowserClient")
     @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.registration_flow._maybe_accept")
     @patch("core.roxy_registration._center_browser_window")
     @patch("core.roxy_registration._check_manual_stop")
     def test_otp_path_login_password_failure_releases_email_failed(
@@ -622,29 +628,32 @@ class ForcePasswordFlowTests(unittest.TestCase):
             )
 
         self.assertFalse(result["success"])
-        self.assertIn("已注册", str(result.get("message") or result))
+        self.assertIn(
+            "邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用",
+            result["error"],
+        )
         release_email.assert_called_once()
         self.assertEqual(release_email.call_args.kwargs["status"], "failed")
     @patch("core.roxy_registration._twofa_cfg.ENABLE_2FA", True)
-    @patch("core.roxy_registration._fill_password_page_if_present", return_value="Secret123!")
-    @patch("core.roxy_registration._submit_email_and_wait_next", return_value="otp")
+    @patch("core.registration_flow._fill_password_page_if_present", return_value="Secret123!")
+    @patch("core.registration_flow._submit_email_and_wait_next", return_value="otp")
     @patch("core.roxy_registration._build_driver")
     @patch("core.roxy_registration.RoxyBrowserClient")
     @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._maybe_accept")
+    @patch("core.registration_flow._maybe_accept")
     @patch("core.roxy_registration._center_browser_window")
     @patch("core.roxy_registration._check_manual_stop")
     @patch("core.roxy_registration.db.update_account_2fa")
-    @patch("core.roxy_registration.checkpoint_account_data", return_value=41)
+    @patch("core.registration_flow.checkpoint_account_data", return_value=41)
     @patch("core.roxy_registration.resolve_email_source", return_value="paymesh")
     @patch("core.account_export.setup_2fa_for_registration", side_effect=RuntimeError("script timeout"))
-    @patch("core.roxy_registration._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
-    @patch("core.roxy_registration._complete_profile_page", return_value=True)
-    @patch("core.roxy_registration._wait_after_email_otp_submit", return_value="accepted")
-    @patch("core.roxy_registration.wait_for_otp", return_value="123456")
-    @patch("core.roxy_registration._click_continue")
-    @patch("core.roxy_registration._type_otp")
-    @patch("core.roxy_registration._clear_otp_inputs")
+    @patch("core.registration_flow._fetch_chatgpt_session", return_value={"accessToken": "tok", "user": {}, "account": {}})
+    @patch("core.registration_flow._complete_profile_page", return_value=True)
+    @patch("core.roxy_registration._complete_email_otp", return_value="accepted")
+    @patch("core.email_provider.wait_for_otp", return_value="123456")
+    @patch("core.browser_page_actions._click_continue")
+    @patch("core.browser_page_actions._type_otp")
+    @patch("core.browser_page_actions._clear_otp_inputs")
     def test_twofa_failure_returns_persisted_partial_account(
         self, _clear, _type, _click, _wait_otp, _wait_after, _profile, _fetch,
         _setup_twofa, _resolve, checkpoint, update_twofa, _check_stop, _center,
@@ -668,7 +677,10 @@ class ForcePasswordFlowTests(unittest.TestCase):
         self.assertEqual(result["account_id"], 41)
         self.assertEqual(result["twofa_status"], "failed")
         self.assertIn("script timeout", result["twofa_error"])
-        checkpoint.assert_called_once()
+        # about-you 后先落早检查点（无 token），session 到手后再补 token 检查点。
+        self.assertEqual(checkpoint.call_count, 2)
+        self.assertEqual(checkpoint.call_args_list[0].kwargs["access_token"], "")
+        self.assertEqual(checkpoint.call_args_list[1].kwargs["access_token"], "tok")
         _setup_twofa.assert_called_once_with(driver, "user@example.com")
         update_twofa.assert_called_with(41, status="failed", error=result["twofa_error"])
 

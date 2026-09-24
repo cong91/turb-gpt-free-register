@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 
 from core.account_export import BrowserPageTransport, fetch_session, setup_2fa_in_page
+from core.browser_twofa_login import _login_existing_account
 from core.codex_login_credentials import CodexLoginCredentials
 from core.email_change import _parse_credential_lines_strict
 
@@ -158,7 +159,6 @@ def _mfa_request_headers(transport: BrowserPageTransport, access_token: str, pat
 
 def _login_and_get_access_token(driver, item: TwofaChangeInput) -> str:
     """Use the shared existing-account browser login and return its fresh token."""
-    from core.browser_twofa_login import _login_existing_account
     from core.openai_auth import AccountUnusableError
 
     last_error: Exception | None = None

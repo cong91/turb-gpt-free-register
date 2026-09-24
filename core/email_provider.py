@@ -87,6 +87,37 @@ def _current_otpmail_order_id(email: str) -> str | None:
         return None
 
 
+def _current_gmail_api_url_ancestor_job_ids(limit: int = 5) -> list[int]:
+    """Các job tổ tiên theo parent_job_id của job đang chạy.
+
+    Job 2FA/Codex requeue không sở hữu alias assignment riêng; alias thuộc
+    job registration gốc ở đầu chuỗi (vd 2FA 2893 → requeue 2890 → regis 2880).
+    Resolver theo job_id hiện tại sẽ trượt, phải thử lần lượt các tổ tiên.
+    """
+    job_id = _current_otp_job_id()
+    ancestors: list[int] = []
+    current: int | None = job_id
+    seen: set[int] = set()
+    while current is not None and current not in seen and len(ancestors) < limit:
+        seen.add(current)
+        try:
+            from core import db
+
+            job = db.get_job(current) or {}
+        except (AttributeError, TypeError, ValueError):
+            break
+        parent = job.get("parent_job_id")
+        try:
+            parent_id = int(parent) if parent is not None else None
+        except (TypeError, ValueError):
+            break
+        if parent_id is None:
+            break
+        ancestors.append(parent_id)
+        current = parent_id
+    return ancestors
+
+
 def _get_code_url_account(email: str, source: str):
     """Resolve a Gmail API URL account for either URL-backed provider."""
     source = _canonicalize_runtime_source(source)
@@ -102,6 +133,11 @@ def _get_code_url_account(email: str, source: str):
             job_id=job_id,
             batch_id=_current_gmail_api_url_batch_id(),
         )
+        if batch_account is None:
+            for ancestor_id in _current_gmail_api_url_ancestor_job_ids():
+                batch_account = get_batch_account_context(email, job_id=ancestor_id)
+                if batch_account is not None:
+                    break
         account = batch_account or get_account_context(email)
     else:
         return None
@@ -147,8 +183,13 @@ def _quarantine_code_url_after_provider_error(account, *, source: str, error: Ex
         )
 
 
-def _raise_if_code_url_is_quarantined(account) -> None:
-    """Prevent polling a Gmail root/alias that is disabled or retired."""
+def _raise_if_code_url_is_quarantined(account, *, stage: str | None = None) -> None:
+    """Prevent polling a Gmail root/alias that is disabled or retired.
+
+    Existing-account OTP reads (stage twofa_*) skip the raw-root allocation
+    gate: disabled/exhausted chỉ chặn việc cấp alias mới, còn quarantine 602
+    thật của provider vẫn chặn mọi lượt đọc.
+    """
     from core import db
 
     code_url = str(getattr(account, "code_url", "") or "")
@@ -162,6 +203,10 @@ def _raise_if_code_url_is_quarantined(account) -> None:
         from core.gmail_api_url_client import GmailApiUrlError
 
         raise GmailApiUrlError("Provider error code=602: Gmail API URL source is quarantined")
+    from core.gmail_api_url_client import is_existing_account_otp_stage
+
+    if is_existing_account_otp_stage(stage):
+        return
     source_blocked = db.is_gmail_api_url_account_blocked(
         email,
         sqlite_path=runtime_path,
@@ -191,8 +236,8 @@ def snapshot_verification_code(email: str, *, stage: str | None = None) -> str |
 
     account = _get_code_url_account(email, source)
     try:
-        _raise_if_code_url_is_quarantined(account)
-        code = snapshot_code(account)
+        _raise_if_code_url_is_quarantined(account, stage=stage)
+        code = snapshot_code(account, stage=stage)
     except Exception as exc:
         _quarantine_code_url_after_provider_error(account, source=source, error=exc)
         raise
@@ -656,7 +701,7 @@ def _mark_job_gmail_otp_received() -> None:
             return
         context["gmail_api_url_otp_received"] = True
         db.update_job(job_id, provider_context=context)
-    except Exception:  # noqa: BLE001 - binding bookkeeping must not break OTP delivery.
+    except Exception:
         logger.exception(
             "[EmailProvider] Không thể ghi nhận OTP đã nhận cho job %s", job_id
         )
@@ -700,7 +745,7 @@ def _wait_for_code_url_otp(
     if before_code is not _BEFORE_CODE_UNSET:
         poll_kwargs["before_code"] = before_code
     try:
-        _raise_if_code_url_is_quarantined(account)
+        _raise_if_code_url_is_quarantined(account, stage=stage)
         otp = poll_verification_code(normalized_account, **poll_kwargs)
     except GmailApiUrlError as exc:
         _quarantine_code_url_after_provider_error(account, source=source, error=exc)

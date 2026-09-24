@@ -245,7 +245,9 @@ def _run_plan_check(
             from config import register as register_cfg
 
             if trigger == "manual_pay153_promotion":
-                from core.account_pay153_promotion import run_account_pay153_promotion_probe
+                from core.account_pay153_promotion import (
+                    run_account_pay153_promotion_probe,
+                )
 
                 promotion_result = run_account_pay153_promotion_probe(
                     account_id=account_id,

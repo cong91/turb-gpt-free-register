@@ -1,6 +1,6 @@
 import unittest
 
-from core import roxy_registration
+from core import registration_profile_utils
 
 
 class RoxyProfileErrorTests(unittest.TestCase):
@@ -11,7 +11,7 @@ class RoxyProfileErrorTests(unittest.TestCase):
             "errors": [],
         }
 
-        error = roxy_registration._profile_submission_error(snapshot)
+        error = registration_profile_utils.profile_submission_error(snapshot)
 
         self.assertEqual(
             error,
@@ -26,7 +26,7 @@ class RoxyProfileErrorTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            roxy_registration._profile_submission_error(snapshot),
+            registration_profile_utils.profile_submission_error(snapshot),
             "Cannot create your account due to the terms of use.",
         )
 
@@ -36,7 +36,7 @@ class RoxyProfileErrorTests(unittest.TestCase):
             "errors": [],
         }
 
-        self.assertIsNone(roxy_registration._profile_submission_error(snapshot))
+        self.assertIsNone(registration_profile_utils.profile_submission_error(snapshot))
 
     def test_unsupported_email_error_is_terminal(self):
         snapshot = {
@@ -46,9 +46,29 @@ class RoxyProfileErrorTests(unittest.TestCase):
         }
 
         self.assertEqual(
-            roxy_registration._profile_submission_error(snapshot),
+            registration_profile_utils.profile_submission_error(snapshot),
             "This email is not supported.",
         )
+
+    def test_user_already_exists_error_is_terminal(self):
+        # Trang lỗi OpenAI (batch 2026-09-21): "An account already exists for
+        # this email address or phone number. Please log in instead." +
+        # error_code: user_already_exists — alias đã có account server-side,
+        # phải bỏ alias này và lấy alias mới.
+        snapshot = {
+            "url": "https://auth.openai.com/about-you",
+            "text": (
+                "Oops, an error occurred! An account already exists for this "
+                "email address or phone number. Please log in instead. "
+                "error_code: user_already_exists"
+            ),
+            "errors": [],
+        }
+
+        error = registration_profile_utils.profile_submission_error(snapshot)
+
+        self.assertIsNotNone(error)
+        self.assertIn("already exists for this email", error)
 
 
 if __name__ == "__main__":

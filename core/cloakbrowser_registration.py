@@ -12,7 +12,6 @@ from config import twofa as _twofa_cfg
 from core import db
 from core.account_export import (
     BrowserPageTransport,
-    checkpoint_account_data,
     post_register_dwell,
     save_account_data,
 )
@@ -23,25 +22,14 @@ from core.browser_challenge import (
     wait_for_browser_challenge as _wait_for_browser_challenge,
 )
 
-# 复用 Roxy 注册流程里已维护好的页面操作函数。
-from core.browser_registration import (
-    _check_manual_stop,
+# 复用注册共享流程里已维护好的页面操作函数（P2/P3/P4 各 module）。
+from core.browser_page_actions import (
     _clear_otp_inputs,
     _click_continue,
-    _click_continue_with_password_link,
-    _click_if_enabled_submit,
     _click_resend_email_otp,
-    _complete_profile_page,
     _email_otp_page_state,
-    _fetch_chatgpt_session,
-    _fill_password_page_if_present,
-    _is_email_verification_page,
-    _is_unsupported_email_error,
-    _maybe_accept,
     _page_snapshot,
-    _profile_submission_error,
     _safe_get,
-    _submit_email_and_wait_next,
     _type_otp,
     _wait_after_email_otp_submit,
 )
@@ -56,7 +44,19 @@ from core.email_provider import (
     wait_for_otp,
 )
 from core.humanize import delay as human_delay
-from core.openai_auth import AccountUnusableError, account_unusable_message
+from core.registration_flow import (
+    _check_manual_stop,
+    _click_if_enabled_submit,
+    registration_failure_result,
+    release_registration_email_on_failure,
+    run_registration_page_flow,
+)
+from core.registration_profile_utils import (
+    profile_submission_error as _profile_submission_error,
+)
+from core.registration_profile_utils import (
+    profile_submission_failure_message as _profile_submission_failure_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +169,7 @@ def _wait_for_profile_submit_transition(
         last_snapshot = _page_snapshot(driver)
         profile_error = _profile_submission_error(last_snapshot)
         if profile_error:
-            raise RuntimeError(f"about-you 提交失败：{profile_error}")
+            raise RuntimeError(_profile_submission_failure_message(profile_error))
 
         current_url = str(
             last_snapshot.get("url") or getattr(driver, "current_url", "") or ""
@@ -204,6 +204,91 @@ def _wait_for_profile_submit_transition(
     return False
 
 
+def _complete_cloak_email_otp(
+    driver,
+    email: str,
+    *,
+    otp_after_ts: float,
+    otp_code: str | None = None,
+    otp_before_code: str | None | object = None,
+) -> None:
+    """Cloak lane OTP loop: chờ form OTP sẵn sàng trước khi lấy/submit mã."""
+    current_otp = otp_code
+    max_otp_attempts = 3
+    otp_ready_timeout = max(
+        45.0,
+        min(90.0, float(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90)),
+    )
+    for otp_attempt in range(1, max_otp_attempts + 1):
+        if current_otp is None:
+            logger.info("[Cloak注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
+            try:
+                if driver.__class__.__name__ == "BrowserSeleniumDriver":
+                    # Do not consume a mailbox OTP while Cloudflare or the
+                    # verification form is still transitioning.
+                    _wait_for_otp_inputs(driver, timeout=otp_ready_timeout)
+                wait_kwargs = {
+                    "after_ts": otp_after_ts,
+                    "before_code": otp_before_code,
+                    "stage": "registration_email_otp",
+                }
+                current_otp = wait_for_otp(email, **wait_kwargs)
+            except Exception as exc:
+                if otp_attempt >= max_otp_attempts:
+                    raise
+                logger.warning(
+                    "[Cloak注册][OTP] 一直未收到验证码，点击“重新发送电子邮件”后继续等待（下一轮 %s/%s）：%s: %s",
+                    otp_attempt + 1,
+                    max_otp_attempts,
+                    type(exc).__name__,
+                    str(exc)[:180],
+                )
+                otp_after_ts = time.time()
+                otp_before_code = snapshot_verification_code(
+                    email,
+                    stage="registration_email_resend",
+                )
+                _click_resend_email_otp(driver, timeout=25)
+                human_delay("api")
+                current_otp = None
+                continue
+        logger.info("[Cloak注册][OTP] 收到验证码：%s", current_otp)
+        if driver.__class__.__name__ == "BrowserSeleniumDriver":
+            _wait_for_otp_inputs(driver, timeout=otp_ready_timeout)
+        _clear_otp_inputs(driver)
+        _type_otp(driver, current_otp)
+        human_delay("otp_input")
+        try:
+            _click_continue(driver)
+        except Exception as exc:  # noqa: BLE001
+            logger.info("[Cloak注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
+
+        outcome = _wait_after_email_otp_submit(driver, timeout=10)
+        if outcome == "accepted":
+            acknowledge_verification_code(
+                email,
+                current_otp,
+                stage="registration_email_otp",
+            )
+            return
+        if otp_attempt >= max_otp_attempts:
+            raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
+        otp_after_ts = time.time()
+        otp_before_code = snapshot_verification_code(
+            email,
+            stage="registration_email_resend",
+        ) or current_otp
+        _click_resend_email_otp(driver, timeout=25)
+        human_delay("api")
+        current_otp = None
+
+
+def _after_cloak_profile_submit(driver) -> None:
+    """Cloak lane: đợi rời profile page rồi follow signup callback nếu có."""
+    _wait_for_profile_submit_transition(driver)
+    _follow_signup_callback_if_present(driver)
+
+
 def run_cloak_registration(
     email: str,
     name: str,
@@ -216,7 +301,6 @@ def run_cloak_registration(
     """CloakBrowser 自动化注册入口。"""
     driver = None
     opened = None
-    create_acknowledged = False
     openai_password: str | None = None
     traffic_tracker: SeleniumTrafficTracker | None = None
     network_traffic: dict | None = None
@@ -231,20 +315,6 @@ def run_cloak_registration(
         registration_geo = (((opened.raw or {}).get("locale") or {}).get("geo") or {})
         logger.info("[Cloak注册] 开始：%s，profile=%s", email, opened.profile_id)
 
-        otp_before_code = snapshot_verification_code(email, stage="registration_email_request")
-        otp_after_ts = time.time()
-        logger.info("[Cloak注册] 打开登录页：https://chatgpt.com/auth/login")
-        _safe_get(
-            driver,
-            "https://chatgpt.com/auth/login",
-            timeout=min(45, int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90)),
-            attempts=max(1, int(getattr(_cfg, "CLOAK_NAVIGATION_RETRIES", 3) or 3)),
-            accept_hosts=("chatgpt.com", "auth.openai.com"),
-        )
-        human_delay("navigate")
-        _maybe_accept(driver)
-        _check_manual_stop()
-
         def _email_supplier_after_input() -> str:
             nonlocal email
             _check_manual_stop()
@@ -253,124 +323,41 @@ def run_cloak_registration(
                 on_email_acquired(email)
             return email
 
-        next_state = _submit_email_and_wait_next(
+        otp_before_code = snapshot_verification_code(email, stage="registration_email_request")
+        flow_result = run_registration_page_flow(
             driver,
             email,
-            attempts=3,
+            name,
+            birthday,
+            otp_code=otp_code,
+            otp_before_code=otp_before_code,
             email_supplier=_email_supplier_after_input,
-        )
-        _check_manual_stop()
-
-        # 如果邮箱提交后直接进入验证码页，也尝试点击“使用密码继续”进入密码创建页；
-        # _fill_password_page_if_present 会在设置成功后返回本次 OpenAI 注册密码。
-        # Luôn force password: nếu email transition trả về OTP, chuyển sang
-        # create-account/password trước khi nhập, không chạy OTP-only.
-        if next_state == "otp" or (next_state == "logged_in" and _is_email_verification_page(driver)):
-            _click_continue_with_password_link(driver)
-            _check_manual_stop()
-        openai_password = _fill_password_page_if_present(driver, email, timeout=25)
-        if openai_password:
-            create_acknowledged = True
-        _check_manual_stop()
-
-        current_otp = otp_code
-        max_otp_attempts = 3
-        otp_ready_timeout = max(
-            45.0,
-            min(90.0, float(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90)),
-        )
-        for otp_attempt in range(1, max_otp_attempts + 1):
-            if current_otp is None:
-                logger.info("[Cloak注册][OTP] 等待验证码：%s（第 %s/%s 次）", email, otp_attempt, max_otp_attempts)
-                try:
-                    if driver.__class__.__name__ == "BrowserSeleniumDriver":
-                        # Do not consume a mailbox OTP while Cloudflare or the
-                        # verification form is still transitioning.
-                        _wait_for_otp_inputs(driver, timeout=otp_ready_timeout)
-                    wait_kwargs = {
-                        "after_ts": otp_after_ts,
-                        "before_code": otp_before_code,
-                        "stage": "registration_email_otp",
-                    }
-                    current_otp = wait_for_otp(email, **wait_kwargs)
-                except Exception as exc:
-                    if otp_attempt >= max_otp_attempts:
-                        raise
-                    logger.warning(
-                        "[Cloak注册][OTP] 一直未收到验证码，点击“重新发送电子邮件”后继续等待（下一轮 %s/%s）：%s: %s",
-                        otp_attempt + 1,
-                        max_otp_attempts,
-                        type(exc).__name__,
-                        str(exc)[:180],
-                    )
-                    otp_after_ts = time.time()
-                    otp_before_code = snapshot_verification_code(
-                        email,
-                        stage="registration_email_resend",
-                    )
-                    _click_resend_email_otp(driver, timeout=25)
-                    human_delay("api")
-                    current_otp = None
-                    continue
-            logger.info("[Cloak注册][OTP] 收到验证码：%s", current_otp)
-            if driver.__class__.__name__ == "BrowserSeleniumDriver":
-                _wait_for_otp_inputs(driver, timeout=otp_ready_timeout)
-            _clear_otp_inputs(driver)
-            _type_otp(driver, current_otp)
-            human_delay("otp_input")
-            try:
-                _click_continue(driver)
-            except Exception as exc:  # noqa: BLE001
-                logger.info("[Cloak注册][OTP] 未找到显式提交按钮，继续等待页面状态：%s", str(exc)[:120])
-
-            outcome = _wait_after_email_otp_submit(driver, timeout=10)
-            if outcome == "accepted":
-                acknowledge_verification_code(
-                    email,
-                    current_otp,
-                    stage="registration_email_otp",
-                )
-                break
-            if otp_attempt >= max_otp_attempts:
-                raise RuntimeError("邮箱验证码连续错误/过期，已达到最大重试次数")
-            otp_after_ts = time.time()
-            otp_before_code = snapshot_verification_code(
-                email,
-                stage="registration_email_resend",
-            ) or current_otp
-            _click_resend_email_otp(driver, timeout=25)
-            human_delay("api")
-            current_otp = None
-
-        profile_submitted = _complete_profile_page(driver, name, birthday, timeout=60)
-        if profile_submitted:
-            create_acknowledged = True
-            if driver.__class__.__name__ == "BrowserSeleniumDriver":
-                _wait_for_profile_submit_transition(driver)
-            human_delay("post_auth")
-            if driver.__class__.__name__ == "BrowserSeleniumDriver":
-                _follow_signup_callback_if_present(driver)
-
-        session_info = _fetch_chatgpt_session(driver, timeout=120, auto_jump_wait=45)
-        access_token = session_info["accessToken"]
-        logger.info("[Cloak注册] 已拿到 accessToken：%s", email)
-
-        account_id = checkpoint_account_data(
-            email=email,
-            access_token=access_token,
-            email_source=resolve_email_source(email),
-            proxy_used=((opened.raw or {}).get("proxy") if opened else None) or proxy or None,
-            registration_ip=registration_geo.get("ip") or None,
-            extra={
-                "user": session_info.get("user"),
-                "account": session_info.get("account"),
-                "expires": session_info.get("expires"),
-                "registration_password": openai_password,
+            proxy=proxy,
+            registration_driver="cloak",
+            checkpoint_extras={
                 "cloakbrowser": {"profile_id": opened.profile_id, "open_result": opened.raw},
-                "registration_driver": "cloak",
             },
+            registration_ip=registration_geo.get("ip") or None,
+            login_page_timeout=min(45, int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90)),
+            login_page_attempts=max(1, int(getattr(_cfg, "CLOAK_NAVIGATION_RETRIES", 3) or 3)),
+            session_auto_jump_wait=45,
+            otp_completion=_complete_cloak_email_otp,
+            after_profile_submit=_after_cloak_profile_submit,
+            log_prefix="[Cloak注册]",
         )
-        logger.info("[Cloak注册] token 检查点已保存：account_id=%s twofa=pending", account_id)
+        if not flow_result.get("success"):
+            if traffic_tracker is not None:
+                try:
+                    network_traffic = traffic_tracker.stop()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            flow_result["network_traffic"] = network_traffic
+            return flow_result
+        email = flow_result["email"]
+        openai_password = flow_result["openai_password"]
+        access_token = flow_result["access_token"]
+        session_info = flow_result["session_info"]
+        account_id = flow_result["account_id"]
 
         totp_secret = None
         twofa_status = "disabled"
@@ -447,7 +434,9 @@ def run_cloak_registration(
                         f"{str(recovery.get('message') or 'unknown error')[:300]}"
                     )
                 try:
-                    from core.registration_auto_pay153 import enqueue_registration_auto_pay153
+                    from core.registration_auto_pay153 import (
+                        enqueue_registration_auto_pay153,
+                    )
 
                     enqueue_registration_auto_pay153(
                         account_id=account_id,
@@ -567,26 +556,15 @@ def run_cloak_registration(
                 pass
         logger.error("[Cloak注册] 失败：%s: %s", type(exc).__name__, exc)
         logger.debug("[Cloak注册] 失败详情", exc_info=True)
-        try:
-            from core.email_provider import release_email
-            error_text = str(exc)
-            note_text = account_unusable_message(exc.error_code) if isinstance(exc, AccountUnusableError) else error_text
-            release_status = "disabled" if (
-                isinstance(exc, AccountUnusableError)
-                or "account_deactivated" in error_text
-                or "account_deleted" in error_text
-                or "account_banned" in error_text
-                or _is_unsupported_email_error(error_text)
-            ) else "failed" if create_acknowledged else "available"
-            release_email(email, status=release_status, note=note_text[:180])
-        except Exception:  # noqa: BLE001, S110
-            pass
-        return {
-            "success": False,
-            "email": email,
-            "network_traffic": network_traffic,
-            "error": f"{type(exc).__name__}: {str(exc)[:800]}",
-        }
+        # Flow dùng chung đã release email cho lỗi xảy ra bên trong nó; ở đây chỉ
+        # cần release cho lỗi trước/sau flow (build driver, 2FA, Codex, save).
+        release_registration_email_on_failure(
+            exc,
+            email,
+            create_acknowledged=True,
+            log_prefix="[Cloak注册]",
+        )
+        return registration_failure_result(exc, email, extras={"network_traffic": network_traffic})
     finally:
         if traffic_tracker is not None:
             try:

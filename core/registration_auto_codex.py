@@ -8,39 +8,27 @@ from datetime import datetime, timezone
 
 from config import register as _register_cfg
 from core import db
+from core.browser_registry import (
+    is_live_browser_driver,
+    normalize_driver,
+    resolve_registration_driver,
+)
 from core.chatgpt_plan import PlanCheckBrowserTransport, check_account_plan
 from core.registration_auto_pay153 import run_registration_auto_pay153
 
 logger = logging.getLogger(__name__)
-
-_LIVE_BROWSER_REGISTRATION_DRIVERS = frozenset({
-    "roxy",
-    "roxybrowser",
-    "fingerprint",
-    "browser",
-    "cloak",
-    "cloakbrowser",
-    "browser_use",
-    "browseruse",
-    "browser-use",
-    "bu",
-    "skyvern",
-    "sv",
-})
 
 
 def configured_registration_driver() -> str:
     """Return the normalized registration driver from the live configuration."""
     from config import roxybrowser as _driver_cfg
 
-    return str(
-        getattr(_driver_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol"
-    ).strip().lower()
+    return resolve_registration_driver(_driver_cfg)
 
 
 def registration_driver_uses_live_browser(driver: str | None = None) -> bool:
     """Return whether a registration driver owns a browser Codex must reuse."""
-    return str(driver or configured_registration_driver()).strip().lower() in _LIVE_BROWSER_REGISTRATION_DRIVERS
+    return is_live_browser_driver(driver or configured_registration_driver())
 
 
 def account_registration_driver(account: dict | None) -> str:
@@ -48,7 +36,7 @@ def account_registration_driver(account: dict | None) -> str:
     if isinstance(account, dict):
         direct = str(account.get("registration_driver") or "").strip().lower()
         if direct:
-            return direct
+            return normalize_driver(direct)
         extra_json = account.get("extra_json")
         if isinstance(extra_json, str) and extra_json:
             import json
@@ -60,7 +48,7 @@ def account_registration_driver(account: dict | None) -> str:
             if isinstance(extra, dict):
                 persisted = str(extra.get("registration_driver") or "").strip().lower()
                 if persisted:
-                    return persisted
+                    return normalize_driver(persisted)
     return configured_registration_driver()
 
 

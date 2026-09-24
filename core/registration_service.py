@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from core import codex_retry_service, db
+from core.browser_failure_policy import is_account_unusable_failure
+from core.browser_registry import (
+    is_live_browser_driver,
+    resolve_twofa_retry_driver,
+)
 from core.openai_auth import account_unusable_message
 from core.registration_maintenance_barrier import RegistrationMaintenanceBarrier
 
@@ -36,6 +41,8 @@ _executor_workers = _DEFAULT_MAX_WORKERS
 _executor_generation = 0
 _retired_executors: list[ThreadPoolExecutor] = []
 _executor_lock = threading.RLock()
+# 2FA 补做专用池：与注册 lane 互不排队（见 get_twofa_executor）。
+_twofa_executor: ThreadPoolExecutor | None = None
 
 _STOP_EVENTS: dict[int, threading.Event] = {}
 _ACTIVE_JOBS: set[int] = set()
@@ -47,7 +54,6 @@ _JOB_EMAIL_INPUTS_LOCK = threading.Lock()
 _MAINTENANCE_BARRIER = RegistrationMaintenanceBarrier()
 _rotation_pending = False
 _ROTATION_LOCK = threading.Lock()
-_SUPPORTED_BROWSER_TWOFA_DRIVERS = frozenset({"roxy", "cloak", "browser_use", "skyvern"})
 _PROVIDER_BATCH_STOP_SOURCES = frozenset({"gmail_api_url", "otpmail", "bamboommo"})
 _PROVIDER_BATCH_STOP_MARKERS = (
     "checkout_blocked",
@@ -477,11 +483,18 @@ def _reattach_gmail_api_url_retry_alias(source: dict, job: dict) -> dict:
     otp_received = bool(source_context.get("gmail_api_url_otp_received"))
     error_text = str(source.get("error_message") or "")
     poisoned = _should_disable_failed_registration_email(error_text)
+    # user_already_exists = alias này đã có account server-side (WARNING_BANNER
+    # lần trước đã finalize chậm): đăng ký lại chắc chắn gặp lại lỗi — luôn
+    # chuyển alias mới, nhưng root email vẫn tốt nên không disable root.
+    alias_already_registered = (
+        "user_already_exists" in error_text
+        or "already exists for this email" in error_text
+    )
 
     if not alias:
         return _assign_fresh_gmail_api_url_registration_batch(job)
 
-    if otp_received and poisoned:
+    if otp_received and (poisoned or alias_already_registered):
         # OpenAI tự từ chối mailbox này sau khi đã nhận OTP → email khác.
         return _assign_fresh_gmail_api_url_registration_batch(job, force=True)
 
@@ -511,7 +524,7 @@ def _reattach_gmail_api_url_retry_alias(source: dict, job: dict) -> dict:
         found = GmailApiUrlBatchStore(APP_STATE_DB_PATH).find_item_by_alias(alias)
         if found:
             code_url = str(found[1] or "")
-    except Exception:  # noqa: BLE001 - quarantine probing must not block retry creation.
+    except Exception:
         logger.debug("[Service] Không xác định được code_url của alias retry", exc_info=True)
     if code_url:
         from core.gmail_api_url_client import _runtime_store_path
@@ -680,6 +693,10 @@ def _stop_registration_batch_on_provider_failure(
         # The worker that observed the terminal provider response will finish
         # through its normal exception path and retain the provider reason.
         if target_id == int(job_id):
+            continue
+        # 2FA/Codex 补做任务不领取新邮箱（读的是账号已有 alias 的 OTP）：
+        # 供应耗尽不会让它们失效，取消只会把已创建账号永远卡在 2FA pending。
+        if str(job.get("retry_action") or "").strip().lower() in {"2fa", "codex"}:
             continue
         status = str(job.get("status") or "").strip().lower()
         if status == "pending":
@@ -1008,10 +1025,7 @@ def _should_disable_failed_registration_email(error: object) -> bool:
     ))
     return (
         unsupported_email
-        or "AccountUnusableError" in text
-        or "account_deactivated" in text
-        or "account_deleted" in text
-        or "account_banned" in text
+        or is_account_unusable_failure(text)
         or _is_final_session_access_token_timeout(text)
         or "邮箱提交后进入登录密码页" in text
         or "auth.openai.com/log-in/password" in text
@@ -1111,13 +1125,33 @@ def get_executor_workers() -> int:
         return _executor_workers
 
 
+def get_twofa_executor() -> ThreadPoolExecutor:
+    """2FA 补做专用单线程池。
+
+    2FA 补做不领取新邮箱供应；若 submit 进注册线程池，会排在整条注册 lane
+    后面（批量 12 任务时账号要挂到批末才补上 2FA），批停止时还可能被一起
+    取消。串行单线程即可：2FA 是独立浏览器任务，也不宜与注册并发过多。
+    """
+    global _twofa_executor
+    with _executor_lock:
+        if _twofa_executor is None:
+            _twofa_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="twofa-worker",
+            )
+    return _twofa_executor
+
+
 def shutdown_executor(wait: bool = True) -> None:
-    global _executor
+    global _executor, _twofa_executor
     with _executor_lock:
         executors = []
         if _executor is not None:
             executors.append(_executor)
             _executor = None
+        if _twofa_executor is not None:
+            executors.append(_twofa_executor)
+            _twofa_executor = None
         executors.extend(_retired_executors)
         _retired_executors.clear()
     for ex in executors:
@@ -1428,6 +1462,24 @@ def _registration_force_refresh_proxy(job: dict) -> bool:
     return bool(getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False))
 
 
+# Lỗi hạ tầng xảy ra TRƯỚC khi registration bắt đầu (chưa mở browser, chưa
+# đọc OTP): alias chưa tiêu hao, phải recycle thay vì đốt.
+_PROXY_INFRA_ERROR_MARKERS = (
+    "RotatingProxyError",
+    "Roxy 创建环境连续失败",
+    "RoxyBrowserClientError",
+    # Mọi lỗi Roxy API tầng create/open (vd "Roxy API 返回失败 POST
+    # /browser/create: timeout of 15000ms exceeded") — chưa đụng registration.
+    "Roxy API 返回失败",
+    "Roxy API 请求失败",
+)
+
+
+def _is_proxy_infra_failure(error_text: object) -> bool:
+    text = str(error_text or "")
+    return any(marker in text for marker in _PROXY_INFRA_ERROR_MARKERS)
+
+
 def _run_one_job(job_id: int, log_file: str) -> None:
     """单任务入口（线程池里跑这个）。"""
     log_logger = logging.getLogger(__name__)
@@ -1604,7 +1656,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     alias_discarded = _release_unconsumed_job_email(
                         email_to_handle,
                         str(err),
-                        discard_on_failure=True,
+                        discard_on_failure=not _is_proxy_infra_failure(err),
                     )
                 elif email_to_handle:
                     _consume_recoverable_twofa_assignment(email_to_handle, str(err))
@@ -1651,7 +1703,9 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             alias_discarded = _release_unconsumed_job_email(
                 email,
                 err_text,
-                discard_on_failure=not is_stop_requested(job_id),
+                discard_on_failure=(
+                    not is_stop_requested(job_id) and not _is_proxy_infra_failure(err_text)
+                ),
             )
         elif email:
             _consume_recoverable_twofa_assignment(email, err_text)
@@ -2245,20 +2299,7 @@ def _configured_twofa_retry_driver() -> str:
     """Return the browser/provider selected in the live WebUI settings."""
     from config import roxybrowser as _driver_cfg
 
-    raw = str(getattr(_driver_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
-    aliases = {
-        "roxybrowser": "roxy",
-        "fingerprint": "roxy",
-        "browser": "roxy",
-        "cloakbrowser": "cloak",
-        "browseruse": "browser_use",
-        "browser-use": "browser_use",
-        "bu": "browser_use",
-        "sv": "skyvern",
-        "api": "protocol",
-        "http": "protocol",
-    }
-    return aliases.get(raw, raw)
+    return resolve_twofa_retry_driver(_driver_cfg)
 
 
 def _run_configured_twofa_retry(
@@ -2268,7 +2309,7 @@ def _run_configured_twofa_retry(
 ) -> dict:
     """Run the shared reactive 2FA flow for a supported browser provider."""
     driver = _configured_twofa_retry_driver()
-    if driver in _SUPPORTED_BROWSER_TWOFA_DRIVERS:
+    if is_live_browser_driver(driver):
         from core.browser_twofa_retry import run_twofa_retry
 
         if proxy_lane_id is None:
@@ -2292,7 +2333,7 @@ def _account_supports_twofa_retry(account: dict) -> bool:
     """判断账号是否具备当前设置的 provider 所需的登录密码。"""
     if not str(account.get("registration_password") or "").strip():
         return False
-    return _configured_twofa_retry_driver() in _SUPPORTED_BROWSER_TWOFA_DRIVERS
+    return is_live_browser_driver(_configured_twofa_retry_driver())
 
 
 def get_retry_info(job: dict) -> dict:
@@ -2473,7 +2514,8 @@ def retry_job(
                     proxy_lane_id,
                 )
             elif action == "2fa":
-                executor.submit(
+                # 专用池：不等注册 lane 排空（见 get_twofa_executor）。
+                get_twofa_executor().submit(
                     _run_twofa_retry_job,
                     job["id"],
                     job["log_file"],

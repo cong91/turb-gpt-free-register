@@ -23,10 +23,10 @@ from core.gmail_api_url_client import (
     _request_qan8_after_sales,
     acknowledge_verification_code,
     create_registration_batch,
+    ensure_batch_alias,
     get_account_context,
     get_batch_account_context,
     get_email_from_batch,
-    ensure_batch_alias,
     pick_account,
     poll_verification_code,
     provision_next_gmail_api_url_source,
@@ -1435,6 +1435,33 @@ class GmailApiUrlClientTests(unittest.TestCase):
 
         mock_get.assert_not_called()
 
+    @patch("core.gmail_api_url_client.requests.get")
+    @patch("core.db.is_gmail_api_url_account_blocked", return_value=True)
+    @patch("core.db.is_gmail_api_url_code_url_failed", return_value=False)
+    @patch("core.gmail_api_url_client._batch_store")
+    def test_poll_allows_blocked_source_for_existing_account_twofa_stage(
+        self,
+        mock_batch_store,
+        _mock_failed_url,
+        _mock_account_blocked,
+        mock_get,
+    ):
+        # Allocation states (disabled/exhausted) chỉ chặn cấp alias mới; đọc OTP
+        # cho alias đã đăng ký (stage twofa_*) phải đi tiếp tới provider.
+        mock_batch_store.return_value.path = "runtime/turb.sqlite3"
+        mock_get.return_value = _Response({"code": 0, "data": {"code": "123456"}})
+        account = GmailApiUrlAccount("blocked+alias@gmail.com", "https://api.example/blocked")
+
+        code = poll_verification_code(
+            account,
+            max_wait=5,
+            poll_interval=1,
+            stage="twofa_login_email_otp",
+        )
+
+        self.assertEqual(code, "123456")
+        mock_get.assert_called_once()
+
     @patch("core.gmail_api_url_client.time.time", side_effect=[0.0, 0.0, 2.0])
     @patch("core.gmail_api_url_client.time.sleep", return_value=None)
     @patch("core.gmail_api_url_client.requests.get")
@@ -1879,7 +1906,7 @@ class GmailApiUrlSharedLedgerConsumptionTests(unittest.TestCase):
             "core.qan8_gmail_api_purchaser.Qan8GmailApiPurchaser"
         ) as purchaser:
             purchaser.return_value.purchase_source.return_value = False
-            with self.assertRaises(Exception):
+            with self.assertRaisesRegex((RuntimeError, ValueError), ".+"):
                 get_email_from_batch(
                     new_batch, str(retry_job["id"]), poll_interval=0,
                 )

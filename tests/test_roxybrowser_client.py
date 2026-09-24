@@ -52,6 +52,35 @@ class RoxyBrowserCreateProfileTests(unittest.TestCase):
         self.assertEqual(request_mock.call_count, 1)
         sleep_mock.assert_not_called()
 
+    def test_create_profile_retries_server_side_timeout_response(self):
+        # Roxy server trả lỗi rõ ràng (axios timeout bên trong Roxy app): server
+        # đã phản hồi là fail — không phải client-timeout ambiguous, phải chờ retry
+        # (batch 2026-09-21 job 2919: 1 timeout = chết 1 job + đốt alias).
+        with patch.object(
+            self.client,
+            "request",
+            side_effect=[
+                RuntimeError("Roxy API 返回失败 POST /browser/create: timeout of 15000ms exceeded"),
+                self._ok_response(),
+            ],
+        ) as request_mock, patch("core.roxybrowser_client.time.sleep") as sleep_mock:
+            profile_id = self.client.create_profile()
+
+        self.assertEqual(profile_id, "profile-1")
+        self.assertEqual(request_mock.call_count, 2)
+        self.assertEqual(sleep_mock.call_count, 1)
+
+    def test_create_profile_gives_up_after_five_server_timeouts(self):
+        with patch.object(
+            self.client,
+            "request",
+            side_effect=RuntimeError("Roxy API 返回失败 POST /browser/create: timeout of 15000ms exceeded"),
+        ) as request_mock, patch("core.roxybrowser_client.time.sleep"), self.assertRaises(RuntimeError) as ctx:
+            self.client.create_profile()
+
+        self.assertIn("连续失败 5 次", str(ctx.exception))
+        self.assertEqual(request_mock.call_count, 5)
+
     def test_create_profile_raises_immediately_on_non_retryable_error(self):
         with patch.object(
             self.client,

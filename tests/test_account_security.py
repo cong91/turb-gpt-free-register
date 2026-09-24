@@ -74,25 +74,30 @@ class BrowserProfileSelectionTests(unittest.TestCase):
     def test_personal_info_uses_the_configured_browser_provider(self):
         with (
             patch("config.roxybrowser.REGISTRATION_DRIVER", "cloak"),
-            patch("core.browser_profile._open_cloak") as open_cloak,
+            patch("core.browser_registry.open_registered_profile") as open_profile,
         ):
             expected = object()
-            open_cloak.return_value = expected
+            open_profile.return_value = expected
 
             result = open_browser_profile()
 
         self.assertIs(result, expected)
-        open_cloak.assert_called_once_with()
+        open_profile.assert_called_once_with("cloak", proxy=None)
 
-    def test_personal_info_routes_cloud_browser_aliases_to_generic_opener(self):
-        with patch("core.browser_profile._open_cloud") as open_cloud:
-            for configured, expected in (("browser_use", "browser_use"), ("skyvern", "skyvern")):
+    def test_personal_info_routes_cloud_browser_aliases_to_registry_openers(self):
+        with patch("core.browser_registry.open_registered_profile") as open_profile:
+            expected = object()
+            open_profile.return_value = expected
+            for configured in ("browser_use", "skyvern"):
                 with self.subTest(configured=configured), patch(
                     "config.roxybrowser.REGISTRATION_DRIVER", configured
                 ):
-                    open_browser_profile()
+                    self.assertIs(open_browser_profile(), expected)
 
-                open_cloud.assert_called_with(expected)
+            self.assertEqual(
+                [call.args[0] for call in open_profile.call_args_list],
+                ["browser_use", "skyvern"],
+            )
 
     def test_personal_info_does_not_silently_fallback_for_unknown_provider(self):
         with (
@@ -210,7 +215,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
             return "NEWSECRET"
 
         with (
-            patch("core.browser_twofa_login._login_existing_account", side_effect=login),
+            patch("core.account_security._login_existing_account", side_effect=login),
             patch("core.account_security.deactivate_2fa_in_page", side_effect=deactivate),
             patch("core.account_security.setup_2fa_in_page", side_effect=setup),
         ):
@@ -232,7 +237,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("user@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 return_value={"accessToken": "fresh-token"},
             ) as login,
             patch(
@@ -259,7 +264,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("user@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=RuntimeError("ChatGPT login did not provide accessToken"),
             ) as login,
             patch(
@@ -290,7 +295,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
                 return_value="NEWSECRET",
             ),
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 return_value={"accessToken": "fresh-token"},
             ) as login,
         ):
@@ -359,7 +364,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("user@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=RuntimeError("ChatGPT login did not provide accessToken"),
             ) as login,
             patch(
@@ -417,7 +422,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("dom@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=RuntimeError("找不到邮箱输入框/邮箱入口"),
             ),
             patch("core.account_security._oauth_login_and_get_access_token") as oauth_login,
@@ -433,7 +438,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("locked@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=AccountUnusableError("OpenAI đã khóa tài khoản", error_code="account_deactivated"),
             ) as login,
             self.assertRaisesRegex(AccountUnusableError, "đã khóa"),

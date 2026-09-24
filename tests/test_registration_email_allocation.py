@@ -3,8 +3,7 @@ from unittest.mock import patch
 
 from config import email as email_config
 from core import browser_use_registration as browser_use
-from core import email_provider
-from core import roxy_registration as roxy
+from core import email_provider, registration_flow
 
 
 class DelayedEmailAllocationTests(unittest.TestCase):
@@ -38,31 +37,37 @@ class DelayedEmailAllocationTests(unittest.TestCase):
             events.append("acquire_email")
             return "roxy@example.com"
 
-        with patch.object(roxy, "_wait_for_email_input", side_effect=find_input), patch.object(
-            roxy,
+        with patch.object(
+            registration_flow, "_wait_for_browser_challenge"
+        ), patch.object(
+            registration_flow, "_wait_for_email_input", side_effect=find_input
+        ), patch.object(
+            registration_flow,
             "_human_type_text",
             side_effect=lambda *args, **kwargs: events.append("type_email"),
         ), patch.object(
-            roxy,
+            registration_flow,
             "_email_input_value_state",
             return_value={"inputs": [{"value": "roxy@example.com"}]},
         ), patch.object(
-            roxy,
+            registration_flow,
             "_submit_email_step",
             side_effect=lambda *args, **kwargs: events.append("submit_email"),
         ), patch.object(
-            roxy,
+            registration_flow,
             "_wait_email_submit_next_state",
             return_value="otp",
-        ), patch.object(roxy, "human_delay"), patch.object(roxy, "_check_manual_stop"):
-            result = roxy._submit_email_and_wait_next(
+        ), patch.object(registration_flow, "human_delay"), patch.object(
+            registration_flow, "_check_manual_stop"
+        ):
+            result = registration_flow._submit_email_and_wait_next(
                 object(), None, email_supplier=acquire
             )
 
         self.assertEqual(result, "otp")
         self.assertEqual(
             events,
-            ["find_input", "acquire_email", "type_email", "submit_email"],
+            ["acquire_email", "find_input", "type_email", "submit_email"],
         )
 
     def test_browser_use_finds_input_before_allocating_email(self):

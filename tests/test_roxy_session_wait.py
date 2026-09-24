@@ -1,8 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from core import registration_service, roxy_registration
-from core import browser_registration
+from core import registration_flow, registration_service
 
 
 class _FakeClock:
@@ -28,15 +27,15 @@ class RoxySessionWaitTests(unittest.TestCase):
         driver.current_url = "https://chatgpt.com/"
 
         with patch.object(
-            roxy_registration,
+            registration_flow,
             "_read_chatgpt_session_once",
             return_value=None,
         ), patch.object(
-            roxy_registration,
+            registration_flow,
             "_check_manual_stop",
             side_effect=registration_service.StopRequested("stop requested"),
         ), self.assertRaises(registration_service.StopRequested):
-            roxy_registration._fetch_chatgpt_session(driver, timeout=120)
+            registration_flow._fetch_chatgpt_session(driver, timeout=120)
 
     def test_session_reader_prefers_driver_request_api(self):
         class Driver:
@@ -52,7 +51,7 @@ class RoxySessionWaitTests(unittest.TestCase):
 
         driver = Driver()
 
-        session = browser_registration._read_chatgpt_session_once(driver)
+        session = registration_flow._read_chatgpt_session_once(driver)
 
         self.assertEqual(session, {"accessToken": "request-token"})
         self.assertEqual(driver.async_calls, 0)
@@ -62,21 +61,21 @@ class RoxySessionWaitTests(unittest.TestCase):
         driver = Mock()
         driver.current_url = "https://chatgpt.com/"
         token = {"accessToken": "token-1", "_http_status": 200}
-        responses = [_banner_response() for _ in range(roxy_registration._SESSION_BANNER_REFRESH_AFTER)] + [token]
+        responses = [_banner_response() for _ in range(registration_flow._SESSION_BANNER_REFRESH_AFTER)] + [token]
 
         with patch.object(
-            roxy_registration,
+            registration_flow,
             "_read_chatgpt_session_once",
             side_effect=responses,
         ), patch.object(
-            roxy_registration,
+            registration_flow,
             "_check_manual_stop",
         ), patch.object(
-            roxy_registration,
+            registration_flow,
             "time",
             clock,
         ):
-            result = roxy_registration._fetch_chatgpt_session(driver, timeout=120)
+            result = registration_flow._fetch_chatgpt_session(driver, timeout=120)
 
         self.assertEqual(result, token)
         driver.refresh.assert_called_once()
@@ -87,22 +86,22 @@ class RoxySessionWaitTests(unittest.TestCase):
         driver.current_url = "https://chatgpt.com/"
         responses = [
             _banner_response()
-            for _ in range(roxy_registration._SESSION_BANNER_REFRESH_AFTER * 2 + 2)
+            for _ in range(registration_flow._SESSION_BANNER_REFRESH_AFTER * 2 + 2)
         ]
 
         with patch.object(
-            roxy_registration,
+            registration_flow,
             "_read_chatgpt_session_once",
             side_effect=responses,
         ), patch.object(
-            roxy_registration,
+            registration_flow,
             "_check_manual_stop",
         ), patch.object(
-            roxy_registration,
+            registration_flow,
             "time",
             clock,
         ), self.assertRaises(RuntimeError) as ctx:
-            roxy_registration._fetch_chatgpt_session(driver, timeout=120)
+            registration_flow._fetch_chatgpt_session(driver, timeout=120)
 
         message = str(ctx.exception)
         self.assertIn("等待 /api/auth/session accessToken 超时", message)
@@ -148,22 +147,22 @@ class RoxySessionWaitTests(unittest.TestCase):
         token = {"accessToken": "token-2", "_http_status": 200}
         responses = [
             _banner_response()
-            for _ in range(roxy_registration._SESSION_BANNER_REFRESH_AFTER - 1)
+            for _ in range(registration_flow._SESSION_BANNER_REFRESH_AFTER - 1)
         ] + [token]
 
         with patch.object(
-            roxy_registration,
+            registration_flow,
             "_read_chatgpt_session_once",
             side_effect=responses,
         ), patch.object(
-            roxy_registration,
+            registration_flow,
             "_check_manual_stop",
         ), patch.object(
-            roxy_registration,
+            registration_flow,
             "time",
             clock,
         ):
-            result = roxy_registration._fetch_chatgpt_session(driver, timeout=120)
+            result = registration_flow._fetch_chatgpt_session(driver, timeout=120)
 
         self.assertEqual(result, token)
         driver.refresh.assert_not_called()

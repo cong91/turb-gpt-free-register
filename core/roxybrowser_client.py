@@ -20,6 +20,11 @@ _PROFILE_CREATE_LOCK = threading.Lock()
 _RETRYABLE_PROFILE_CREATE_MESSAGES = (
     "creating, please wait",
     "insufficient profile quota",
+    # "timeout of NNNms exceeded" là axios-timeout do chính Roxy server trả về
+    # trong payload: server đã phản hồi rõ là FAIL (khác client ReadTimeout —
+    # ambiguous, không biết server có tạo hay không). Batch 2026-09-21 job 2919
+    # chết 1 job + đốt 1 alias chỉ vì timeout này không được retry.
+    "timeout of",
 )
 # 连续失败上限：Roxy 长时间不可用时不能无限占用注册 lane。
 _ROXY_CREATE_MAX_ATTEMPTS = 5
@@ -165,7 +170,7 @@ def _apply_data_saver_open_args(params: dict) -> dict:
         if switch not in args:
             args.append(switch)
         params["args"] = args
-    except Exception as exc:
+    except (AttributeError, TypeError, ValueError) as exc:
         logger.debug("[Roxy] 添加省流量图片启动参数失败，继续使用原参数：%s", exc)
     return params
 

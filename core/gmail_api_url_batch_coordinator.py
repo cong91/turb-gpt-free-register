@@ -19,6 +19,8 @@ from core.gmail_api_url_batch_store import (
 )
 from core.time_utils import local_now
 
+from .gmail_batch_store_base import Assignment
+
 if TYPE_CHECKING:
     from core.gmail_api_url_client import GmailApiUrlAccount
 
@@ -388,19 +390,11 @@ def ensure_batch_alias(
             _reconcile_source_alias_ownership(target_store, code_url)
             usage = target_store.alias_usage_for_code_urls({code_url}).get(
                 code_url,
-                {"allocated": set(), "consumed": set(), "failed": set()},
+                {},
             )
             allocated = {
                 str(alias or "").strip().casefold()
                 for alias in usage.get("allocated", set())
-            }
-            consumed = {
-                str(alias or "").strip().casefold()
-                for alias in usage.get("consumed", set())
-            }
-            failed = {
-                str(alias or "").strip().casefold()
-                for alias in usage.get("failed", set())
             }
             unavailable = target_store.list_globally_unavailable_aliases()
             return [

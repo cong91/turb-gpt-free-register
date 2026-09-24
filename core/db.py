@@ -1977,6 +1977,42 @@ def update_account_access_token(
         )
 
 
+def update_account_password(
+    acc_id: int,
+    *,
+    password: str,
+    extra_updates: dict | None = None,
+) -> bool:
+    """Ghi mật khẩu mới sau khi đổi pass và merge extra_json.
+
+    Chỉ đụng registration_password + extra_json; 2FA/codex fields giữ nguyên.
+    Mặc định gắn password_changed_at (ISO local) nếu caller không truyền.
+    """
+    target_id = int(acc_id)
+    updates = {"password_changed_at": _now()}
+    updates.update(extra_updates or {})
+    with _LOCK:
+        def mutate(row: dict) -> bool:
+            if not str(password or "").strip():
+                return False
+            extra_raw = row.get("extra_json")
+            try:
+                extra = json.loads(extra_raw) if isinstance(extra_raw, str) and extra_raw.strip() else {}
+            except (TypeError, json.JSONDecodeError):
+                logger.debug("解析扩展字段失败", exc_info=True)
+                extra = {}
+            if not isinstance(extra, dict):
+                extra = {}
+            extra.update(updates)
+            row.update({
+                "registration_password": str(password),
+                "extra_json": json.dumps(extra, ensure_ascii=False),
+            })
+            return True
+
+        return _mutate_account_row(acc_id=target_id, mutator=mutate)
+
+
 def mark_account_plan_login_pending(
     acc_id: int,
     *,

@@ -14,9 +14,12 @@ import os
 import re
 from pathlib import Path
 
+from core.browser_registry import ALIASES, DEFAULT_DRIVER
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _CONFIG_DIR = _PROJECT_ROOT / "config"
 EXPLICIT_EMPTY_LIST_KEYS = {"PROXY_POOL"}
+_BROWSER_DRIVER_ALIASES = ", ".join(sorted(ALIASES))
 
 
 # ============================================================
@@ -47,7 +50,7 @@ EDITABLE_FIELDS = [
     },
     {
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "注册方式",
-        "label": "注册驱动", "help": "默认推荐 roxy；protocol=纯协议，容易封号不建议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright",
+        "label": "注册驱动", "help": f"默认 {DEFAULT_DRIVER}；protocol=纯协议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright；浏览器别名：{_BROWSER_DRIVER_ALIASES}",
     },
     {
         "key": "AUTO_PLAN_CHECK_AFTER_REGISTER", "file": "register.py", "type": "bool", "group": "注册方式",

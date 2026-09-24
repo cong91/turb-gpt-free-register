@@ -51,7 +51,11 @@ class BrowserTwofaRetryTests(unittest.TestCase):
             "password",
             timeout=90,
             totp_secret="CURRENT-TOTP-SECRET",
+            profile=login.call_args.kwargs["profile"],
         )
+        # Profile fallback luôn hợp lệ (name + birthday) để điền lại about-you.
+        self.assertEqual(len(login.call_args.kwargs["profile"]), 2)
+        self.assertTrue(all(login.call_args.kwargs["profile"]))
         self.assertEqual(save_account.call_args.kwargs["proxy_used"], "http://proxy")
         self.assertEqual(save_account.call_args.kwargs["extra"]["registration_driver"], "cloak")
         setup_2fa.assert_called_once_with(

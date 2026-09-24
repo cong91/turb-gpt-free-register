@@ -7,29 +7,32 @@
 import logging
 import time
 
+from core.browser_page_actions import (
+    _clear_otp_inputs,
+    _click_continue,
+    _email_otp_page_state,
+    _is_email_verification_page,
+    _maybe_accept,
+    _page_warmup,
+    _safe_get,
+    _type_otp,
+    _wait_after_email_otp_submit,
+)
+from core.browser_selenium_adapter import build_selenium_driver as _build_driver
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
-from core.roxybrowser_client import RoxyBrowserClient
+from core.registration_flow import (
+    _fetch_chatgpt_session,
+    _submit_email_step,
+    _type_email_address,
+)
 from core.roxy_codex_oauth import (
     _fill_login_password_if_present,
     _fill_mfa_challenge_if_present,
     _is_mfa_challenge_page,
     _wait_for_otp_input,
 )
-from core.roxy_registration import (
-    _build_driver,
-    _clear_otp_inputs,
-    _click_continue,
-    _fetch_chatgpt_session,
-    _is_email_verification_page,
-    _maybe_accept,
-    _page_warmup,
-    _resend_or_restart_email_otp,
-    _safe_get,
-    _submit_email_step,
-    _type_email_address,
-    _type_otp,
-)
+from core.roxybrowser_client import RoxyBrowserClient
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +65,8 @@ def _submit_email_otp(driver, email: str, *, email_source: str | None, otp_after
             raise RuntimeError("邮箱验证码连续错误/过期，浏览器登录失败")
         logger.warning("[查活][Browser] 验证码无效/过期，重发后重取（%s/%s）", attempt + 1, _OTP_MAX_ATTEMPTS)
         after_ts = time.time()
+        from core.registration_flow import _resend_or_restart_email_otp
+
         _resend_or_restart_email_otp(driver, email)
         human_delay("api")
         current_otp = None
@@ -69,8 +74,6 @@ def _submit_email_otp(driver, email: str, *, email_source: str | None, otp_after
 
 def _wait_after_submit(driver, timeout: int = 45) -> str:
     """OTP 提交后等待离开验证码页；无错误标记的超时按已接受处理。"""
-    from core.roxy_registration import _email_otp_page_state, _wait_after_email_otp_submit
-
     outcome = _wait_after_email_otp_submit(driver, timeout=timeout)
     if outcome == "invalid" and not _is_email_verification_page(driver):
         return "accepted"
