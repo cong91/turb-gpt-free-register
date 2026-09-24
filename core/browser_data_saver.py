@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """浏览器注册流程的省流量资源拦截。
 
 省流量模式只拦截 Roxy/Cloak 本地指纹浏览器中的可选页面资源和配置中明确指定的
@@ -121,7 +120,7 @@ def _infer_resource_type(url: str) -> str:
     """Selenium 的 CDP 事件缺少 type 时，按 URL 后缀做保守推断。"""
     try:
         path = urlsplit(str(url or "")).path.lower()
-    except Exception:
+    except (TypeError, ValueError):
         path = str(url or "").lower().split("?", 1)[0].split("#", 1)[0]
     for resource_type, extensions in _URL_EXTENSIONS_BY_TYPE.items():
         if any(path.endswith(extension) for extension in extensions):
@@ -159,8 +158,8 @@ class BrowserDataSaver:
             try:
                 if fnmatchcase(text, pattern):
                     return pattern
-            except Exception:
-                continue
+            except (TypeError, ValueError) as exc:
+                logger.debug("[%s] URL pattern match failed: %s", self.label, exc)
         return None
 
     def _should_block(self, resource_type: str, url: str) -> bool:
@@ -171,9 +170,7 @@ class BrowserDataSaver:
         if resource_type not in self.resource_types and matched_url_pattern is None:
             return False
         # 验证挑战资源优先放行；普通页面图片/媒体仍然拦截。
-        if _is_challenge_url(url):
-            return False
-        return True
+        return not _is_challenge_url(url)
 
     def _record_blocked(
         self,
@@ -200,7 +197,7 @@ class BrowserDataSaver:
             self._blocked_playwright_requests.remove(key)
             return True
 
-    def install_playwright(self, context: Any) -> "BrowserDataSaver":
+    def install_playwright(self, context: Any) -> BrowserDataSaver:
         """在 BrowserContext 上按 resource_type 拦截请求。"""
         if not self.enabled:
             return self
@@ -226,13 +223,13 @@ class BrowserDataSaver:
                             route.abort()
                         return
                     route.continue_()
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - the route handler must never break the main flow.
                     # 拦截器不能阻断注册主流程；处理异常时尽量放行请求。
                     logger.debug("[%s] 省流量路由处理失败，尝试放行：%s", self.label, exc)
                     try:
                         route.continue_()
-                    except Exception:
-                        pass
+                    except Exception as exc:  # noqa: BLE001 - best-effort passthrough only.
+                        logger.debug("[%s] route passthrough failed: %s", self.label, exc)
 
             context.route("**/*", _handle_route)
             self._context = context
@@ -245,11 +242,11 @@ class BrowserDataSaver:
                 ",".join(self.resource_types) or "-",
                 len(self.url_patterns),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - interception is optional and must not fail registration.
             logger.warning("[%s] 安装 Playwright 省流量拦截失败，继续不拦截：%s: %s", self.label, type(exc).__name__, exc)
         return self
 
-    def install_selenium(self, driver: Any) -> "BrowserDataSaver":
+    def install_selenium(self, driver: Any) -> BrowserDataSaver:
         """通过 Chrome CDP Network.setBlockedURLs 安装 URL 后缀和 URL glob 拦截。"""
         if not self.enabled:
             return self
@@ -270,8 +267,8 @@ class BrowserDataSaver:
             # 某些情况下流量统计器没有成功初始化，仍需单独开启 Network 域。
             try:
                 driver.execute_cdp_cmd("Network.enable", {})
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - the Network domain may already be enabled.
+                logger.debug("[%s] Network domain enable skipped: %s", self.label, exc)
             driver.execute_cdp_cmd("Network.setBlockedURLs", {"urls": patterns})
             self._driver = driver
             self._selenium_patterns = patterns
@@ -284,7 +281,7 @@ class BrowserDataSaver:
                 sum(len(_URL_EXTENSIONS_BY_TYPE.get(resource_type, ())) for resource_type in self.resource_types),
                 len(self.url_patterns),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - interception is optional and must not fail registration.
             logger.warning("[%s] 安装 Selenium 省流量拦截失败，继续不拦截：%s: %s", self.label, type(exc).__name__, exc)
         return self
 
@@ -332,8 +329,8 @@ class BrowserDataSaver:
         if self._context is not None and self._route_handler is not None:
             try:
                 self._context.unroute("**/*", self._route_handler)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - cleanup is best-effort.
+                logger.debug("[%s] route cleanup skipped: %s", self.label, exc)
         self._route_handler = None
         self._context = None
         self._driver = None

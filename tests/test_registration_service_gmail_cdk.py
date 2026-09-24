@@ -135,9 +135,14 @@ class GmailCdkRegistrationServiceTests(unittest.TestCase):
             routed_domains=["route-one.net"],
         )
         self.assertEqual(len(submitted), 2)
+        contexts = [db.get_job(job["id"])["provider_context"] for job in jobs]
+        batch_ids = {context["registration_batch_id"] for context in contexts}
+        self.assertEqual(len(batch_ids), 1)
+        registration_batch_id = batch_ids.pop()
         for job in jobs:
             persisted = db.get_job(job["id"])
             self.assertEqual(persisted["provider_context"], {
+                "registration_batch_id": registration_batch_id,
                 "gmail_batch_id": "batch-123",
                 "gmail_routed_domains": ["route-one.net"],
             })

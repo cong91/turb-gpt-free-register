@@ -119,6 +119,20 @@ def _json_object_response(response, *, action: str) -> dict:
     return payload
 
 
+def _browser_script_timeout(driver) -> int:
+    """取浏览器脚本超时预算；Selenium 4 WebDriver 没有 script_timeout 属性时回退到配置值。"""
+    value = getattr(driver, "script_timeout", None)
+    try:
+        timeout = int(value) if value else 0
+    except (TypeError, ValueError):
+        timeout = 0
+    if timeout > 0:
+        return timeout
+    from config import roxybrowser as _roxy_cfg
+
+    return max(1, int(getattr(_roxy_cfg, "ROXY_SCRIPT_TIMEOUT", _roxy_cfg.ROXY_SELENIUM_TIMEOUT)))
+
+
 class BrowserPageTransport:
     """用 Selenium 页面 fetch 执行同源 API 请求，保持当前浏览器登录态。"""
 
@@ -147,22 +161,36 @@ class BrowserPageTransport:
         current_url = str(getattr(self.driver, "current_url", "") or "")
         if current_url and urlparse(current_url).netloc != urlparse(url).netloc:
             self.driver.get(url)
-        script = """
+        timeout = _browser_script_timeout(self.driver)
+        script = f"""
         const done = arguments[arguments.length - 1];
         const method = arguments[0];
         const url = arguments[1];
-        const headers = arguments[2] || {};
+        const headers = arguments[2] || {{}};
         const body = arguments[3];
-        fetch(url, {method, headers, body, credentials: 'include', redirect: 'follow'})
-          .then(async response => {
+        const controller = typeof AbortController === 'function' ? new AbortController() : null;
+        const options = {{method, headers, body, credentials: 'include', redirect: 'follow'}};
+        if (controller) options.signal = controller.signal;
+        let settled = false;
+        const finish = value => {{
+          if (settled) return;
+          settled = true;
+          done(value);
+        }};
+        const timer = setTimeout(() => {{
+          try {{ if (controller) controller.abort(); }} catch (_) {{}}
+          finish({{status: 0, url: url, text: 'browser fetch timeout', json: null}});
+        }}, {max(1, timeout - 1) * 1000});
+        fetch(url, options)
+          .then(async response => {{
             const text = await response.text();
             let json = null;
-            try { json = text ? JSON.parse(text) : null; } catch (_) {}
-            done({status: response.status, url: response.url, text, json});
-          })
-          .catch(error => done({status: 0, url, text: String(error), json: null}));
+            try {{ json = text ? JSON.parse(text) : null; }} catch (_) {{}}
+            finish({{status: response.status, url: response.url, text, json}});
+          }})
+          .catch(error => finish({{status: 0, url: url, text: String(error), json: null}}))
+          .finally(() => {{ try {{ clearTimeout(timer); }} catch (_) {{}} }});
         """
-        timeout = max(1, int(getattr(self.driver, "script_timeout", 30) or 30))
         set_timeout = getattr(self.driver, "set_script_timeout", None)
         previous_timeout = None
         if callable(set_timeout):
@@ -560,6 +588,13 @@ def _follow_reauth(session: BrowserSession, auth_url: str) -> str:
     final_url = str(getattr(response, "url", "") or "")
     lower_url = final_url.lower()
     logger.info("[2FA] re-auth OTP 页面: %s", final_url)
+    
+    # Check for rate limit error page
+    if "errorcode=rate_limit_exceeded" in lower_url or "/error?" in lower_url and "rate_limit" in lower_url:
+        raise RuntimeError(
+            f"re-auth rate_limit_exceeded: OpenAI 限制了认证请求频率: {final_url[:180]}"
+        )
+    
     if "/log-in/password" in lower_url:
         raise RuntimeError(
             "re-auth 未进入 email-verification 页面，当前落在登录密码页"
@@ -568,6 +603,10 @@ def _follow_reauth(session: BrowserSession, auth_url: str) -> str:
         raise RuntimeError(
             f"re-auth 未进入 email-verification 页面: {final_url[:180]}"
         )
+    # BrowserPageTransport 会先 driver.get 再同源 fetch 一次 authorize；最后
+    # 一次 authorize 触发的 OTP 邮件可能比前一步的晚到。稍等让它落地，避免
+    # 调用方轮询到已被作废的上一步验证码（wrong_email_otp_code）。
+    time.sleep(random.uniform(3.0, 5.0))
     return final_url
 
 
@@ -615,6 +654,8 @@ def _is_reauth_retryable_error(exc: Exception) -> bool:
             "response is not a json object",
             "missing csrftoken",
             "missing csrf token",
+            "timeout",
+            "timed out",
         )
     )
 
@@ -946,11 +987,111 @@ def setup_2fa(
 def setup_2fa_for_registration(session: BrowserSession, email: str) -> str:
     """Enable MFA after the fresh signup session completes an email re-auth."""
     if not callable(getattr(session, "get_auth_headers", None)) and callable(
-        getattr(session, "execute_async_script", None)
+        getattr(session, "execute_async_script", None),
     ):
         session = BrowserPageTransport(session)
     logger.info("[2FA] 注册完成，先完成邮箱 re-auth 再 enroll TOTP...")
     return setup_2fa(session, email, reauth=True)
+
+
+def reauth_login_after_session_timeout(session, email: str, *, max_attempts: int = 2) -> None:
+    """session 未签发 accessToken 时，用 2FA 同款 re-auth 邮箱 OTP 重新登录。
+
+    此时 auth.openai.com 已有本轮注册留下的登录 cookie，connection=password +
+    login_hint 发起 re-auth，auth.openai.com 自己进入 email-verification 并发送
+    邮箱 OTP；校验通过后让浏览器真实导航 callback 重建 chatgpt.com session。
+    只做登录，不 enroll TOTP——注册流程随后会自己执行 2FA 设置。
+    """
+    if not callable(getattr(session, "get_auth_headers", None)) and callable(
+        getattr(session, "execute_async_script", None),
+    ):
+        session = BrowserPageTransport(session)
+    from core.email_provider import (
+        acknowledge_verification_code,
+        snapshot_verification_code,
+        wait_for_otp,
+    )
+
+    previous_submitted_otp = None
+    continue_url = None
+    for attempt in range(1, max(1, int(max_attempts)) + 1):
+        before_code = (
+            snapshot_verification_code(email, stage="registration_reauth_otp")
+            or previous_submitted_otp
+        )
+        otp_after_ts = time.time()
+        current_otp = None
+        try:
+            logger.info(
+                "[2FA][Session恢复] 发起 re-auth 登录（第 %s/%s 次）：email=%s",
+                attempt,
+                max_attempts,
+                email,
+            )
+            auth_url = _trigger_reauth(session, email)
+            human_delay("api")
+            _follow_reauth(session, auth_url)
+            human_delay("navigate")
+            if attempt > 1:
+                # 上一次提交失败会令 auth step 失效；重建认证页后主动请求新验证码。
+                _resend_reauth_otp(session)
+            logger.info(
+                "[2FA][Session恢复] 等待 re-auth 邮箱 OTP（第 %s/%s 次）",
+                attempt,
+                max_attempts,
+            )
+            current_otp = wait_for_otp(
+                email,
+                after_ts=otp_after_ts,
+                before_code=before_code,
+                stage="registration_reauth_email_otp",
+            )
+            human_delay("otp_input")
+            continue_url = _validate_reauth_otp(session, current_otp)
+            acknowledge_verification_code(
+                email,
+                current_otp,
+                stage="registration_reauth_email_otp",
+            )
+            logger.info("[2FA][Session恢复] re-auth OTP 校验通过，导航 callback 重建 session")
+            break
+        except Exception as exc:
+            if not _is_reauth_retryable_error(exc) or attempt >= max_attempts:
+                raise
+            if current_otp:
+                previous_submitted_otp = current_otp
+            backoff = _reauth_retry_backoff_seconds(exc, attempt)
+            logger.warning(
+                "[2FA][Session恢复] re-auth 失败，第 %s/%s 次，%.1fs 后重建认证并重新取码：%s",
+                attempt,
+                max_attempts,
+                backoff,
+                str(exc)[:180],
+            )
+            try:
+                _reset_reauth_context(session)
+            except Exception as reset_exc:  # noqa: BLE001
+                logger.warning(
+                    "[2FA][Session恢复] 重置会话失败：%s: %s",
+                    type(reset_exc).__name__,
+                    str(reset_exc)[:160],
+                )
+            human_delay(
+                "api",
+                minimum=backoff,
+                maximum=min(backoff * 1.25, _TWOFA_REAUTH_RETRY_BACKOFF_MAX_SECONDS),
+            )
+            continue
+    if not continue_url:
+        raise RuntimeError("re-auth 未返回 continue_url")
+    # callback 的 Set-Cookie 只有真实导航链才会写入（页面内 fetch 不建立
+    # chatgpt.com session），必须让浏览器走完整个重定向。
+    navigate = getattr(session, "navigate", None)
+    if callable(navigate):
+        navigate(continue_url)
+    else:
+        session.get(continue_url, allow_redirects=True)
+    human_delay("navigate")
 
 
 def checkpoint_account_data(
@@ -982,6 +1123,38 @@ def checkpoint_account_data(
 
         context = get_account_context(email)
         source_cdk = context.cdk if context is not None else None
+    elif str(email_source or "").strip().lower() == "bamboommo":
+        try:
+            from core.bamboommo_client import get_account_context_metadata
+
+            bamboommo_metadata = get_account_context_metadata(email)
+            if bamboommo_metadata:
+                existing_service = payload.get("email_service")
+                merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
+                merged_service.update(bamboommo_metadata)
+                payload["email_service"] = merged_service
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[Checkpoint] 保存 BambooMMO 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
+    elif str(email_source or "").strip().lower() == "otpmail":
+        try:
+            from core.otpgmail_client import get_account_context_metadata
+
+            otpmail_metadata = get_account_context_metadata(email)
+            if otpmail_metadata:
+                existing_service = payload.get("email_service")
+                merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
+                merged_service.update(otpmail_metadata)
+                payload["email_service"] = merged_service
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[Checkpoint] 保存 OTPGmail 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
 
     row_id = insert_account(
         email=email,
@@ -1045,6 +1218,38 @@ def save_account_data(
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[Save] 保存 Remail 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
+    elif str(email_source or "").strip().lower() == "otpmail":
+        try:
+            from core.otpgmail_client import get_account_context_metadata
+
+            otpmail_metadata = get_account_context_metadata(email)
+            if otpmail_metadata:
+                existing_service = extra.get("email_service")
+                merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
+                merged_service.update(otpmail_metadata)
+                extra["email_service"] = merged_service
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[Save] 保存 OTPGmail 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
+    elif str(email_source or "").strip().lower() == "bamboommo":
+        try:
+            from core.bamboommo_client import get_account_context_metadata
+
+            bamboommo_metadata = get_account_context_metadata(email)
+            if bamboommo_metadata:
+                existing_service = extra.get("email_service")
+                merged_service = dict(existing_service) if isinstance(existing_service, dict) else {}
+                merged_service.update(bamboommo_metadata)
+                extra["email_service"] = merged_service
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[Save] 保存 BambooMMO 订单上下文失败，后续将尝试按邮箱恢复：%s: %s",
                 type(exc).__name__,
                 str(exc)[:180],
             )
@@ -1120,6 +1325,7 @@ def save_account_data(
             auto_plan_check = bool(
                 getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                 or getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+                or getattr(_register_cfg, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False)
             )
         except Exception:  # noqa: BLE001
             auto_plan_check = False

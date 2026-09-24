@@ -144,20 +144,32 @@ def generate_gmail_dual_domain_aliases(
     email: str,
     limit: int = MAX_GMAIL_DUAL_DOMAIN_VARIANTS,
 ) -> list[str]:
-    """Sinh đúng số alias yêu cầu, tối đa một alias có dấu chấm."""
+    """Sinh địa chỉ đăng ký cho một mailbox Gmail: gốc trước, alias sau.
+
+    Mỗi mailbox cung cấp tối đa 12 slot: 1 địa chỉ Gmail gốc (nguyên bản,
+    không biến thể) đứng đầu, phần còn lại là alias (1 dấu chấm + các alias +,
+    chia trên gmail.com và googlemail.com). Mọi địa chỉ forward về cùng một
+    hộp thư nên dùng chung một Gmail API URL record để lấy OTP.
+    """
     count = max(0, min(MAX_GMAIL_DUAL_DOMAIN_VARIANTS, int(limit)))
     if count == 0:
         return []
 
     local, source_domain = _gmail_parts(email)
+    source_value = str(email or "").strip().lower().split("+", 1)[0]
+    original = source_value if "@" in source_value else f"{local}@{source_domain}"
+    addresses = [original]
+    alias_count = count - 1
+    if alias_count <= 0:
+        return addresses
+
     source_values = {
         f"{local}@gmail.com",
         f"{local}@googlemail.com",
     }
-    source_value = str(email or "").strip().lower().split("+", 1)[0]
-    if "." in source_value.split("@", 1)[0]:
-        source_values.add(source_value)
-    raw_count = count + len(source_values)
+    if "." in original.split("@", 1)[0]:
+        source_values.add(original)
+    raw_count = alias_count + len(source_values)
     gmail_count = min(MAX_GMAIL_VARIANTS, raw_count)
     googlemail_count = raw_count - gmail_count
 
@@ -171,7 +183,8 @@ def generate_gmail_dual_domain_aliases(
     aliases = [value for value in variants if value not in source_values]
     if source_domain == "googlemail.com":
         aliases = [value for value in aliases if value != f"{local}@googlemail.com"]
-    return aliases[:count]
+    addresses.extend(aliases[:alias_count])
+    return addresses
 
 
 def _normalize_domain(domain: str) -> str:

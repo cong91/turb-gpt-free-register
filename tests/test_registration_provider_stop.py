@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from core import registration_service
+from core.bamboommo_client import BambooMmoError
 
 
 class RegistrationProviderStopTests(unittest.TestCase):
@@ -119,6 +120,294 @@ class RegistrationProviderStopTests(unittest.TestCase):
         self.assertEqual(result["cancelled"], 1)
         self.assertEqual(result["stopped"], 0)
         self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_insufficient_balance_stops_pending_gmail_api_url_jobs(self):
+        current = {
+            "id": 31,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-balance"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 32,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-balance"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                31,
+                "QAN8 HTTP 409: {'code': 'INSUFFICIENT_BALANCE', 'message': 'Insufficient API member balance'}",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_insufficient_balance_stops_otpmail_batch(self):
+        current = {
+            "id": 41,
+            "status": "running",
+            "email_source": "otpmail",
+            "provider_context": {"registration_batch_id": "batch-otp"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 42,
+                "status": "pending",
+                "email_source": "otpmail",
+                "provider_context": {"registration_batch_id": "batch-otp"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                41,
+                "OTPGmail 请求失败: HTTP 400; Insufficient balance, please recharge",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_insufficient_balance_stops_bamboommo_batch(self):
+        current = {
+            "id": 51,
+            "status": "running",
+            "email_source": "bamboommo",
+            "provider_context": {"registration_batch_id": "batch-bamboo"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 52,
+                "status": "pending",
+                "email_source": "bamboommo",
+                "provider_context": {"registration_batch_id": "batch-bamboo"},
+            },
+        ]
+        error = BambooMmoError(
+            "BambooMMO API error ORDER_NOT_ENOUGH_MONEY: Tài khoản không đủ số dư",
+            resource_key="ORDER_NOT_ENOUGH_MONEY",
+        )
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                51,
+                error,
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+
+    def test_gmail_source_pool_exhaustion_stops_pending_jobs(self):
+        current = {
+            "id": 61,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-pool"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 62,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-pool"},
+            },
+            {
+                "id": 63,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-pool"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                61,
+                "GmailApiUrlError: No Gmail API URL source available",
+            )
+
+        self.assertEqual(result["matched"], 3)
+        self.assertEqual(result["cancelled"], 2)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_supply_exhaustion_stop_spares_account_bound_2fa_requeue(self):
+        # 2FA 补做（含 running）不领取新邮箱：批停止时必须保留，否则账号 981
+        # 这类已创建账号会永远卡在 2FA pending（2026-09-20 批次事故）。
+        current = {
+            "id": 2707,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-twofa"},
+        }
+        twofa_event = threading.Event()
+        registration_service._STOP_EVENTS[2714] = twofa_event
+        registration_service._ACTIVE_JOBS.add(2714)
+        jobs = [
+            current,
+            {
+                "id": 2708,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-twofa"},
+            },
+            {
+                "id": 2714,
+                "status": "running",
+                "retry_action": "2fa",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-twofa"},
+            },
+            {
+                "id": 2719,
+                "status": "pending",
+                "retry_action": "2fa",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-twofa"},
+            },
+        ]
+        try:
+            with (
+                patch.object(registration_service.db, "get_job", return_value=current),
+                patch.object(registration_service.db, "list_jobs", return_value=jobs),
+                patch.object(registration_service.db, "update_job") as update_job,
+            ):
+                result = registration_service._stop_registration_batch_on_provider_failure(
+                    2707,
+                    "GmailApiUrlError: No Gmail API URL source available",
+                )
+        finally:
+            registration_service._STOP_EVENTS.pop(2714, None)
+            registration_service._ACTIVE_JOBS.discard(2714)
+
+        self.assertEqual(result["matched"], 4)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(result["stopping"], 0)
+        # 只有普通注册任务 2708 被取消；2FA 补做任务保持原状。
+        self.assertEqual([call.args[0] for call in update_job.call_args_list], [2708])
+        self.assertFalse(twofa_event.is_set())
+
+    def test_email_source_alloc_failure_stops_pending_jobs(self):
+        current = {
+            "id": 71,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-alloc"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 72,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-alloc"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                71,
+                "RuntimeError: 所有邮箱来源均领取失败: ['gmail_api_url']; last=No Gmail API URL source available",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_alloc_wrap_alone_stops_batch_without_pool_marker(self):
+        """独立固定包装标记：last= 是其他原因（如 code=602 隔离）时仍必须停批。"""
+        current = {
+            "id": 75,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-wrap"},
+        }
+        jobs = [
+            current,
+            {
+                "id": 76,
+                "status": "pending",
+                "email_source": "gmail_api_url",
+                "provider_context": {"registration_batch_id": "batch-wrap"},
+            },
+        ]
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs", return_value=jobs),
+            patch.object(registration_service.db, "update_job") as update_job,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                75,
+                "RuntimeError: 所有邮箱来源均领取失败: ['gmail_api_url']; last=GmailApiUrlError: Provider error code=602: Account is unavailable",
+            )
+
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["cancelled"], 1)
+        update_job.assert_called_once()
+        self.assertEqual(update_job.call_args_list[0].kwargs["status"], "cancelled")
+
+    def test_busy_queue_conflict_does_not_stop_batch(self):
+        """最接近的未命中：忙/排队冲突绝不能停批。"""
+        current = {
+            "id": 85,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-busy"},
+        }
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs") as list_jobs,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                85,
+                "GmailApiUrlBatchConflict: Gmail API URL batch đang bận; job đã được lưu vào hàng đợi",
+            )
+
+        self.assertEqual(result, {"matched": 0, "cancelled": 0, "stopping": 0})
+        list_jobs.assert_not_called()
+
+    def test_transient_session_timeout_does_not_stop_batch(self):
+        current = {
+            "id": 81,
+            "status": "running",
+            "email_source": "gmail_api_url",
+            "provider_context": {"registration_batch_id": "batch-session"},
+        }
+        with (
+            patch.object(registration_service.db, "get_job", return_value=current),
+            patch.object(registration_service.db, "list_jobs") as list_jobs,
+        ):
+            result = registration_service._stop_registration_batch_on_provider_failure(
+                81,
+                "RuntimeError: 等待 /api/auth/session accessToken 超时，最后响应: session 暂无 accessToken",
+            )
+
+        self.assertEqual(result, {"matched": 0, "cancelled": 0, "stopping": 0})
+        list_jobs.assert_not_called()
 
 
 if __name__ == "__main__":

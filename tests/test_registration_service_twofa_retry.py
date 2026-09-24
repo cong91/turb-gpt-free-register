@@ -7,6 +7,17 @@ from unittest.mock import call, patch
 from core import db, registration_service
 
 
+class _DiscardingTwofaExecutor:
+    """Chặn lớp bảo vệ: mọi submit 2FA không được patch tường minh sẽ bị bỏ,
+
+    không bao giờ chạy vào executor thật (Roxy/proxy/MailNest là tài nguyên
+    thật — class real-DB leak #6384/#6450).
+    """
+
+    def submit(self, fn, *args):
+        return None
+
+
 class RegistrationServiceTwofaRetryTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -14,6 +25,14 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.driver_patcher = patch("config.roxybrowser.REGISTRATION_DRIVER", "roxy")
         self.driver_patcher.start()
         self.addCleanup(self.driver_patcher.stop)
+        # Lớp bảo vệ class-level: không test nào được submit 2FA vào executor thật.
+        twofa_guard = patch.object(
+            registration_service,
+            "get_twofa_executor",
+            return_value=_DiscardingTwofaExecutor(),
+        )
+        twofa_guard.start()
+        self.addCleanup(twofa_guard.stop)
         root = Path(self.temp_dir.name)
         for name, value in (
             ("_ACCOUNTS_JSON", root / "accounts.json"),
@@ -139,7 +158,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         with patch(
             "core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"
         ) as prepare, patch.object(
-            registration_service, "get_executor", return_value=ImmediateExecutor()
+            registration_service, "get_twofa_executor", return_value=ImmediateExecutor()
         ), patch.object(registration_service, "get_executor_workers", return_value=1):
             result = registration_service.retry_job(source["id"], workers=1)
 
@@ -169,7 +188,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             def submit(self, fn, *args):
                 submitted.append((fn, args))
 
-        with patch.object(registration_service, "get_executor", return_value=ImmediateExecutor()), patch.object(
+        with patch.object(registration_service, "get_twofa_executor", return_value=ImmediateExecutor()), patch.object(
             registration_service, "get_executor_workers", return_value=1
         ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
             result = registration_service.retry_account_twofa(account_id, workers=1)
@@ -213,7 +232,9 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             return_value=("user@example.com", "Test User", "1990-01-01"),
         ), patch("main.run_registration", side_effect=RuntimeError("post-checkpoint failure")), patch.object(
             registration_service, "_release_unconsumed_job_email"
-        ) as release_email, patch.object(registration_service, "_disable_job_email") as disable_email:
+        ) as release_email, patch.object(registration_service, "_disable_job_email") as disable_email, patch.object(
+            registration_service, "_queue_twofa_auto_requeue"
+        ) as auto_requeue:
             registration_service._run_one_job(job["id"], job["log_file"])
 
         completed = db.get_job(job["id"])
@@ -221,6 +242,144 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertEqual(completed["account_id"], account_id)
         release_email.assert_not_called()
         disable_email.assert_not_called()
+        auto_requeue.assert_called_once_with(job["id"])
+
+    def test_twofa_failed_outcome_auto_requeues_single_twofa_retry_job(self):
+        account_id = db.insert_account(
+            email="requeue@example.com",
+            access_token="token",
+            registration_password="password",
+            twofa_status="failed",
+            extra={"registration_driver": "roxy"},
+        )
+        job = db.create_job(email_source="paymesh")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("requeue@example.com", "Test User", "1990-01-01"),
+        ), patch("main.run_registration", side_effect=RuntimeError("2FA 设置失败，账号已保存")), patch.object(
+            registration_service, "_release_unconsumed_job_email"
+        ), patch.object(
+            registration_service,
+            "get_twofa_executor",
+            return_value=ImmediateExecutor(),
+        ), patch.object(
+            registration_service,
+            "get_executor_workers",
+            return_value=1,
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        jobs = db.list_jobs(limit=10)
+        requeues = [item for item in jobs if item["job_type"] == "twofa_retry"]
+        self.assertEqual(len(requeues), 1)
+        requeue = requeues[0]
+        self.assertEqual(requeue["retry_action"], "2fa")
+        self.assertEqual(requeue["account_id"], account_id)
+        self.assertEqual(requeue["parent_job_id"], job["id"])
+        self.assertIs(submitted[0][0], registration_service._run_twofa_retry_job)
+
+        # 同一链路已有活跃补做任务时，再次失败不重复入队。
+        result = registration_service._queue_twofa_auto_requeue(job["id"])
+        self.assertFalse(result.get("created"))
+        self.assertEqual(
+            len([item for item in db.list_jobs(limit=10) if item["job_type"] == "twofa_retry"]),
+            1,
+        )
+
+    def test_twofa_failure_result_dict_auto_requeues_one_twofa_retry_job(self):
+        """生产触发路径（result-dict 返回而非异常）也必须自动入队 2FA 补做。"""
+        account_id = db.insert_account(
+            email="dictpath@example.com",
+            access_token="token",
+            registration_password="password",
+            twofa_status="failed",
+            extra={"registration_driver": "roxy"},
+        )
+        job = db.create_job(email_source="paymesh")
+        submitted = []
+
+        class ImmediateExecutor:
+            def submit(self, fn, *args):
+                submitted.append((fn, args))
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("dictpath@example.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            return_value={
+                "success": False,
+                "error": "2FA 设置失败，账号已保存：RuntimeError: re-auth 未进入 email-verification",
+                "account_id": account_id,
+                "twofa_status": "failed",
+            },
+        ), patch.object(
+            registration_service, "_release_unconsumed_job_email"
+        ), patch.object(
+            registration_service,
+            "get_twofa_executor",
+            return_value=ImmediateExecutor(),
+        ), patch.object(
+            registration_service,
+            "get_executor_workers",
+            return_value=1,
+        ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        requeues = [item for item in db.list_jobs(limit=10) if item["job_type"] == "twofa_retry"]
+        self.assertEqual(len(requeues), 1)
+        self.assertEqual(requeues[0]["retry_action"], "2fa")
+        self.assertEqual(requeues[0]["account_id"], account_id)
+        self.assertIs(submitted[0][0], registration_service._run_twofa_retry_job)
+
+    def test_auto_requeue_skipped_when_stop_requested(self):
+        """操作员停止后不得把 2FA 补做任务复活。"""
+        job = db.create_job(email_source="paymesh")
+        registration_service._STOP_EVENTS[job["id"]] = __import__("threading").Event()
+        registration_service._STOP_EVENTS[job["id"]].set()
+        registration_service._ACTIVE_JOBS.add(job["id"])
+        try:
+            with patch.object(registration_service, "retry_job") as retry_job:
+                result = registration_service._queue_twofa_auto_requeue(job["id"])
+            self.assertIsNone(result)
+            retry_job.assert_not_called()
+        finally:
+            registration_service._STOP_EVENTS.pop(job["id"], None)
+            registration_service._ACTIVE_JOBS.discard(job["id"])
+
+    def test_registration_force_refresh_proxy_rotates_for_retry_jobs_only(self):
+        from config import proxy as proxy_cfg
+
+        with patch.object(proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False, create=True):
+            self.assertTrue(
+                registration_service._registration_force_refresh_proxy(
+                    {"retry_attempt": 1, "parent_job_id": 9}
+                )
+            )
+            self.assertTrue(
+                registration_service._registration_force_refresh_proxy(
+                    {"retry_attempt": 0, "parent_job_id": 9}
+                )
+            )
+            self.assertFalse(
+                registration_service._registration_force_refresh_proxy(
+                    {"retry_attempt": 0, "parent_job_id": None}
+                )
+            )
+        with patch.object(proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True, create=True):
+            self.assertTrue(
+                registration_service._registration_force_refresh_proxy(
+                    {"retry_attempt": 0, "parent_job_id": None}
+                )
+            )
 
     def test_gmail_api_url_registration_exception_discards_unconsumed_alias(self):
         job = db.create_job(
@@ -244,6 +403,96 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
             "alias+one@gmail.com",
             "RuntimeError: registration failed",
             discard_on_failure=True,
+        )
+
+    def test_proxy_infra_failure_recycles_alias_instead_of_discarding(self):
+        # RotatingProxyError xảy ra TRƯỚC khi registration bắt đầu (chưa mở
+        # browser, chưa đọc OTP): alias chưa tiêu hao — recycle để job sau
+        # claim lại, đừng đốt supply khi provider trục trặc (batch 07:00
+        # 2026-09-21 đốt oan 12 alias).
+        job = db.create_job(
+            email_source="gmail_api_url",
+            provider_context={
+                "gmail_api_url_batch_id": "batch-1",
+                "gmail_api_url_lane_id": 0,
+            },
+        )
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            side_effect=RuntimeError("RotatingProxyError: Không lấy được proxy khả dụng sau khi thử lại"),
+        ), patch.object(
+            registration_service, "_release_unconsumed_job_email"
+        ) as release_email:
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        release_email.assert_called_once_with(
+            "alias+one@gmail.com",
+            "RuntimeError: RotatingProxyError: Không lấy được proxy khả dụng sau khi thử lại",
+            discard_on_failure=False,
+        )
+
+    def test_roxy_browser_failure_recycles_alias_instead_of_discarding(self):
+        job = db.create_job(
+            email_source="gmail_api_url",
+            provider_context={
+                "gmail_api_url_batch_id": "batch-1",
+                "gmail_api_url_lane_id": 0,
+            },
+        )
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            side_effect=RuntimeError("Roxy 创建环境连续失败 5 次: HTTPConnectionPool"),
+        ), patch.object(
+            registration_service, "_release_unconsumed_job_email"
+        ) as release_email:
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        release_email.assert_called_once_with(
+            "alias+one@gmail.com",
+            "RuntimeError: Roxy 创建环境连续失败 5 次: HTTPConnectionPool",
+            discard_on_failure=False,
+        )
+
+    def test_roxy_api_timeout_failure_recycles_alias_instead_of_discarding(self):
+        # Batch 2026-09-21 job 2919: "Roxy API 返回失败 POST /browser/create:
+        # timeout of 15000ms exceeded" — Roxy server bận, alias không được đốt,
+        # job sau claim lại (owner yêu cầu chờ bật lại thay vì bỏ qua).
+        job = db.create_job(
+            email_source="gmail_api_url",
+            provider_context={
+                "gmail_api_url_batch_id": "batch-1",
+                "gmail_api_url_lane_id": 0,
+            },
+        )
+
+        with patch.object(
+            registration_service,
+            "_prepare_registration_args",
+            return_value=("alias+one@gmail.com", "Test User", "1990-01-01"),
+        ), patch(
+            "main.run_registration",
+            side_effect=RuntimeError(
+                "Roxy API 返回失败 POST /browser/create: timeout of 15000ms exceeded"
+            ),
+        ), patch.object(
+            registration_service, "_release_unconsumed_job_email"
+        ) as release_email:
+            registration_service._run_one_job(job["id"], job["log_file"])
+
+        release_email.assert_called_once_with(
+            "alias+one@gmail.com",
+            "RuntimeError: Roxy API 返回失败 POST /browser/create: timeout of 15000ms exceeded",
+            discard_on_failure=False,
         )
 
     @patch("config.proxy.ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True, create=True)
@@ -293,9 +542,11 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertEqual(len(submitted), 1)
         self.assertIs(submitted[0][0], registration_service._run_one_job)
 
-    @patch("config.proxy.ROTATING_PROXY_ONE_ACCOUNT_PER_IP", True, create=True)
+    @patch("config.proxy.ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False, create=True)
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 0, create=True)
     def test_registration_retry_job_force_refreshes_proxy_for_new_child_job(self):
+        # 全局 one-account-per-ip 关闭时，重试任务仍必须换新 IP——这是本 bead
+        # 唯一的行为变更；旧实现（仅读配置）会让该测试失败。
         source = db.create_job(email_source="outlook")
         db.update_job(source["id"], status="failed")
         retry_job, created = db.create_retry_job(
@@ -321,7 +572,7 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         self.assertTrue(run_registration.call_args.kwargs["force_refresh_proxy"])
 
     @patch("config.register.REGISTRATION_AUTO_RETRY_ATTEMPTS", 1, create=True)
-    def test_provider_602_queues_fresh_gmail_api_url_job_on_same_lane(self):
+    def test_provider_602_does_not_queue_fresh_gmail_api_url_job(self):
         provider_context = {
             "gmail_api_url_batch_id": "batch-1",
             "gmail_api_url_lane_id": 0,
@@ -358,15 +609,8 @@ class RegistrationServiceTwofaRetryTests(unittest.TestCase):
         ), patch("core.rotating_proxy_runtime.prepare_rotating_proxy_lanes"):
             registration_service._run_one_job(source["id"], source["log_file"])
 
-        jobs = db.list_jobs(limit=10)
-        child = next(job for job in jobs if job["id"] != source["id"])
-        self.assertEqual(child["parent_job_id"], source["id"])
-        self.assertNotEqual(
-            child["provider_context"]["gmail_api_url_batch_id"],
-            provider_context["gmail_api_url_batch_id"],
-        )
-        self.assertEqual(child["provider_context"]["gmail_api_url_lane_id"], 0)
-        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(db.list_jobs(limit=10)), 1)
+        self.assertEqual(submitted, [])
         release_email.assert_called_once_with(
             "alias+one@gmail.com",
             "Provider error code=602",

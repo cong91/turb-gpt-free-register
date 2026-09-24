@@ -34,8 +34,8 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from curl_cffi import requests
 
-from config.browser import CHROME_UA_VERSION as BROWSER_CHROME_UA_VERSION
 from config.browser import CHROME_MAJOR as BROWSER_CHROME_MAJOR
+from config.browser import CHROME_UA_VERSION as BROWSER_CHROME_UA_VERSION
 from config.browser import IMPERSONATE as BROWSER_IMPERSONATE
 
 # ============================================================

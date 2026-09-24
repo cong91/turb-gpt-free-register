@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from core import browser_registration
+from core import browser_page_actions, registration_flow
 
 
 class _VisibleEmailElement:
@@ -25,7 +25,7 @@ class BrowserRegistrationEmailEntryTests(unittest.TestCase):
         element = _VisibleEmailElement()
         driver = _GenericSeleniumDriver(element)
 
-        found = browser_registration._wait_for_email_input(driver, timeout=1)
+        found = registration_flow._wait_for_email_input(driver, timeout=1)
 
         self.assertIs(found, element)
 
@@ -36,7 +36,7 @@ class BrowserRegistrationEmailEntryTests(unittest.TestCase):
                 return False
 
         driver = Driver()
-        result = browser_registration._set_element_value(driver, None, "user@example.com")
+        result = browser_page_actions._set_element_value(driver, None, "user@example.com")
 
         self.assertFalse(result)
         self.assertIn("if (!el) return false", driver.script)
@@ -49,18 +49,18 @@ class BrowserRegistrationEmailEntryTests(unittest.TestCase):
 
         with (
             patch.object(
-                browser_registration,
+                registration_flow,
                 "_wait_for_email_input",
                 side_effect=[first, replacement],
             ),
             patch.object(
-                browser_registration,
+                registration_flow,
                 "_human_type_text",
                 side_effect=[RuntimeError("JavascriptException: element became null"), None],
             ) as type_text,
-            patch.object(browser_registration.time, "sleep"),
+            patch.object(registration_flow.time, "sleep"),
         ):
-            browser_registration._type_email_address(driver, email, timeout=1)
+            registration_flow._type_email_address(driver, email, timeout=1)
 
         self.assertEqual(type_text.call_count, 2)
 

@@ -163,6 +163,7 @@ def probe_socks_public_ip(
     import time
 
     from curl_cffi import requests
+
     from config.browser import IMPERSONATE
 
     errors: list[str] = []

@@ -21,7 +21,10 @@ from core.rotating_proxy_runtime import TWOFA_RETRY_PROXY_SCOPE
 
 logger = logging.getLogger(__name__)
 
-_TWOFA_BROWSER_RESTART_ATTEMPTS = 3
+# 每次浏览器重启 = 新代理租约 + 新环境 + 完整重登，成本高；两次重启 × 两次登录
+# 已覆盖绝大多数临时失败（DB 统计 2FA 重试前两次成功率 ~70%），再多只是烧钱。
+_TWOFA_BROWSER_RESTART_ATTEMPTS = 2
+_TWOFA_LOGIN_ATTEMPTS = 2
 
 
 def _account_credentials(account: dict) -> tuple[int, str, str] | None:
@@ -31,6 +34,36 @@ def _account_credentials(account: dict) -> tuple[int, str, str] | None:
     if not account_id or not email or not password:
         return None
     return account_id, email, password
+
+
+def _account_profile(account: dict) -> tuple[str, str]:
+    """(name, birthday) để điền lại about-you khi login bị OpenAI đẩy về profile.
+
+    Ưu tiên giá trị đã checkpoint lúc đăng ký; account cũ không có thì sinh
+    mới (OpenAI chỉ cần form hợp lệ, không đối chiếu giá trị cũ).
+    """
+    import json as _json
+
+    extra: dict = {}
+    raw = account.get("extra_json")
+    if raw:
+        try:
+            parsed = _json.loads(str(raw))
+            if isinstance(parsed, dict):
+                extra = parsed
+        except (TypeError, ValueError):
+            extra = {}
+    name = str(extra.get("registration_name") or "").strip()
+    birthday = str(extra.get("registration_birthday") or "").strip()
+    if not name:
+        from core.name_samples import random_display_name
+
+        name = random_display_name()
+    if not birthday:
+        from core.profile_utils import generate_random_birthday
+
+        birthday = generate_random_birthday()
+    return name, birthday
 
 
 def _failure_result(account_id: int, email: str, error: str) -> dict[str, object]:
@@ -108,6 +141,7 @@ def _run_twofa_retry_in_profile(
                 password,
                 timeout=profile.timeout,
                 totp_secret=str(account.get("totp_secret") or "").strip() or None,
+                profile=_account_profile(account),
             )
             secret = setup_2fa_in_page(profile.driver, email, reauth=True)
             if not secret:
@@ -125,6 +159,7 @@ def _run_twofa_retry_in_profile(
                 post_auth_automation_enabled = bool(
                     getattr(register_config, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
                     or getattr(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+                    or getattr(register_config, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False)
                     or getattr(codex_config, "ENABLE_CODEX_AUTO", False)
                 )
                 if post_auth_automation_enabled:
@@ -245,7 +280,7 @@ def _run_twofa_retry_in_profile(
 def run_twofa_retry(
     account: dict,
     *,
-    max_attempts: int = 3,
+    max_attempts: int = _TWOFA_LOGIN_ATTEMPTS,
     browser_restart_attempts: int = _TWOFA_BROWSER_RESTART_ATTEMPTS,
     proxy: str | None = None,
     proxy_lane_id: int | None = None,

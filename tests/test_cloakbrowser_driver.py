@@ -90,13 +90,16 @@ class BrowserElementTests(unittest.TestCase):
         self.assertEqual("Send a new code", element.text)
 
     def test_browser_helpers_use_native_locator_for_cloak_elements(self):
-        source = (Path(__file__).parents[1] / "core" / "browser_registration.py").read_text(
+        source = (Path(__file__).parents[1] / "core" / "browser_page_actions.py").read_text(
             encoding="utf-8"
         )
 
         self.assertIn('native = getattr(el, "locator", None) or getattr(el, "handle", None)', source)
         self.assertIn('if getattr(el, "locator", None) is not None or getattr(el, "handle", None) is not None:', source)
-        self.assertIn('el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)', source)
+        email_entry_source = (Path(__file__).parents[1] / "core" / "registration_flow.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)', email_entry_source)
 
 
 class _NavigatingPage:
@@ -161,8 +164,9 @@ class _CaptureEvaluatePage:
 class _CaptureSelectorPage:
     url = "https://chatgpt.com/auth/login"
 
-    def __init__(self):
+    def __init__(self, *, visible_selectors=()):
         self.calls = []
+        self.visible_selectors = tuple(visible_selectors)
 
     def locator(self, selector):
         if selector != "body":
@@ -175,7 +179,7 @@ class _CaptureSelectorPage:
 
     def wait_for_selector(self, selector, *, state, timeout):
         self.calls.append((selector, state, timeout))
-        if "password" in selector:
+        if any(marker in selector for marker in self.visible_selectors):
             return object()
         raise TimeoutError("selector timeout")
 
@@ -245,20 +249,30 @@ class CloakAdapterContractTests(unittest.TestCase):
         self.assertEqual(7000, payload["timeoutMs"])
 
     def test_auth_flow_state_uses_bounded_selector_waits(self):
-        page = _CaptureSelectorPage()
+        page = _CaptureSelectorPage(visible_selectors=("password",))
         driver = BrowserSeleniumDriver(browser=None, context=None, page=page)
 
         self.assertEqual(
             {"state": "password", "body_text": ""},
             driver.read_auth_flow_state(timeout_ms=2300),
         )
-        self.assertEqual(3, len(page.calls))
+        self.assertEqual(2, len(page.calls))
         self.assertTrue(all(timeout >= 1 for _, _, timeout in page.calls))
 
+    def test_auth_flow_state_prefers_password_when_otp_and_password_are_visible(self):
+        page = _CaptureSelectorPage(visible_selectors=("password", "otp"))
+        driver = BrowserSeleniumDriver(browser=None, context=None, page=page)
+
+        self.assertEqual(
+            {"state": "password", "body_text": ""},
+            driver.read_auth_flow_state(timeout_ms=2300),
+        )
+        self.assertEqual(2, len(page.calls))
+
 class BrowserSeleniumDriverTests(unittest.TestCase):
-    @patch("core.browser_registration._find_any")
+    @patch("core.registration_flow._find_any")
     def test_browser_registration_returns_native_email_element_for_cloak(self, find_any):
-        from core.browser_registration import _wait_for_email_input
+        from core.registration_flow import _wait_for_email_input
 
         driver = type("BrowserSeleniumDriver", (), {})()
         expected_element = object()
@@ -364,7 +378,7 @@ class BrowserSeleniumDriverTests(unittest.TestCase):
         self.assertIs(result["target"].handle, element_handle)
 
     def test_shared_registration_scripts_guard_optional_scroll_api(self):
-        source = (Path(__file__).parents[1] / "core" / "browser_registration.py").read_text(
+        source = (Path(__file__).parents[1] / "core" / "browser_page_actions.py").read_text(
             encoding="utf-8"
         )
 
@@ -393,7 +407,7 @@ class BrowserSeleniumDriverTests(unittest.TestCase):
         )
 
         self.assertNotIn("from core.roxy_registration import", source)
-        self.assertIn("from core.browser_registration import", source)
+        self.assertIn("from core.registration_flow import", source)
 
 
 class _RetryingNavigationPage:

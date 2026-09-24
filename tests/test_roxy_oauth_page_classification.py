@@ -1,6 +1,6 @@
 import unittest
 
-from core.roxy_registration import _is_oauth_consent_like
+from core.browser_auth_actions import _is_oauth_consent_like
 
 
 class _PageStateDriver:

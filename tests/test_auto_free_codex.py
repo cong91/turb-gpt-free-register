@@ -1,4 +1,5 @@
 import unittest
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from config import register as register_config
@@ -16,6 +17,17 @@ class AutoFreeCodexTests(unittest.TestCase):
         )
         self._wireguard_proxy.start()
         self.addCleanup(self._wireguard_proxy.stop)
+        @contextmanager
+        def required_proxy(*_args, **_kwargs):
+            yield "http://test-proxy.example:8080", "proxy_pool"
+
+        self._required_proxy = patch.object(
+            plan_check_service,
+            "required_account_proxy",
+            side_effect=required_proxy,
+        )
+        self._required_proxy.start()
+        self.addCleanup(self._required_proxy.stop)
 
     @patch("core.plan_check_service.enqueue_account_plan_check", return_value={"accepted": True})
     @patch("core.email_provider.mark_email_consumed", return_value=True)
@@ -74,6 +86,34 @@ class AutoFreeCodexTests(unittest.TestCase):
         )
         update_status.assert_called_once_with("free@example.com", "success", None)
         submit.assert_not_called()
+
+    def test_failed_twofa_blocks_background_codex_oauth(self):
+        result = {
+            "ok": True,
+            "current_plan_type": "free",
+            "plus_trial_eligible": False,
+        }
+
+        with (
+            patch.object(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True, create=True),
+            patch.object(
+                plan_check_service.db,
+                "get_account",
+                return_value={"id": 7, "twofa_status": "failed"},
+            ),
+            patch("core.codex_oauth.run_codex_oauth", create=True) as run_oauth,
+        ):
+            outcome = plan_check_service._run_auto_codex_oauth_for_free_account(
+                account_id=7,
+                email="twofa-failed@example.com",
+                access_token="token",
+                trigger="registration_auto",
+                result=result,
+            )
+
+        self.assertFalse(outcome["accepted"])
+        self.assertEqual(outcome["reason"], "twofa_required")
+        run_oauth.assert_not_called()
 
     def test_free_plus_trial_does_not_enqueue_codex(self):
         with patch.object(register_config, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", True, create=True), patch(
@@ -257,7 +297,7 @@ class AutoFreeCodexTests(unittest.TestCase):
             access_token="token",
             trigger="registration_auto",
             result=result,
-            proxy=None,
+            proxy="http://test-proxy.example:8080",
         )
 
     @patch.object(plan_check_service, "_run_auto_codex_oauth_for_free_account", return_value={"accepted": False, "reason": "disabled"})

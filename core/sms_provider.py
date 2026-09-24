@@ -356,6 +356,7 @@ def acquire_number(
                     api_key=getattr(_cfg, "HERO_SMS_API_KEY", ""),
                     service=service or getattr(_cfg, "HERO_SMS_SERVICE", "dr"),
                     country=country or getattr(_cfg, "HERO_SMS_COUNTRY", "auto"),
+                    min_price=getattr(_cfg, "HERO_SMS_MIN_PRICE", "0.01"),
                     max_price=(getattr(_cfg, "HERO_SMS_MAX_PRICE", "") or _cfg.SMS_MAX_PRICE),
                     lane_key=lane_key or "",
                 )

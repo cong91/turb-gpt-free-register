@@ -4,6 +4,55 @@ from unittest.mock import patch
 
 
 class AccountNetworkSelectionTests(unittest.TestCase):
+    def test_required_proxy_ignores_registration_proxy_and_uses_rotating_lease(self):
+        from core.account_network import required_account_proxy
+
+        with (
+            patch(
+                "core.account_network.resolve_rotating_proxy",
+                return_value="http://rotating.example:8080",
+            ) as resolve_proxy,
+            patch("core.account_network.release_rotating_proxy") as release_proxy,
+            required_account_proxy(
+                "http://nord-registration.example:1080",
+                rotating_scope="plan_check",
+                lane_id=3,
+            ) as route,
+        ):
+            self.assertEqual(route, ("http://rotating.example:8080", "rotating_proxy"))
+
+        resolve_proxy.assert_called_once_with(
+            None,
+            scope="plan_check",
+            lane_id=3,
+        )
+        release_proxy.assert_called_once_with(
+            scope="plan_check",
+            lane_id=3,
+            proxy_url="http://rotating.example:8080",
+        )
+
+    def test_required_proxy_falls_back_to_pool_when_rotating_lease_missing(self):
+        from core.account_network import required_account_proxy
+
+        with (
+            patch("core.account_network.resolve_rotating_proxy", return_value=None),
+            patch(
+                "config.proxy.pick_proxy",
+                return_value="socks5://pool.example:1080",
+            ) as pick_proxy,
+            required_account_proxy(
+                "http://nord-registration.example:1080",
+                rotating_scope="plan_check",
+            ) as route,
+        ):
+            self.assertEqual(route, ("socks5://pool.example:1080", "proxy_pool"))
+
+        pick_proxy.assert_called_once_with(
+            probe_url="https://chatgpt.com/auth/login",
+            probe_timeout=4.0,
+        )
+
     def test_proxy_pool_mode_uses_configured_pool(self):
         from core.account_network import selected_account_proxy
 

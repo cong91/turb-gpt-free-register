@@ -178,6 +178,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         self.assertEqual(click_continue.call_count, 2)
 
     @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
     @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="logged_in")
     @patch("core.browser_twofa_login._wait_for_browser_challenge")
     @patch("core.browser_twofa_login._page_warmup")
@@ -194,6 +195,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         page_warmup,
         wait_for_challenge,
         submit_email,
+        _snapshot,
         fetch_session,
     ):
         driver = type("Driver", (), {})()
@@ -214,6 +216,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         fetch_session.assert_called_once_with(driver, timeout=120)
 
     @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
     @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="logged_in")
     @patch("core.browser_twofa_login._wait_for_browser_challenge")
     @patch("core.browser_twofa_login._page_warmup")
@@ -230,6 +233,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         page_warmup,
         wait_for_challenge,
         _submit_email,
+        _snapshot,
         _fetch_session,
     ):
         driver = type(
@@ -370,6 +374,73 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         with self.assertRaisesRegex(AccountUnusableError, "account_deactivated"):
             _login_password(Driver(), "password", timeout=1)
 
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.registration_flow._complete_profile_page", return_value=True)
+    @patch("core.browser_twofa_login._on_about_you_page", return_value=True)
+    @patch("core.browser_twofa_login._login_password", return_value="next")
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="login_password")
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
+    @patch("core.browser_twofa_login._safe_get")
+    @patch("core.browser_twofa_login._page_warmup")
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_completes_about_you_profile_when_redirected(
+        self,
+        _human_delay,
+        _has_token,
+        _maybe_accept,
+        _safe_get,
+        _page_warmup,
+        _snapshot,
+        _submit_email,
+        _login_password,
+        _on_about_you,
+        complete_profile,
+        fetch_session,
+    ):
+        # Account đã qua about-you lúc đăng ký nhưng server chưa finalize:
+        # login lại bị đẩy về about-you → phải điền nốt profile rồi mới có token
+        # (batch 5: job 2909 chết "登录密码提交后未进入邮箱验证码页 state=next").
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/about-you"})()
+
+        result = _login_existing_account(
+            driver,
+            "user@example.com",
+            "password",
+            profile=("John Ruiz", "1990-01-01"),
+        )
+
+        self.assertEqual(result["accessToken"], "token")
+        complete_profile.assert_called_once_with(driver, "John Ruiz", "1990-01-01", timeout=60)
+        fetch_session.assert_called_once_with(driver, timeout=120)
+
+    @patch("core.browser_twofa_login._login_password", return_value="next")
+    @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="login_password")
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
+    @patch("core.browser_twofa_login._safe_get")
+    @patch("core.browser_twofa_login._page_warmup")
+    @patch("core.browser_twofa_login._maybe_accept")
+    @patch("core.browser_twofa_login._has_access_token", return_value=False)
+    @patch("core.browser_twofa_login.human_delay")
+    def test_existing_login_without_profile_still_fails_on_about_you(
+        self,
+        _human_delay,
+        _has_token,
+        _maybe_accept,
+        _snapshot,
+        _safe_get,
+        _page_warmup,
+        _submit_email,
+        _login_password,
+    ):
+        # Không có profile (caller cũ không truyền) → giữ nguyên hành vi raise
+        # thay vì điền mù form about-you.
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/about-you"})()
+
+        with self.assertRaisesRegex(RuntimeError, "state=next"):
+            _login_existing_account(driver, "user@example.com", "password")
+
     @patch("core.browser_twofa_login.wait_for_otp")
     @patch("core.browser_twofa_login._login_password", side_effect=RuntimeError("password submit stuck"))
     @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="login_password")
@@ -393,6 +464,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         wait_for_otp.assert_not_called()
 
     @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
     @patch("core.browser_twofa_login.wait_for_otp")
     @patch("core.browser_twofa_login._submit_email_and_wait_next", return_value="logged_in")
     @patch("core.browser_twofa_login._maybe_accept")
@@ -403,6 +475,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         _maybe_accept,
         _submit_email,
         wait_for_otp,
+        _snapshot,
         fetch_session,
     ):
         driver = type("Driver", (), {"get": lambda self, _url: None})()
@@ -414,6 +487,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         fetch_session.assert_called_once_with(driver, timeout=120)
 
     @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
     @patch("core.browser_twofa_login._has_access_token", return_value=True)
     @patch("core.browser_twofa_login._submit_email_and_wait_next")
     @patch("core.browser_twofa_login._maybe_accept")
@@ -424,6 +498,7 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         _maybe_accept,
         submit_email,
         has_token,
+        _snapshot,
         fetch_session,
     ):
         driver = type("Driver", (), {"get": lambda self, _url: None})()
@@ -469,6 +544,8 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         fetch_session.assert_called_once_with(driver, timeout=120)
 
     @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login.acknowledge_verification_code")
+    @patch("core.browser_twofa_login.snapshot_verification_code", return_value=None)
     @patch("core.browser_twofa_login._is_email_verification_page", return_value=False)
     @patch("core.browser_twofa_login._wait_after_email_otp_submit", return_value="invalid")
     @patch("core.browser_twofa_login._click_continue")
@@ -490,6 +567,8 @@ class BrowserTwofaLoginTests(unittest.TestCase):
         _type_otp,
         _click_continue,
         _wait_after_submit,
+        _ack,
+        _snapshot,
         _is_email_page,
         fetch_session,
     ):

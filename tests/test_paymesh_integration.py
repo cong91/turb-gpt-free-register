@@ -1,15 +1,42 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from config import email as email_config
 from config import register as register_config
-from core import registration_service
+from core import app_state_db, db, registration_service
 from core.account_export import save_account_data
 from webui.app import create_app
 
 
 class PaymeshIntegrationTests(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        root = Path(self.temp_dir.name)
+        state_path = root / "turb.sqlite3"
+        patches = (
+            patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+            patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy-accounts.json"),
+            patch.object(db, "_OUTLOOK_JSON", root / "outlook.json"),
+            patch.object(db, "_LEGACY_OUTLOOK_JSON", root / "legacy-outlook.json"),
+            patch.object(db, "_JOBS_JSON", root / "jobs.json"),
+            patch.object(db, "_LEGACY_JOBS_JSON", root / "legacy-jobs.json"),
+            patch.object(db, "_LOG_DIR", root / "logs"),
+            patch.object(db, "_GMAIL_API_URL_EMAIL_JSON", root / "gmail-pool.json"),
+            patch.object(db, "_GMAIL_API_URL_EMAIL_TXT", root / "gmail-pool.txt"),
+            patch.object(db, "_SQLITE_PATH", state_path),
+            patch.object(db, "_DEFAULT_SQLITE_PATH", state_path),
+            patch.object(db, "_SQLITE_READY", False),
+            patch.object(db, "_SQLITE_READY_PATH", None),
+            patch.object(app_state_db, "APP_STATE_DB_PATH", state_path),
+        )
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        registration_service._JOB_EMAIL_INPUTS.clear()
+        self.addCleanup(registration_service._JOB_EMAIL_INPUTS.clear)
         self.client = create_app(auth_code="test-auth").test_client()
         self.client.environ_base["HTTP_X_AUTH_CODE"] = "test-auth"
 

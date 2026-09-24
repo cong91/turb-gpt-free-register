@@ -16,7 +16,8 @@ class RegistrationSettingsUiTests(unittest.TestCase):
 
         self.assertIn("AUTO_PLAN_CHECK_AFTER_REGISTER", renderer)
         self.assertIn("AUTO_CODEX_FOR_FREE_AFTER_REGISTER", renderer)
-        self.assertIn("const switches = [autoPlan, autoCodex].filter(Boolean)", renderer)
+        self.assertIn("AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", renderer)
+        self.assertIn("const switches = [autoPlan, autoCodex, autoPay153].filter(Boolean)", renderer)
         self.assertIn("switches.map(f => renderFeatureSwitchField(f", renderer)
 
     def test_proxy_settings_render_rotating_proxy_status_tools(self):
@@ -53,6 +54,23 @@ class RegistrationSettingsUiTests(unittest.TestCase):
         source = VI_TRANSLATION.read_text(encoding="utf-8")
 
         self.assertIn("'Proxy.vn 代理旋转': 'Proxy xoay Proxy.vn'", source)
+
+    def test_email_provider_settings_have_dedicated_tabs(self):
+        template = INDEX_TEMPLATE.read_text(encoding="utf-8")
+        translations = VI_TRANSLATION.read_text(encoding="utf-8")
+
+        self.assertIn("if (key.startsWith('EMAIL_API_')) return ['Automated Email API'", template)
+        self.assertIn("if (key.startsWith('OTPGMAIL_')) return ['OTPGmail'", template)
+        self.assertIn("'Automated Email API', 'OTPGmail'", template)
+        self.assertIn("'Automated Email API': 'Automated Email API'", translations)
+        self.assertIn("'OTPGmail': 'OTPGmail'", translations)
+
+    def test_bamboommo_is_available_in_registration_and_pool_selectors(self):
+        template = INDEX_TEMPLATE.read_text(encoding="utf-8")
+
+        self.assertIn('<option value="bamboommo">BambooMMO Gmail</option>', template)
+        self.assertIn('data-value="bamboommo" role="option">BambooMMO Gmail 邮箱池</button>', template)
+        self.assertIn("bamboommo: 'BambooMMO Gmail 邮箱池'", template)
 
     def test_roxy_profile_manager_owner_prefix_has_vietnamese_label(self):
         source = CONFIG_EDITOR.read_text(encoding="utf-8")

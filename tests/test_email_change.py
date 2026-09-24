@@ -577,6 +577,33 @@ class EmailChangeApiTests(unittest.TestCase):
         self.assertIn("const blob = await response.blob();", export_block)
         self.assertIn("setTimeout(() =>", export_block)
 
+    def test_twofa_validation_errors_are_visible_with_server_line_details(self):
+        script = (Path(__file__).resolve().parents[1] / "webui" / "static" / "email_change.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("const showRequestError = (message) => {", script)
+        self.assertIn("resultPanel.hidden = false;", script)
+        self.assertIn("resultBody.innerHTML = '';", script)
+        self.assertIn("showRequestError(isTwofa ? 'Hãy nhập danh sách tài khoản cần đổi 2FA.'", script)
+        self.assertIn("showRequestError(error instanceof Error ? error.message : 'Không thể gửi yêu cầu');", script)
+
+    def test_twofa_results_expose_manual_retry_and_poll_again(self):
+        script = (Path(__file__).resolve().parents[1] / "webui" / "static" / "email_change.js").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("data-twofa-retry-index", script)
+        self.assertIn("/api/accounts/change-twofa-retry", script)
+        self.assertIn("body: JSON.stringify({ batch_id: batchId, index, credentials })", script)
+        self.assertIn("await pollTwofaProgress(batchId);", script)
+        self.assertIn("if (isTwofa && payload.batch_id)", script)
+        self.assertIn("Sẽ tự động thử đọc lại...", script)
+        self.assertIn("statusCode >= 400 && statusCode < 500", script)
+        self.assertIn("result.retryable !== false", script)
+        self.assertNotIn("password: ", script)
+        self.assertNotIn("totp_secret: ", script)
+
     @patch("webui.email_change_api.db.get_personal_info_change_export_rows")
     @patch("webui.email_change_api.db.get_personal_info_change_batch")
     def test_export_route_downloads_db_backed_batch_in_modern_format(self, get_batch, get_rows):

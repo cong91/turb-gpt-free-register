@@ -93,6 +93,46 @@ def preferred_account_proxy(
 
 
 @contextmanager
+def required_account_proxy(
+    explicit_proxy: str | None,
+    *,
+    rotating_scope: str,
+    lane_id: int | None = None,
+    lease_owner_id: str | None = None,
+) -> Iterator[tuple[str, str]]:
+    """Yield a non-direct route, preferring rotating proxy then proxy pool."""
+    # This contract is intentionally stricter than browser account workflows:
+    # a caller-supplied registration/Nord proxy is never trusted for package
+    # checks or PAY.153.  Only an allocated rotating lease or pool entry may be
+    # used, so the explicit argument is retained solely for API compatibility.
+
+    # Package checks have a stricter contract than browser recovery flows:
+    # only a rotating lease or a configured proxy-pool entry is acceptable.
+    active_proxy = resolve_rotating_proxy(None, scope=rotating_scope, lane_id=lane_id)
+    if active_proxy:
+        try:
+            yield active_proxy, "rotating_proxy"
+            return
+        finally:
+            release_rotating_proxy(
+                scope=rotating_scope,
+                lane_id=lane_id,
+                proxy_url=active_proxy,
+            )
+
+    from config.proxy import pick_proxy
+
+    pool_proxy = pick_proxy(
+        probe_url="https://chatgpt.com/auth/login",
+        probe_timeout=4.0,
+    )
+    if pool_proxy:
+        yield pool_proxy, "proxy_pool"
+        return
+    raise RuntimeError("套餐查询必须使用 proxy xoay hoặc proxy pool; hiện chưa lấy được proxy")
+
+
+@contextmanager
 def selected_account_proxy(
     mode: str | None,
     *,

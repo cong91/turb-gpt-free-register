@@ -65,6 +65,9 @@ except ImportError:  # pragma: no cover - exercised by the CLI error path
 VERSION = "1.0.0"
 CHECKOUT_URL = "https://chatgpt.com/backend-api/payments/checkout"
 UPDATE_PATH = "/backend-api/payments/checkout/update"
+SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
+CHECKOUT_SENTINEL_FLOW = "chatgpt_checkout"
+CSRF_WARMUP_URL = "https://chatgpt.com/api/auth/csrf"
 TRACE_URL = "https://www.cloudflare.com/cdn-cgi/trace"
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
@@ -949,7 +952,98 @@ class CheckoutExtractor:
             f"update={self.config.update_proxy_country}."
         )
 
-    def _create_checkout(self, session: Any) -> dict[str, Any]:
+    def _warmup_session(self, session: Any) -> None:
+        """Prime chatgpt.com cookies (__cf_bm/_cfuvid) before the checkout POST."""
+        try:
+            session.get(
+                CSRF_WARMUP_URL,
+                headers={
+                    "Referer": "https://chatgpt.com/",
+                    "Accept": "application/json, text/plain, */*",
+                },
+                timeout=self.config.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - warmup only improves odds.
+            self.log(f"Checkout warmup note: {type(exc).__name__}.")
+
+    def _sentinel_headers(self, proxy: str) -> dict[str, str]:
+        """Build OpenAI Sentinel proof headers for the checkout request.
+
+        The payments checkout endpoint rejects proof-less API clients with
+        HTTP 400 "unusual activity"; the provider flows already send these
+        headers.  Generation is best-effort: without a Node runner the
+        request continues exactly as before instead of failing the run.
+        """
+        session: Any = None
+        try:
+            from core.sentinel import (
+                build_sentinel_request_body,
+                generate_requirements_token,
+            )
+            from core.sentinel_runner import generate_sentinel_token
+
+            sentinel_sid = str(uuid.uuid4())
+            session = self.session_factory()
+            set_proxy(session, proxy)
+            response = session.post(
+                SENTINEL_REQ_URL,
+                data=build_sentinel_request_body(
+                    generate_requirements_token(sentinel_sid),
+                    self.device_id,
+                    CHECKOUT_SENTINEL_FLOW,
+                ),
+                headers={
+                    "Content-Type": "text/plain;charset=UTF-8",
+                    "Referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+                    "User-Agent": self.config.user_agent,
+                },
+                timeout=self.config.timeout,
+            )
+            status = int(getattr(response, "status_code", 0) or 0)
+            if status != 200:
+                self.log(
+                    f"Sentinel request HTTP {status}; checkout continues without proof headers."
+                )
+                return {}
+            challenge = response.json()
+            if not isinstance(challenge, dict):
+                raise TypeError("sentinel returned an invalid challenge")
+            token_text = generate_sentinel_token(
+                challenge=challenge,
+                flow=CHECKOUT_SENTINEL_FLOW,
+                device_id=self.device_id,
+                user_agent=self.config.user_agent,
+                page_url="https://chatgpt.com/",
+                sentinel_sid=sentinel_sid,
+                cookie=f"oai-did={self.device_id}",
+            )
+        except Exception as exc:  # noqa: BLE001 - proof generation must not block checkout.
+            self.log(
+                f"Sentinel proof unavailable ({type(exc).__name__}); "
+                "checkout continues without proof headers."
+            )
+            return {}
+        finally:
+            safe_close(session)
+        headers = {"OpenAI-Sentinel-Token": token_text}
+        try:
+            token_payload = json.loads(token_text)
+            so_value = token_payload.get("so") if isinstance(token_payload, dict) else ""
+            if so_value:
+                headers["OpenAI-Sentinel-SO-Token"] = json.dumps(
+                    {
+                        "so": so_value,
+                        "c": token_payload.get("c") or challenge.get("token") or "",
+                        "id": self.device_id,
+                        "flow": CHECKOUT_SENTINEL_FLOW,
+                    },
+                    separators=(",", ":"),
+                )
+        except (TypeError, ValueError):
+            pass
+        return headers
+
+    def _create_checkout(self, session: Any, proxy: str) -> dict[str, Any]:
         refresh_cookie_header(session)
         body = {
             "entry_point": "all_plans_pricing_modal",
@@ -958,16 +1052,20 @@ class CheckoutExtractor:
                 "country": self.config.billing_country,
                 "currency": self.config.currency,
             },
+            "cancel_url": "https://chatgpt.com/",
+            "check_card_proxy": True,
             "checkout_ui_mode": self.config.checkout_ui_mode,
         }
+        headers = {
+            "Referer": "https://chatgpt.com/",
+            "x-openai-target-path": "/backend-api/payments/checkout",
+            "x-openai-target-route": "/backend-api/payments/checkout",
+        }
+        headers.update(self._sentinel_headers(proxy))
         response = session.post(
             CHECKOUT_URL,
             json=body,
-            headers={
-                "Referer": "https://chatgpt.com/",
-                "x-openai-target-path": "/backend-api/payments/checkout",
-                "x-openai-target-route": "/backend-api/payments/checkout",
-            },
+            headers=headers,
             timeout=self.config.timeout,
         )
         if int(getattr(response, "status_code", 0) or 0) >= 400:
@@ -998,6 +1096,7 @@ class CheckoutExtractor:
 
     def _create_checkout_with_retry(self, checkout_proxy: str) -> tuple[Any, dict[str, Any]]:
         session = self._new_identity_session(checkout_proxy)
+        self._warmup_session(session)
         current_proxy = checkout_proxy
         cloudflare_failures = 0
         exit_rotated = False
@@ -1005,7 +1104,7 @@ class CheckoutExtractor:
         for attempt in range(1, self.config.checkout_attempts + 1):
             self.log(f"Checkout attempt {attempt}/{self.config.checkout_attempts}.")
             try:
-                return session, self._create_checkout(session)
+                return session, self._create_checkout(session, current_proxy)
             except UpstreamError as exc:
                 last_error = exc
                 if not exc.retryable or attempt >= self.config.checkout_attempts:

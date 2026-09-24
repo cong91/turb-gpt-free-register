@@ -25,6 +25,7 @@ from core.account_export import (
     save_account_data,
     setup_2fa_for_registration,
 )
+from core.browser_registry import run_registered_registration
 from core.chatgpt_auth import get_csrf_token, get_providers, signin_openai
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
@@ -247,147 +248,36 @@ def _run_registration_impl(
     lease_owner_id: str | None = None,
     on_email_acquired: Callable[[str], None] | None = None,
 ):
-    """
-    执行完整的 ChatGPT 注册流程。
-
-    Browser registration drivers always force the OpenAI password step;
-    the legacy protocol driver retains its own OTP flow.
-
-    OpenAI 当前默认流程：signin 时携带 login_hint+screen_hint=login_or_signup
-    → follow_authorize 重定向链自动落到 /email-verification 并触发 OTP 发送
-    → 用户输入验证码 → validate_email_otp → about-you 提交昵称生日 → 完成。
-
-    Args:
-        email: 注册邮箱
-        name: 用户显示名称
-        birthday: 生日，格式 YYYY-MM-DD
-        proxy: 代理地址（不传则按当前配置从代理池或代理旋转 lease 获取）
-        otp_code: 邮箱验证码（如果为None，会等待手动输入）
-        proxy_lane_id: 代理旋转 lane；批量注册时由 worker lane 传入
-    """
-    # 可选注册驱动：
-    #   protocol     = 原有纯协议（curl_cffi）
-    #   roxy         = RoxyBrowser 指纹浏览器 + Selenium
-    #   cloak        = CloakBrowser + Playwright/Selenium 适配层
-    #   browser_use  = Browser Use Cloud stealth Chromium + Playwright
-    #   skyvern      = Skyvern Browser Sessions + Playwright
-    driver_mode = str(getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
+    """Dispatch registration through the canonical browser registry."""
+    driver_mode = _roxy_cfg.REGISTRATION_DRIVER
     if proxy and proxy_lane_id is not None:
         logger.info("[RotatingProxy] registration lane=%s 已分配 proxy lease", proxy_lane_id)
-    if driver_mode in ("roxy", "roxybrowser", "fingerprint", "browser"):
-        from core.roxy_registration import run_roxy_registration
+    return run_registered_registration(
+        driver_mode,
+        email=email,
+        name=name,
+        birthday=birthday or generate_random_birthday(),
+        proxy=proxy,
+        otp_code=otp_code,
+        batch_dir=batch_dir,
+        proxy_lane_id=proxy_lane_id,
+        lease_owner_id=lease_owner_id,
+        on_email_acquired=on_email_acquired,
+    )
 
-        if proxy:
-            return run_roxy_registration(
-                email=email,
-                name=name,
-                birthday=birthday or generate_random_birthday(),
-                proxy=proxy,
-                otp_code=otp_code,
-                batch_dir=batch_dir,
-            )
 
-        from core.nordvpn_wireguard import proxy_for_registration
-
-        proxy_context = (
-            proxy_for_registration(owner_id=lease_owner_id)
-            if lease_owner_id is not None
-            else proxy_for_registration()
-        )
-        with proxy_context as nordvpn_proxy:
-            return run_roxy_registration(
-                email=email,
-                name=name,
-                birthday=birthday or generate_random_birthday(),
-                proxy=nordvpn_proxy,
-                otp_code=otp_code,
-                batch_dir=batch_dir,
-            )
-    if driver_mode in ("cloak", "cloakbrowser"):
-        from core.cloakbrowser_registration import run_cloak_registration
-
-        if proxy is not None:
-            return run_cloak_registration(
-                email=email,
-                name=name,
-                birthday=birthday or generate_random_birthday(),
-                proxy=proxy,
-                otp_code=otp_code,
-                batch_dir=batch_dir,
-                on_email_acquired=on_email_acquired,
-            )
-
-        from core.nordvpn_wireguard import proxy_for_registration
-
-        proxy_context = (
-            proxy_for_registration(owner_id=lease_owner_id)
-            if lease_owner_id is not None
-            else proxy_for_registration()
-        )
-        with proxy_context as nordvpn_proxy:
-            return run_cloak_registration(
-                email=email,
-                name=name,
-                birthday=birthday or generate_random_birthday(),
-                proxy=nordvpn_proxy,
-                otp_code=otp_code,
-                batch_dir=batch_dir,
-                on_email_acquired=on_email_acquired,
-            )
-    if driver_mode in ("browser_use", "browseruse", "browser-use", "bu"):
-        from core.browser_use_registration import run_browser_use_registration
-        return run_browser_use_registration(
-            email=email,
-            name=name,
-            birthday=birthday or generate_random_birthday(),
-            proxy=proxy,
-            otp_code=otp_code,
-            batch_dir=batch_dir,
-            on_email_acquired=on_email_acquired,
-        )
-    if driver_mode in ("skyvern", "sv"):
-        from core.skyvern_registration import run_skyvern_registration
-        return run_skyvern_registration(
-            email=email,
-            name=name,
-            birthday=birthday or generate_random_birthday(),
-            proxy=proxy,
-            otp_code=otp_code,
-            batch_dir=batch_dir,
-            on_email_acquired=on_email_acquired,
-        )
-    if driver_mode not in ("protocol", "api", "http"):
-        raise RuntimeError(
-            f"不支持的 REGISTRATION_DRIVER={driver_mode!r}，可选 protocol / roxy / cloak / browser_use / skyvern"
-        )
-
-    # Protocol driver: nếu PROXY_POOL rỗng nhưng NordVPN WireGuard đang bật
-    # → dùng proxy_for_registration() giống Roxy driver
-    if proxy is None:
-        from core.nordvpn_wireguard import (
-            is_per_profile_proxy_enabled,
-            proxy_for_registration,
-        )
-        if is_per_profile_proxy_enabled():
-            from core.nordvpn_wireguard import proxy_for_registration as _pfr
-            proxy_context = (
-                _pfr(owner_id=lease_owner_id)
-                if lease_owner_id is not None
-                else _pfr()
-            )
-            with proxy_context as nordvpn_proxy:
-                return run_registration(
-                    email=email,
-                    name=name,
-                    birthday=birthday,
-                    proxy=nordvpn_proxy or "",
-                    otp_code=otp_code,
-                    batch_dir=batch_dir,
-                    lease_owner_id=lease_owner_id,
-                    on_email_acquired=on_email_acquired,
-                )
-
-    # 创建浏览器会话（proxy=None 时自动从 config.PROXY_POOL 随机抽一个）
+def _run_protocol_registration(
+    email: str,
+    name: str,
+    birthday: str | None = None,
+    proxy: str | None = None,
+    otp_code: str | None = None,
+    batch_dir=None,
+    proxy_lane_id: int | None = None,
+    lease_owner_id: str | None = None,
+    on_email_acquired: Callable[[str], None] | None = None,
+):
+    """Execute the legacy protocol registration lane."""
     session = BrowserSession(proxy=proxy)
 
     # 从代理 URL 中抽取 sid 段做日志，避免把账号密码完整打印
@@ -601,10 +491,12 @@ def _run_registration_impl(
                 )
             human_delay("post_auth")
 
+        from core.email_provider import resolve_email_source
+
         account_id = checkpoint_account_data(
             email=email,
             access_token=access_token,
-            email_source=None,
+            email_source=resolve_email_source(email),
             proxy_used=session.proxy or None,
             registration_ip=(getattr(session, "exit_geo", {}) or {}).get("ip"),
             extra={
@@ -633,6 +525,23 @@ def _run_registration_impl(
                 twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
                 logger.error(f"2FA 设置失败: {twofa_error}")
                 db.update_account_2fa(account_id, status="failed", error=twofa_error)
+                try:
+                    from core.registration_auto_pay153 import (
+                        enqueue_registration_auto_pay153,
+                    )
+
+                    enqueue_registration_auto_pay153(
+                        account_id=account_id,
+                        email=email,
+                        access_token=access_token,
+                        proxy=session.proxy or None,
+                    )
+                except Exception as queue_exc:  # noqa: BLE001 - preserve the checkpointed account.
+                    logger.warning(
+                        "[PAY.153][注册后] 2FA 失败后的自动任务未入队: %s: %s",
+                        type(queue_exc).__name__,
+                        str(queue_exc)[:180],
+                    )
                 return {
                     "success": False,
                     "email": email,

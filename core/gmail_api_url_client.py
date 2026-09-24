@@ -314,10 +314,22 @@ def _quarantine_provider_code_url(
         )
 
 
+def is_existing_account_otp_stage(stage: str | None) -> bool:
+    """True khi stage là đọc OTP cho alias đã đăng ký (2FA setup / re-login).
+
+    Allocation states (disabled/exhausted) chỉ chặn việc CẤP alias mới;
+    đọc OTP cho alias cũ chỉ được chặn bởi quarantine 602 thật của provider —
+    nếu không, một root bị auto-disable cục bộ sẽ khoá 2FA recovery của
+    mọi alias đã tạo trên root đó.
+    """
+    return str(stage or "").strip().lower().startswith("twofa_")
+
+
 def _ensure_account_pollable(
     account: GmailApiUrlAccount,
     *,
     sqlite_path=None,
+    stage: str | None = None,
 ) -> None:
     """Reject disabled roots and quarantined URLs before any provider request."""
     from core import db
@@ -330,6 +342,8 @@ def _ensure_account_pollable(
         raise GmailApiUrlError(
             "Provider error code=602: Gmail API URL source is quarantined"
         )
+    if is_existing_account_otp_stage(stage):
+        return
     if db.is_gmail_api_url_account_blocked(
         account.email,
         sqlite_path=runtime_path,
@@ -343,9 +357,10 @@ def snapshot_verification_code(
     account: GmailApiUrlAccount,
     *,
     sqlite_path=None,
+    stage: str | None = None,
 ) -> str | None:
     """Return the currently visible code without logging, waiting, or persisting."""
-    _ensure_account_pollable(account, sqlite_path=sqlite_path)
+    _ensure_account_pollable(account, sqlite_path=sqlite_path, stage=stage)
     try:
         api_code, otp = _fetch_code_once(account.code_url, sqlite_path=sqlite_path)
     except GmailApiUrlError as exc:
@@ -412,7 +427,7 @@ def poll_verification_code(
     Raises:
         GmailApiUrlError: 超时 / code=602 / data.code 缺失
     """
-    _ensure_account_pollable(account, sqlite_path=sqlite_path)
+    _ensure_account_pollable(account, sqlite_path=sqlite_path, stage=stage)
     log_context = f"job={job_id or '-'} stage={stage or '-'}"
     baseline_source = "explicit"
     # ── 只有调用方没有提供 baseline 时，才回退到该 code_url 的持久化值 ──
@@ -560,17 +575,17 @@ def create_registration_batch(
     return create(count, aliases_per_email=aliases_per_email, allow_partial=allow_partial)
 
 
-def materialize_next_available_source(
+def ensure_batch_alias(
     batch_id: str,
     *,
     aliases_per_source: int = 12,
     store: GmailApiUrlBatchStore | None = None,
 ) -> bool:
     from core.gmail_api_url_batch_coordinator import (
-        materialize_next_available_source as materialize,
+        ensure_batch_alias as ensure_alias,
     )
 
-    return materialize(batch_id, aliases_per_source=aliases_per_source, store=store)
+    return ensure_alias(batch_id, aliases_per_source=aliases_per_source, store=store)
 
 
 def provision_next_gmail_api_url_source(
