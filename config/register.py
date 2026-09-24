@@ -30,7 +30,7 @@ AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER = False
 
 # 注册成功并拿到 accessToken 后，在浏览器里随机停留一段时间再关闭连接。
 # 格式：最小秒,最大秒。设为 "0,0" 表示不额外停留。
-POST_REGISTER_DWELL_SECONDS_RANGE = "18,45"
+POST_REGISTER_DWELL_SECONDS_RANGE = "5,15"
 
 # 账号尚未创建时，浏览器页面/OTP 的已知临时错误自动创建的新注册任务数。
 # 每次会使用一个新邮箱 alias；0 表示关闭，默认只补跑一次。
