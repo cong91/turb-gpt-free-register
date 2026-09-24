@@ -1,6 +1,6 @@
 ---
 purpose: Project rules for AI agents
-updated: 2026-08-15
+updated: 2026-09-17
 source: generated-by-zcode-starterkit
 ---
 
@@ -13,16 +13,17 @@ Maintain the Python-first ChatGPT registration and Codex OAuth tool without leak
 ## Reading Order
 
 1. This `AGENTS.md` and the task-specific nearby code/tests.
-2. `README.md`, `.env.example`, and relevant files under `config/`.
+2. `README.md`, `.env.example`, and relevant files under `config/`; for deployment changes also read the README "Production Docker / CI-CD" section, `compose.yaml`, `Dockerfile`, `deploy/deploy.sh`, and `.github/workflows/ci-cd.yml`.
 3. `.codex/memory/project/tech-stack.md` and `.codex/memory/project/project.md`; consult preserved legacy `.zcode/` memory only when needed.
 4. Code and tests; external guidance applies only when it matches this repository.
 
 ## Stack and Structure
 
-- Python 3.10+ with Flask, `curl_cffi`, Playwright, Selenium, CloakBrowser, and standard-library `unittest`.
+- Python 3.10+ with Flask, `curl_cffi`, Playwright, Selenium, CloakBrowser, and standard-library `unittest`. CI runs Python 3.12 and Node 22.
 - Node.js 18+ runs the CommonJS Sentinel/PoW helper; there is no `package.json`.
-- Entry points: `main.py` (CLI), `web.py` (WebUI), `core/codex_agent.py`, and `sentinel/sentinel-runner.js`.
+- Entry points: `main.py` (CLI), `web.py` (local WebUI dev server), `wsgi.py` (production gunicorn app; runs startup reconciliation of interrupted registration jobs and stale Codex retry states), `core/codex_agent.py`, and `sentinel/sentinel-runner.js`.
 - Boundaries: `config/` owns defaults/env wiring, `core/` owns domain and integration logic, `webui/` owns HTTP/UI orchestration, and `tests/` mirrors behavior areas.
+- Deployment surface: `Dockerfile`, `compose.yaml`, `docker-entrypoint.sh`, `deploy/deploy.sh`, `deploy/nginx/`, and `.github/workflows/ci-cd.yml`. `artifacts/pay153_port/baseline/` is a tracked snapshot of an older tree — never edit it and exclude it from lint reasoning.
 
 ## Core Coding Contract
 
@@ -76,18 +77,23 @@ These principles apply to implementation and architecture decisions:
 - WebUI auth and secret endpoints are security-sensitive; preserve header/cookie checks and add negative tests for bypass attempts.
 - Runtime data belongs outside tracked source. Check `.gitignore` before introducing new generated paths.
 - Dynamic configuration reads such as `from config import email as _email_cfg` preserve WebUI hot reload; binding mutable values directly can leave stale settings.
-- Persistence changes must preserve coordinated JSON and TXT outputs, and `accounts_viewer.html` must be treated as a credential-bearing export.
-- Ruff is not clean; the 2026-08-15 setup scan reported 1,194 findings across the current dirty worktree, including undefined names in `core/roxy_codex_oauth.py`. Do not mix unrelated cleanup into feature work.
+- Persistence changes must preserve coordinated JSON and TXT outputs, and `accounts_viewer.html` must be treated as a credential-bearing export. `turb.sqlite3` is the source of truth; JSON/TXT/HTML exports are artifacts regenerated from it.
+- Production runs as non-root uid 1000 in a read-only container: all runtime state lives in the `turb_gpt_runtime` volume at `/var/lib/turb` (symlinked over repo paths such as `turb.sqlite3`, `accounts/`, and the Chinese-named mailbox/token files listed in `Dockerfile`). New generated paths must be added to that symlink list or they will fail at runtime in the container.
+- WebUI config saves go to the `runtime_config` document in `turb.sqlite3`; the production secret file (`/run/secrets/turb.env`, mode 600 on the server) is read-only bootstrap input and is never rewritten. Nginx terminates HTTPS and proxies to `127.0.0.1:5057` — never publish port 5057 directly.
+- CI deployment gate tests (`tests.test_app_state_db`, `tests.test_read_only_runtime_exports`, `tests.test_sqlite_state_migration`, `tests.test_wireproxy_runtime`, `tests.test_webui_auth`) must pass locally before pushing; the deploy pipeline refuses a server checkout with uncommitted changes and only pulls immutable `sha-<commit>`/`main` GHCR images.
+- Ruff is not clean; the 2026-09-17 scan reported 1,595 findings including 1,545 inside the `artifacts/` snapshot (all 19 F821 undefined-name findings live there). The live tree reports ~50 findings with `--exclude artifacts`. Do not mix unrelated cleanup into feature work.
 
 ## Verified Commands
 
 - `python -m pip install -r requirements.txt`
 - `python -m pip check`
 - `python -m unittest discover -s tests -p 'test_*.py' -v`
-- `python -m compileall -q main.py web.py core config webui tests`
+- CI gate subset: `python -m unittest -v tests.test_app_state_db tests.test_read_only_runtime_exports tests.test_sqlite_state_migration tests.test_wireproxy_runtime tests.test_webui_auth`
+- `python -m compileall -q main.py web.py wsgi.py core config webui tests`
 - `python -X utf8 main.py --help` and `python -X utf8 web.py --help`
 - `node --check sentinel/sentinel-runner.js && node --check sentinel/sdk.js`
-- `ruff check . --exclude .zcode,.beads,.codex` (known non-clean baseline; report the live result)
+- `ruff check . --exclude .zcode,.beads,.codex,artifacts` (known non-clean baseline; report the live result)
+- Local WebUI on Windows: `start-local.bat -Port 5057` (bootstraps `.venv`, copies `.env.example`, force-closes the port first; `-CheckOnly` verifies without starting).
 
 ## Code Example
 

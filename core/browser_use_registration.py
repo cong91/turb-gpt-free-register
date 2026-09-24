@@ -19,32 +19,27 @@ from pathlib import Path
 from typing import Any
 
 from config import browser_use as _cfg
-from config import twofa as _twofa_cfg
-from core import db
-from core.account_export import (
-    BrowserContextTransport,
-    _post_register_dwell_seconds,
-    checkpoint_account_data,
-    save_account_data,
+from core.account_export import _post_register_dwell_seconds
+from core.browser_failure_policy import (
+    account_unusable_page_code as _account_unusable_page_code,
 )
-from core.browser_registration import (
-    _is_unsupported_email_error,
-    _profile_submission_error,
+from core.browser_failure_policy import (
+    raise_if_account_unusable as _raise_if_account_unusable,
 )
-from core.browser_traffic import PlaywrightTrafficTracker
-from core.browser_use_client import BrowserUseClient
-from core.codex_login_credentials import CodexLoginCredentials
-from core.email_provider import (
-    acquire_email_after_input,
-    resolve_email_source,
-    wait_for_otp,
-)
+from core.email_provider import acquire_email_after_input, wait_for_otp
 from core.humanize import delay as human_delay
 from core.openai_auth import (
     AccountUnusableError,
     account_unusable_error_message,
-    account_unusable_message,
-    detect_account_unusable_text,
+)
+from core.registration_profile_utils import (
+    poll_profile_submission_error as _poll_profile_submission_error,
+)
+from core.registration_profile_utils import (
+    profile_submission_error as _profile_submission_error,
+)
+from core.registration_profile_utils import (
+    profile_submission_failure_message as _profile_submission_failure_message,
 )
 from core.time_utils import local_today
 
@@ -273,14 +268,12 @@ def _generate_password(length: int = 14) -> str:
     upper = string.ascii_uppercase
     lower = string.ascii_lowercase
     digits = string.digits
-    symbols = "!@#$%^&*"
     chars = [
         random.choice(upper),
         random.choice(lower),
         random.choice(digits),
-        random.choice(symbols),
     ]
-    pool = upper + lower + digits + symbols
+    pool = upper + lower + digits
     chars.extend(random.choice(pool) for _ in range(max(0, length - len(chars))))
     random.shuffle(chars)
     return "".join(chars)
@@ -534,21 +527,6 @@ def _assert_not_external_idp(page, stage: str) -> None:
         raise RuntimeError(f"[BrowserUse] {stage} 误入第三方登录：{url}")
 
 
-def _account_unusable_page_code(page) -> str:
-    """读取 Playwright 页面正文并识别账号停用/删除状态。"""
-    try:
-        body = page.locator("body").inner_text(timeout=1000) or ""
-    except Exception:  # noqa: BLE001
-        return ""
-    return detect_account_unusable_text(str(body))
-
-
-def _raise_if_account_unusable(page) -> None:
-    code = _account_unusable_page_code(page)
-    if code:
-        raise AccountUnusableError(account_unusable_error_message(code), error_code=code)
-
-
 def _wait_after_password_submit(page, initial_url: str, timeout: float = 5.0) -> None:
     """等待密码提交结果；账号停用页出现时立即停止后续 OTP。"""
     end = time.time() + max(0.0, float(timeout))
@@ -606,15 +584,15 @@ def _quick_auth_state(page) -> dict:
               // /log-in/password 代表该邮箱已走登录密码分支；即便页面 DOM 里有 code/otp 字样，
               // 注册流程也按不可用邮箱处理，不能误判成邮箱验证码页。
               if (url.includes('/log-in/password')) state = 'login_password';
-              else if (hasOtp) state = 'email_verification';
               else if (hasPassword) state = 'password';
+              else if (hasOtp) state = 'email_verification';
               else if (url.includes('about-you') || url.includes('profile') || url.includes('create-account/about')) state = 'profile';
               else if (url.includes('chatgpt.com') && !url.includes('/auth/')) state = 'chatgpt';
               return {state, url, hasOtp, hasPassword, textPreview: text.slice(0, 160)};
             }"""
         ) or {"state": "other", "url": _page_url(page)}
         if isinstance(result, dict):
-            code = detect_account_unusable_text(str(result.get("textPreview") or ""))
+            code = _account_unusable_page_code(str(result.get("textPreview") or ""))
             if code:
                 result["state"] = f"deactivated:{code}"
         return result
@@ -2146,6 +2124,16 @@ def _force_exit_profile_page(page, deadline: float) -> bool:
     return False
 
 
+def _profile_error_snapshot(page) -> dict:
+    """构建用于轮询 about-you 提交错误的快照（与主循环 classifier 同 shape）。"""
+    body = ""
+    try:
+        body = (page.locator("body").inner_text(timeout=800) or "").lower()
+    except Exception:  # noqa: BLE001, S110
+        pass
+    return {"url": _page_url(page).lower(), "text": body, "errors": []}
+
+
 def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) -> bool:
     """资料页填写/提交：提交后不无限等待；Skyvern 卡住时强制跳出 about-you。"""
 
@@ -2174,7 +2162,7 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
             pass
         profile_error = _profile_submission_error({"url": url, "text": body, "errors": []})
         if profile_error:
-            raise RuntimeError(f"about-you 提交失败：{profile_error}")
+            raise RuntimeError(_profile_submission_failure_message(profile_error))
         looks_profile = any(x in url for x in ("about-you", "profile", "create-account/about", "signup/profile")) or any(x in body for x in ("birthday", "birth", "age", "name", "誕生日", "年齢", "名前", "生日", "年龄", "姓名"))
 
         if looks_profile:
@@ -2191,14 +2179,25 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
                 else:
                     submitted = True
                 if submitted and post_submit_hard_exit_at is None:
-                    # 已提交后不再重复填写/点击；最多给它 10~16 秒同步登录态，然后强制跳出。
-                    post_submit_hard_exit_at = time.time() + (10 if _fast_mode() else 16)
+                    # 已提交后不再重复填写/点击；给 20 秒同步登录态/等待迟到渲染的
+                    # 提交错误（与 poll_profile_submission_error 的 20s 窗口对齐），然后强制跳出。
+                    post_submit_hard_exit_at = time.time() + 20
                 _bu_delay("form")
             elif time.time() - last_log > 2:
                 logger.info("[BrowserUse] 资料页已提交，等待短暂跳转/准备取 AT：url=%s", _page_url(page) or "-")
                 last_log = time.time()
 
             if submitted and post_submit_hard_exit_at and time.time() >= post_submit_hard_exit_at:
+                # 强制跳出前最后轮询一次迟到渲染的提交错误（如 user_already_exists）。
+                delayed_error = _poll_profile_submission_error(
+                    lambda: _profile_error_snapshot(page),
+                    left_profile=lambda snap: not any(
+                        x in str(snap.get("url") or "") for x in ("about-you", "profile", "create-account/about", "signup/profile")
+                    ),
+                )
+                if delayed_error:
+                    logger.error("[BrowserUse] about-you 提交被服务端拒绝（延迟渲染）：%s", delayed_error)
+                    raise RuntimeError(_profile_submission_failure_message(delayed_error))
                 if _force_exit_profile_page(page, min(end, time.time() + (8 if _fast_mode() else 12))):
                     logger.info("[BrowserUse] 资料页提交后已通过强制跳转退出：%s", _page_url(page) or "-")
                     return True
@@ -2211,11 +2210,21 @@ def _complete_profile_page(page, name: str, birthday: str, timeout: int = 60) ->
                 logger.info("[BrowserUse] 资料页提交后已检测到 accessToken")
                 return True
             if post_submit_hard_exit_at is None:
-                post_submit_hard_exit_at = time.time() + (10 if _fast_mode() else 16)
+                post_submit_hard_exit_at = time.time() + 20
             if time.time() - last_log > 2:
                 logger.info("[BrowserUse] 资料页已提交，等待登录态同步：url=%s", _page_url(page) or "-")
                 last_log = time.time()
             if time.time() >= post_submit_hard_exit_at:
+                # 强制跳出前最后轮询一次迟到渲染的提交错误（如 user_already_exists）。
+                delayed_error = _poll_profile_submission_error(
+                    lambda: _profile_error_snapshot(page),
+                    left_profile=lambda snap: not any(
+                        x in str(snap.get("url") or "") for x in ("about-you", "profile", "create-account/about", "signup/profile")
+                    ),
+                )
+                if delayed_error:
+                    logger.error("[BrowserUse] about-you 提交被服务端拒绝（延迟渲染）：%s", delayed_error)
+                    raise RuntimeError(_profile_submission_failure_message(delayed_error))
                 if _force_exit_profile_page(page, min(end, time.time() + (8 if _fast_mode() else 12))):
                     logger.info("[BrowserUse] 资料页提交后已通过强制跳转退出：%s", _page_url(page) or "-")
                     return True
@@ -2645,499 +2654,129 @@ def run_browser_use_registration(
     cloud_provider: str = "browser_use",
     on_email_acquired: Callable[[str], None] | None = None,
 ) -> dict:
-    """Browser Use / Skyvern 云端浏览器注册入口。proxy 参数保留兼容。"""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise RuntimeError(
-            "缺少 playwright。请先执行: uv pip install playwright --python .venv/bin/python"
-        ) from exc
-
-    provider = str(cloud_provider or "browser_use").strip().lower()
-    if provider in ("skyvern", "sv"):
-        from core.skyvern_client import SkyvernClient
-        cloud_label = "Skyvern"
-        provider_prefix = "skyvern"
-        client = SkyvernClient()
-    else:
-        cloud_label = "BrowserUse"
-        provider_prefix = "browser_use"
-        client = BrowserUseClient()
-
-    _set_log_provider_label(cloud_label)
-    _set_cloud_provider(provider_prefix)
-    _t_all = _StepTimer(f"{cloud_label} 注册全流程")
-    session_info_open = (
-        client.open_session(proxy=proxy)
-        if proxy is not None
-        else client.open_session()
+    """Run cloud registration through the shared registration orchestration."""
+    from config import twofa as _twofa_cfg
+    from core import db
+    from core.account_export import (
+        BrowserContextTransport,
+        setup_2fa_for_registration,
     )
-    create_acknowledged = False
-    openai_password: str | None = None
-    browser = None
-    context = None
-    page = None
-    traffic_tracker: PlaywrightTrafficTracker | None = None
-    network_traffic: dict[str, Any] | None = None
-
-    logger.info(
-        "[%s] 开始注册：%s proxyCountry=%s profileId=%s local_proxy_arg=%s",
-        cloud_label,
-        email,
-        session_info_open.proxy_country_code or "-",
-        session_info_open.profile_id or "-",
-        "yes" if proxy else "no",
+    from core.browser_registry import normalize_driver, resolve_profile_opener
+    from core.codex_login_credentials import CodexLoginCredentials
+    from core.registration_flow import (
+        _complete_email_otp,
+        run_registration_page_flow,
     )
 
+    provider = normalize_driver(cloud_provider or "browser_use")
+    profile = resolve_profile_opener(provider)(proxy=proxy)
+    driver = profile.driver
     try:
-        with sync_playwright() as p:
-            logger.info("[%s] 连接 CDP ...", cloud_label)
-            _t_cdp = _StepTimer(f"连接 {cloud_label} CDP")
-            connect_kwargs = {}
-            if provider_prefix == "skyvern" and hasattr(client, "cdp_headers"):
-                connect_kwargs["headers"] = client.cdp_headers()
-            browser = p.chromium.connect_over_cdp(session_info_open.connect_url, **connect_kwargs)
-            _t_cdp.done()
-            # Browser Use 通常已有默认 context/page
-            if browser.contexts:
-                context = browser.contexts[0]
-            else:
-                context = browser.new_context()
-            page = context.pages[0] if context.pages else context.new_page()
-            from core.registration_network_identity import probe_playwright_geo
+        def session_fetch(current_driver, *, timeout: int, auto_jump_wait: int) -> dict:
+            del auto_jump_wait
+            return _fetch_chatgpt_session(
+                getattr(current_driver, "page", current_driver),
+                context=getattr(current_driver, "context", None),
+                timeout=timeout,
+            )
 
-            registration_geo = probe_playwright_geo(page)
-            page.set_default_timeout(_timeout_ms())
-            page.set_default_navigation_timeout(_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
+        def otp_completion(current_driver, current_email, **kwargs) -> None:
+            return _complete_email_otp(current_driver, current_email, **kwargs, max_attempts=3)
+
+        result = run_registration_page_flow(
+            driver,
+            email,
+            name,
+            birthday,
+            otp_code=otp_code,
+            email_supplier=(
+                lambda: _acquire_cloud_email(email, on_email_acquired)
+            ),
+            proxy=proxy,
+            registration_driver=provider,
+            checkpoint_extras={"cloud_provider": provider},
+            session_fetch=session_fetch,
+            otp_completion=otp_completion,
+            session_timeout=120,
+            session_auto_jump_wait=15,
+            warmup_after_login=True,
+            log_prefix=f"[{provider}注册]",
+            release_failure=True,
+            raise_failure=False,
+        )
+        if not result.get("success"):
+            return result
+        account_id = result["account_id"]
+        access_token = result["access_token"]
+        openai_password = result.get("openai_password")
+        totp_secret = None
+        twofa_status = "disabled"
+        twofa_error = None
+        if _twofa_cfg.ENABLE_2FA:
             try:
-                # 从拿到远端 BrowserContext 后立即监听，覆盖后续所有 page/popup 的注册请求。
-                traffic_tracker = PlaywrightTrafficTracker(context, label=cloud_label)
+                totp_secret = setup_2fa_for_registration(
+                    BrowserContextTransport(driver.context, driver.page),
+                    result["email"],
+                )
+                twofa_status = "active"
+                db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
             except Exception as exc:  # noqa: BLE001
-                # 统计失败不应影响注册主流程。
-                logger.warning(
-                    "[%s] 初始化浏览器流量统计失败，继续注册：%s: %s",
-                    cloud_label,
-                    type(exc).__name__,
-                    str(exc)[:180],
+                twofa_status = "failed"
+                twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
+                db.update_account_2fa(account_id, status="failed", error=twofa_error)
+                result.update({"twofa_status": twofa_status, "twofa_error": twofa_error})
+                return result
+        codex_result = {"status": "skipped", "ok": True, "message": "未触发"}
+        try:
+            from config import codex as _codex_cfg
+            from config import register as _register_cfg
+            if (
+                getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False)
+                or getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
+                or getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
+            ):
+                from core.codex_oauth import run_codex_oauth
+                from core.registration_auto_codex import run_registration_auto_codex
+
+                credentials = (
+                    CodexLoginCredentials(result["email"], openai_password, totp_secret)
+                    if openai_password and totp_secret
+                    else None
                 )
-            if _should_apply_cloud_automation_mask(provider_prefix):
-                _apply_cloud_browser_automation_mask(
-                    context,
-                    page,
-                    label=cloud_label,
-                    provider_prefix=provider_prefix,
-                    proxy_country_code=session_info_open.proxy_country_code,
-                )
-            else:
-                logger.info("[%s] 已跳过额外 JS 指纹补丁，使用云浏览器原生 stealth 环境", cloud_label)
-
-            if provider_prefix == "skyvern":
-                try:
-                    from config import skyvern as _skyvern_cfg
-                    start_url = str(getattr(_skyvern_cfg, "SKYVERN_START_URL", "https://chatgpt.com/auth/login") or "https://chatgpt.com/auth/login")
-                except Exception:  # noqa: BLE001
-                    start_url = "https://chatgpt.com/auth/login"
-            else:
-                start_url = str(getattr(_cfg, "BROWSER_USE_START_URL", "https://chatgpt.com/auth/login") or "https://chatgpt.com/auth/login")
-            logger.info("[%s] 打开登录页：%s", cloud_label, start_url)
-            _t_goto = _StepTimer("打开登录页")
-            page.goto(start_url, wait_until="domcontentloaded")
-            _t_goto.done(f"url={_page_url(page) or '-'}")
-            _bu_delay("navigate")
-            _maybe_accept_cookies(page)
-            _check_manual_stop()
-
-            def _email_supplier_after_input() -> str:
-                nonlocal email
-                _check_manual_stop()
-                email = acquire_email_after_input(email)
-                if on_email_acquired:
-                    on_email_acquired(email)
-                return email
-
-            _t_email = _StepTimer("填写并提交邮箱")
-            # OpenAI 可能在点击提交后立刻发 OTP，甚至邮件 ReceivedDateTime 早于 Playwright
-            # 点击函数返回的本地时间；先记录时间戳，配合 _is_after 的时钟容忍，避免过滤掉首次验证码。
-            otp_after_ts = time.time()
-            next_state = _submit_email_until_transition(
-                page,
-                context,
-                email,
-                attempts=2,
-                timeout_ms=20000,
-                email_supplier=_email_supplier_after_input,
-            )
-            _t_email.done(f"state={next_state}")
-            logger.info("[BrowserUse] 已提交邮箱：%s", email)
-            _assert_not_external_idp(page, "提交邮箱后")
-            _check_manual_stop()
-
-            _t_pwd = _StepTimer("检测/处理密码页")
-            try:
-                if next_state == "email_verification":
-                    logger.info("[BrowserUse] 邮箱提交已进入验证码页，尝试点击“使用密码继续”并设置密码")
-                openai_password = _fill_password_if_present(page, email, timeout=25, context=context)
-                create_acknowledged = True
-                _t_pwd.done("password_set=yes" if openai_password else "password_set=no")
-            except Exception as exc:
-                _t_pwd.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
-                raise
-            _check_manual_stop()
-
-            def _restart_email_otp_flow(reason: str) -> None:
-                """
-                OpenAI 验证码页直接点 resend 偶发跳 chrome-error/500。
-                这里改为重新打开注册入口、重新提交同一个邮箱来触发新 OTP，保持页面回到可输入验证码的状态。
-                """
-                nonlocal page, otp_after_ts, openai_password, create_acknowledged
-                logger.info("[BrowserUse][OTP] 重新触发邮箱 OTP：%s", reason)
-                try:
-                    _check_manual_stop()
-                    page = _pick_live_page(context, page) or page
-                    otp_after_ts = time.time()
-                    page.goto(start_url, wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
-                    _check_manual_stop()
-                    _bu_delay("navigate")
-                    _maybe_accept_cookies(page)
-                    _check_manual_stop()
-                    _submit_email_until_transition(
-                        page,
-                        context,
-                        email,
-                        attempts=2,
-                        timeout_ms=12000 if _fast_mode() else 18000,
-                    )
-                    _check_manual_stop()
-                    logger.info("[BrowserUse][OTP] 已重新提交邮箱：%s", email)
-                    _assert_not_external_idp(page, "重新提交邮箱后")
-                    pwd = _fill_password_if_present(page, email, timeout=25, context=context)
-                    _check_manual_stop()
-                    if pwd:
-                        openai_password = pwd
-                        create_acknowledged = True
-                    _bu_delay("api")
-                except Exception as restart_exc:
-                    if _is_manual_stop_exception(restart_exc) or "密码" in str(restart_exc) or "password" in str(restart_exc).lower():
-                        raise
-                    logger.warning("[BrowserUse][OTP] 重新触发邮箱 OTP 失败，继续按当前页面处理：%s: %s", type(restart_exc).__name__, str(restart_exc)[:180])
-
-            current_otp = otp_code
-            previous_submitted_otp = None
-            max_otp_attempts = 3
-            for otp_attempt in range(1, max_otp_attempts + 1):
-                # 等验证码页出现
-                wait_end = time.time() + (20 if _fast_mode() else 45)
-                last_verify_log = 0.0
-                while time.time() < wait_end:
-                    page = _browser_use_heartbeat(page, context=context, label="wait-email-verification")
-                    state_info = _quick_auth_state(page)
-                    state = str(state_info.get("state") or "other")
-                    if "/log-in/password" in str(state_info.get("url") or _page_url(page) or "").lower() or state == "login_password":
-                        raise RuntimeError(f"邮箱提交后进入登录密码页，按已注册/不可用邮箱处理并停用: url={state_info.get('url') or _page_url(page) or 'https://auth.openai.com/log-in/password'}")
-                    if state == "email_verification":
-                        logger.info("[BrowserUse][OTP] 已检测到验证码页：url=%s", state_info.get("url") or "-")
-                        break
-                    if any(x in _page_url(page).lower() for x in ("about-you", "profile", "chatgpt.com/")):
-                        break
-                    if time.time() - last_verify_log > 5:
-                        logger.info("[BrowserUse][OTP] 等待验证码输入页出现：state=%s url=%s", state, state_info.get("url") or "-")
-                        last_verify_log = time.time()
-                    time.sleep(0.2 if _fast_mode() else 0.4)
-
-                if current_otp is None:
-                    logger.info("[BrowserUse][OTP] 等待验证码：%s（%s/%s）", email, otp_attempt, max_otp_attempts)
-                    _t_otp_wait = _StepTimer("等待邮箱 OTP")
-                    try:
-                        current_otp = _wait_for_otp_with_browser_heartbeat(
-                            page,
-                            context,
-                            email,
-                            after_ts=otp_after_ts,
-                            before_code=previous_submitted_otp,
-                        )
-                        page = _pick_live_page(context, page) or page
-                        _t_otp_wait.done()
-                    except Exception as exc:
-                        _t_otp_wait.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
-                        if _is_manual_stop_exception(exc):
-                            raise
-                        if otp_attempt >= max_otp_attempts:
-                            raise
-                        logger.warning(
-                            "[BrowserUse][OTP] 本次未收到邮箱验证码，重新触发 OTP 后继续等待（%s/%s）：%s: %s",
-                            otp_attempt + 1,
-                            max_otp_attempts,
-                            type(exc).__name__,
-                            str(exc)[:180],
-                        )
-                        _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500/chrome-error")
-                        current_otp = None
-                        continue
-                logger.info("[BrowserUse][OTP] 收到验证码：%s", current_otp)
-                _t_otp_submit = _StepTimer("提交邮箱 OTP")
-                _clear_otp_inputs(page)
-                _type_otp(page, current_otp)
-                _bu_delay("otp_input")
-                try:
-                    _click_continue(page)
-                except Exception as exc:  # noqa: BLE001
-                    logger.info("[BrowserUse][OTP] 提交按钮未找到，继续观察页面：%s", str(exc)[:120])
-                _check_manual_stop()
-
-                outcome = _wait_after_otp(page, timeout=6 if _fast_mode() else 12)
-                _t_otp_submit.done(f"state={outcome}")
-                if outcome in ("accepted", "unknown"):
-                    # unknown 也继续尝试资料页/session
-                    break
-                if otp_attempt >= max_otp_attempts:
-                    raise RuntimeError("邮箱验证码连续错误/过期")
-                logger.warning("[BrowserUse][OTP] 验证码可能无效，重新触发 OTP（%s/%s）", otp_attempt + 1, max_otp_attempts)
-                previous_submitted_otp = current_otp
-                _restart_email_otp_flow("验证码错误/过期或页面未跳转，避免点击 resend 导致 500/chrome-error")
-                current_otp = None
-
-            logger.info("[BrowserUse] 处理资料页/登录态")
-            _t_profile = _StepTimer("资料页/登录态")
-            if provider_prefix == "skyvern":
-                profile_timeout = int(getattr(_cfg, "SKYVERN_PROFILE_TIMEOUT", 45) or 45)
-                session_timeout = int(getattr(_cfg, "SKYVERN_SESSION_ACCESS_TOKEN_TIMEOUT", 35) or 35)
-            else:
-                profile_timeout = int(getattr(_cfg, "BROWSER_USE_PROFILE_TIMEOUT", 28 if _fast_mode() else 60) or (28 if _fast_mode() else 60))
-                session_timeout = int(getattr(_cfg, "BROWSER_USE_SESSION_ACCESS_TOKEN_TIMEOUT", 18 if _fast_mode() else 60) or (18 if _fast_mode() else 60))
-
-            try:
-                profile_submitted = _complete_profile_page(page, name, birthday, timeout=profile_timeout)
-                if profile_submitted:
-                    create_acknowledged = True
-                    _bu_delay("post_auth")
-            except Exception as exc:
-                if _is_unsupported_email_error(exc):
-                    raise
-                # 资料页是高频卡点：超时/强制跳出失败后不继续卡，直接进入取 AT；取不到则由下一步抛错失败。
-                logger.warning("[BrowserUse] 资料页处理超时/失败，直接尝试取 AT：%s: %s", type(exc).__name__, str(exc)[:260])
-
-            try:
-                session_info = _fetch_chatgpt_session(page, context=context, timeout=session_timeout)
-                _t_profile.done()
-            except Exception as exc:
-                _t_profile.done(f"failed={type(exc).__name__}: {str(exc)[:160]}")
-                raise
-            access_token = session_info.get("accessToken")
-            if not access_token:
-                raise RuntimeError("注册流程结束但未拿到 accessToken")
-            create_acknowledged = True
-            logger.info("[BrowserUse] 已拿到 accessToken：%s", email)
-
-            account_id = checkpoint_account_data(
-                email=email,
-                access_token=access_token,
-                email_source=resolve_email_source(email),
-                proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
-                registration_ip=registration_geo.get("ip") or None,
-                extra={
-                    "proxy_country_code": session_info_open.proxy_country_code,
-                    "registration_geo": registration_geo,
-                    "user": session_info.get("user"),
-                    "account": session_info.get("account"),
-                    "expires": session_info.get("expires"),
-                    "registration_password": openai_password,
-                    provider_prefix: {
-                        "proxy_country_code": session_info_open.proxy_country_code,
-                        "registration_geo": registration_geo,
-                        "profile_id": session_info_open.profile_id,
-                        "session_id": getattr(session_info_open, "session_id", ""),
-                        "connect": session_info_open.raw,
-                    },
-                },
-            )
-            logger.info("[%s] token 检查点已保存：account_id=%s twofa=pending", provider_prefix, account_id)
-
-            totp_secret = None
-            twofa_status = "disabled"
-            twofa_error = None
-            if _twofa_cfg.ENABLE_2FA:
-                from core.account_export import setup_2fa_for_registration
-                try:
-                    totp_secret = setup_2fa_for_registration(BrowserContextTransport(context, page), email)
-                    twofa_status = "active"
-                    db.update_account_2fa(account_id, status="active", totp_secret=totp_secret)
-                except Exception as exc:  # noqa: BLE001
-                    twofa_status = "failed"
-                    twofa_error = f"{type(exc).__name__}: {str(exc)[:300]}"
-                    db.update_account_2fa(account_id, status="failed", error=twofa_error)
-                    logger.error("[%s] 2FA 设置失败，账号已保留待重试：%s", provider_prefix, twofa_error)
-                    return {"success": False, "email": email, "account_id": account_id, "access_token": access_token, "twofa_status": twofa_status, "twofa_error": twofa_error, "error": f"2FA 设置失败，账号已保存：{twofa_error}"}
-
-            codex_result = {
-                "status": "skipped",
-                "ok": True,
-                "message": "ENABLE_CODEX_AUTO=False，跳过 Codex",
-            }
-            free_codex_auto_enabled = False
-            try:
-                from config import codex as _codex_cfg
-                from config import register as _register_cfg
-                codex_auto_enabled = bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False))
-                free_codex_auto_enabled = bool(
-                    getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
-                )
-                codex_credentials = None
-                if openai_password and totp_secret:
-                    codex_credentials = CodexLoginCredentials(
-                        email=email,
-                        password=openai_password,
-                        totp_secret=totp_secret,
-                    )
-
-                def _run_codex_in_current_browser() -> dict:
-                    from core.codex_oauth import run_codex_oauth
-
-                    logger.info(
-                        "[BrowserUse][Codex] 复用当前注册 browser session 执行 Codex OAuth：driver=%s，登录方式=%s",
-                        provider_prefix,
-                        (
-                            "密码 + authenticator TOTP"
-                            if codex_credentials
-                            else "邮箱 OTP fallback（注册密码或 TOTP 不完整）"
-                        ),
-                    )
-                    _check_manual_stop()
-                    return run_codex_oauth(
-                        email,
-                        otp_provider=wait_for_otp,
+                codex_result = run_registration_auto_codex(
+                    account_id=account_id,
+                    email=result["email"],
+                    access_token=access_token,
+                    proxy=proxy,
+                    browser_transport=BrowserContextTransport(driver.context, driver.page),
+                    run_codex=lambda: run_codex_oauth(
+                        result["email"],
                         proxy=proxy,
                         force=True,
-                        oauth_driver=provider_prefix,
-                        existing_browser=browser,
-                        existing_context=context,
-                        existing_page=page,
-                        existing_session_info=session_info_open,
-                        credentials=codex_credentials,
-                    )
-
-                post_auth_automation_enabled = bool(
-                    getattr(_register_cfg, "AUTO_PLAN_CHECK_AFTER_REGISTER", False)
-                    or free_codex_auto_enabled
-                    or codex_auto_enabled
-                )
-                if post_auth_automation_enabled:
-                    from core.registration_auto_codex import run_registration_auto_codex
-
-                    auto_codex = run_registration_auto_codex(
-                        account_id=account_id,
-                        email=email,
-                        access_token=access_token,
-                        proxy=proxy,
-                        browser_transport=BrowserContextTransport(context, page),
-                        run_codex=_run_codex_in_current_browser,
-                        twofa_status=twofa_status,
-                    )
-                    codex_result = auto_codex["codex"]
-                else:
-                    logger.info("[BrowserUse][Codex] ENABLE_CODEX_AUTO=False，注册后跳过 Codex OAuth")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[BrowserUse][Codex] 自动授权失败：%s: %s", type(exc).__name__, str(exc)[:220])
-                codex_result = {
-                    "status": "failed",
-                    "ok": False,
-                    "message": f"{type(exc).__name__}: {str(exc)[:220]}",
-                }
-
-            # 统计窗口在浏览器关闭前结束；注册后停留期间的页面请求也计入。
-            _post_register_dwell(page, context, provider_prefix=provider_prefix, email=email)
-            if network_traffic is None and traffic_tracker is not None:
-                network_traffic = traffic_tracker.stop()
-            account_id = save_account_data(
-                email=email,
-                access_token=access_token,
-                totp_secret=totp_secret,
-                email_source=resolve_email_source(email),
-                proxy_used=proxy or f"{provider_prefix}:{session_info_open.proxy_country_code or 'default'}",
-                registration_ip=registration_geo.get("ip") or None,
-                batch_dir=batch_dir,
-                auto_plan_check=False,
-                extra={
-                    "proxy_country_code": session_info_open.proxy_country_code,
-                    "registration_geo": registration_geo,
-                    "user": session_info.get("user"),
-                    "account": session_info.get("account"),
-                    "expires": session_info.get("expires"),
-                    provider_prefix: {
-                        "proxy_country_code": session_info_open.proxy_country_code,
-                        "registration_geo": registration_geo,
-                        "profile_id": session_info_open.profile_id,
-                        "session_id": getattr(session_info_open, "session_id", ""),
-                        "connect": session_info_open.raw,
-                    },
-                    "registration_password": openai_password,
-                    "registration_driver": provider_prefix,
-                    "twofa_status": twofa_status,
-                    "twofa_error": twofa_error,
-                    "codex": codex_result,
-                    "network_traffic": network_traffic,
-                },
-            )
-            _t_all.done("success")
-            return {
-                "success": True,
-                "email": email,
-                "account_id": account_id,
-                "access_token": access_token,
-                "totp_secret": totp_secret,
-                "twofa_status": twofa_status,
-                "twofa_error": twofa_error,
-                "codex": codex_result,
-                "network_traffic": network_traffic,
-                "error": None,
-            }
-    except Exception as exc:
-        if traffic_tracker is not None:
-            try:
-                network_traffic = traffic_tracker.stop()
-            except Exception:  # noqa: BLE001, S110
-                pass
-        logger.error("[BrowserUse] 注册失败：%s: %s", type(exc).__name__, exc)
-        logger.debug("[BrowserUse] 失败详情", exc_info=True)
-        try:
-            from core.email_provider import release_email
-            error_text = str(exc)
-            note_text = account_unusable_message(exc.error_code) if isinstance(exc, AccountUnusableError) else error_text
-            release_status = "disabled" if (
-                isinstance(exc, AccountUnusableError)
-                or "account_deactivated" in error_text
-                or "account_deleted" in error_text
-                or "account_banned" in error_text
-                or _is_unsupported_email_error(error_text)
-            ) else "failed" if create_acknowledged else "available"
-            release_email(
-                email,
-                status=release_status,
-                note=note_text[:180],
-            )
-        except Exception:  # noqa: BLE001, S110
-            pass
-        return {
-            "success": False,
-            "email": email,
-            "network_traffic": network_traffic,
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
-        }
+                        oauth_driver=provider,
+                        existing_browser=driver.browser,
+                        existing_context=driver.context,
+                        existing_page=driver.page,
+                        credentials=credentials,
+                    ),
+                    twofa_status=twofa_status,
+                )["codex"]
+        except Exception as exc:  # noqa: BLE001
+            codex_result = {"status": "failed", "ok": False, "message": f"{type(exc).__name__}: {str(exc)[:220]}"}
+        result.update({
+            "totp_secret": totp_secret,
+            "twofa_status": twofa_status,
+            "twofa_error": twofa_error,
+            "codex": codex_result,
+        })
+        return result
     finally:
-        # 任务结束统一关闭连接，避免云浏览器/CDP 残留占用。
-        if traffic_tracker is not None:
-            try:
-                traffic_tracker.stop()
-            except Exception:  # noqa: BLE001, S110
-                pass
-        try:
-            if browser is not None:
-                browser.close()
-        except Exception:  # noqa: BLE001, S110
-            pass
-        if provider_prefix == "skyvern" and 'client' in locals() and hasattr(client, "close_browser_session") and getattr(session_info_open, "session_id", ""):
-            try:
-                client.close_browser_session(session_info_open.session_id)
-            except Exception:  # noqa: BLE001, S110
-                pass
-        _set_log_provider_label("BrowserUse")
-        _set_cloud_provider("browser_use")
+        profile.close()
+        profile.cleanup()
+
+
+def _acquire_cloud_email(email: str | None, callback) -> str:
+    value = acquire_email_after_input(email)
+    if callback is not None:
+        callback(value)
+    return value

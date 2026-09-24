@@ -88,6 +88,8 @@ class HeroSmsProviderTests(unittest.TestCase):
         fields = {field["key"]: field for field in config_editor.EDITABLE_FIELDS}
         self.assertEqual(fields["HERO_SMS_SERVICE"]["type"], "str")
         self.assertEqual(fields["HERO_SMS_COUNTRY"]["type"], "str")
+        self.assertEqual(fields["HERO_SMS_MIN_PRICE"]["type"], "str")
+        self.assertEqual(fields["HERO_SMS_COUNTRY_RECOVERY_SECONDS"]["type"], "int")
         self.assertEqual(fields["HERO_SMS_NUMBER_REJECT_THRESHOLD"]["type"], "int")
         self.assertTrue(fields["HERO_SMS_API_KEY"].get("secret"))
         self.assertIn("'HeroSMS'", Path("webui/templates/index.html").read_text(encoding="utf-8"))
@@ -107,7 +109,7 @@ class HeroSmsProviderTests(unittest.TestCase):
             "HERO_SMS_MAX_PRICE": "",
         }
         values.update(overrides)
-        return patch.multiple(codex_config, **values)
+        return patch.multiple(codex_config, create=True, **values)
 
     def test_auto_country_uses_cheapest_openai_stock(self):
         http = _Http([
@@ -155,6 +157,54 @@ class HeroSmsProviderTests(unittest.TestCase):
             [call["params"]["country"] for call in get_number_calls],
             ["16", "31", "52", "44", "55"],
         )
+
+    def test_auto_country_filters_live_offers_to_configured_minimum_price(self):
+        http = _Http([
+            _Resp(json.dumps({
+                "4": {"dr": {"cost": 0.005, "count": 1}},
+                "16": {"dr": {"cost": 0.01, "count": 1}},
+                "55": {"dr": {"cost": 0.1, "count": 1}},
+                "66": {"dr": {"cost": 0.11, "count": 1}},
+            })),
+            _Resp("ACCESS_NUMBER:hero-price-range:165500000001"),
+        ])
+
+        with self._config(HERO_SMS_MIN_PRICE="0.01", HERO_SMS_MAX_PRICE="0.1"):
+            activation_id, phone = sms_provider.acquire_number(http=http)
+
+        self.assertEqual((activation_id, phone), ("hero-price-range", "165500000001"))
+        get_number_calls = [call for call in http.calls if call["params"].get("action") == "getNumber"]
+        self.assertEqual([call["params"]["country"] for call in get_number_calls], ["16"])
+
+    def test_auto_country_retries_expired_high_failure_country_as_warm_probe(self):
+        profile = hero_sms_client.make_profile_key("https://hero.test/stubs/handler_api.php", "dr", "0.1")
+        for _ in range(4):
+            self._country_store.mark_unusable(profile, "52", "otp timeout")
+        connection = self._country_store._connect()
+        try:
+            connection.execute(
+                "UPDATE hero_sms_country_records "
+                "SET updated_at = datetime('now', '-7200 seconds') "
+                "WHERE profile_key = ? AND country_id = ?",
+                (profile, "52"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        http = _Http([
+            _Resp(json.dumps({
+                "52": {"dr": {"cost": 0.03, "count": 2}},
+                "16": {"dr": {"cost": 0.08, "count": 5}},
+            })),
+            _Resp("ACCESS_NUMBER:hero-warm-1:525500000001"),
+        ])
+
+        with self._config(HERO_SMS_MAX_PRICE="0.1", HERO_SMS_COUNTRY_RECOVERY_SECONDS=3600):
+            activation_id, phone = sms_provider.acquire_number(http=http)
+
+        self.assertEqual((activation_id, phone), ("hero-warm-1", "525500000001"))
+        get_number_calls = [call for call in http.calls if call["params"].get("action") == "getNumber"]
+        self.assertEqual([call["params"]["country"] for call in get_number_calls], ["52"])
 
     def test_auto_country_skips_no_numbers_and_tries_next_cheapest(self):
         http = _Http([

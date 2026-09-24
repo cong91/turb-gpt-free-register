@@ -60,6 +60,64 @@ def _current_gmail_api_url_batch_id() -> str | None:
         return None
 
 
+def _current_otpmail_order_id(email: str) -> str | None:
+    """Return the parent OTPGmail order persisted on the active job.
+
+    The local address is only an alias.  OTPGmail polling must therefore use
+    the exact order assigned to this job instead of resolving the email from a
+    global pool after a restart or retry.
+    """
+    job_id = _current_otp_job_id()
+    if job_id is None:
+        return None
+    try:
+        from core import db
+
+        job = db.get_job(job_id) or {}
+        if str(job.get("email") or "").strip().casefold() != str(email or "").strip().casefold():
+            return None
+        if _canonicalize_runtime_source(job.get("email_source")) != "otpmail":
+            return None
+        context = job.get("provider_context")
+        if not isinstance(context, dict):
+            return None
+        order_id = str(context.get("otpmail_order_id") or "").strip()
+        return order_id or None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _current_gmail_api_url_ancestor_job_ids(limit: int = 5) -> list[int]:
+    """Các job tổ tiên theo parent_job_id của job đang chạy.
+
+    Job 2FA/Codex requeue không sở hữu alias assignment riêng; alias thuộc
+    job registration gốc ở đầu chuỗi (vd 2FA 2893 → requeue 2890 → regis 2880).
+    Resolver theo job_id hiện tại sẽ trượt, phải thử lần lượt các tổ tiên.
+    """
+    job_id = _current_otp_job_id()
+    ancestors: list[int] = []
+    current: int | None = job_id
+    seen: set[int] = set()
+    while current is not None and current not in seen and len(ancestors) < limit:
+        seen.add(current)
+        try:
+            from core import db
+
+            job = db.get_job(current) or {}
+        except (AttributeError, TypeError, ValueError):
+            break
+        parent = job.get("parent_job_id")
+        try:
+            parent_id = int(parent) if parent is not None else None
+        except (TypeError, ValueError):
+            break
+        if parent_id is None:
+            break
+        ancestors.append(parent_id)
+        current = parent_id
+    return ancestors
+
+
 def _get_code_url_account(email: str, source: str):
     """Resolve a Gmail API URL account for either URL-backed provider."""
     source = _canonicalize_runtime_source(source)
@@ -75,6 +133,11 @@ def _get_code_url_account(email: str, source: str):
             job_id=job_id,
             batch_id=_current_gmail_api_url_batch_id(),
         )
+        if batch_account is None:
+            for ancestor_id in _current_gmail_api_url_ancestor_job_ids():
+                batch_account = get_batch_account_context(email, job_id=ancestor_id)
+                if batch_account is not None:
+                    break
         account = batch_account or get_account_context(email)
     else:
         return None
@@ -120,8 +183,13 @@ def _quarantine_code_url_after_provider_error(account, *, source: str, error: Ex
         )
 
 
-def _raise_if_code_url_is_quarantined(account) -> None:
-    """Prevent polling a Gmail root/alias that is disabled or retired."""
+def _raise_if_code_url_is_quarantined(account, *, stage: str | None = None) -> None:
+    """Prevent polling a Gmail root/alias that is disabled or retired.
+
+    Existing-account OTP reads (stage twofa_*) skip the raw-root allocation
+    gate: disabled/exhausted chỉ chặn việc cấp alias mới, còn quarantine 602
+    thật của provider vẫn chặn mọi lượt đọc.
+    """
     from core import db
 
     code_url = str(getattr(account, "code_url", "") or "")
@@ -135,6 +203,10 @@ def _raise_if_code_url_is_quarantined(account) -> None:
         from core.gmail_api_url_client import GmailApiUrlError
 
         raise GmailApiUrlError("Provider error code=602: Gmail API URL source is quarantined")
+    from core.gmail_api_url_client import is_existing_account_otp_stage
+
+    if is_existing_account_otp_stage(stage):
+        return
     source_blocked = db.is_gmail_api_url_account_blocked(
         email,
         sqlite_path=runtime_path,
@@ -149,6 +221,14 @@ def _raise_if_code_url_is_quarantined(account) -> None:
 def snapshot_verification_code(email: str, *, stage: str | None = None) -> str | None:
     """Capture a URL provider's current code before triggering a new OTP."""
     source = _canonicalize_runtime_source(resolve_email_source(email))
+    if source == "otpmail":
+        from core.otpgmail_client import snapshot_verification_code as snapshot_code
+        order_id = _current_otpmail_order_id(email)
+        return snapshot_code(email, order_id=order_id) if order_id else snapshot_code(email)
+    if source == "bamboommo":
+        from core.bamboommo_client import snapshot_verification_code as snapshot_code
+
+        return snapshot_code(email)
     if source != "gmail_api_url":
         return None
 
@@ -156,8 +236,8 @@ def snapshot_verification_code(email: str, *, stage: str | None = None) -> str |
 
     account = _get_code_url_account(email, source)
     try:
-        _raise_if_code_url_is_quarantined(account)
-        code = snapshot_code(account)
+        _raise_if_code_url_is_quarantined(account, stage=stage)
+        code = snapshot_code(account, stage=stage)
     except Exception as exc:
         _quarantine_code_url_after_provider_error(account, source=source, error=exc)
         raise
@@ -179,6 +259,24 @@ def acknowledge_verification_code(
 ) -> None:
     """Persist a URL provider OTP only after its remote validation succeeds."""
     source = _canonicalize_runtime_source(resolve_email_source(email))
+    if source == "otpmail":
+        from core.otpgmail_client import (
+            acknowledge_verification_code as acknowledge_code,
+        )
+
+        order_id = _current_otpmail_order_id(email)
+        if order_id:
+            acknowledge_code(email, otp, order_id=order_id)
+        else:
+            acknowledge_code(email, otp)
+        return
+    if source == "bamboommo":
+        from core.bamboommo_client import (
+            acknowledge_verification_code as acknowledge_code,
+        )
+
+        acknowledge_code(email, otp)
+        return
     if source != "gmail_api_url":
         return
 
@@ -197,7 +295,7 @@ def acknowledge_verification_code(
 
 _VALID_SOURCES = (
     "outlook", "generic_api", "imap", "gmail_api_url", "cloudflare_domain", "cloudflare", "gptmail", "mailnest", "cloudmail", "tinyhost",
-    "gmail_123452026", "paymesh", "remail",
+    "gmail_123452026", "paymesh", "remail", "automated_email_api", "otpmail", "bamboommo",
 )
 
 _SOURCE_ALIASES = {
@@ -207,6 +305,14 @@ _SOURCE_ALIASES = {
     "sms.paymesh.cn": "paymesh",
     "paymesh.cn": "paymesh",
     "mail": "paymesh",
+    "email_api": "automated_email_api",
+    "automated_email": "automated_email_api",
+    "otpgmail": "otpmail",
+    "otp_gmail": "otpmail",
+    "otpgmail.net": "otpmail",
+    "bamboo": "bamboommo",
+    "bamboo_mmo": "bamboommo",
+    "bamboo-mail": "bamboommo",
 }
 _OBSOLETE_RUNTIME_SOURCES = frozenset({"qan8_gmail_api"})
 
@@ -399,6 +505,15 @@ def _pick_from_source(
     if source == "remail":
         from core.remail_client import pick_account
         return pick_account().email
+    if source == "automated_email_api":
+        from core.automated_email_api_client import pick_account
+        return pick_account().email
+    if source == "otpmail":
+        from core.otpgmail_client import pick_account
+        return pick_account().email
+    if source == "bamboommo":
+        from core.bamboommo_client import pick_account
+        return pick_account().email
     from core.outlook_client import pick_account
     return pick_account().email
 
@@ -481,13 +596,13 @@ def acquire_email_after_input(email: str | None = None) -> str:
 
 
 def resolve_email_source(email: str) -> str:
-    """根据邮箱判断实际来源，已注册账号优先使用落库来源。"""
-    registered_source = _registered_email_source(email)
-    if registered_source:
-        return registered_source
+    """根据邮箱判断实际来源，当前 job 的来源优先于历史账号记录。"""
     active_job_source = _active_job_email_source(email)
     if active_job_source:
         return active_job_source
+    registered_source = _registered_email_source(email)
+    if registered_source:
+        return registered_source
     # Canonical Gmail API inventory wins before the other provider contexts.
     # Purchased sources are materialized into this same ledger.
     from core import db
@@ -522,6 +637,17 @@ def resolve_email_source(email: str) -> str:
     from core.remail_client import get_account_context as get_remail_context
     if get_remail_context(email):
         return "remail"
+    from core.automated_email_api_client import (
+        get_account_context as get_automated_email_context,
+    )
+    if get_automated_email_context(email):
+        return "automated_email_api"
+    from core.otpgmail_client import get_account_context as get_otpmail_context
+    if get_otpmail_context(email):
+        return "otpmail"
+    from core.bamboommo_client import get_account_context as get_bamboommo_context
+    if get_bamboommo_context(email):
+        return "bamboommo"
 
     if db.get_generic_api_email_by_email(email):
         return "generic_api"
@@ -546,9 +672,39 @@ def otp_max_wait_for_source(source: str, max_wait: int | None = None) -> int:
         return int(max_wait)
     from config import email as _email_cfg
 
-    if str(source or "").strip().lower() == "paymesh":
+    normalized_source = str(source or "").strip().lower()
+    if normalized_source == "paymesh":
         return int(getattr(_email_cfg, "PAYMESH_OTP_MAX_WAIT", 60) or 60)
+    if normalized_source == "otpmail":
+        return int(getattr(_email_cfg, "OTPGMAIL_OTP_MAX_WAIT", 120) or 120)
+    if normalized_source == "bamboommo":
+        return int(getattr(_email_cfg, "BAMBOOMMO_OTP_MAX_WAIT", 120) or 120)
     return int(getattr(_email_cfg, "OTP_MAX_WAIT", 60) or 60)
+
+
+def _mark_job_gmail_otp_received() -> None:
+    """Bind the active job to its alias: an OTP arrived from the shared URL.
+
+    Từ thời điểm này job được coi đã gắn với alias của nó; retry của chuỗi
+    job phải dùng lại đúng alias thay vì cấp alias mới hay thuê email khác.
+    """
+    job_id = _current_otp_job_id()
+    if job_id is None:
+        return
+    try:
+        from core import db
+
+        job = db.get_job(job_id) or {}
+        context = job.get("provider_context")
+        context = dict(context) if isinstance(context, dict) else {}
+        if context.get("gmail_api_url_otp_received"):
+            return
+        context["gmail_api_url_otp_received"] = True
+        db.update_job(job_id, provider_context=context)
+    except Exception:
+        logger.exception(
+            "[EmailProvider] Không thể ghi nhận OTP đã nhận cho job %s", job_id
+        )
 
 
 def _wait_for_code_url_otp(
@@ -589,11 +745,13 @@ def _wait_for_code_url_otp(
     if before_code is not _BEFORE_CODE_UNSET:
         poll_kwargs["before_code"] = before_code
     try:
-        _raise_if_code_url_is_quarantined(account)
-        return poll_verification_code(normalized_account, **poll_kwargs)
+        _raise_if_code_url_is_quarantined(account, stage=stage)
+        otp = poll_verification_code(normalized_account, **poll_kwargs)
     except GmailApiUrlError as exc:
         _quarantine_code_url_after_provider_error(account, source=source, error=exc)
         raise
+    _mark_job_gmail_otp_received()
+    return otp
 
 
 def wait_for_otp(
@@ -636,6 +794,8 @@ def wait_for_otp(
     # Resolve through the single provider resolver so registered-account,
     # active-job, and canonical Gmail inventory all follow the same precedence.
     source = _canonicalize_runtime_source(email_source)
+    if not source:
+        source = _active_job_email_source(email)
     if not source:
         source = _registered_email_source(email)
     if not source:
@@ -693,6 +853,22 @@ def wait_for_otp(
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     if source == "remail":
         from core.remail_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "automated_email_api":
+        from core.automated_email_api_client import fetch_latest_otp
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "otpmail":
+        from core.otpgmail_client import fetch_latest_otp
+        order_id = _current_otpmail_order_id(email)
+        if order_id:
+            extra_kwargs["order_id"] = order_id
+        if before_code is not _BEFORE_CODE_UNSET:
+            extra_kwargs["before_code"] = before_code
+        return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
+    if source == "bamboommo":
+        from core.bamboommo_client import fetch_latest_otp
+        if before_code is not _BEFORE_CODE_UNSET:
+            extra_kwargs["before_code"] = before_code
         return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
     from core.outlook_client import fetch_latest_otp
     return fetch_latest_otp(email, after_ts=after_ts, **extra_kwargs)
@@ -756,6 +932,19 @@ def release_email(email: str, status: str = "available", note: str | None = None
         release_account(email, status=status, note=note)
     elif source == "remail":
         from core.remail_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "automated_email_api":
+        from core.automated_email_api_client import release_account
+        release_account(email, status=status, note=note)
+    elif source == "otpmail":
+        from core.otpgmail_client import release_account
+        order_id = _current_otpmail_order_id(email)
+        release_kwargs = {"status": status, "note": note}
+        if order_id:
+            release_kwargs["order_id"] = order_id
+        release_account(email, **release_kwargs)
+    elif source == "bamboommo":
+        from core.bamboommo_client import release_account
         release_account(email, status=status, note=note)
     else:
         from core.outlook_client import release_account
@@ -831,6 +1020,24 @@ def release_email_if_unconsumed(
             changed = existing is not None
         else:
             changed = db.release_unconsumed_gmail_api_url_email(email, note=note)
+    elif source == "automated_email_api":
+        from core.automated_email_api_client import release_account
+        terminal = any(code in str(note or "") for code in ("HTTP 410", "HTTP 411", "code=410", "code=411"))
+        changed = release_account(
+            email,
+            status="failed" if terminal else "available",
+            note=note,
+        )
+    elif source == "otpmail":
+        from core.otpgmail_client import release_account
+        order_id = _current_otpmail_order_id(email)
+        release_kwargs = {"status": "failed", "note": note}
+        if order_id:
+            release_kwargs["order_id"] = order_id
+        changed = release_account(email, **release_kwargs)
+    elif source == "bamboommo":
+        from core.bamboommo_client import release_account
+        changed = release_account(email, status="failed", note=note)
     elif source == "cloudflare_domain":
         changed = db.release_unconsumed_domain_email(email, note=note)
     else:
@@ -864,6 +1071,20 @@ def mark_email_consumed(email: str) -> bool:
         if job_id is not None:
             release_kwargs["job_id"] = job_id
         return bool(release_account(email, **release_kwargs))
+    if source == "automated_email_api":
+        from core.automated_email_api_client import mark_account_consumed
+        return mark_account_consumed(email)
+    if source == "otpmail":
+        from core.otpgmail_client import mark_account_consumed
+        order_id = _current_otpmail_order_id(email)
+        return (
+            mark_account_consumed(email, order_id=order_id)
+            if order_id
+            else mark_account_consumed(email)
+        )
+    if source == "bamboommo":
+        from core.bamboommo_client import mark_account_consumed
+        return mark_account_consumed(email)
     if source == "tinyhost":
         from core.tinyhost_mail_client import mark_domain_supported
         return mark_domain_supported(email)

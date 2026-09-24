@@ -3,7 +3,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from core import roxy_registration
+from core import registration_flow, roxy_registration
 
 
 class RoxyRegistrationRetryTests(unittest.TestCase):
@@ -19,12 +19,12 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
         with ExitStack() as stack:
             for target in (
                 "core.roxy_registration._center_browser_window",
-                "core.roxy_registration._safe_get",
-                "core.roxy_registration._page_warmup",
-                "core.roxy_registration._maybe_accept",
-                "core.roxy_registration._check_manual_stop",
+                "core.registration_flow._safe_get",
+                "core.registration_flow._page_warmup",
+                "core.registration_flow._maybe_accept",
+                "core.registration_flow._check_manual_stop",
                 "core.roxy_registration._complete_email_otp",
-                "core.roxy_registration.human_delay",
+                "core.registration_flow.human_delay",
                 "core.roxy_registration.post_register_dwell",
             ):
                 stack.enter_context(patch(target))
@@ -34,21 +34,22 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
             stack.enter_context(patch("core.registration_network_identity.probe_browser_geo", return_value=browser_geo))
             if browser_ip is not None:
                 stack.enter_context(patch("core.registration_network_identity.probe_browser_public_ip", return_value=browser_ip))
-            stack.enter_context(patch("core.roxy_registration._submit_email_and_wait_next", return_value="password"))
-            stack.enter_context(patch("core.roxy_registration._fill_password_page_if_present", return_value="openai-password"))
-            stack.enter_context(patch("core.roxy_registration._complete_profile_page", return_value=True))
+            stack.enter_context(patch("core.registration_flow._submit_email_and_wait_next", return_value="password"))
+            stack.enter_context(patch("core.registration_flow._fill_password_page_if_present", return_value="openai-password"))
+            stack.enter_context(patch("core.registration_flow._complete_profile_page", return_value=True))
             stack.enter_context(
                 patch(
-                    "core.roxy_registration._fetch_chatgpt_session",
+                    "core.registration_flow._fetch_chatgpt_session",
                     return_value={"accessToken": "access-token", "user": {}, "account": {}, "expires": None},
                 )
             )
             stack.enter_context(patch("core.roxy_registration.resolve_email_source", return_value="paymesh"))
-            stack.enter_context(patch("core.roxy_registration.checkpoint_account_data", checkpoint))
+            stack.enter_context(patch("core.registration_flow.checkpoint_account_data", checkpoint))
             stack.enter_context(patch("core.roxy_registration.save_account_data", save))
             stack.enter_context(patch("config.twofa.ENABLE_2FA", False))
             stack.enter_context(patch("config.register.AUTO_PLAN_CHECK_AFTER_REGISTER", False))
             stack.enter_context(patch("config.register.AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False))
+            stack.enter_context(patch("config.register.AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False))
             stack.enter_context(patch("config.codex.ENABLE_CODEX_AUTO", False))
             stack.enter_context(patch("config.roxybrowser.ROXY_KEEP_BROWSER_OPEN", True))
 
@@ -102,29 +103,29 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
         with ExitStack() as stack:
             for target in (
                 "core.roxy_registration._center_browser_window",
-                "core.roxy_registration._safe_get",
-                "core.roxy_registration._page_warmup",
-                "core.roxy_registration._maybe_accept",
-                "core.roxy_registration._check_manual_stop",
+                "core.registration_flow._safe_get",
+                "core.registration_flow._page_warmup",
+                "core.registration_flow._maybe_accept",
+                "core.registration_flow._check_manual_stop",
                 "core.roxy_registration._complete_email_otp",
-                "core.roxy_registration.human_delay",
+                "core.registration_flow.human_delay",
                 "core.roxy_registration.db.update_account_2fa",
                 "core.roxy_registration.post_register_dwell",
             ):
                 stack.enter_context(patch(target))
             stack.enter_context(patch("core.roxy_registration.RoxyBrowserClient", return_value=client))
             stack.enter_context(patch("core.roxy_registration._build_driver", return_value=driver))
-            stack.enter_context(patch("core.roxy_registration._submit_email_and_wait_next", return_value="password"))
-            stack.enter_context(patch("core.roxy_registration._fill_password_page_if_present", return_value="openai-password"))
-            stack.enter_context(patch("core.roxy_registration._complete_profile_page", return_value=True))
+            stack.enter_context(patch("core.registration_flow._submit_email_and_wait_next", return_value="password"))
+            stack.enter_context(patch("core.registration_flow._fill_password_page_if_present", return_value="openai-password"))
+            stack.enter_context(patch("core.registration_flow._complete_profile_page", return_value=True))
             stack.enter_context(
                 patch(
-                    "core.roxy_registration._fetch_chatgpt_session",
+                    "core.registration_flow._fetch_chatgpt_session",
                     return_value={"accessToken": "access-token", "user": {}, "account": {}, "expires": None},
                 )
             )
             stack.enter_context(patch("core.roxy_registration.resolve_email_source", return_value="gmail_api_url"))
-            stack.enter_context(patch("core.roxy_registration.checkpoint_account_data", return_value=7))
+            stack.enter_context(patch("core.registration_flow.checkpoint_account_data", return_value=7))
             stack.enter_context(patch("core.account_export.setup_2fa_for_registration", return_value="TOTPSECRET"))
             stack.enter_context(
                 patch("core.registration_auto_codex.run_registration_auto_codex", side_effect=run_auto)
@@ -155,12 +156,12 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
             existing_opened=opened,
         )
 
-    @patch("core.roxy_registration._assert_not_external_idp")
-    @patch("core.roxy_registration._maybe_accept")
-    @patch("core.roxy_registration.human_delay")
-    @patch("core.roxy_registration._wait_email_submit_next_state", side_effect=["unknown", "otp"])
-    @patch("core.roxy_registration._submit_email_step")
-    @patch("core.roxy_registration._email_input_value_state")
+    @patch("core.registration_flow._assert_not_external_idp")
+    @patch("core.registration_flow._maybe_accept")
+    @patch("core.registration_flow.human_delay")
+    @patch("core.registration_flow._wait_email_submit_next_state", side_effect=["unknown", "otp"])
+    @patch("core.registration_flow._submit_email_step")
+    @patch("core.registration_flow._email_input_value_state")
     def test_retry_reloads_login_page_after_spa_clears_email_inputs(
         self,
         email_state,
@@ -174,7 +175,6 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
         email = "user@example.com"
         email_state.side_effect = [
             {"url": "https://chatgpt.com/auth/login", "inputs": [{"value": email}]},
-            {"url": "https://chatgpt.com/auth/login", "inputs": []},
             {"url": "https://chatgpt.com/auth/login", "inputs": [{"value": email}]},
         ]
 
@@ -184,14 +184,44 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
             type_email.calls += 1
 
         type_email.calls = 0
-        with patch("core.roxy_registration._type_email_address", side_effect=type_email):
-            result = roxy_registration._submit_email_and_wait_next(driver, email, attempts=2)
+        with patch("core.registration_flow._type_email_address", side_effect=type_email):
+            result = registration_flow._submit_email_and_wait_next(driver, email, attempts=2)
 
         self.assertEqual(result, "otp")
         driver.get.assert_called_once_with("https://chatgpt.com/auth/login")
         maybe_accept.assert_called_once_with(driver)
         assert_not_external.assert_called_once_with(driver, "retry login page")
         self.assertEqual(type_email.calls, 2)
+
+    def test_email_input_wait_rechecks_late_browser_challenge(self):
+        driver = Mock(current_url="https://chatgpt.com/auth/login")
+        email_input = object()
+        with (
+            patch("core.registration_flow._find_any", side_effect=[RuntimeError("email input is not mounted"), email_input]) as find_input,
+            patch("core.registration_flow._email_entry_state", return_value={
+                "url": "https://chatgpt.com/auth/login",
+                "title": "Chờ một chút...",
+                "inputs": [],
+                "actions": [],
+            }),
+            patch(
+                "core.registration_flow._browser_challenge_state",
+                return_value={"is_challenge": True, "reason": "chờ một chút"},
+            ),
+            patch(
+                "core.registration_flow._wait_for_browser_challenge",
+                return_value={"is_challenge": False},
+            ) as wait_for_challenge,
+            patch("core.registration_flow._click_email_entry_option", return_value=False),
+            patch("core.registration_flow.time.sleep"),
+        ):
+            from core.registration_flow import _wait_for_email_input
+
+            result = _wait_for_email_input(driver, timeout=1)
+
+        self.assertIs(result, email_input)
+        self.assertEqual(find_input.call_count, 2)
+        wait_for_challenge.assert_called_once_with(driver, timeout=unittest.mock.ANY)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
       <div>
         <p class="personal-info-eyebrow">THAO TÁC TÀI KHOẢN</p>
         <h1 class="personal-info-title">Thông tin cá nhân</h1>
-        <p class="personal-info-subtitle">Cập nhật email đăng nhập hoặc thay khóa xác thực cho các tài khoản đã lưu.</p>
+        <p class="personal-info-subtitle">Cập nhật email, mật khẩu hoặc thay khóa xác thực cho các tài khoản đã lưu.</p>
       </div>
       <div class="personal-info-head-mark" aria-hidden="true">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -23,6 +23,10 @@
       <button type="button" class="personal-info-mode" data-personal-mode="twofa" role="tab" aria-selected="false">
         <span class="personal-info-mode-icon" aria-hidden="true">••</span>
         <span>Đổi 2FA</span>
+      </button>
+      <button type="button" class="personal-info-mode" data-personal-mode="password" role="tab" aria-selected="false">
+        <span class="personal-info-mode-icon" aria-hidden="true">***</span>
+        <span>Đổi mật khẩu</span>
       </button>
     </div>
 
@@ -77,6 +81,31 @@
         </div>
       </section>
 
+      <section class="personal-info-workspace is-hidden" data-personal-panel="password" role="tabpanel" aria-hidden="true">
+        <div class="personal-info-form-head">
+          <div>
+            <p class="personal-info-kicker">MẬT KHẨU ĐĂNG NHẬP</p>
+            <h2>Đổi mật khẩu tài khoản</h2>
+          </div>
+          <span class="personal-info-form-state">Reset / thêm mới tự động</span>
+        </div>
+        <div class="personal-info-twofa-layout">
+          <label class="personal-info-field personal-info-field-wide">
+            <span>Danh sách tài khoản <b>EMAIL[----MẬT KHẨU HIỆN TẠI[----TOTP]]</b></span>
+            <textarea id="passwordCredentials" name="password_credentials" spellcheck="false" autocomplete="off" placeholder="user@example.com"></textarea>
+          </label>
+          <div class="personal-info-sequence" aria-label="Trạng thái quy trình đổi mật khẩu">
+            <div><span>01</span><p>Mở xác thực đổi mật khẩu bằng phiên đăng nhập sẵn có</p></div>
+            <div><span>02</span><p>Trả lời OTP / 2FA / mật khẩu hiện tại nếu được yêu cầu</p></div>
+            <div><span>03</span><p>Đặt mật khẩu mới ngẫu nhiên cho từng tài khoản và lưu lại</p></div>
+          </div>
+        </div>
+        <div class="personal-info-actionbar">
+          <label class="personal-info-number">Luồng xử lý <input id="passwordWorkers" type="number" min="1" max="4" value="1"></label>
+          <button class="personal-info-primary" id="passwordSubmit" type="button">Chạy đổi mật khẩu</button>
+        </div>
+      </section>
+
       <section id="personalInfoResults" class="personal-info-results" hidden>
         <div class="personal-info-results-head">
           <div>
@@ -95,7 +124,7 @@
         </div>
         <div class="personal-info-result-table-wrap">
           <table class="personal-info-result-table">
-            <thead><tr><th>Tài khoản</th><th>Thao tác</th><th>Trạng thái</th><th>Chi tiết</th></tr></thead>
+            <thead><tr><th>Tài khoản</th><th>Thao tác</th><th>Trạng thái</th><th>Chi tiết</th><th>Thử lại</th></tr></thead>
             <tbody id="personalResultBody"></tbody>
           </table>
           <div id="personalResultEmpty" class="personal-info-empty">Chưa có kết quả</div>

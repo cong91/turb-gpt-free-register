@@ -17,6 +17,11 @@ from pathlib import Path
 from typing import Any
 
 from core import codex_retry_service, db
+from core.browser_failure_policy import is_account_unusable_failure
+from core.browser_registry import (
+    is_live_browser_driver,
+    resolve_twofa_retry_driver,
+)
 from core.openai_auth import account_unusable_message
 from core.registration_maintenance_barrier import RegistrationMaintenanceBarrier
 
@@ -36,6 +41,8 @@ _executor_workers = _DEFAULT_MAX_WORKERS
 _executor_generation = 0
 _retired_executors: list[ThreadPoolExecutor] = []
 _executor_lock = threading.RLock()
+# 2FA 补做专用池：与注册 lane 互不排队（见 get_twofa_executor）。
+_twofa_executor: ThreadPoolExecutor | None = None
 
 _STOP_EVENTS: dict[int, threading.Event] = {}
 _ACTIVE_JOBS: set[int] = set()
@@ -47,7 +54,7 @@ _JOB_EMAIL_INPUTS_LOCK = threading.Lock()
 _MAINTENANCE_BARRIER = RegistrationMaintenanceBarrier()
 _rotation_pending = False
 _ROTATION_LOCK = threading.Lock()
-_SUPPORTED_BROWSER_TWOFA_DRIVERS = frozenset({"roxy", "cloak", "browser_use", "skyvern"})
+_PROVIDER_BATCH_STOP_SOURCES = frozenset({"gmail_api_url", "otpmail", "bamboommo"})
 _PROVIDER_BATCH_STOP_MARKERS = (
     "checkout_blocked",
     "checkout blocked",
@@ -56,6 +63,19 @@ _PROVIDER_BATCH_STOP_MARKERS = (
     "sold out",
     "insufficient stock",
     "stock unavailable",
+    # 邮箱来源池耗尽：继续跑只会让剩余任务逐个失败，直接停批。
+    "no gmail api url source available",
+    "gmail api source pool exhausted",
+    "所有邮箱来源均领取失败",
+    "insufficient_balance",
+    "insufficient balance",
+    "insufficient_funds",
+    "insufficient funds",
+    "not_enough_balance",
+    "not enough balance",
+    "not_enough_money",
+    "not enough money",
+    "余额不足",
     "库存不足",
     "库存已售罄",
 )
@@ -155,6 +175,75 @@ def _get_job_email_inputs(job_id: int | None) -> dict[str, Any]:
             persisted.get("gmail_api_url_aliases_per_source") or 12
         )
     return result
+
+
+def _persist_otpmail_job_context(
+    job_id: int,
+    email: str,
+    provider_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Persist the alias-to-parent-order identity before registration starts."""
+    from core.email_provider import normalize_email_source
+
+    context = dict(provider_context or {})
+    job = db.get_job(int(job_id)) or {}
+    source = normalize_email_source(str(job.get("email_source") or ""))
+    if source != "otpmail":
+        return context
+
+    expected_order_id = str(context.get("otpmail_order_id") or "").strip() or None
+    from core.otpgmail_client import (
+        get_account_context,
+        get_account_context_metadata,
+    )
+
+    try:
+        metadata = (
+            get_account_context_metadata(email, order_id=expected_order_id)
+            if expected_order_id
+            else get_account_context_metadata(email)
+        )
+    except AttributeError:
+        # Keep the registration lock path compatible with lightweight provider
+        # contexts used by legacy callers/tests; the real client always returns
+        # the complete metadata shape below.
+        account = (
+            get_account_context(email, order_id=expected_order_id)
+            if expected_order_id
+            else get_account_context(email)
+        )
+        metadata = {
+            "source": "otpmail",
+            "email": email,
+            "query_email": str(getattr(account, "query_email", "") or email).strip().lower(),
+            "order_id": str(getattr(account, "order_id", "") or "").strip(),
+            "service_code": str(getattr(account, "service_code", "") or "").strip(),
+            "aliases": list(getattr(account, "aliases", ()) or (email,)),
+        }
+    if not isinstance(metadata, dict) or not str(metadata.get("order_id") or "").strip():
+        raise RuntimeError(f"OTPGmail không tìm thấy mapping order cho alias của job #{job_id}")
+
+    order_id = str(metadata["order_id"]).strip()
+    query_email = str(metadata.get("query_email") or "").strip().lower()
+    aliases = [
+        str(alias or "").strip().lower()
+        for alias in metadata.get("aliases", [])
+        if str(alias or "").strip()
+    ]
+    if not aliases:
+        aliases = [email.strip().lower()]
+    if email.strip().lower() not in aliases:
+        raise RuntimeError(f"OTPGmail alias không thuộc order đã cấp cho job #{job_id}")
+    context.update(
+        {
+            "otpmail_order_id": order_id,
+            "otpmail_query_email": query_email,
+            "otpmail_aliases": aliases,
+            "otpmail_service_code": str(metadata.get("service_code") or "").strip(),
+        }
+    )
+    db.update_job(int(job_id), email=email, provider_context=context)
+    return context
 
 
 def _clear_job_email_inputs(job_id: int) -> None:
@@ -329,8 +418,12 @@ def _ensure_gmail_api_url_canonical_batch(
     return batch_id
 
 
-def _assign_fresh_gmail_api_url_registration_batch(job: dict) -> dict:
-    """Give an exhausted Gmail registration retry its own lazy source budget."""
+def _assign_fresh_gmail_api_url_registration_batch(
+    job: dict,
+    *,
+    force: bool = False,
+) -> dict:
+    """Give a Gmail registration retry its own lazy source budget when needed."""
     from core.app_state_db import APP_STATE_DB_PATH
     from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
 
@@ -340,7 +433,11 @@ def _assign_fresh_gmail_api_url_registration_batch(job: dict) -> dict:
     context = dict(source_context)
     store = GmailApiUrlBatchStore(APP_STATE_DB_PATH)
     current_batch_id = str(context.get("gmail_api_url_batch_id") or "").strip()
-    if current_batch_id and not store.batch_status(current_batch_id)["exhausted_batch"]:
+    if (
+        not force
+        and current_batch_id
+        and not store.batch_status(current_batch_id)["exhausted_batch"]
+    ):
         return job
     aliases_per_source = max(
         1,
@@ -366,6 +463,81 @@ def _assign_fresh_gmail_api_url_registration_batch(job: dict) -> dict:
     return updated
 
 
+def _reattach_gmail_api_url_retry_alias(source: dict, job: dict) -> dict:
+    """Gán alias cho retry theo vòng đời OTP của job gốc.
+
+    - Job gốc đã nhận OTP từ code_url (context flag) → alias đã bị tiêu và
+      gắn vào chuỗi job: retry dùng lại đúng alias đó (reactivate).
+    - Job gốc chết trước khi nhận OTP → retry giữ nguyên batch gốc để runtime
+      cấp một alias mới cho cùng record email; không mượn alias của job khác,
+      không thuê email mới.
+    - OpenAI đã từ chối/burn mailbox sau khi nhận OTP (unsupported/banned/…
+      hoặc session terminal-timeout — account đã tạo phía server, đăng ký lại
+      alias đó chắc chắn gặp "Failed to create account") hoặc code_url đã bị
+      quarantine → retry nhận batch/alias mới, tuyệt không re-register alias
+      đã dùng.
+    """
+    alias = str(source.get("email") or "").strip()
+    source_context = source.get("provider_context")
+    source_context = source_context if isinstance(source_context, dict) else {}
+    otp_received = bool(source_context.get("gmail_api_url_otp_received"))
+    error_text = str(source.get("error_message") or "")
+    poisoned = _should_disable_failed_registration_email(error_text)
+    # user_already_exists = alias này đã có account server-side (WARNING_BANNER
+    # lần trước đã finalize chậm): đăng ký lại chắc chắn gặp lại lỗi — luôn
+    # chuyển alias mới, nhưng root email vẫn tốt nên không disable root.
+    alias_already_registered = (
+        "user_already_exists" in error_text
+        or "already exists for this email" in error_text
+    )
+
+    if not alias:
+        return _assign_fresh_gmail_api_url_registration_batch(job)
+
+    if otp_received and (poisoned or alias_already_registered):
+        # OpenAI tự từ chối mailbox này sau khi đã nhận OTP → email khác.
+        return _assign_fresh_gmail_api_url_registration_batch(job, force=True)
+
+    if otp_received:
+        from core.gmail_api_url_batch_coordinator import (
+            reactivate_registration_assignment,
+        )
+
+        account = reactivate_registration_assignment(
+            int(source["id"]),
+            int(job["id"]),
+            alias=alias,
+        )
+        if account is not None:
+            db.update_job(int(job["id"]), email=account.email)
+            updated = dict(job)
+            updated["email"] = account.email
+            return updated
+        # Reactivate thất bại (alias đã tiêu hết…): giữ batch gốc, runtime
+        # sẽ cấp alias kế tiếp của cùng record nếu còn slot.
+
+    code_url = ""
+    try:
+        from core.app_state_db import APP_STATE_DB_PATH
+        from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
+
+        found = GmailApiUrlBatchStore(APP_STATE_DB_PATH).find_item_by_alias(alias)
+        if found:
+            code_url = str(found[1] or "")
+    except Exception:
+        logger.debug("[Service] Không xác định được code_url của alias retry", exc_info=True)
+    if code_url:
+        from core.gmail_api_url_client import _runtime_store_path
+
+        if db.is_gmail_api_url_code_url_failed(
+            code_url,
+            sqlite_path=_runtime_store_path(),
+        ):
+            return _assign_fresh_gmail_api_url_registration_batch(job, force=True)
+
+    return job
+
+
 def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str]:
     """复用 CLI 的默认规则，为旧 Web 任务入口补齐注册参数。"""
     # 用模块属性读，支持 WebUI 热加载
@@ -375,6 +547,16 @@ def _prepare_registration_args(job_id: int | None = None) -> tuple[str, str, str
     from core.profile_utils import generate_random_birthday
 
     email = str(getattr(_r, "REGISTER_EMAIL", "") or "").strip()
+    persisted_job = db.get_job(int(job_id)) if job_id is not None else None
+    persisted_source = normalize_email_source(
+        str((persisted_job or {}).get("email_source") or "")
+    )
+    persisted_email = str((persisted_job or {}).get("email") or "").strip()
+    if persisted_source in {"otpmail", "gmail_api_url"} and persisted_email:
+        # A retry/restart must reuse its assigned alias; calling pick_account()
+        # here would silently move the job to the next alias/order, and for
+        # Gmail API URL it would provision or even purchase a new source.
+        email = persisted_email
     name = str(getattr(_r, "REGISTER_NAME", "") or "").strip()
     # WebUI/配置里有时会把空值存成 "-"，这不是合法 OpenAI 显示名，按空处理并自动生成
     if name in {"-", "—", "无", "空", "none", "None", "null", "NULL"}:
@@ -453,7 +635,7 @@ def _is_terminal_provider_batch_error(error: object, *, email_source: str | None
     """Identify provider failures that make every job in this registration batch unusable."""
     from core.email_provider import normalize_email_source
 
-    if normalize_email_source(str(email_source or "")) != "gmail_api_url":
+    if normalize_email_source(str(email_source or "")) not in _PROVIDER_BATCH_STOP_SOURCES:
         return False
     messages: list[str] = []
     current: object | None = error
@@ -461,6 +643,10 @@ def _is_terminal_provider_batch_error(error: object, *, email_source: str | None
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         messages.append(str(current or "").casefold())
+        # Typed provider errors carry machine-readable codes outside the
+        # message text (BambooMMO resourceKey, OTPGmail error_code).
+        messages.append(str(getattr(current, "error_code", "") or "").casefold())
+        messages.append(str(getattr(current, "resource_key", "") or "").casefold())
         current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
     message = " ".join(messages)
     return any(marker in message for marker in _PROVIDER_BATCH_STOP_MARKERS)
@@ -470,7 +656,7 @@ def _stop_registration_batch_on_provider_failure(
     job_id: int | None,
     error: object,
 ) -> dict[str, int | str | None]:
-    """Stop the submitted registration batch after a terminal QAN8 checkout failure."""
+    """Stop the submitted registration batch after a terminal provider failure."""
     if job_id is None:
         return {"matched": 0, "cancelled": 0, "stopping": 0}
     current = db.get_job(int(job_id)) or {}
@@ -508,6 +694,10 @@ def _stop_registration_batch_on_provider_failure(
         # through its normal exception path and retain the provider reason.
         if target_id == int(job_id):
             continue
+        # 2FA/Codex 补做任务不领取新邮箱（读的是账号已有 alias 的 OTP）：
+        # 供应耗尽不会让它们失效，取消只会把已创建账号永远卡在 2FA pending。
+        if str(job.get("retry_action") or "").strip().lower() in {"2fa", "codex"}:
+            continue
         status = str(job.get("status") or "").strip().lower()
         if status == "pending":
             db.update_job(
@@ -538,7 +728,7 @@ def _stop_registration_batch_on_provider_failure(
                 )
                 stopped += 1
     logger.error(
-        "[Provider] Terminal QAN8 checkout failure stopped registration batch=%s lane=%s; "
+        "[Provider] Terminal provider failure stopped registration batch=%s lane=%s; "
         "matched=%s cancelled=%s stopping=%s stopped=%s reason=%s",
         batch_id or "-",
         lane_batch_id or "-",
@@ -589,7 +779,7 @@ def quarantine_provider_lane(
     provider_lane_id: int | None = None,
     reason: str,
 ) -> dict[str, int | str | None]:
-    """Retire one failed provider source without cancelling its replacement lane."""
+    """Retire a failed provider URL and stop jobs that could consume a replacement."""
     current = db.get_job(int(job_id)) if job_id is not None else None
     current = current or {}
     context = current.get("provider_context") if isinstance(current, dict) else {}
@@ -612,6 +802,43 @@ def quarantine_provider_lane(
 
     normalized_code_url = str(code_url or "").strip()
     provider_items = 0
+    runtime_store = None
+    affected_job_ids: set[str] = set()
+    if normalized_source == "gmail_api_url" and normalized_code_url:
+        from core.gmail_api_url_batch_store import GmailApiUrlBatchStore
+        from core.gmail_api_url_client import _runtime_store_path
+
+        runtime_store = GmailApiUrlBatchStore(_runtime_store_path())
+        affected_job_ids.update(runtime_store.list_job_ids_for_code_url(normalized_code_url))
+        affected_batches = set(runtime_store.list_batch_ids_for_code_urls({normalized_code_url}))
+        source_slots = {
+            batch: runtime_store.source_slots_for_code_url(
+                batch,
+                normalized_code_url,
+                aliases_per_source=int(
+                    (
+                        runtime_store.batch_provision_plan(batch) or {}
+                    ).get("aliases_per_source")
+                    or 12
+                ),
+            )
+            for batch in affected_batches
+        }
+        for job in db.list_jobs(limit=10_000):
+            job_context = job.get("provider_context") if isinstance(job, dict) else {}
+            if not isinstance(job_context, dict):
+                continue
+            job_batch = str(job_context.get("gmail_api_url_batch_id") or "").strip()
+            if job_batch not in affected_batches:
+                continue
+            try:
+                slot = int(job_context.get("gmail_api_url_source_slot"))
+            except (TypeError, ValueError):
+                if len(source_slots.get(job_batch, set())) == 1:
+                    affected_job_ids.add(str(job.get("id") or ""))
+                continue
+            if slot in source_slots.get(job_batch, set()):
+                affected_job_ids.add(str(job.get("id") or ""))
     if (
         normalized_source == "gmail_api_url"
         and normalized_code_url
@@ -643,14 +870,82 @@ def quarantine_provider_lane(
             **scope_kwargs,
         )
 
+    reason_text = f"邮箱来源已因 code_url 故障停止，取消同源任务: {str(reason or '')[:220]}"
+    cancelled = 0
+    stopping = 0
+    stopped = 0
+    now_iso = _local_now().isoformat(timespec="seconds")
+    # Keep cancellation order deterministic for logs and persistence callbacks.
+    for raw_job_id in sorted(
+        affected_job_ids,
+        key=lambda value: (0, int(value))
+        if str(value).isdigit()
+        else (1, str(value)),
+    ):
+        try:
+            target_id = int(raw_job_id)
+        except (TypeError, ValueError):
+            continue
+        if job_id is not None and target_id == int(job_id):
+            continue
+        target_job = db.get_job(target_id) or {}
+        status = str(target_job.get("status") or "").strip().lower()
+        if status == "pending":
+            target_context = target_job.get("provider_context")
+            target_context = target_context if isinstance(target_context, dict) else {}
+            target_batch_id = str(target_context.get("gmail_api_url_batch_id") or "").strip()
+            if target_batch_id:
+                try:
+                    runtime_store.cancel_waiter(
+                        target_batch_id,
+                        str(target_id),
+                        reason_text,
+                    )
+                except Exception:
+                    # A worker may fail before persisting its waiter.  The job
+                    # state still must be cancelled so it cannot acquire mail.
+                    logger.debug(
+                        "[Service] Gmail waiter already absent for cancelled job #%s",
+                        target_id,
+                        exc_info=True,
+                    )
+            db.update_job(
+                target_id,
+                status="cancelled",
+                error=reason_text,
+                completed_at=now_iso,
+            )
+            cancelled += 1
+        elif status == "running":
+            with _STOP_LOCK:
+                event = _STOP_EVENTS.get(target_id)
+                active = target_id in _ACTIVE_JOBS
+                if event is not None and active:
+                    event.set()
+            if event is not None and active:
+                db.update_job(target_id, status="stopping", error=reason_text)
+                stopping += 1
+            else:
+                db.update_job(
+                    target_id,
+                    status="stopped",
+                    error=reason_text,
+                    completed_at=now_iso,
+                )
+                stopped += 1
+
     logger.warning(
         "[Service] Quarantined provider source: source=%s batch=%s lane=%s provider_items=%s "
-        "failed_sources=%s reason=%s",
+        "failed_sources=%s affected_jobs=%s cancelled=%s stopping=%s stopped=%s reason=%s",
         normalized_source,
         batch_id or "-",
         lane_id if lane_id is not None else "-",
         provider_items,
         failed_sources,
+        len(affected_job_ids),
+        cancelled,
+        stopping,
+        stopped,
         str(reason or "")[:180],
     )
     return {
@@ -659,8 +954,10 @@ def quarantine_provider_lane(
         "lane_id": lane_id,
         "provider_items": provider_items,
         "failed_sources": failed_sources,
-        "cancelled": 0,
-        "stopping": 0,
+        "cancelled": cancelled,
+        "stopping": stopping,
+        "stopped": stopped,
+        "affected_jobs": len(affected_job_ids),
     }
 
 
@@ -672,7 +969,7 @@ def _consume_recoverable_twofa_assignment(email: str | None, reason: str) -> boo
         from core.email_provider import mark_email_consumed, resolve_email_source
 
         source = resolve_email_source(email)
-        if source != "gmail_api_url":
+        if source not in {"gmail_api_url", "automated_email_api", "otpmail", "bamboommo"}:
             return False
         changed = bool(mark_email_consumed(email))
         if changed:
@@ -728,10 +1025,7 @@ def _should_disable_failed_registration_email(error: object) -> bool:
     ))
     return (
         unsupported_email
-        or "AccountUnusableError" in text
-        or "account_deactivated" in text
-        or "account_deleted" in text
-        or "account_banned" in text
+        or is_account_unusable_failure(text)
         or _is_final_session_access_token_timeout(text)
         or "邮箱提交后进入登录密码页" in text
         or "auth.openai.com/log-in/password" in text
@@ -831,13 +1125,33 @@ def get_executor_workers() -> int:
         return _executor_workers
 
 
+def get_twofa_executor() -> ThreadPoolExecutor:
+    """2FA 补做专用单线程池。
+
+    2FA 补做不领取新邮箱供应；若 submit 进注册线程池，会排在整条注册 lane
+    后面（批量 12 任务时账号要挂到批末才补上 2FA），批停止时还可能被一起
+    取消。串行单线程即可：2FA 是独立浏览器任务，也不宜与注册并发过多。
+    """
+    global _twofa_executor
+    with _executor_lock:
+        if _twofa_executor is None:
+            _twofa_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="twofa-worker",
+            )
+    return _twofa_executor
+
+
 def shutdown_executor(wait: bool = True) -> None:
-    global _executor
+    global _executor, _twofa_executor
     with _executor_lock:
         executors = []
         if _executor is not None:
             executors.append(_executor)
             _executor = None
+        if _twofa_executor is not None:
+            executors.append(_twofa_executor)
+            _twofa_executor = None
         executors.extend(_retired_executors)
         _retired_executors.clear()
     for ex in executors:
@@ -1057,7 +1371,113 @@ def _registration_cleanup_allows_retry(job_id: int, cleanup_succeeded: bool) -> 
         except Exception:
             logger.exception("[Job %s] 无法确认 Gmail API URL assignment 是否已终态", job_id)
             return False
+    if email_source in {"otpmail", "bamboommo"}:
+        # OTPGmail cancellation is handled by release_email_if_unconsumed;
+        # once that local cleanup returns, a fresh order is safe to request.
+        return cleanup_succeeded
     return False
+
+
+def _email_provider_registration_lock(email: str, *, otpmail_order_id: str | None = None):
+    """Serialize registrations sharing one provider mailbox or OTP order."""
+    from core.email_provider import _active_job_email_source
+
+    active_source = _active_job_email_source(email)
+    if active_source == "otpmail":
+        from core.otpgmail_client import get_account_context as get_otpmail_context
+        from core.otpgmail_client import registration_order_lock
+
+        context = (
+            get_otpmail_context(email, order_id=otpmail_order_id)
+            if otpmail_order_id
+            else get_otpmail_context(email)
+        )
+        if context is not None:
+            return registration_order_lock(email, order_id=otpmail_order_id)
+
+    from core.automated_email_api_client import (
+        get_account_context,
+        registration_mailbox_lock,
+    )
+
+    if get_account_context(email) is not None:
+        return registration_mailbox_lock(email)
+    from core.otpgmail_client import get_account_context as get_otpmail_context
+    from core.otpgmail_client import registration_order_lock
+
+    if get_otpmail_context(email) is not None:
+        return registration_order_lock(email, order_id=otpmail_order_id)
+    from core.bamboommo_client import get_account_context as get_bamboommo_context
+    from core.bamboommo_client import registration_rental_lock
+
+    if get_bamboommo_context(email) is not None:
+        return registration_rental_lock(email)
+    return None
+
+
+def _automated_email_api_registration_lock(email: str):
+    """Backward-compatible helper for callers that only expect Automated Email API."""
+    from core.automated_email_api_client import get_account_context
+
+    if get_account_context(email) is None:
+        return None
+    from core.automated_email_api_client import registration_mailbox_lock
+
+    return registration_mailbox_lock(email)
+
+
+def _queue_twofa_auto_requeue(job_id: int) -> dict | None:
+    """账号已保存但 2FA 未完成时，自动入队一次有界的 2FA 补做任务。
+
+    retry_job 会按 get_retry_info 路由到 action="2fa"（job_type=twofa_retry），
+    走 TWOFA_RETRY 代理 scope（新 IP、新浏览器），且 create_retry_job 自带
+    同链路去重；2FA 补做任务自身失败不会再触发本函数（一次注册结果只补一次）。
+    操作员已请求停止时不入队——不能把用户刚取消的工作复活成浏览器任务。
+    """
+    if is_stop_requested(job_id):
+        return None
+    result = retry_job(job_id)
+    if result.get("ok") and result.get("created"):
+        logger.warning(
+            "[Job %s] 2FA 未完成但账号已保存，已自动入队补做任务 #%s",
+            job_id,
+            (result.get("job") or {}).get("id"),
+        )
+    elif not result.get("ok"):
+        logger.warning(
+            "[Job %s] 2FA 自动补做未入队: %s",
+            job_id,
+            str(result.get("error") or "unknown")[:180],
+        )
+    return result
+
+
+def _registration_force_refresh_proxy(job: dict) -> bool:
+    """重试任务必须换新出口 IP：失败往往因为当前 IP 已被网关标记，
+    复用缓存 IP 只会把同样的失败原样再跑一遍。普通任务按全局配置。"""
+    if int(job.get("retry_attempt") or 0) > 0 or job.get("parent_job_id") is not None:
+        return True
+    from config import proxy as _proxy_cfg
+
+    return bool(getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False))
+
+
+# Lỗi hạ tầng xảy ra TRƯỚC khi registration bắt đầu (chưa mở browser, chưa
+# đọc OTP): alias chưa tiêu hao, phải recycle thay vì đốt.
+_PROXY_INFRA_ERROR_MARKERS = (
+    "RotatingProxyError",
+    "Roxy 创建环境连续失败",
+    "RoxyBrowserClientError",
+    # Mọi lỗi Roxy API tầng create/open (vd "Roxy API 返回失败 POST
+    # /browser/create: timeout of 15000ms exceeded") — chưa đụng registration.
+    "Roxy API 返回失败",
+    "Roxy API 请求失败",
+)
+
+
+def _is_proxy_infra_failure(error_text: object) -> bool:
+    text = str(error_text or "")
+    return any(marker in text for marker in _PROXY_INFRA_ERROR_MARKERS)
 
 
 def _run_one_job(job_id: int, log_file: str) -> None:
@@ -1097,26 +1517,41 @@ def _run_one_job(job_id: int, log_file: str) -> None:
     db.update_job(job_id, status="running", started_at=_local_now().isoformat(timespec="seconds"))
 
     email: str | None = None
+    mailbox_lock = None
+    mailbox_lock_acquired = False
     try:
         with _JobLogContext(log_file):
             from main import run_registration
             log_logger.info(f"[Job {job_id}] 开始注册任务")
             email, name, birthday = _prepare_registration_args(job_id=job_id)
-            db.update_job(job_id, email=email)
-            check_stop_requested()
-            provider_context = current.get("provider_context") or {}
-            proxy_lane_id = provider_context.get("proxy_lane_id")
-            from config import proxy as _proxy_cfg
+            provider_context = dict(current.get("provider_context") or {})
+            from core.email_provider import normalize_email_source
 
+            normalized_job_source = normalize_email_source(
+                str(current.get("email_source") or "")
+            )
+            provider_context = _persist_otpmail_job_context(
+                job_id,
+                email,
+                provider_context,
+            )
+            db.update_job(job_id, email=email, provider_context=provider_context)
+            mailbox_lock = _email_provider_registration_lock(
+                email,
+                otpmail_order_id=provider_context.get("otpmail_order_id"),
+            )
+            if mailbox_lock is not None:
+                mailbox_lock.acquire()
+                mailbox_lock_acquired = True
+            check_stop_requested()
+            proxy_lane_id = provider_context.get("proxy_lane_id")
             result = run_registration(
                 email=email,
                 name=name,
                 birthday=birthday,
                 proxy_lane_id=proxy_lane_id,
                 lease_owner_id=f"registration-job:{job_id}",
-                force_refresh_proxy=bool(
-                    getattr(_proxy_cfg, "ROTATING_PROXY_ONE_ACCOUNT_PER_IP", False)
-                ),
+                force_refresh_proxy=_registration_force_refresh_proxy(current),
             )
             if is_stop_requested(job_id):
                 result_dict = result if isinstance(result, dict) else {}
@@ -1134,7 +1569,11 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 db.update_job(
                     job_id,
                     status="stopped",
-                    email=result_dict.get("email") or email,
+                    email=(
+                        email
+                        if normalized_job_source == "otpmail"
+                        else result_dict.get("email") or email
+                    ),
                     account_id=result_dict.get("account_id") if recoverable_twofa else None,
                     error="用户手动停止",
                     completed_at=_local_now().isoformat(timespec="seconds"),
@@ -1148,14 +1587,18 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                         resolve_email_source,
                     )
 
-                    if resolve_email_source(email or "") == "gmail_api_url":
+                    if resolve_email_source(email or "") in {"gmail_api_url", "automated_email_api", "otpmail", "bamboommo"}:
                         mark_email_consumed(email or "")
                 except Exception:
                     logger.exception("[Job %s] consume Gmail API alias after success failed", job_id)
                 db.update_job(
                     job_id,
                     status="success",
-                    email=result.get("email"),
+                    email=(
+                        email
+                        if normalized_job_source == "otpmail"
+                        else result.get("email")
+                    ),
                     account_id=result.get("account_id"),
                     network_identity=result.get("network_identity"),
                     completed_at=_local_now().isoformat(timespec="seconds"),
@@ -1183,13 +1626,25 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                 db.update_job(
                     job_id,
                     status="failed",
-                    email=result_email,
+                    email=(
+                        email
+                        if normalized_job_source == "otpmail"
+                        else result_email
+                    ),
                     account_id=(result or {}).get("account_id") if isinstance(result, dict) else None,
                     network_identity=(result or {}).get("network_identity") if isinstance(result, dict) else None,
                     error=str(err)[:500],
                     completed_at=_local_now().isoformat(timespec="seconds"),
                 )
-                email_to_handle = str(result_email or email or "").strip()
+                # OTPGmail drivers may report the parent/query mailbox in
+                # their result.  Cleanup must retain the alias assigned to
+                # this job so release/consume resolves the persisted order,
+                # never a different order inferred from the result mailbox.
+                email_to_handle = (
+                    email
+                    if normalized_job_source == "otpmail"
+                    else str(result_email or email or "").strip()
+                )
                 recoverable_twofa = bool(
                     (result or {}).get("account_id")
                     and str((result or {}).get("twofa_status") or "").lower() in {"pending", "failed"}
@@ -1201,7 +1656,7 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                     alias_discarded = _release_unconsumed_job_email(
                         email_to_handle,
                         str(err),
-                        discard_on_failure=True,
+                        discard_on_failure=not _is_proxy_infra_failure(err),
                     )
                 elif email_to_handle:
                     _consume_recoverable_twofa_assignment(email_to_handle, str(err))
@@ -1210,10 +1665,9 @@ def _run_one_job(job_id: int, log_file: str) -> None:
                         job_id,
                         (result or {}).get("account_id"),
                     )
-                if (
-                    not recoverable_twofa
-                    and _registration_cleanup_allows_retry(job_id, alias_discarded)
-                ):
+                if recoverable_twofa:
+                    _queue_twofa_auto_requeue(job_id)
+                elif _registration_cleanup_allows_retry(job_id, alias_discarded):
                     _queue_transient_registration_retry(job_id, err)
                 log_logger.error(f"[Job {job_id}] 失败: {err}")
     except StopRequested as exc:
@@ -1249,7 +1703,9 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             alias_discarded = _release_unconsumed_job_email(
                 email,
                 err_text,
-                discard_on_failure=not is_stop_requested(job_id),
+                discard_on_failure=(
+                    not is_stop_requested(job_id) and not _is_proxy_infra_failure(err_text)
+                ),
             )
         elif email:
             _consume_recoverable_twofa_assignment(email, err_text)
@@ -1273,12 +1729,13 @@ def _run_one_job(job_id: int, log_file: str) -> None:
             error=f"{type(exc).__name__}: {exc}"[:500],
             completed_at=_local_now().isoformat(timespec="seconds"),
         )
-        if (
-            not recoverable_twofa
-            and _registration_cleanup_allows_retry(job_id, alias_discarded)
-        ):
+        if recoverable_twofa:
+            _queue_twofa_auto_requeue(job_id)
+        elif _registration_cleanup_allows_retry(job_id, alias_discarded):
             _queue_transient_registration_retry(job_id, err_text)
     finally:
+        if mailbox_lock_acquired:
+            mailbox_lock.release()
         _deactivate_job(job_id)
         _notify_sub2api_automation_job(job_id)
 
@@ -1615,8 +2072,9 @@ def submit_registration(
 ) -> list[dict]:
     """
     创建 N 个注册任务并提交到线程池。
-    Gmail API URL 任务按 12 alias source group 分配到独立的 canonical lane
-    batch；source 只在对应 lane 需要时从本地池或 shop.qan8.com 物化。
+    Gmail API URL、Automated Email API、OTPGmail 和 BambooMMO 的每个邮箱
+    source 最多提供 12 个 alias；Gmail API URL 任务按 source group 分配到
+    独立的 canonical lane，其他共享 mailbox/order 的 provider 由注册锁串行化。
 
     Returns:
         N 个新创建的 job dict
@@ -1627,7 +2085,7 @@ def submit_registration(
     from core.email_provider import normalize_email_source
 
     normalized_source = normalize_email_source(str(email_source or ""))
-    if normalized_source == "gmail_api_url":
+    if normalized_source in {"gmail_api_url", "automated_email_api", "otpmail", "bamboommo"}:
         email_source = normalized_source
     if gmail_cdks and not gmail_batch_id:
         from core.gmail_123452026_client import create_registration_batch
@@ -1656,9 +2114,9 @@ def submit_registration(
             ),
         )
     registration_batch_id = uuid.uuid4().hex
-    provider_context = {
+    provider_context: dict = {
         "registration_batch_id": registration_batch_id,
-    } if email_source == "gmail_api_url" else {}
+    }
     if gmail_batch_id:
         provider_context.update(
             {
@@ -1741,9 +2199,11 @@ def submit_registration(
                 )
 
         job_lane_ids = [0] * count
+        job_source_slots = [0] * count
         for lane_id, lane_positions in enumerate(gmail_lane_positions):
-            for position in lane_positions:
+            for lane_position, position in enumerate(lane_positions):
                 job_lane_ids[position] = lane_id
+                job_source_slots[position] = lane_position // aliases_per_email
         lane_jobs: list[list[tuple[int, str]]] = [
             [] for _ in range(gmail_api_url_lane_count)
         ]
@@ -1754,6 +2214,7 @@ def submit_registration(
                 lane_id = job_lane_ids[index]
                 job_provider_context["gmail_api_url_lane_id"] = lane_id
                 job_provider_context["gmail_api_url_batch_id"] = gmail_lane_batch_ids[lane_id]
+                job_provider_context["gmail_api_url_source_slot"] = job_source_slots[index]
                 if rotating_proxy_enabled:
                     job_provider_context["proxy_lane_id"] = lane_id
             elif rotating_proxy_enabled:
@@ -1838,20 +2299,7 @@ def _configured_twofa_retry_driver() -> str:
     """Return the browser/provider selected in the live WebUI settings."""
     from config import roxybrowser as _driver_cfg
 
-    raw = str(getattr(_driver_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol").strip().lower()
-    aliases = {
-        "roxybrowser": "roxy",
-        "fingerprint": "roxy",
-        "browser": "roxy",
-        "cloakbrowser": "cloak",
-        "browseruse": "browser_use",
-        "browser-use": "browser_use",
-        "bu": "browser_use",
-        "sv": "skyvern",
-        "api": "protocol",
-        "http": "protocol",
-    }
-    return aliases.get(raw, raw)
+    return resolve_twofa_retry_driver(_driver_cfg)
 
 
 def _run_configured_twofa_retry(
@@ -1861,7 +2309,7 @@ def _run_configured_twofa_retry(
 ) -> dict:
     """Run the shared reactive 2FA flow for a supported browser provider."""
     driver = _configured_twofa_retry_driver()
-    if driver in _SUPPORTED_BROWSER_TWOFA_DRIVERS:
+    if is_live_browser_driver(driver):
         from core.browser_twofa_retry import run_twofa_retry
 
         if proxy_lane_id is None:
@@ -1885,7 +2333,7 @@ def _account_supports_twofa_retry(account: dict) -> bool:
     """判断账号是否具备当前设置的 provider 所需的登录密码。"""
     if not str(account.get("registration_password") or "").strip():
         return False
-    return _configured_twofa_retry_driver() in _SUPPORTED_BROWSER_TWOFA_DRIVERS
+    return is_live_browser_driver(_configured_twofa_retry_driver())
 
 
 def get_retry_info(job: dict) -> dict:
@@ -1990,11 +2438,21 @@ def retry_job(
         reserved_codex = True
 
     try:
+        from core.email_provider import normalize_email_source
+
+        normalized_email_source = normalize_email_source(
+            str(source.get("email_source") or "")
+        )
+        retry_email = (
+            str(source.get("email") or "").strip() or None
+            if action == "registration" and normalized_email_source == "otpmail"
+            else email if action in {"codex", "2fa"} else None
+        )
         job, created = db.create_retry_job(
             int(job_id),
             job_type=("codex_retry" if action == "codex" else "twofa_retry" if action == "2fa" else "registration"),
             email_source=str(source.get("email_source") or "outlook"),
-            email=email if action in {"codex", "2fa"} else None,
+            email=retry_email,
             account_id=account_id if action in {"codex", "2fa"} else None,
             allow_success_for_twofa=allow_success_twofa and action == "2fa",
         )
@@ -2027,11 +2485,11 @@ def retry_job(
             from core.email_provider import normalize_email_source
 
             if normalize_email_source(str(job.get("email_source") or "")) == "gmail_api_url":
-                job = _assign_fresh_gmail_api_url_registration_batch(job)
+                job = _reattach_gmail_api_url_retry_alias(source, job)
         effective_workers = (
             workers if action in {"codex", "2fa"} else effective_registration_workers(workers)
         )
-        proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers))
+        proxy_lane_id = (int(job["id"]) - 1) % max(1, int(effective_workers or 1))
         from core.rotating_proxy_runtime import (
             CODEX_RETRY_PROXY_SCOPE,
             REGISTRATION_PROXY_SCOPE,
@@ -2056,7 +2514,8 @@ def retry_job(
                     proxy_lane_id,
                 )
             elif action == "2fa":
-                executor.submit(
+                # 专用池：不等注册 lane 排空（见 get_twofa_executor）。
+                get_twofa_executor().submit(
                     _run_twofa_retry_job,
                     job["id"],
                     job["log_file"],

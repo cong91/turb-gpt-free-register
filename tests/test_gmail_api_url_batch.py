@@ -292,6 +292,29 @@ def test_quarantine_code_url_exhausts_every_alias_for_that_mailbox(tmp_path):
     assert healthy.inventory_id.startswith("healthy-one@gmail.com----")
 
 
+def test_quarantined_source_still_consumes_batch_source_budget(tmp_path):
+    """A quarantined source does not create a replacement purchase slot."""
+    store = GmailApiUrlBatchStore(tmp_path / "batch.db")
+    batch_id = store.create_empty_batch(
+        target_count=24,
+        aliases_per_source=12,
+        desired_sources=2,
+    )
+    source_url = "https://api.mail.com/quarantined"
+    store.append_source_group(
+        batch_id,
+        "source@gmail.com",
+        source_url,
+        [f"source+{index}@gmail.com" for index in range(12)],
+    )
+
+    assert store.count_source_groups(batch_id) == 1
+    store.quarantine_code_url(source_url, reason="Provider error code=602")
+
+    assert store.count_source_groups(batch_id) == 1
+    assert store.batch_provision_plan(batch_id)["desired_sources"] == 1
+
+
 def test_quarantine_code_url_exhausts_matching_aliases_across_batches(tmp_path):
     """A 602 source cannot remain usable through another batch."""
     store = GmailApiUrlBatchStore(tmp_path / "batch.db")

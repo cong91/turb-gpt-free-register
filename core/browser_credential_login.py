@@ -5,13 +5,11 @@ import logging
 import time
 from urllib.parse import urlsplit
 
-from core.browser_registration import (
+from core.browser_page_actions import (
     _clear_otp_inputs,
     _click_continue,
     _human_type_text,
     _maybe_accept,
-    _submit_email_step,
-    _type_email_address,
     _type_otp,
     _visible,
 )
@@ -21,6 +19,10 @@ from core.openai_auth import (
     AccountUnusableError,
     account_unusable_error_message,
     detect_account_unusable_text,
+)
+from core.registration_flow import (
+    _submit_email_step,
+    _type_email_address,
 )
 
 logger = logging.getLogger(__name__)

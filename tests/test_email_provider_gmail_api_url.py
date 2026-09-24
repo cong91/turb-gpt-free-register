@@ -40,6 +40,38 @@ class GmailApiUrlProviderTests(unittest.TestCase):
             batch_id="batch-1",
         )
 
+    @patch("core.gmail_api_url_client.get_account_context", return_value=None)
+    @patch("core.gmail_api_url_client.get_batch_account_context")
+    @patch("core.db.get_job")
+    @patch("core.email_provider._current_otp_job_id", return_value=2893)
+    def test_twofa_requeue_job_resolves_alias_via_ancestor_jobs(
+        self,
+        _mock_job_id,
+        mock_get_job,
+        mock_batch_context,
+        _mock_raw_context,
+    ):
+        # Job 2FA requeue không sở hữu alias assignment riêng; alias thuộc job
+        # registration gốc ở ĐẦU chuỗi (2FA 2893 → requeue 2890 → regis 2880) —
+        # resolver phải leo cả chuỗi parent (bug batch 4: ValueError).
+        mock_get_job.side_effect = lambda job_id: {
+            2893: {"id": 2893, "parent_job_id": 2890},
+            2890: {"id": 2890, "parent_job_id": 2880},
+            2880: {"id": 2880},
+        }[int(job_id)]
+        expected = object()
+        mock_batch_context.side_effect = [None, None, expected]
+
+        account = email_provider._get_code_url_account(
+            "alias+one@gmail.com",
+            "gmail_api_url",
+        )
+
+        self.assertIs(account, expected)
+        self.assertEqual(mock_batch_context.call_count, 3)
+        mock_batch_context.assert_any_call("alias+one@gmail.com", job_id=2890)
+        mock_batch_context.assert_any_call("alias+one@gmail.com", job_id=2880)
+
     def test_parse_sources_includes_gmail_api_url(self):
         """parse_email_sources 保留 gmail_api_url。"""
         sources = email_provider.parse_email_sources("outlook,gmail_api_url,generic_api")
@@ -146,6 +178,85 @@ class GmailApiUrlProviderTests(unittest.TestCase):
             sqlite_path=Path("runtime") / "turb.sqlite3",
         )
         mock_poll.assert_not_called()
+
+    @patch("core.email_provider._get_code_url_account")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.is_gmail_api_url_account_blocked", return_value=True)
+    @patch("core.db.is_gmail_api_url_code_url_failed", return_value=False)
+    @patch("core.gmail_api_url_client.poll_verification_code", return_value="654321")
+    def test_wait_for_otp_allows_blocked_root_for_twofa_stage(
+        self,
+        mock_poll,
+        mock_failed_url,
+        _mock_account_blocked,
+        mock_batch_store,
+        _mock_source,
+        mock_account,
+    ):
+        # Root bị auto-disable cục bộ (heuristic session-timeout) không được
+        # chặn OTP read cho alias đã đăng ký — otherwise 2FA recovery of every
+        # alias on that root fails with "disabled or terminally retired".
+        from pathlib import Path
+
+        mock_batch_store.return_value.path = Path("runtime") / "turb.sqlite3"
+        mock_account.return_value = type(
+            "Account",
+            (),
+            {
+                "email": "disabled.root+alias@gmail.com",
+                "code_url": "http://example.com/otp",
+            },
+        )()
+
+        code = email_provider.wait_for_otp(
+            "disabled.root+alias@gmail.com",
+            after_ts=123.0,
+            stage="twofa_login_email_otp",
+        )
+
+        self.assertEqual(code, "654321")
+        _mock_account_blocked.assert_not_called()
+        mock_poll.assert_called_once()
+
+    @patch("core.email_provider._quarantine_code_url_after_provider_error")
+    @patch("core.email_provider._get_code_url_account")
+    @patch("core.email_provider.resolve_email_source", return_value="gmail_api_url")
+    @patch("core.gmail_api_url_client._batch_store")
+    @patch("core.db.is_gmail_api_url_account_blocked", return_value=True)
+    @patch("core.db.is_gmail_api_url_code_url_failed", return_value=True)
+    @patch("core.gmail_api_url_client.poll_verification_code")
+    def test_wait_for_otp_preserves_602_for_twofa_stage(
+        self,
+        mock_poll,
+        mock_url_failed,
+        _mock_account_blocked,
+        mock_batch_store,
+        _mock_source,
+        mock_account,
+        quarantine,
+    ):
+        # Live provider 602 quarantine vẫn chặn cả existing-account read.
+        from pathlib import Path
+
+        from core.gmail_api_url_client import GmailApiUrlError
+
+        mock_batch_store.return_value.path = Path("runtime") / "turb.sqlite3"
+        mock_account.return_value = type(
+            "Account",
+            (),
+            {"email": "failed.root+alias@gmail.com", "code_url": "http://example.com/otp"},
+        )()
+
+        with self.assertRaisesRegex(GmailApiUrlError, "code=602"):
+            email_provider.wait_for_otp(
+                "failed.root+alias@gmail.com",
+                after_ts=123.0,
+                stage="twofa_reauth_request",
+            )
+
+        mock_poll.assert_not_called()
+        quarantine.assert_called_once()
 
     @patch("core.email_provider._quarantine_code_url_after_provider_error")
     @patch("core.email_provider._get_code_url_account")

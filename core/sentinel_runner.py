@@ -40,8 +40,8 @@ from config import (
     TIMEZONE_IANA,
     TIMEZONE_NAME,
     TIMEZONE_OFFSET_MINUTES,
-    USER_AGENT_DATA_PLATFORM,
     USER_AGENT,
+    USER_AGENT_DATA_PLATFORM,
 )
 
 logger = logging.getLogger(__name__)

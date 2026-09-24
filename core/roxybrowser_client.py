@@ -20,7 +20,14 @@ _PROFILE_CREATE_LOCK = threading.Lock()
 _RETRYABLE_PROFILE_CREATE_MESSAGES = (
     "creating, please wait",
     "insufficient profile quota",
+    # "timeout of NNNms exceeded" là axios-timeout do chính Roxy server trả về
+    # trong payload: server đã phản hồi rõ là FAIL (khác client ReadTimeout —
+    # ambiguous, không biết server có tạo hay không). Batch 2026-09-21 job 2919
+    # chết 1 job + đốt 1 alias chỉ vì timeout này không được retry.
+    "timeout of",
 )
+# 连续失败上限：Roxy 长时间不可用时不能无限占用注册 lane。
+_ROXY_CREATE_MAX_ATTEMPTS = 5
 
 
 @dataclass
@@ -163,7 +170,7 @@ def _apply_data_saver_open_args(params: dict) -> dict:
         if switch not in args:
             args.append(switch)
         params["args"] = args
-    except Exception as exc:
+    except (AttributeError, TypeError, ValueError) as exc:
         logger.debug("[Roxy] 添加省流量图片启动参数失败，继续使用原参数：%s", exc)
     return params
 
@@ -422,6 +429,10 @@ class RoxyBrowserClient:
 
     @staticmethod
     def _is_retryable_profile_create_error(exc: Exception) -> bool:
+        if isinstance(exc, requests.ConnectionError):
+            # 连接阶段失败（本地 Roxy 服务未启动/连接被拒）不会到达服务端，
+            # 不可能已创建环境，可安全重试；响应超时仍视为不可判定，不重试。
+            return True
         text = str(exc or "").lower()
         return any(message in text for message in _RETRYABLE_PROFILE_CREATE_MESSAGES)
 
@@ -492,7 +503,8 @@ class RoxyBrowserClient:
         )
         attempt = 0
         base_delay = max(0.5, float(getattr(_cfg, "ROXY_API_RETRY_DELAY", 2) or 2))
-        while True:
+        last_error: Exception | None = None
+        while attempt < _ROXY_CREATE_MAX_ATTEMPTS:
             attempt += 1
             if stop_check is not None:
                 stop_check()
@@ -507,10 +519,14 @@ class RoxyBrowserClient:
                         _cfg.ROXY_CREATE_PATH,
                         json_body=body,
                     )
+                last_error = None
                 break
             except (RuntimeError, requests.RequestException) as exc:
+                last_error = exc
                 if not self._is_retryable_profile_create_error(exc):
                     raise
+                if attempt >= _ROXY_CREATE_MAX_ATTEMPTS:
+                    break
                 delay = min(30.0, base_delay * min(attempt, 5))
                 logger.warning(
                     "[Roxy] 创建环境暂不可用，保留当前任务并在 %.1fs 后重试：attempt=%s error=%s",
@@ -521,6 +537,11 @@ class RoxyBrowserClient:
                 if stop_check is not None:
                     stop_check()
                 time.sleep(delay)
+        if last_error is not None:
+            # 走到这里说明重试额度耗尽仍未创建成功。
+            raise RuntimeError(
+                f"Roxy 创建环境连续失败 {attempt} 次: {last_error}"
+            ) from last_error
         profile_id = _first(result, [
             ("id",), ("dirId",), ("dir_id",), ("profile_id",), ("profileId",), ("browser_id",),
             ("data", "id"), ("data", "dirId"), ("data", "dir_id"),
@@ -617,57 +638,61 @@ class RoxyBrowserClient:
                 if proxy_info is not None:
                     self._verify_profile_proxy(pid, proxy_info)
 
-            path = str(_cfg.ROXY_OPEN_PATH).format(profile_id=pid)
-            params = dict(getattr(_cfg, "ROXY_OPEN_EXTRA_PARAMS", {}) or {})
-            args = list(params.get("args") or [])
-            if proxy and getattr(proxy, "tunnel", None) is not None:
-                proxy_arg = f"--proxy-server={proxy!s}"
-                if proxy_arg not in args:
-                    args.append(proxy_arg)
-                if "--proxy-bypass-list=<-loopback>" not in args:
-                    args.append("--proxy-bypass-list=<-loopback>")
-            # Roxy 官方 /browser/open body: {workspaceId, dirId, args, forceOpen, headless}
-            params.setdefault("workspaceId", _workspace_id_value())
-            params.setdefault("dirId", int(pid) if str(pid).isdigit() else pid)
-            params["args"] = args
-            params.setdefault("forceOpen", True)
-            _apply_data_saver_open_args(params)
-            # ROXY_OPEN_HEADLESS 是显式开关，优先级应高于 ROXY_OPEN_EXTRA_PARAMS，
-            # 否则 extra 里残留 headless=False 会导致 WebUI 保存无头后仍弹窗口。
-            params["headless"] = bool(getattr(_cfg, "ROXY_OPEN_HEADLESS", False))
-            logger.info("[Roxy] open 参数：profile=%s headless=%s keep_open=%s", pid, params.get("headless"), getattr(_cfg, "ROXY_KEEP_BROWSER_OPEN", False))
-            result = self.request(
-                _cfg.ROXY_OPEN_METHOD,
-                path,
-                params=params if _cfg.ROXY_OPEN_METHOD.upper() == "GET" else None,
-                json_body=params if _cfg.ROXY_OPEN_METHOD.upper() != "GET" else None,
-            )
-            debugger_address = self._extract_debugger_address(result)
-            logger.info("[Roxy] open 返回摘要: debugger=%s raw=%s", debugger_address, json.dumps(result, ensure_ascii=False)[:800])
-            webdriver_url = _first(result, [
-                ("webdriver",), ("webDriver",), ("webdriver_url",), ("webdriverUrl",),
-                ("selenium",), ("selenium_url",), ("seleniumUrl",),
-                ("data", "webdriver"), ("data", "webDriver"), ("data", "webdriver_url"), ("data", "webdriverUrl"),
-                ("data", "selenium"), ("data", "selenium_url"), ("data", "seleniumUrl"),
-            ]) or None
-            ws_endpoint = _first(result, [
-                ("ws",), ("wsEndpoint",), ("ws_endpoint",), ("debuggerWsUrl",),
-                ("data", "ws"), ("data", "wsEndpoint"), ("data", "ws_endpoint"), ("data", "debuggerWsUrl"),
-            ]) or None
-            if not debugger_address and not webdriver_url:
-                raise RuntimeError(f"Roxy 已打开环境但未返回 Selenium/调试地址，请检查 ROXY_OPEN_PATH 或接口响应: {result}")
-            return RoxyOpenResult(
-                pid,
-                result,
-                debugger_address=debugger_address,
-                webdriver_url=webdriver_url,
-                ws_endpoint=ws_endpoint,
-                created_by_run=created_by_run,
-            )
+            return self._open_profile_by_id(pid, proxy, created_by_run=created_by_run)
         except Exception:
             if created_by_run and pid:
                 self.cleanup_profile(RoxyOpenResult(pid, {}, created_by_run=True))
             raise
+
+    def _open_profile_by_id(self, pid: str, proxy=None, *, created_by_run: bool) -> RoxyOpenResult:
+        """打开已存在的 Roxy 环境；open_profile 与 reopen_profile 共用。"""
+        path = str(_cfg.ROXY_OPEN_PATH).format(profile_id=pid)
+        params = dict(getattr(_cfg, "ROXY_OPEN_EXTRA_PARAMS", {}) or {})
+        args = list(params.get("args") or [])
+        if proxy and getattr(proxy, "tunnel", None) is not None:
+            proxy_arg = f"--proxy-server={proxy!s}"
+            if proxy_arg not in args:
+                args.append(proxy_arg)
+            if "--proxy-bypass-list=<-loopback>" not in args:
+                args.append("--proxy-bypass-list=<-loopback>")
+        # Roxy 官方 /browser/open body: {workspaceId, dirId, args, forceOpen, headless}
+        params.setdefault("workspaceId", _workspace_id_value())
+        params.setdefault("dirId", int(pid) if str(pid).isdigit() else pid)
+        params["args"] = args
+        params.setdefault("forceOpen", True)
+        _apply_data_saver_open_args(params)
+        # ROXY_OPEN_HEADLESS 是显式开关，优先级应高于 ROXY_OPEN_EXTRA_PARAMS，
+        # 否则 extra 里残留 headless=False 会导致 WebUI 保存无头后仍弹窗口。
+        params["headless"] = bool(getattr(_cfg, "ROXY_OPEN_HEADLESS", False))
+        logger.info("[Roxy] open 参数：profile=%s headless=%s keep_open=%s", pid, params.get("headless"), getattr(_cfg, "ROXY_KEEP_BROWSER_OPEN", False))
+        result = self.request(
+            _cfg.ROXY_OPEN_METHOD,
+            path,
+            params=params if _cfg.ROXY_OPEN_METHOD.upper() == "GET" else None,
+            json_body=params if _cfg.ROXY_OPEN_METHOD.upper() != "GET" else None,
+        )
+        debugger_address = self._extract_debugger_address(result)
+        logger.info("[Roxy] open 返回摘要: debugger=%s raw=%s", debugger_address, json.dumps(result, ensure_ascii=False)[:800])
+        webdriver_url = _first(result, [
+            ("webdriver",), ("webDriver",), ("webdriver_url",), ("webdriverUrl",),
+            ("selenium",), ("selenium_url",), ("seleniumUrl",),
+            ("data", "webdriver"), ("data", "webDriver"), ("data", "webdriver_url"), ("data", "webdriverUrl"),
+            ("data", "selenium"), ("data", "selenium_url"), ("data", "seleniumUrl"),
+        ]) or None
+        ws_endpoint = _first(result, [
+            ("ws",), ("wsEndpoint",), ("ws_endpoint",), ("debuggerWsUrl",),
+            ("data", "ws"), ("data", "wsEndpoint"), ("data", "ws_endpoint"), ("data", "debuggerWsUrl"),
+        ]) or None
+        if not debugger_address and not webdriver_url:
+            raise RuntimeError(f"Roxy 已打开环境但未返回 Selenium/调试地址，请检查 ROXY_OPEN_PATH 或接口响应: {result}")
+        return RoxyOpenResult(
+            pid,
+            result,
+            debugger_address=debugger_address,
+            webdriver_url=webdriver_url,
+            ws_endpoint=ws_endpoint,
+            created_by_run=created_by_run,
+        )
 
     def close_profile(self, profile_id: str) -> None:
         if not profile_id:

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -11,6 +13,21 @@ import requests
 
 from config import proxy as proxy_config
 from config.proxy import normalize_proxy_url
+
+logger = logging.getLogger(__name__)
+
+# Document proxy.vn (apixoay get.php): nhamang nhận Random|viettel|fpt|vnpt,
+# tinhthanh nhận 0 (=provider Random) hoặc mã tỉnh 1..31. Provider-side
+# "Random" thực tế dồn IP về cùng một dải /24, nên chế độ random do client
+# tự chọn cặp cụ thể và tránh lặp giá trị liền trước.
+_CARRIER_CHOICES = ("viettel", "fpt", "vnpt")
+_PROVINCE_CHOICES = tuple(str(code) for code in range(1, 32))
+
+
+def _pick_random_choice(values: tuple[str, ...], avoid: str | None) -> str:
+    """Chọn ngẫu nhiên nhưng không bao giờ trả lại giá trị liền trước."""
+    pool = [value for value in values if value != avoid] or list(values)
+    return random.choice(pool)
 
 
 class RotatingProxyApiError(RuntimeError):
@@ -112,6 +129,8 @@ class RotatingProxyClient:
 
     def __init__(self, http_client=None):
         self._http = http_client or requests
+        self._last_carrier: str | None = None
+        self._last_province: str | None = None
 
     @staticmethod
     def _timeout() -> float:
@@ -119,6 +138,36 @@ class RotatingProxyClient:
             return max(1.0, float(getattr(proxy_config, "ROTATING_PROXY_REQUEST_TIMEOUT", 15.0)))
         except (TypeError, ValueError):
             return 15.0
+
+    def _resolve_proxy_location(self) -> tuple[str, str]:
+        """Resolve cặp (nhamang, tinhthanh) cho một lượt get_proxy.
+
+        Config ghim giá trị cụ thể (viettel/fpt/vnpt, mã tỉnh 1..31) thì dùng
+        nguyên theo ý operator; "random"/0 thì client tự chọn ngẫu nhiên và
+        không bao giờ lặp giá trị liền trước, để các lượt lấy IP phân tán
+        qua nhiều nhà mạng/tỉnh thay vì dồn về cùng một dải /24.
+        """
+        carrier_cfg = str(
+            getattr(proxy_config, "ROTATING_PROXY_NHAMANG", "random") or "random"
+        ).strip().lower()
+        if carrier_cfg in _CARRIER_CHOICES:
+            carrier = carrier_cfg
+        else:
+            carrier = _pick_random_choice(_CARRIER_CHOICES, self._last_carrier)
+
+        province_cfg = str(
+            getattr(proxy_config, "ROTATING_PROXY_TINHTHANH", "0") or "0"
+        ).strip()
+        try:
+            province_code = int(province_cfg)
+        except ValueError:
+            province_code = 0
+        if province_code >= 1:
+            province = str(province_code)
+        else:
+            province = _pick_random_choice(_PROVINCE_CHOICES, self._last_province)
+
+        return carrier, province
 
     @staticmethod
     def _provider_url(path: str) -> str:
@@ -230,8 +279,15 @@ class RotatingProxyClient:
         return {"key": str(key), "expires_at": expiry}
 
     def get_proxy(self, key: str) -> dict[str, Any]:
-        carrier = str(getattr(proxy_config, "ROTATING_PROXY_NHAMANG", "random") or "random").strip()
-        province = str(getattr(proxy_config, "ROTATING_PROXY_TINHTHANH", "0") or "0").strip()
+        carrier, province = self._resolve_proxy_location()
+        self._last_carrier = carrier
+        self._last_province = province
+        logger.info(
+            "[RotatingProxy] get_proxy key=%s… nhamang=%s tinhthanh=%s",
+            str(key)[:4],
+            carrier,
+            province,
+        )
         whitelist = str(getattr(proxy_config, "ROTATING_PROXY_WHITELIST", "") or "").strip()
         protocol = str(getattr(proxy_config, "ROTATING_PROXY_PROTOCOL", "http") or "http").strip().lower()
         if protocol not in {"http", "socks5"}:

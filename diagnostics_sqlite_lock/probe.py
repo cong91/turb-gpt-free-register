@@ -10,7 +10,6 @@ import threading
 import time
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 MODIFIED = ROOT / "diagnostics_sqlite_lock" / "MODIFIED_FILE.py"
 
@@ -36,7 +35,7 @@ def _baseline_module():
         raise RuntimeError("cannot create baseline module")
     module = importlib.util.module_from_spec(spec)
     module.__file__ = str(ROOT / "core" / "app_state_db.py")
-    exec(compile(source, "HEAD:core/app_state_db.py", "exec"), module.__dict__)
+    exec(compile(source, "HEAD:core/app_state_db.py", "exec"), module.__dict__)  # noqa: S102 - load the committed baseline for comparison.
     return module
 
 

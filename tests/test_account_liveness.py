@@ -80,11 +80,27 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertEqual(authorize_url, "https://auth.example/authorize")
         self.assertEqual(session.kwargs["fingerprint_seed"], "account:user@example.com")
 
-    def test_preflight_retries_with_new_session_when_csrf_is_blocked(self):
-        csrf_errors = [RuntimeError("HTTP Error 403"), "csrf"]
+    def test_preflight_fails_fast_on_csrf_403_without_same_proxy_retry(self):
+        # 403 是出口被 CF 拦截，同一出口重试只会加深封禁评分，必须立即上抛。
         with (
             patch.object(liveness, "BrowserSession", _DummyBrowserSession),
-            patch.object(liveness, "get_csrf_token", side_effect=csrf_errors),
+            patch.object(liveness, "get_csrf_token", side_effect=RuntimeError("HTTP Error 403")),
+            patch.object(liveness, "signin_openai", return_value="authorize"),
+            patch.object(liveness.time, "sleep"),
+            self.assertRaises(RuntimeError),
+        ):
+            liveness._network_preflight_with_retry(
+                "user@example.com", None, max_attempts=4
+            )
+
+        self.assertEqual(len(_DummyBrowserSession.created), 1)
+        self.assertTrue(_DummyBrowserSession.created[0].session.closed)
+
+    def test_preflight_retries_with_new_session_on_transient_network_error(self):
+        errors = [RuntimeError("proxy connection reset"), "csrf-ok"]
+        with (
+            patch.object(liveness, "BrowserSession", _DummyBrowserSession),
+            patch.object(liveness, "get_csrf_token", side_effect=errors),
             patch.object(liveness, "signin_openai", return_value="authorize"),
             patch.object(liveness.time, "sleep"),
         ):
@@ -95,9 +111,6 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertIs(_DummyBrowserSession.created[-1], session)
         self.assertEqual(len(_DummyBrowserSession.created), 2)
         self.assertTrue(_DummyBrowserSession.created[0].session.closed)
-        # None means each attempt may reselect a proxy from the configured pool.
-        self.assertIsNone(_DummyBrowserSession.created[0].received_proxy)
-        self.assertIsNone(_DummyBrowserSession.created[1].received_proxy)
 
     def test_reauth_otp_dead_account_error_is_not_retried(self):
         response = SimpleNamespace(

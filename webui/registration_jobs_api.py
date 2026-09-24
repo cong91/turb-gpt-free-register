@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from urllib.parse import urlparse
 
 from config import email as email_config
@@ -14,6 +15,8 @@ from core.gmail_batch_store_base import GmailBatchError
 from core.paymesh_aliases import PaymeshAliasError, normalize_paymesh_routed_domains
 from core.registration_limits import MAX_REGISTRATION_TASKS
 from webui.email_source_validation import validate_email_sources
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_cdks(value) -> list[str]:
@@ -96,6 +99,33 @@ def _provider_error(
             return "Remail 服务模式只能填写 code 或 purchase（配置 → 邮箱 / OTP）。"
     if "tinyhost" in sources and not str(getattr(email_config, "TINYHOST_API_BASE", "") or "").strip():
         return "已选择 tinyhost 邮箱来源，请填写 TinyHost API 地址（配置 → 邮箱 / OTP）。"
+    if "automated_email_api" in sources:
+        api_base = str(getattr(email_config, "EMAIL_API_BASE_URL", "") or "").strip()
+        api_key = str(getattr(email_config, "EMAIL_API_KEY", "") or "").strip()
+        parsed = urlparse(api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "已选择 automated_email_api 邮箱来源，请填写有效的 Automated Email API 地址。"
+        if not api_key:
+            return "已选择 automated_email_api 邮箱来源，请填写 Automated Email API Key（配置 → 邮箱 / OTP）。"
+    if "otpmail" in sources:
+        api_base = str(getattr(email_config, "OTPGMAIL_API_BASE", "https://otpgmail.net") or "").strip()
+        api_key = str(getattr(email_config, "OTPGMAIL_API_KEY", "") or "").strip()
+        service_code = str(getattr(email_config, "OTPGMAIL_SERVICE_CODE", "dr") or "").strip()
+        parsed = urlparse(api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "已选择 otpmail 邮箱来源，请填写有效的 OTPGmail API 地址。"
+        if not api_key:
+            return "已选择 otpmail 邮箱来源，请填写 OTPGMAIL_API_KEY（配置 → 邮箱 / OTP）。"
+        if not service_code:
+            return "已选择 otpmail 邮箱来源，请填写 OTPGMAIL_SERVICE_CODE（来自 /v1/services）。"
+    if "bamboommo" in sources:
+        api_base = str(getattr(email_config, "BAMBOOMMO_API_BASE", "https://api.bamboommo.com") or "").strip()
+        api_key = str(getattr(email_config, "BAMBOOMMO_API_KEY", "") or "").strip()
+        parsed = urlparse(api_base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return "已选择 bamboommo 邮箱来源，请填写有效的 BambooMMO API 地址。"
+        if not api_key:
+            return "已选择 bamboommo 邮箱来源，请填写 BAMBOOMMO_API_KEY（配置 → 邮箱 / OTP）。"
     return None
 
 
@@ -107,7 +137,7 @@ def _pool_warning(
     gmail_api_url_aliases_per_email: int = 12,
 ) -> str:
     if any(source in sources for source in (
-        "gptmail", "mailnest", "cloudmail", "tinyhost", "cloudflare", "gmail_123452026", "paymesh", "remail",
+        "gptmail", "mailnest", "cloudmail", "tinyhost", "cloudflare", "gmail_123452026", "paymesh", "remail", "automated_email_api", "otpmail", "bamboommo",
     )):
         return ""
     if sources == ["gmail_api_url"]:
@@ -149,6 +179,50 @@ def _qan8_purchase_config_error() -> str | None:
         return "Kho Gmail API URL không đủ alias, hãy cấu hình QAN8 API Key để mua bổ sung."
     if not str(getattr(email_config, "QAN8_GMAIL_SKU_ID", "") or "").strip():
         return "Kho Gmail API URL không đủ alias, hãy cấu hình SKU Gmail của shop.qan8.com để mua bổ sung."
+    return None
+
+
+def _balance_value(payload: object) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return float(payload.get("balance"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _qan8_balance_error() -> str | None:
+    """Kiểm tra số dư QAN8 trước khi tạo job; không kết nối được thì chỉ cảnh báo."""
+    from requests import RequestException
+
+    from core.qan8_gmail_api_client import Qan8GmailApiClient, Qan8GmailApiError
+
+    try:
+        balance = _balance_value(Qan8GmailApiClient().get_balance())
+    except (Qan8GmailApiError, RequestException) as exc:
+        logger.warning("QAN8 pre-flight balance check failed, bỏ qua: %s", exc)
+        return None
+    if balance is not None and balance <= 0:
+        return (
+            "Tài khoản shop.qan8.com không đủ số dư (balance=0). "
+            "Hãy nạp tiền rồi tạo job lại."
+        )
+    return None
+
+
+def _otpmail_balance_error() -> str | None:
+    """检查 OTPGmail 余额；余额接口不可用时仅告警，不拦截提交。"""
+    from requests import RequestException
+
+    from core import otpgmail_client
+
+    try:
+        balance = _balance_value(otpgmail_client.get_quota())
+    except (otpgmail_client.OtpGmailError, RequestException) as exc:
+        logger.warning("OTPGmail pre-flight balance check failed, bỏ qua: %s", exc)
+        return None
+    if balance is not None and balance <= 0:
+        return "已选择 otpmail 邮箱来源，但 OTPGmail 余额不足 (balance=0)，请先充值再提交任务。"
     return None
 
 
@@ -225,8 +299,8 @@ def create_registration_jobs(
 
     submit_kwargs = {"count": count, "workers": workers}
     # Automation callers already provide the number of account jobs required
-    # by Sub2API. The manual WebUI form enters source-group count and expands
-    # each source to the fixed twelve-alias registration capacity.
+    # by Sub2API. Manual WebUI counts are source/order counts for providers
+    # whose one mailbox is exposed as twelve local aliases, including OTPGmail.
     automation_registration = (
         isinstance(automation_context, dict)
         and automation_context.get("sub2api_automation_kind") == "registration"
@@ -241,12 +315,14 @@ def create_registration_jobs(
         submit_kwargs["paymesh_cdks"] = paymesh_cdks
         if paymesh_routed_domains:
             submit_kwargs["paymesh_routed_domains"] = paymesh_routed_domains
-    if "gmail_api_url" in sources:
+    aliases_per_email = 12
+    alias_expanding_sources = {"gmail_api_url", "automated_email_api", "otpmail", "bamboommo"}
+    expands_aliases = bool(alias_expanding_sources.intersection(sources))
+    if expands_aliases:
         # Manual WebUI count is the number of source purchases/groups. Each
         # source contributes up to 12 aliases, so the service receives the
         # expanded registration-job count. Automation already sends account
         # count and must never be multiplied here.
-        aliases_per_email = 12
         requested_job_count = (
             count if automation_registration else count * aliases_per_email
         )
@@ -254,24 +330,33 @@ def create_registration_jobs(
             return {
                 "ok": False,
                 "error": (
-                    f"Gmail API URL: {count} source × {aliases_per_email} alias = "
+                    f"{', '.join(sources)}: {count} source × {aliases_per_email} alias = "
                     f"{requested_job_count} task, vượt {MAX_REGISTRATION_TASKS}"
                 ),
             }, 400
-        summary = database.gmail_api_url_email_pool_summary()
-        alias_available = int(summary.get("alias_available", 0) or 0)
         submit_kwargs["count"] = requested_job_count
-        submit_kwargs["gmail_api_url_aliases_per_email"] = aliases_per_email
-        purchase_error = (
-            _qan8_purchase_config_error()
-            if alias_available < requested_job_count
-            else None
-        )
-        if purchase_error:
-            return {
-                "ok": False,
-                "error": purchase_error,
-            }, 400
+        if "gmail_api_url" in sources:
+            submit_kwargs["gmail_api_url_aliases_per_email"] = aliases_per_email
+            summary = database.gmail_api_url_email_pool_summary()
+            alias_available = int(summary.get("alias_available", 0) or 0)
+            purchase_error = (
+                _qan8_purchase_config_error()
+                if alias_available < requested_job_count
+                else None
+            )
+            if purchase_error:
+                return {
+                    "ok": False,
+                    "error": purchase_error,
+                }, 400
+            if alias_available < requested_job_count:
+                balance_error = _qan8_balance_error()
+                if balance_error:
+                    return {"ok": False, "error": balance_error}, 400
+        if "otpmail" in sources:
+            balance_error = _otpmail_balance_error()
+            if balance_error:
+                return {"ok": False, "error": balance_error}, 400
     if automation_context:
         submit_kwargs["automation_context"] = automation_context
     try:
@@ -288,7 +373,7 @@ def create_registration_jobs(
             sources,
             count,
             gmail_api_url_aliases_per_email=aliases_per_email
-            if "gmail_api_url" in sources
+            if expands_aliases
             else 1,
         ),
         "workers": effective_workers,

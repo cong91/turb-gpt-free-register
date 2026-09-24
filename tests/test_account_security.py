@@ -62,30 +62,42 @@ class TwofaChangeInputTests(unittest.TestCase):
                 "OLD@example.com|secret|JBSWY3DPEHPK3PXP"
             )
 
+    def test_reports_the_invalid_input_line_and_expected_format(self):
+        with self.assertRaisesRegex(ValueError, r"Dòng 2.*email\|password\|2FA"):
+            parse_twofa_change_inputs(
+                "valid@example.com|password|JBSWY3DPEHPK3PXP\n"
+                "broken@example.com|password"
+            )
+
 
 class BrowserProfileSelectionTests(unittest.TestCase):
     def test_personal_info_uses_the_configured_browser_provider(self):
         with (
             patch("config.roxybrowser.REGISTRATION_DRIVER", "cloak"),
-            patch("core.browser_profile._open_cloak") as open_cloak,
+            patch("core.browser_registry.open_registered_profile") as open_profile,
         ):
             expected = object()
-            open_cloak.return_value = expected
+            open_profile.return_value = expected
 
             result = open_browser_profile()
 
         self.assertIs(result, expected)
-        open_cloak.assert_called_once_with()
+        open_profile.assert_called_once_with("cloak", proxy=None)
 
-    def test_personal_info_routes_cloud_browser_aliases_to_generic_opener(self):
-        with patch("core.browser_profile._open_cloud") as open_cloud:
-            for configured, expected in (("browser_use", "browser_use"), ("skyvern", "skyvern")):
+    def test_personal_info_routes_cloud_browser_aliases_to_registry_openers(self):
+        with patch("core.browser_registry.open_registered_profile") as open_profile:
+            expected = object()
+            open_profile.return_value = expected
+            for configured in ("browser_use", "skyvern"):
                 with self.subTest(configured=configured), patch(
                     "config.roxybrowser.REGISTRATION_DRIVER", configured
                 ):
-                    open_browser_profile()
+                    self.assertIs(open_browser_profile(), expected)
 
-                open_cloud.assert_called_with(expected)
+            self.assertEqual(
+                [call.args[0] for call in open_profile.call_args_list],
+                ["browser_use", "skyvern"],
+            )
 
     def test_personal_info_does_not_silently_fallback_for_unknown_provider(self):
         with (
@@ -203,7 +215,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
             return "NEWSECRET"
 
         with (
-            patch("core.browser_twofa_login._login_existing_account", side_effect=login),
+            patch("core.account_security._login_existing_account", side_effect=login),
             patch("core.account_security.deactivate_2fa_in_page", side_effect=deactivate),
             patch("core.account_security.setup_2fa_in_page", side_effect=setup),
         ):
@@ -225,7 +237,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("user@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 return_value={"accessToken": "fresh-token"},
             ) as login,
             patch(
@@ -252,7 +264,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("user@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=RuntimeError("ChatGPT login did not provide accessToken"),
             ) as login,
             patch(
@@ -283,7 +295,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
                 return_value="NEWSECRET",
             ),
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 return_value={"accessToken": "fresh-token"},
             ) as login,
         ):
@@ -325,12 +337,34 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         login.assert_not_called()
         deactivate.assert_called_once_with(driver, access_token="stored-token")
 
+    def test_change_resume_after_remote_disable_skips_second_deactivate(self):
+        driver = Mock(current_url="https://chatgpt.com/")
+        item = TwofaChangeInput("user@example.com", "password", "OLDSECRET")
+        with (
+            patch("core.account_security.deactivate_2fa_in_page") as deactivate,
+            patch("core.account_security.setup_2fa_in_page", return_value="NEWSECRET") as setup,
+            patch("core.account_security._login_and_get_access_token") as login,
+        ):
+            result = change_twofa_in_browser(
+                driver,
+                item,
+                access_token="stored-token",
+                allow_oauth_fallback=False,
+                resume_after_remote_disable=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["remote_disabled"])
+        login.assert_not_called()
+        deactivate.assert_not_called()
+        setup.assert_called_once_with(driver, item.email, access_token="stored-token")
+
     def test_login_session_failure_does_not_repeat_before_oauth(self):
         driver = Mock(current_url="https://chatgpt.com/")
         item = TwofaChangeInput("user@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=RuntimeError("ChatGPT login did not provide accessToken"),
             ) as login,
             patch(
@@ -388,7 +422,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("dom@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=RuntimeError("找不到邮箱输入框/邮箱入口"),
             ),
             patch("core.account_security._oauth_login_and_get_access_token") as oauth_login,
@@ -404,7 +438,7 @@ class TwofaBrowserWorkflowTests(unittest.TestCase):
         item = TwofaChangeInput("locked@example.com", "password", "OLDSECRET")
         with (
             patch(
-                "core.browser_twofa_login._login_existing_account",
+                "core.account_security._login_existing_account",
                 side_effect=AccountUnusableError("OpenAI đã khóa tài khoản", error_code="account_deactivated"),
             ) as login,
             self.assertRaisesRegex(AccountUnusableError, "đã khóa"),
@@ -618,6 +652,136 @@ class TwofaRunnerTests(unittest.TestCase):
         )
         profile.close.assert_called_once_with()
         profile.cleanup.assert_called_once_with()
+
+    def test_runner_retries_login_and_change_with_a_fresh_browser_after_failure(self):
+        account_id = db.insert_account(
+            email="retry-browser@example.com",
+            access_token="stored-token",
+            registration_password="password",
+            totp_secret="OLDSECRET",
+            twofa_status="active",
+        )
+        item = TwofaChangeInput("retry-browser@example.com", "password", "OLDSECRET")
+        profiles = [
+            Mock(driver=Mock(), provider="cloak"),
+            Mock(driver=Mock(), provider="cloak"),
+        ]
+
+        @contextmanager
+        def direct_route(*_args, **_kwargs):
+            yield None, "direct"
+
+        with (
+            patch("core.browser_twofa_change.preferred_account_proxy", side_effect=direct_route),
+            patch("core.browser_twofa_change.open_browser_profile", side_effect=profiles) as open_profile,
+            patch(
+                "core.browser_twofa_change.change_twofa_in_browser",
+                side_effect=[
+                    {
+                        "ok": False,
+                        "email": item.email,
+                        "remote_disabled": False,
+                        "error": "login/session did not provide accessToken",
+                    },
+                    {
+                        "ok": True,
+                        "email": item.email,
+                        "new_totp_secret": "NEWSECRET",
+                    },
+                ],
+            ) as change,
+        ):
+            result = run_twofa_change(item)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["persisted"])
+        self.assertEqual(result["account_id"], account_id)
+        self.assertEqual(open_profile.call_count, 2)
+        self.assertEqual(change.call_count, 2)
+        profiles[0].close.assert_called_once_with()
+        profiles[0].cleanup.assert_called_once_with()
+        profiles[1].close.assert_called_once_with()
+        profiles[1].cleanup.assert_called_once_with()
+
+    def test_runner_retries_enrollment_after_remote_disable_with_fresh_token(self):
+        account_id = db.insert_account(
+            email="resume-browser@example.com",
+            access_token="stored-token",
+            registration_password="password",
+            totp_secret="OLDSECRET",
+            twofa_status="active",
+        )
+        item = TwofaChangeInput("resume-browser@example.com", "password", "OLDSECRET")
+        profiles = [
+            Mock(driver=Mock(), provider="cloak"),
+            Mock(driver=Mock(), provider="cloak"),
+        ]
+
+        @contextmanager
+        def direct_route(*_args, **_kwargs):
+            yield None, "direct"
+
+        with (
+            patch("core.browser_twofa_change.preferred_account_proxy", side_effect=direct_route),
+            patch("core.browser_twofa_change.open_browser_profile", side_effect=profiles),
+            patch(
+                "core.browser_twofa_change.change_twofa_in_browser",
+                side_effect=[
+                    {
+                        "ok": False,
+                        "email": item.email,
+                        "remote_disabled": True,
+                        "access_token": "fresh-token",
+                        "error": "enrollment failed",
+                    },
+                    {
+                        "ok": True,
+                        "email": item.email,
+                        "new_totp_secret": "NEWSECRET",
+                        "access_token": "fresh-token",
+                    },
+                ],
+            ) as change,
+        ):
+            result = run_twofa_change(item)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["persisted"])
+        self.assertEqual(result["account_id"], account_id)
+        self.assertEqual(change.call_count, 2)
+        self.assertEqual(change.call_args_list[1].kwargs["access_token"], "fresh-token")
+        self.assertTrue(change.call_args_list[1].kwargs["resume_after_remote_disable"])
+
+    def test_runner_retries_after_proxy_acquisition_failure(self):
+        item = TwofaChangeInput("proxy-retry@example.com", "password", "OLDSECRET")
+        profiles = [Mock(driver=Mock(), provider="cloak")]
+
+        @contextmanager
+        def failed_route(*_args, **_kwargs):
+            raise RuntimeError("proxy lease unavailable")
+            yield  # pragma: no cover - keeps this a generator context manager.
+
+        @contextmanager
+        def direct_route(*_args, **_kwargs):
+            yield None, "direct"
+
+        with (
+            patch(
+                "core.browser_twofa_change.preferred_account_proxy",
+                side_effect=[failed_route(), direct_route()],
+            ) as preferred_proxy,
+            patch("core.browser_twofa_change.open_browser_profile", return_value=profiles[0]),
+            patch(
+                "core.browser_twofa_change.change_twofa_in_browser",
+                return_value={"ok": True, "email": item.email, "new_totp_secret": "NEWSECRET"},
+            ),
+        ):
+            result = run_twofa_change(item)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(preferred_proxy.call_count, 2)
+        profiles[0].close.assert_called_once_with()
+        profiles[0].cleanup.assert_called_once_with()
 
     def test_batch_reports_each_account_progress(self):
         items = [
@@ -850,6 +1014,149 @@ class TwofaApiTests(unittest.TestCase):
         self.assertEqual(payload["status"], "completed")
         self.assertEqual(payload["succeeded"], 0)
         self.assertEqual(payload["failed"], 1)
+
+    @patch("webui.email_change_api.db.save_personal_info_change_batch")
+    @patch("webui.email_change_api.run_twofa_change_batch")
+    @patch("webui.email_change_api.threading.Thread")
+    def test_change_twofa_manual_retry_accepts_credentials_without_server_retention(
+        self,
+        thread,
+        run_batch,
+        save_batch,
+    ):
+        self._run_thread_target_immediately(thread)
+        run_batch.side_effect = [
+            [{
+                "ok": False,
+                "persisted": False,
+                "email": "user@example.com",
+                "error": "temporary login failure",
+            }],
+            [{
+                "ok": True,
+                "persisted": True,
+                "email": "user@example.com",
+                "account_id": 7,
+                "access_token_saved": True,
+                "new_totp_secret": "SECRET-MUST-STAY-SERVER-SIDE",
+            }],
+        ]
+        save_batch.side_effect = [
+            {"batch_id": "e" * 32, "exportable_count": 0},
+            {"batch_id": "f" * 32, "exportable_count": 1},
+        ]
+
+        initial = self.client.post(
+            "/api/accounts/change-twofa",
+            json={"credentials": "user@example.com|password|OLDSECRET"},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+        self.assertEqual(initial.status_code, 202, initial.get_json())
+        initial_payload = initial.get_json()
+        self.assertEqual(initial_payload["failed"], 1)
+
+        retry = self.client.post(
+            "/api/accounts/change-twofa-retry",
+            json={
+                "batch_id": initial_payload["batch_id"],
+                "index": 0,
+                "credentials": "user@example.com|password|OLDSECRET",
+            },
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(retry.status_code, 202, retry.get_json())
+        payload = retry.get_json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["results"][0]["status"], "success")
+        self.assertNotIn("OLDSECRET", json.dumps(payload))
+        self.assertNotIn("SECRET-MUST-STAY-SERVER-SIDE", json.dumps(payload))
+        self.assertEqual(run_batch.call_count, 2)
+        retried_items = run_batch.call_args_list[1].args[0]
+        self.assertEqual(len(retried_items), 1)
+        retried_item = retried_items[0]
+        self.assertEqual(retried_item.email, "user@example.com")
+        self.assertEqual(retried_item.password, "password")
+        self.assertEqual(retried_item.current_totp_secret, "OLDSECRET")
+        from webui import email_change_api
+
+        self.assertNotIn("items", email_change_api._twofa_progress[initial_payload["batch_id"]])
+
+    @patch("webui.email_change_api.threading.Thread", side_effect=RuntimeError("thread unavailable"))
+    def test_change_twofa_start_failure_marks_each_row_retryable(self, _thread):
+        response = self.client.post(
+            "/api/accounts/change-twofa",
+            json={"credentials": "user@example.com|password|OLDSECRET"},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(response.status_code, 500, response.get_json())
+        batch_id = response.get_json()["batch_id"]
+        status = self.client.get(
+            f"/api/accounts/change-twofa-status?batch_id={batch_id}",
+            headers={"X-Auth-Code": "test-auth"},
+        )
+        payload = status.get_json()
+        self.assertEqual(payload["status"], "failed")
+        self.assertEqual(payload["results"][0]["status"], "failed")
+        self.assertIn("逐条重试", payload["results"][0]["detail"])
+
+    @patch("webui.email_change_api.db.save_personal_info_change_batch", return_value={"batch_id": "g" * 32, "exportable_count": 0})
+    @patch("webui.email_change_api.run_twofa_change_batch")
+    @patch("webui.email_change_api.threading.Thread")
+    def test_manual_retry_rejects_remote_success_without_local_persistence(self, thread, run_batch, _save_batch):
+        self._run_thread_target_immediately(thread)
+        run_batch.return_value = [{
+            "ok": True,
+            "persisted": False,
+            "remote_disabled": True,
+            "retryable": False,
+            "email": "user@example.com",
+            "warning": "local 2FA persistence was not updated",
+        }]
+
+        initial = self.client.post(
+            "/api/accounts/change-twofa",
+            json={"credentials": "user@example.com|password|OLDSECRET"},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+        batch_id = initial.get_json()["batch_id"]
+        retry = self.client.post(
+            "/api/accounts/change-twofa-retry",
+            json={
+                "batch_id": batch_id,
+                "index": 0,
+                "credentials": "user@example.com|password|OLDSECRET",
+            },
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(retry.status_code, 409, retry.get_json())
+        self.assertIn("đối soát", retry.get_json()["error"])
+        run_batch.assert_called_once()
+
+    @patch("webui.email_change_api.threading.Thread")
+    def test_change_twofa_manual_retry_requires_failed_row(self, thread):
+        response = self.client.post(
+            "/api/accounts/change-twofa",
+            json={"credentials": "user@example.com|password|OLDSECRET"},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+        self.assertEqual(response.status_code, 202, response.get_json())
+        batch_id = response.get_json()["batch_id"]
+
+        retry = self.client.post(
+            "/api/accounts/change-twofa-retry",
+            json={
+                "batch_id": batch_id,
+                "index": 0,
+                "credentials": "user@example.com|password|OLDSECRET",
+            },
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(retry.status_code, 409, retry.get_json())
+        self.assertIn("đang xử lý", retry.get_json()["error"])
 
     @patch("webui.email_change_api.db.get_personal_info_change_export_rows")
     @patch("webui.email_change_api.db.get_personal_info_change_batch")

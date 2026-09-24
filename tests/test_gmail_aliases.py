@@ -99,23 +99,27 @@ class GmailAliasTests(unittest.TestCase):
         self.assertEqual(plan.candidates[0].email, "abcdef@gmail.com")
         self.assertEqual(len({candidate.email for candidate in plan.candidates}), 6)
 
-    def test_gmail_api_aliases_use_only_one_dotted_address(self):
+    def test_gmail_api_aliases_keep_original_first_then_aliases(self):
         aliases = generate_gmail_dual_domain_aliases("abcdef@gmail.com", limit=12)
 
         dotted = [email for email in aliases if "." in email.split("@", 1)[0]]
 
         self.assertEqual(len(aliases), 12)
-        self.assertNotIn("abcdef@gmail.com", aliases)
+        self.assertEqual(aliases[0], "abcdef@gmail.com")
+        self.assertNotIn("abcdef@gmail.com", aliases[1:])
         self.assertLessEqual(len(dotted), 1)
-        self.assertTrue(all("+" in email for email in aliases if email not in dotted))
+        self.assertTrue(
+            all("+" in email for email in aliases[1:] if email not in dotted)
+        )
 
     def test_gmail_api_aliases_do_not_reuse_dotted_source(self):
         source = "abcd.ef@gmail.com"
         aliases = generate_gmail_dual_domain_aliases(source, limit=12)
 
-        self.assertNotIn(source, aliases)
+        self.assertEqual(aliases[0], source)
+        self.assertNotIn(source, aliases[1:])
         self.assertLessEqual(
-            sum("." in email.split("@", 1)[0] for email in aliases),
+            sum("." in email.split("@", 1)[0] for email in aliases[1:]),
             1,
         )
 

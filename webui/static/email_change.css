@@ -90,7 +90,8 @@
 
 .personal-info-mode:focus-visible,
 .personal-info-primary:focus-visible,
-.personal-info-export:focus-visible {
+.personal-info-export:focus-visible,
+.personal-info-retry:focus-visible {
   outline: 3px solid #bfdbfe;
   outline-offset: 2px;
 }
@@ -420,10 +421,11 @@
   text-transform: uppercase;
 }
 
-.personal-info-result-table th:nth-child(1) { width: 28%; }
-.personal-info-result-table th:nth-child(2) { width: 21%; }
-.personal-info-result-table th:nth-child(3) { width: 17%; }
-.personal-info-result-table th:nth-child(4) { width: 34%; }
+.personal-info-result-table th:nth-child(1) { width: 25%; }
+.personal-info-result-table th:nth-child(2) { width: 18%; }
+.personal-info-result-table th:nth-child(3) { width: 15%; }
+.personal-info-result-table th:nth-child(4) { width: 30%; }
+.personal-info-result-table th:nth-child(5) { width: 12%; }
 
 .personal-info-result-table tbody tr:hover td {
   background: #fbfdff;
@@ -469,6 +471,32 @@
 .personal-info-result-status.is-failed {
   color: #b42318;
   background: #fee2e2;
+}
+
+.personal-info-retry {
+  min-height: 30px;
+  border: 1px solid #f59e0b;
+  border-radius: 5px;
+  padding: 4px 9px;
+  color: #92400e;
+  background: #fffbeb;
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.personal-info-retry:hover:not(:disabled) {
+  background: #fef3c7;
+}
+
+.personal-info-retry:disabled {
+  cursor: wait;
+  opacity: .58;
+}
+
+.personal-info-no-action {
+  color: #94a3b8;
 }
 
 .personal-info-empty {

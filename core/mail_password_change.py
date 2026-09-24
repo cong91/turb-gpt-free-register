@@ -28,8 +28,6 @@ from dataclasses import dataclass
 from html import unescape
 from urllib.parse import quote, urljoin
 
-from bs4 import BeautifulSoup
-
 from core.mailcom_client import (
     _CONTEXT_CACHE,
     MailComError,
@@ -44,8 +42,7 @@ MAILCOM_ACCOUNT_BASE = "https://account.mail.com"
 MAILCOM_ACCOUNT_PASSWORD_PATH = "/ciss/security/edit/passwordChange"
 MAILCOM_DEFAULT_ACCEPT_LANGUAGE = "en-US,en;q=0.9"
 
-PASSWORD_ALPHABET = string.ascii_letters + string.digits + "!@#$%^&*_+="
-PASSWORD_SYMBOLS = "!@#$%^&*_+="
+PASSWORD_ALPHABET = string.ascii_letters + string.digits
 
 
 @dataclass(frozen=True)
@@ -62,16 +59,12 @@ class Account:
 
 
 def generate_mailcom_password(length: int = 12) -> str:
-    """生成包含大小写字母、数字、符号的强密码（默认 12 位）。
-
-    与 register_mailcom.generate_chatgpt_password 行为一致。
-    """
+    """生成仅含大小写字母和数字的密码（默认 12 位），避免符号方便人工登录时手输。"""
     length = max(length, 12)
     required = [
         secrets.choice(string.ascii_lowercase),
         secrets.choice(string.ascii_uppercase),
         secrets.choice(string.digits),
-        secrets.choice(PASSWORD_SYMBOLS),
     ]
     remaining = [
         secrets.choice(PASSWORD_ALPHABET) for _ in range(length - len(required))
@@ -90,6 +83,8 @@ def _extract_form(
     html_text: str, form_id: str | None = None
 ) -> tuple[str, dict[str, str]]:
     """从 HTML 抽取指定表单的 action 与所有 input 名值对。"""
+    from bs4 import BeautifulSoup
+
     soup = BeautifulSoup(html_text, "html.parser")
     form = soup.find("form", id=form_id) if form_id else soup.find("form")
     if not form:

@@ -8,11 +8,13 @@ from config import twofa as _twofa_cfg
 from core.browser_challenge import (
     wait_for_browser_challenge as _wait_for_browser_challenge,
 )
-from core.browser_registration import (
+from core.browser_failure_policy import (
+    raise_if_account_unusable as _raise_if_account_unusable,
+)
+from core.browser_page_actions import (
     _clear_otp_inputs,
     _click_continue,
     _click_resend_email_otp,
-    _fetch_chatgpt_session,
     _has_access_token,
     _human_click,
     _human_type_text,
@@ -20,9 +22,7 @@ from core.browser_registration import (
     _is_login_password_page,
     _maybe_accept,
     _page_warmup,
-    _raise_if_account_unusable,
     _safe_get,
-    _submit_email_and_wait_next,
     _type_otp,
     _wait_after_email_otp_submit,
 )
@@ -32,6 +32,10 @@ from core.email_provider import (
     wait_for_otp,
 )
 from core.humanize import delay as human_delay
+from core.registration_flow import (
+    _fetch_chatgpt_session,
+    _submit_email_and_wait_next,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -283,6 +287,15 @@ def _finish_existing_account_totp(
     )
 
 
+def _on_about_you_page(driver) -> bool:
+    """Whether the auth flow currently sits on the about-you/profile page."""
+    url = str(getattr(driver, "current_url", "") or "").lower()
+    return any(
+        marker in url
+        for marker in ("about-you", "profile", "signup/profile", "create-account/about")
+    )
+
+
 def _login_existing_account(
     driver,
     email: str,
@@ -290,14 +303,16 @@ def _login_existing_account(
     timeout: int = 120,
     *,
     totp_secret: str | None = None,
+    profile: tuple[str, str] | None = None,
 ) -> dict:
-    """Use email, password, and the supplied authenticator TOTP to log in."""
+    """Use email, password, and the supplied authenticator TOTP to log in.
+
+    ``profile`` là (name, birthday) dùng khi OpenAI đưa account đã đăng ký
+    quay lại trang about-you để hoàn tất profile trước khi cấp session.
+    """
     current_totp_secret = str(totp_secret or "").strip()
-    # Match the registration flow: tolerate renderer/navigation hiccups, give
-    # the auth SPA a short warm-up, and wait for any browser challenge before
-    # looking for the email control.  A direct one-shot ``driver.get`` often
-    # leaves Cloak with an empty DOM, which then incorrectly falls through to
-    # the HTTP OAuth path and its proxy-sensitive CSRF request.
+    # Auth pages may render slowly after navigation; warm the page, wait for
+    # challenge completion, then locate the email control through the shared port.
     _safe_get(
         driver,
         "https://chatgpt.com/auth/login",
@@ -311,9 +326,8 @@ def _login_existing_account(
     _wait_for_browser_challenge(driver, timeout=min(45, max(1, int(timeout))))
     current_url = str(getattr(driver, "current_url", "") or "").lower()
     if "chatgpt.com" in current_url and "/auth/login" not in current_url:
-        # Cloak profiles can restore a previous ChatGPT page even after a
-        # navigation to /auth/login.  Do not try to type the new account into
-        # the application shell; clear that stale browser session first.
+        # A reused browser may restore an authenticated application page after
+        # navigating to login; clear that stale session before entering credentials.
         logger.info("[Browser 2FA] detected stale ChatGPT page; logging out before credential login")
         _safe_get(
             driver,
@@ -382,6 +396,21 @@ def _login_existing_account(
                 timeout,
                 current_totp_secret,
             )
+        if password_state == "next" and profile and _on_about_you_page(driver):
+            # Account đã qua about-you ở lần đăng ký nhưng OpenAI chưa finalize
+            # profile phía server: login lại sẽ bị đẩy về about-you — điền nốt
+            # form (dùng name/birthday đã checkpoint) rồi mới lấy được session.
+            from core.registration_flow import _complete_profile_page
+
+            logger.info(
+                "[Browser 2FA] login bị đưa về about-you; điền nốt profile (name=%s)",
+                profile[0],
+            )
+            if _complete_profile_page(driver, profile[0], profile[1], timeout=60):
+                session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+                if not session_info.get("accessToken"):
+                    raise RuntimeError("已有账号登录成功但未拿到 accessToken")
+                return session_info
         if password_state != "otp" and not _is_email_verification_page(driver):
             raise RuntimeError(
                 "登录密码提交后未进入邮箱验证码页"

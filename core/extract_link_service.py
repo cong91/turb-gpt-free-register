@@ -31,6 +31,45 @@ from core.time_utils import local_now
 logger = logging.getLogger(__name__)
 
 
+class _BrowserCheckoutSession:
+    """Adapt the active registration browser transport to CheckoutExtractor."""
+
+    def __init__(self, browser_transport):
+        self.browser_transport = browser_transport
+        self.headers: dict[str, str] = {}
+        self.cookies: dict[str, str] = {}
+        self.proxies: dict[str, str] = {}
+        self.trust_env = False
+
+    def _request_headers(self, headers: dict | None) -> dict:
+        merged = dict(self.headers)
+        merged.update(headers or {})
+        return merged
+
+    def get(self, url: str, headers: dict | None = None, **kwargs):
+        return self.browser_transport.get(
+            url,
+            headers=self._request_headers(headers),
+            timeout=kwargs.get("timeout", 30),
+        )
+
+    def post(self, url: str, headers: dict | None = None, json=None, data=None, **kwargs):
+        request_headers = self._request_headers(headers)
+        body = data
+        if json is not None:
+            body = globals()["json"].dumps(json, separators=(",", ":"))
+            request_headers.setdefault("Content-Type", "application/json")
+        return self.browser_transport.post(
+            url,
+            headers=request_headers,
+            data=body,
+            timeout=kwargs.get("timeout", 30),
+        )
+
+    def close(self) -> None:
+        """Keep the registration-owned browser alive after checkout."""
+
+
 def _runtime_setting(name: str, default=None):
     """
     提链配置多数保存在 .env。服务模块会在 WebUI 启动时较早 import，
@@ -124,6 +163,39 @@ def _cdk(value: str | None = None) -> str:
     return cdk
 
 
+def _probe_proxy_exit_country(proxy: str | None) -> str:
+    """Dò exit country thật của proxy qua Cloudflare trace (best-effort)."""
+    if not proxy or curl_requests is None:
+        return ""
+    session = None
+    try:
+        session = curl_requests.Session(impersonate="firefox144")
+        if hasattr(session, "trust_env"):
+            session.trust_env = False
+        response = session.get(
+            "https://www.cloudflare.com/cdn-cgi/trace",
+            proxies={"http": proxy, "https": proxy},
+            timeout=8,
+        )
+        if int(getattr(response, "status_code", 0) or 0) != 200:
+            return ""
+        fields = dict(
+            line.split("=", 1)
+            for line in str(getattr(response, "text", "") or "").splitlines()
+            if "=" in line
+        )
+        country = str(fields.get("loc") or "").strip().upper()
+        return country if re.fullmatch(r"[A-Z]{2}", country) else ""
+    except Exception:  # noqa: BLE001 - probe chỉ là best-effort, luôn có fallback cấu hình.
+        return ""
+    finally:
+        if session is not None:
+            try:
+                session.close()
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+
 def _run_local_checkout(
     *,
     token: str,
@@ -131,7 +203,12 @@ def _run_local_checkout(
     proxy: str | None,
     payment_proxy: str | None = None,
     promotion_proxy: str | None = None,
+    checkout_proxy_country: str | None = None,
+    promotion_proxy_country: str | None = None,
+    verify_proxy_country: bool | None = None,
+    apply_promo: bool | None = None,
     local_method_strategy: str = "standalone",
+    browser_transport=None,
     log,
 ) -> dict:
     """Run PAY.153's direct access-token checkout flow and normalize its result."""
@@ -200,24 +277,66 @@ def _run_local_checkout(
 
     country = str(_runtime_setting("EXTRACT_LINK_LOCAL_BILLING_COUNTRY", "PH") or "PH").strip().upper()
     currency = str(_runtime_setting("EXTRACT_LINK_LOCAL_CURRENCY", "PHP") or "PHP").strip().upper()
+    # OpenAI yêu cầu billing country khớp country của exit IP dùng cho request
+    # ("Billing country must match request country."). Tự dò exit country của
+    # proxy checkout để chọn đúng; chỉ bỏ qua khi .env cấu hình tường minh.
+    explicit_country = str(os.getenv("EXTRACT_LINK_LOCAL_BILLING_COUNTRY", "") or "").strip().upper()
+    explicit_currency = str(os.getenv("EXTRACT_LINK_LOCAL_CURRENCY", "") or "").strip().upper()
+    if not explicit_country:
+        detected_country = _probe_proxy_exit_country(proxy)
+        if detected_country:
+            country = detected_country
+            if not explicit_currency:
+                from core.pay153_stripe_checkout import currency_for_country
+
+                currency = currency_for_country(country) or currency
+            log(f"Billing country tự động theo exit proxy: {country} ({currency}).")
+    checkout_country = str(
+        checkout_proxy_country
+        or _runtime_setting("EXTRACT_LINK_LOCAL_CHECKOUT_PROXY_COUNTRY", "US")
+        or "US"
+    ).strip().upper()
+    update_country = str(
+        promotion_proxy_country
+        or _runtime_setting("EXTRACT_LINK_LOCAL_UPDATE_PROXY_COUNTRY", "TR")
+        or "TR"
+    ).strip().upper()
     config = ExtractorConfig(
         billing_country=country,
         currency=currency,
+        checkout_proxy_country=checkout_country,
+        update_proxy_country=update_country,
         checkout_proxy=str(proxy or ""),
         update_proxy=str(promotion_proxy or proxy or ""),
         plan_name=str(_runtime_setting("EXTRACT_LINK_LOCAL_PLAN_NAME", "chatgptplusplan") or "chatgptplusplan"),
         promo_campaign_id=str(_runtime_setting("EXTRACT_LINK_LOCAL_PROMO_CAMPAIGN_ID", "plus-1-month-free") or "plus-1-month-free"),
-        apply_promo=str(_runtime_setting("EXTRACT_LINK_LOCAL_APPLY_PROMO", "true")).strip().lower() in {"1", "true", "yes", "on"},
-        verify_proxy_country=False,
+        apply_promo=(
+            bool(apply_promo)
+            if apply_promo is not None
+            else str(_runtime_setting("EXTRACT_LINK_LOCAL_APPLY_PROMO", "true")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        ),
+        verify_proxy_country=(
+            bool(verify_proxy_country)
+            if verify_proxy_country is not None
+            else False
+        ),
+        # Tài khoản mới đăng ký không có saved card; tuyệt đối không vứt checkout
+        # đã tạo+áp promo chỉ vì country không trả về CustomerSession.
+        allow_missing_customer_session=True,
         checkout_attempts=_int_setting("EXTRACT_LINK_LOCAL_CHECKOUT_ATTEMPTS", 3, 1, 10),
         update_attempts=_int_setting("EXTRACT_LINK_LOCAL_UPDATE_ATTEMPTS", 3, 1, 10),
         full_attempts=1,
         timeout=float(_int_setting("EXTRACT_LINK_REQUEST_TIMEOUT", 30, 5, 300)),
     )
     messages: list[str] = []
+    session_factory = None
+    if browser_transport is not None:
+        session_factory = lambda: _BrowserCheckoutSession(browser_transport)
     extractor = CheckoutExtractor(
         parse_credentials(token),
         config=config,
+        session_factory=session_factory,
         logger=lambda message: (messages.append(str(message)[:300]), log(str(message)[:300]))[-1],
     )
     result = extractor.extract()
@@ -641,8 +760,22 @@ def _proxy_cooldown_seconds(exc: Exception) -> int | None:
     return max(1, int(match.group(1))) if match else None
 
 
+def _momo_rebuild_marker(exc: Exception) -> bool:
+    """True when the OAICS MoMo chain asked for a same-route checkout rebuild."""
+    try:
+        from core.pay153_momo_oaics import momo_requires_rebuild
+
+        return momo_requires_rebuild(exc)
+    except ImportError:
+        return False
+
+
 def _retryable_local_checkout_error(link_type: str, exc: Exception) -> bool:
     if _provider_method_unavailable(link_type, exc):
+        return True
+    # MoMo rebuild markers are momo-only: gcash/paypal blocked confirms keep
+    # their HEAD fail-fast behavior.
+    if str(link_type or "").strip().lower() == "momo" and _momo_rebuild_marker(exc):
         return True
     detail = str(exc).lower()
     if "status=101" in detail or "cooldown" in detail:
@@ -671,6 +804,26 @@ def _run_extract(
     try:
         if not db.mark_account_extract_running(account_id):
             return {"ok": False, "error": "账号已删除或提链状态已被重置"}
+        if link_type == "momo":
+            session_kind = str((db.get_account(account_id) or {}).get("pay153_checkout_session_kind") or "").strip().lower()
+            if session_kind == "cs_live":
+                # OpenAI pins the checkout processor on an account's first
+                # create: a cs_live registration never yields the OAICS momo
+                # route, so fail fast instead of burning the retry budget.
+                reason = (
+                    "MOMO_ACCOUNT_PINNED_STRIPE: account này đã bị server ghim checkout Stripe (cs_live) "
+                    "từ lần create đầu tiên — momo chỉ nhận được trên account có kind=oaics; chọn account khác"
+                )
+                result = {
+                    "ok": False,
+                    "status": "failed",
+                    "checked_at": local_now().isoformat(timespec="seconds"),
+                    "error": reason,
+                    "message": reason,
+                }
+                db.update_account_extract(account_id, result)
+                logger.info("[提链] %s: %s", email, reason)
+                return result
         if _mode() == "local":
             from core.pay153_provider_workflow import local_method_strategy
 
@@ -720,22 +873,38 @@ def _run_extract(
                     if not retry:
                         raise
                     reason = _format_failure_reason(exc)
-                    transport_error = not _provider_method_unavailable(link_type, exc)
+                    rebuild_marker = (
+                        str(link_type).strip().lower() == "momo" and _momo_rebuild_marker(exc)
+                    )
+                    transport_error = (
+                        not _provider_method_unavailable(link_type, exc) and not rebuild_marker
+                    )
                     route_change = "；đổi proxy" if attempt_rotating_proxies else ""
                     cooldown_seconds = _proxy_cooldown_seconds(exc)
+                    if cooldown_seconds is not None:
+                        message = (
+                            f"Proxy.vn cooldown còn {cooldown_seconds}s; chờ rồi tạo Checkout mới"
+                        )
+                    elif rebuild_marker:
+                        message = (
+                            f"{str(link_type).upper()} rebuild attempt {attempt}/{max_attempts}{route_change}; "
+                            "tạo Checkout mới với timing promo khác"
+                        )
+                    elif transport_error:
+                        message = (
+                            f"Checkout TLS/transport attempt {attempt}/{max_attempts}{route_change}; "
+                            "tạo Checkout mới"
+                        )
+                    else:
+                        message = (
+                            f"{str(link_type).upper()} attempt {attempt}/{max_attempts} chỉ có card{route_change}; "
+                            "tạo Checkout mới"
+                        )
                     db.update_account_extract(account_id, {
                         "ok": False,
                         "status": "running",
                         "link_type": link_type,
-                        "message": (
-                            f"Proxy.vn cooldown còn {cooldown_seconds}s; chờ rồi tạo Checkout mới"
-                            if cooldown_seconds is not None
-                            else (
-                            f"Checkout TLS/transport attempt {attempt}/{max_attempts}{route_change}; tạo Checkout mới"
-                            if transport_error
-                            else f"{str(link_type).upper()} attempt {attempt}/{max_attempts} chỉ có card{route_change}; tạo Checkout mới"
-                            )
-                        ),
+                        "message": message,
                     })
                     logger.info("[提链] local checkout retry %s/%s for %s: %s", attempt, max_attempts, email, reason)
                     for scope, rotating_proxy in attempt_rotating_proxies:
@@ -745,7 +914,9 @@ def _run_extract(
                             scope=scope,
                             lane_id=proxy_lane_id,
                             proxy_url=rotating_proxy,
-                            retire=True,
+                            # PAY.153 keeps the same proxy pair across MoMo
+                            # promo-timing rebuilds; every other retry rotates.
+                            retire=not rebuild_marker,
                         )
                         retired_rotating_proxies.add((scope, rotating_proxy))
                     delay = (

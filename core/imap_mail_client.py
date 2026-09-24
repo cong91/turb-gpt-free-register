@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """通用 IMAP 邮箱池客户端。"""
 from __future__ import annotations
 
@@ -14,7 +13,7 @@ from core.otp_utils import extract_otp, looks_like_openai_email
 from core.qqmail_client import _msg_to_dict
 
 logger = logging.getLogger(__name__)
-_CONTEXT_CACHE: dict[str, "ImapEmailAccount"] = {}
+_CONTEXT_CACHE: dict[str, ImapEmailAccount] = {}
 
 
 class ImapMailError(RuntimeError):
@@ -111,7 +110,7 @@ def _search_messages(mail, after_dt: datetime) -> list[dict]:
             continue
         try:
             messages.append(_msg_to_dict(email_lib.message_from_bytes(raw)))
-        except Exception as exc:
+        except (TypeError, ValueError, email_lib.errors.MessageError) as exc:
             logger.debug("[IMAP] 邮件解析失败 id=%r: %s", message_id, exc)
     return messages
 
@@ -147,8 +146,8 @@ def fetch_latest_otp(
             if mail is not None:
                 try:
                     mail.logout()
-                except Exception:
-                    pass
+                except Exception as exc:  # noqa: BLE001 - logout is best-effort.
+                    logger.debug("[IMAP] mailbox logout failed: %s", exc)
 
         messages.sort(key=lambda item: item.get("date") or "", reverse=True)
         for item in messages:
@@ -161,14 +160,11 @@ def fetch_latest_otp(
             raw_ts = item.get("date") or item.get("receivedDateTime") or ""
             try:
                 ts = datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).timestamp()
-            except Exception:
+            except (TypeError, ValueError):
                 ts = 0.0
-            if ts and ts < after_ts - 30:
-                continue
-            if ts >= best_ts:
-                if otp != best_otp:
-                    best_otp, best_ts, settle_until = otp, ts, time.time() + settle
-                    logger.info("[IMAP] 锁定候选 OTP=%s，等待 %ss settle", otp, settle)
+            if ts and ts >= after_ts - 30 and ts >= best_ts and otp != best_otp:
+                best_otp, best_ts, settle_until = otp, ts, time.time() + settle
+                logger.info("[IMAP] 锁定候选 OTP=%s，等待 %ss settle", otp, settle)
             break
         if best_otp and settle_until is not None and time.time() >= settle_until:
             return best_otp

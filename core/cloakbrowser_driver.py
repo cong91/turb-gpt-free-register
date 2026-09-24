@@ -245,10 +245,18 @@ class BrowserSeleniumDriver:
     _registration_log_prefix: str
     _registration_timeout: int
 
-    def __init__(self, browser: Any, context: Any | None, page: Any):
+    def __init__(
+        self,
+        browser: Any,
+        context: Any | None,
+        page: Any,
+        *,
+        typing_js_fallback_allowed: bool = True,
+    ):
         self.browser = browser
         self.context = context
         self.page = page
+        self._typing_js_fallback_allowed = bool(typing_js_fallback_allowed)
         self._registration_log_prefix = ""
         self._registration_timeout = 90
         self._page_load_timeout_ms = int(getattr(_cfg, "CLOAK_SELENIUM_TIMEOUT", 90) or 90) * 1000
@@ -318,6 +326,9 @@ class BrowserSeleniumDriver:
         """Clear cookies for a reused profile before a credential login."""
         if self.context is not None:
             self.context.clear_cookies()
+
+    def clear_cookies(self) -> None:
+        self.delete_all_cookies()
 
     def get(self, url: str) -> None:
         max_attempts = max(1, int(getattr(_cfg, "CLOAK_NAVIGATION_RETRIES", 3) or 3))
@@ -436,7 +447,13 @@ class BrowserSeleniumDriver:
             message = str(exc or "").lower()
             if "timeout" not in message and not _is_navigation_context_error(exc):
                 raise
+        if "/log-in/password" in self.current_url.lower():
+            return {"state": "login_password", "body_text": body_text}
         selectors = (
+            (
+                "password",
+                "input[type='password'],input[name*='password' i],input[autocomplete='new-password']",
+            ),
             (
                 "otp",
                 (
@@ -444,10 +461,6 @@ class BrowserSeleniumDriver:
                     "input[inputmode='numeric'],input[type='tel'],input[maxlength='1'],"
                     "input[data-index],input[aria-label*='code' i],input[placeholder*='code' i]"
                 ),
-            ),
-            (
-                "password",
-                "input[type='password'],input[name*='password' i],input[autocomplete='new-password']",
             ),
         )
         for state, selector in selectors:

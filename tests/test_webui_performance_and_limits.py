@@ -101,6 +101,113 @@ class WebUiPerformanceAndLimitsTests(unittest.TestCase):
         self.assertTrue(target["plus_trial_eligible"])
         self.assertIsNone(other.get("plan_check_status"))
 
+    def test_pay153_update_writes_checkout_family_without_rewriting_accounts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (
+                patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_schedule_static_viewer_refresh"),
+            ):
+                target_id = db.insert_account(email="pay153@example.com", access_token="token")
+                with (
+                    patch.object(db, "_load_accounts", side_effect=AssertionError("loaded all accounts")),
+                    patch.object(db, "_save_accounts", side_effect=AssertionError("rewrote all accounts")),
+                ):
+                    self.assertTrue(db.update_account_pay153(target_id, {
+                        "ok": True,
+                        "status": "success",
+                        "link_type": "ph_short",
+                        "checkout_session_id": "cs_live_123",
+                        "checkout_session_kind": "cs_live",
+                    }))
+                row = db.get_account(target_id)
+
+        self.assertEqual(row["pay153_status"], "success")
+        self.assertTrue(row["pay153_ok"])
+        self.assertEqual(row["pay153_checkout_session_kind"], "cs_live")
+        self.assertEqual(row["pay153_checkout_session_id"], "cs_live_123")
+
+    def test_pay153_promotion_update_persists_safe_vietnam_status(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (
+                patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_schedule_static_viewer_refresh"),
+            ):
+                target_id = db.insert_account(email="promotion@example.com", access_token="token")
+                with (
+                    patch.object(db, "_load_accounts", side_effect=AssertionError("loaded all accounts")),
+                    patch.object(db, "_save_accounts", side_effect=AssertionError("rewrote all accounts")),
+                ):
+                    self.assertTrue(db.update_account_pay153_promotion(target_id, {
+                        "ok": True,
+                        "status": "success",
+                        "promotion_proxy_country": "VN",
+                        "promotion_proxy_mode": "rotating_proxy",
+                        "checkout_session_id": "cs_live_promotion_123",
+                        "checkout_session_kind": "cs_live",
+                        "amount_verification": "verified_zero",
+                        "plus_trial_eligible_after": True,
+                    }))
+                row = db.get_account(target_id)
+
+        self.assertEqual(row["pay153_promotion_status"], "success")
+        self.assertTrue(row["pay153_promotion_ok"])
+        self.assertEqual(row["pay153_promotion_proxy_country"], "VN")
+        self.assertEqual(row["pay153_promotion_checkout_session_kind"], "cs_live")
+        self.assertEqual(row["pay153_promotion_checkout_session_id"], "cs_live_promotion_123")
+        self.assertTrue(row["pay153_promotion_plus_trial_eligible_after"])
+
+    def test_pay153_claim_is_atomic_and_preserves_completed_session(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (
+                patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_schedule_static_viewer_refresh"),
+            ):
+                account_id = db.insert_account(email="pay153-claim@example.com", access_token="token")
+                self.assertEqual(db.claim_account_pay153(account_id), "claimed")
+                self.assertEqual(db.claim_account_pay153(account_id), "busy")
+                self.assertTrue(db.update_account_pay153(account_id, {
+                    "ok": True,
+                    "status": "success",
+                    "checkout_session_id": "oaics_live_123",
+                    "checkout_session_kind": "oaics",
+                }))
+                self.assertEqual(db.claim_account_pay153(account_id), "completed")
+                row = db.get_account(account_id)
+
+        self.assertEqual(row["pay153_status"], "success")
+        self.assertEqual(row["pay153_checkout_session_id"], "oaics_live_123")
+
+    def test_pay153_recovery_marks_interrupted_checkout_for_confirmation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (
+                patch.object(db, "_ACCOUNTS_JSON", root / "accounts.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_schedule_static_viewer_refresh"),
+            ):
+                account_id = db.insert_account(email="pay153-recovery@example.com", access_token="token")
+                self.assertEqual(db.claim_account_pay153(account_id), "claimed")
+                self.assertEqual(db.recover_interrupted_pay153(), 1)
+                row = db.get_account(account_id)
+                self.assertEqual(db.claim_account_pay153(account_id), "recovery_required")
+
+        self.assertEqual(row["pay153_status"], "failed")
+        self.assertTrue(row["pay153_recovery_required"])
+
     def test_plan_check_deactivation_marks_account_locked(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -312,6 +419,42 @@ class WebUiPerformanceAndLimitsTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         gmail_summary.assert_called_once_with()
         domain_summary.assert_called_once_with()
+
+    def test_summary_uses_automated_email_api_alias_ledger(self):
+        app = create_app(auth_code="test-auth")
+        client = app.test_client()
+        summary = {"total": 12, "available": 10, "used": 1, "failed": 1}
+        with (
+            patch.object(email_config, "EMAIL_SOURCE", "automated_email_api"),
+            patch("webui.app.db.count_accounts", return_value=0),
+            patch("webui.app.db.domain_email_pool_summary", return_value={"total": 0}),
+            patch("webui.app.db.gmail_api_url_email_pool_summary", return_value={"total": 0}),
+            patch("core.automated_email_api_client.pool_summary", return_value=summary) as pool_summary,
+        ):
+            response = client.get("/api/summary", headers={"X-Auth-Code": "test-auth"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["outlook_total"], 12)
+        self.assertEqual(response.get_json()["outlook_available"], 10)
+        pool_summary.assert_called_once_with()
+
+    def test_summary_uses_otpmail_order_ledger(self):
+        app = create_app(auth_code="test-auth")
+        client = app.test_client()
+        summary = {"total": 2, "available": 1, "used": 1, "failed": 0}
+        with (
+            patch.object(email_config, "EMAIL_SOURCE", "otpmail"),
+            patch("webui.app.db.count_accounts", return_value=0),
+            patch("webui.app.db.domain_email_pool_summary", return_value={"total": 0}),
+            patch("webui.app.db.gmail_api_url_email_pool_summary", return_value={"total": 0}),
+            patch("core.otpgmail_client.pool_summary", return_value=summary) as pool_summary,
+        ):
+            response = client.get("/api/summary", headers={"X-Auth-Code": "test-auth"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["outlook_total"], 2)
+        self.assertEqual(response.get_json()["outlook_available"], 1)
+        pool_summary.assert_called_once_with()
 
     @patch("core.db._render_static_viewer")
     @patch("core.db._schedule_static_viewer_refresh")

@@ -228,6 +228,7 @@ class AccountFilterTests(unittest.TestCase):
             "&email_source=paymesh&email_domain=gmail.com&account_locale=jp"
             "&registration_driver=roxy"
             "&free_plus_export=unexported&twofa_status=failed&totp_status=enabled&q=alpha"
+            "&pay153_kind=cs_live"
             "&date_from=2026-08-01&date_to=2026-08-27",
             headers={"X-Auth-Code": "test-auth"},
         )
@@ -249,6 +250,7 @@ class AccountFilterTests(unittest.TestCase):
             "registration_driver_filter": "roxy",
             "twofa_filter": "failed",
             "totp_filter": "enabled",
+            "pay153_kind_filter": "cs_live",
         })
 
     @patch("webui.app.db.list_accounts")

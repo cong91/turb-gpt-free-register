@@ -1,7 +1,9 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from config import codex as codex_config
 from core.hero_sms_country_store import HeroSmsCountryStore, make_profile_key
 
 
@@ -39,6 +41,52 @@ class HeroSmsCountryStoreTests(unittest.TestCase):
 
             store.mark_unusable(profile, "52", "otp timeout")
             self.assertEqual(store.blocked_countries(profile), {"52"})
+
+    def test_high_failure_country_is_warmed_after_recovery_cooldown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HeroSmsCountryStore(Path(temp_dir) / "state.sqlite3")
+            profile = make_profile_key("https://hero.test/api", "dr", "")
+
+            for _ in range(4):
+                store.mark_unusable(profile, "52", "otp timeout")
+            connection = store._connect()
+            try:
+                connection.execute(
+                    "UPDATE hero_sms_country_records "
+                    "SET updated_at = datetime('now', '-7200 seconds') "
+                    "WHERE profile_key = ? AND country_id = ?",
+                    (profile.strip(), "52"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with patch.object(codex_config, "HERO_SMS_COUNTRY_RECOVERY_SECONDS", 3600, create=True):
+                self.assertEqual(store.blocked_countries(profile), set())
+
+    def test_successful_warm_probe_resets_failure_window(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = HeroSmsCountryStore(Path(temp_dir) / "state.sqlite3")
+            profile = make_profile_key("https://hero.test/api", "dr", "")
+
+            for _ in range(4):
+                store.mark_unusable(profile, "52", "otp timeout")
+            connection = store._connect()
+            try:
+                connection.execute(
+                    "UPDATE hero_sms_country_records "
+                    "SET updated_at = datetime('now', '-7200 seconds') "
+                    "WHERE profile_key = ? AND country_id = ?",
+                    (profile.strip(), "52"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with patch.object(codex_config, "HERO_SMS_COUNTRY_RECOVERY_SECONDS", 3600, create=True):
+                store.mark_verified(profile, "52", "0.03")
+                self.assertEqual(store.blocked_countries(profile), set())
+                self.assertEqual(store.verified_countries(profile), {"52": "0.03"})
 
     def test_successes_can_recover_a_high_failure_rate_country(self):
         with tempfile.TemporaryDirectory() as temp_dir:

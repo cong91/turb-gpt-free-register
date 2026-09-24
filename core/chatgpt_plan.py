@@ -336,6 +336,7 @@ def check_account_plan(
     *,
     proxy: str | None = None,
     browser_transport: PlanCheckBrowserTransport | None = None,
+    require_proxy: bool = False,
     timezone_offset_min: str = "-",
     timeout: float | None = None,
     max_attempts: int | None = None,
@@ -345,6 +346,38 @@ def check_account_plan(
     """Check an account plan and release a directly acquired rotating lease."""
     normalized_token = normalize_token(token)
     token_is_expired = bool(normalized_token) and token_claims(normalized_token).get("token_expired") is True
+    if require_proxy:
+        from core.account_network import required_account_proxy
+        from core.rotating_proxy_runtime import PLAN_CHECK_PROXY_SCOPE
+
+        try:
+            with required_account_proxy(
+                None,
+                rotating_scope=PLAN_CHECK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+            ) as (required_route, network_mode):
+                result = _check_account_plan_impl(
+                    token,
+                    proxy=required_route,
+                    browser_transport=None,
+                    timezone_offset_min=timezone_offset_min,
+                    timeout=timeout,
+                    max_attempts=max_attempts,
+                    retry_delay=retry_delay,
+                    proxy_lane_id=proxy_lane_id,
+                )
+                result.setdefault("required_proxy_mode", network_mode)
+                return result
+        except Exception as exc:  # noqa: BLE001 - missing route is a configuration failure.
+            return {
+                "ok": False,
+                "checked_at": now_iso(),
+                "http_status": None,
+                "error": f"套餐查询必须使用 proxy xoay hoặc proxy pool: {type(exc).__name__}: {str(exc)[:180]}",
+                "retryable": False,
+                "network_route": "proxy_required",
+                **{k: v for k, v in token_claims(normalized_token).items() if k != "payload"},
+            }
     if proxy is not None or browser_transport is not None or not normalized_token or token_is_expired:
         return _check_account_plan_impl(
             token,

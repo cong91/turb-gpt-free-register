@@ -8,38 +8,27 @@ from datetime import datetime, timezone
 
 from config import register as _register_cfg
 from core import db
+from core.browser_registry import (
+    is_live_browser_driver,
+    normalize_driver,
+    resolve_registration_driver,
+)
 from core.chatgpt_plan import PlanCheckBrowserTransport, check_account_plan
+from core.registration_auto_pay153 import run_registration_auto_pay153
 
 logger = logging.getLogger(__name__)
-
-_LIVE_BROWSER_REGISTRATION_DRIVERS = frozenset({
-    "roxy",
-    "roxybrowser",
-    "fingerprint",
-    "browser",
-    "cloak",
-    "cloakbrowser",
-    "browser_use",
-    "browseruse",
-    "browser-use",
-    "bu",
-    "skyvern",
-    "sv",
-})
 
 
 def configured_registration_driver() -> str:
     """Return the normalized registration driver from the live configuration."""
     from config import roxybrowser as _driver_cfg
 
-    return str(
-        getattr(_driver_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol"
-    ).strip().lower()
+    return resolve_registration_driver(_driver_cfg)
 
 
 def registration_driver_uses_live_browser(driver: str | None = None) -> bool:
     """Return whether a registration driver owns a browser Codex must reuse."""
-    return str(driver or configured_registration_driver()).strip().lower() in _LIVE_BROWSER_REGISTRATION_DRIVERS
+    return is_live_browser_driver(driver or configured_registration_driver())
 
 
 def account_registration_driver(account: dict | None) -> str:
@@ -47,7 +36,7 @@ def account_registration_driver(account: dict | None) -> str:
     if isinstance(account, dict):
         direct = str(account.get("registration_driver") or "").strip().lower()
         if direct:
-            return direct
+            return normalize_driver(direct)
         extra_json = account.get("extra_json")
         if isinstance(extra_json, str) and extra_json:
             import json
@@ -59,7 +48,7 @@ def account_registration_driver(account: dict | None) -> str:
             if isinstance(extra, dict):
                 persisted = str(extra.get("registration_driver") or "").strip().lower()
                 if persisted:
-                    return persisted
+                    return normalize_driver(persisted)
     return configured_registration_driver()
 
 
@@ -87,14 +76,25 @@ def _check_registration_plan(
     proxy: str | None,
     browser_transport: PlanCheckBrowserTransport | None,
     timezone_offset_min: str,
+    strict_proxy: bool = False,
 ) -> dict:
     try:
+        if strict_proxy:
+            return check_account_plan(
+                access_token,
+                proxy=None,
+                browser_transport=None,
+                require_proxy=True,
+                timezone_offset_min=timezone_offset_min,
+            )
         request_kwargs = {
             "proxy": proxy,
             "timezone_offset_min": timezone_offset_min,
         }
         if browser_transport is not None:
             request_kwargs["browser_transport"] = browser_transport
+        elif not str(proxy or "").strip():
+            request_kwargs["require_proxy"] = True
         return check_account_plan(access_token, **request_kwargs)
     except Exception as exc:  # noqa: BLE001 - classify network failures for the retry boundary.
         return {
@@ -112,12 +112,14 @@ def _check_registration_plan_with_retry(
     browser_transport: PlanCheckBrowserTransport | None,
     timezone_offset_min: str,
     email: str,
+    strict_proxy: bool = False,
 ) -> dict:
     plan_result = _check_registration_plan(
         access_token,
         proxy=proxy,
         browser_transport=browser_transport,
         timezone_offset_min=timezone_offset_min,
+        strict_proxy=strict_proxy,
     )
     if plan_result.get("ok") or not plan_result.get("retryable"):
         return plan_result
@@ -138,6 +140,7 @@ def _check_registration_plan_with_retry(
         proxy=proxy,
         browser_transport=browser_transport,
         timezone_offset_min=timezone_offset_min,
+        strict_proxy=strict_proxy,
     )
 
 
@@ -166,19 +169,25 @@ def run_registration_auto_codex(
     auto_free_codex_enabled = bool(
         getattr(_register_cfg, "AUTO_CODEX_FOR_FREE_AFTER_REGISTER", False)
     )
+    auto_pay153_enabled = bool(
+        getattr(_register_cfg, "AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER", False)
+    )
     generic_codex_enabled = bool(getattr(_codex_cfg, "ENABLE_CODEX_AUTO", False))
-    if not (auto_plan_enabled or auto_free_codex_enabled or generic_codex_enabled):
+    if not (auto_plan_enabled or auto_free_codex_enabled or auto_pay153_enabled or generic_codex_enabled):
         return {
             "plan": None,
+            "pay153": _skipped_codex("注册后套餐查询、PAY.153 和 Codex 自动流程均已关闭"),
             "codex": _skipped_codex("注册后套餐查询和 Codex 自动流程均已关闭"),
         }
 
     twofa_state = str(twofa_status or "").strip().lower()
-    if twofa_state != "active":
+    twofa_required = auto_plan_enabled or auto_free_codex_enabled or generic_codex_enabled
+    if twofa_state != "active" and twofa_required:
         message = f"2FA 尚未 active（当前状态={twofa_state or 'unknown'}），禁止查询套餐和启动 Codex"
         logger.error("[Plan][Codex] %s: account_id=%s email=%s", message, account_id, email)
         return {
             "plan": None,
+            "pay153": _failed_codex(message),
             "codex": _failed_codex(message),
         }
 
@@ -186,49 +195,64 @@ def run_registration_auto_codex(
     if not db.claim_account_plan_check(acc_id=account_id, trigger="registration_auto"):
         message = "账号套餐查询已被其它任务占用，注册后串行流程终止"
         logger.warning("[Plan][Codex] %s: account_id=%s email=%s", message, account_id, email)
-        return {"plan": None, "codex": _failed_codex(message)}
+        return {"plan": None, "pay153": _failed_codex(message), "codex": _failed_codex(message)}
     if not db.mark_account_plan_check_running(account_id):
         message = "账号套餐查询无法进入执行状态，注册后串行流程终止"
         logger.warning("[Plan][Codex] %s: account_id=%s email=%s", message, account_id, email)
-        return {"plan": None, "codex": _failed_codex(message)}
+        return {"plan": None, "pay153": _failed_codex(message), "codex": _failed_codex(message)}
 
-    if browser_transport is not None:
-        logger.info("[Plan][Codex] 使用当前注册 browser session 查询套餐: %s", email)
+    # Package lookup is always isolated from the registration browser route.
+    # PAY.153 adds a checkout side effect, but the plan lookup itself follows
+    # the same rotating-proxy/proxy-pool contract for every trigger.
+    strict_proxy = True
     plan_result = _check_registration_plan_with_retry(
         access_token,
-        proxy=proxy,
-        browser_transport=browser_transport,
+        proxy=None if strict_proxy else proxy,
+        browser_transport=None if strict_proxy else browser_transport,
         timezone_offset_min=timezone_offset_min,
         email=email,
+        strict_proxy=strict_proxy,
     )
     db.update_account_plan_check(acc_id=account_id, result=plan_result)
 
     if not bool(plan_result.get("ok")):
         message = f"套餐查询失败，未启动同浏览器 Codex: {plan_result.get('error') or '未知错误'}"
         logger.warning("[Plan][Codex] %s: %s", email, message)
-        return {"plan": plan_result, "codex": _failed_codex(message)}
+        return {"plan": plan_result, "pay153": _failed_codex(message), "codex": _failed_codex(message)}
+
+    pay153_result = _skipped_codex("PAY.153 注册后自动流程已关闭")
+    if auto_pay153_enabled:
+        pay153_result = run_registration_auto_pay153(
+            account_id=account_id,
+            email=email,
+            access_token=access_token,
+            proxy=proxy,
+            browser_transport=browser_transport,
+            plan_result=plan_result,
+        )
 
     plan = str(plan_result.get("current_plan_type") or "").strip().lower()
     if auto_free_codex_enabled:
         if plan != "free":
             message = f"当前套餐为 {plan or 'unknown'}，跳过 Free 自动 Codex OAuth"
             logger.info("[Plan][Codex] %s: %s", email, message)
-            return {"plan": plan_result, "codex": _skipped_codex(message)}
+            return {"plan": plan_result, "pay153": pay153_result, "codex": _skipped_codex(message)}
         if plan_result.get("plus_trial_eligible") is not False:
             message = "Free 账号存在 Plus 试用资格或资格未知，跳过自动 Codex OAuth"
             logger.info("[Plan][Codex] %s: %s", email, message)
-            return {"plan": plan_result, "codex": _skipped_codex(message)}
+            return {"plan": plan_result, "pay153": pay153_result, "codex": _skipped_codex(message)}
 
         logger.info("[Plan][Codex] 已确认 Free 且无 Plus 试用，复用当前注册浏览器执行 OAuth: %s", email)
         codex_result = run_codex()
-        return {"plan": plan_result, "codex": codex_result}
+        return {"plan": plan_result, "pay153": pay153_result, "codex": codex_result}
 
     if generic_codex_enabled:
         logger.info("[Plan][Codex] 套餐查询完成，启动通用 Codex OAuth: %s", email)
         codex_result = run_codex()
-        return {"plan": plan_result, "codex": codex_result}
+        return {"plan": plan_result, "pay153": pay153_result, "codex": codex_result}
 
     return {
         "plan": plan_result,
+        "pay153": pay153_result,
         "codex": _skipped_codex("套餐查询已完成，Free Codex 自动流程已关闭"),
     }

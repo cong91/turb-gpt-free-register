@@ -21,7 +21,10 @@ from core.rotating_proxy_runtime import (
 
 logger = logging.getLogger(__name__)
 
-_TWOFA_CHANGE_BROWSER_RESTART_ATTEMPTS = 1
+# A browser/session failure must get a fresh login attempt before the account
+# is left in the failed state.  Keep the bound small because every attempt can
+# consume a mailbox OTP and proxy capacity.
+_TWOFA_CHANGE_BROWSER_RESTART_ATTEMPTS = 3
 
 
 def _notify_progress(
@@ -62,9 +65,11 @@ def _record_remote_disable_failure(
         )
     except Exception as exc:  # noqa: BLE001 - preserve the remote failure result.
         result["warning"] = _redacted_error(exc, item)
+        result["retryable"] = False
         return result
     if not persisted:
         result["warning"] = "local 2FA failure state was not updated"
+        result["retryable"] = False
     return result
 
 
@@ -126,6 +131,16 @@ def _queue_new_account_plan_check(
         result["warning"] = result.get("warning") or "account plan check could not be queued"
 
 
+def _should_resume_after_remote_disable(account: dict) -> bool:
+    """Identify a failed replacement whose old remote factor is already off."""
+    error = str(account.get("twofa_error") or "").strip().casefold()
+    return (
+        str(account.get("twofa_status") or "").strip().casefold() == "failed"
+        and not str(account.get("totp_secret") or "").strip()
+        and error.startswith("remote 2fa disabled; replacement failed:")
+    )
+
+
 def run_twofa_change(
     item: TwofaChangeInput,
     *,
@@ -166,17 +181,11 @@ def run_twofa_change(
             return {"ok": False, "persisted": False, "email": item.email, "error": "account id missing"}
         account_id = int(account_id_value)
     stored_access_token = str((account or {}).get("access_token") or "").strip()
+    resume_after_remote_disable = bool(account and _should_resume_after_remote_disable(account))
+    remote_disabled_seen = resume_after_remote_disable
 
     profile = None
-    network_stack = ExitStack()
     try:
-        active_proxy, network_mode = network_stack.enter_context(preferred_account_proxy(
-            None,
-            rotating_scope=TWOFA_CHANGE_PROXY_SCOPE,
-            lane_id=proxy_lane_id,
-            lease_owner_id=f"twofa-change:{account_id}",
-        ))
-        logger.info("[2FA] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
         _notify_progress(
             progress_callback,
             progress_index,
@@ -187,37 +196,67 @@ def run_twofa_change(
         last_error = ""
         last_access_token = ""
         for browser_attempt in range(1, _TWOFA_CHANGE_BROWSER_RESTART_ATTEMPTS + 1):
-            profile = (
-                open_browser_profile(proxy=active_proxy)
-                if active_proxy is not None
-                else open_browser_profile()
-            )
-            browser_provider = str(getattr(profile, "provider", "") or "")
+            profile = None
+            attempt_network = ExitStack()
             try:
+                active_proxy, network_mode = attempt_network.enter_context(preferred_account_proxy(
+                    None,
+                    rotating_scope=TWOFA_CHANGE_PROXY_SCOPE,
+                    lane_id=proxy_lane_id,
+                    lease_owner_id=f"twofa-change:{account_id}",
+                ))
+                logger.info("[2FA] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
+                profile = (
+                    open_browser_profile(proxy=active_proxy)
+                    if active_proxy is not None
+                    else open_browser_profile()
+                )
+                browser_provider = str(getattr(profile, "provider", "") or "")
                 # Try one stored token, then one credential login in this same
                 # profile. The security layer owns that fallback boundary.
-                result = change_twofa_in_browser(
-                    profile.driver,
-                    item,
-                    proxy=active_proxy,
-                    access_token=stored_access_token,
-                    allow_oauth_fallback=True,
-                )
+                change_kwargs = {
+                    "proxy": active_proxy,
+                    "access_token": last_access_token or stored_access_token,
+                    "allow_oauth_fallback": True,
+                }
+                if resume_after_remote_disable:
+                    change_kwargs["resume_after_remote_disable"] = True
+                result = change_twofa_in_browser(profile.driver, item, **change_kwargs)
                 last_error = str(result.get("error") or "")
                 last_access_token = str(result.get("access_token") or "").strip() or last_access_token
+                remote_disabled_seen = remote_disabled_seen or bool(result.get("remote_disabled"))
+            except Exception as exc:  # noqa: BLE001 - retry browser startup/flow failures.
+                last_error = _redacted_error(f"{type(exc).__name__}: {exc}", item)
+                result = {
+                    "ok": False,
+                    "email": item.email,
+                    "remote_disabled": remote_disabled_seen,
+                    "error": last_error,
+                }
             finally:
-                try:
-                    profile.close()
-                except Exception:  # noqa: BLE001 - cleanup must not mask result.
-                    logger.debug("Browser driver cleanup failed")
-                try:
-                    profile.cleanup()
-                except Exception:  # noqa: BLE001 - cleanup must not mask result.
-                    logger.debug("Browser profile cleanup failed")
+                if profile is not None:
+                    try:
+                        profile.close()
+                    except Exception:  # noqa: BLE001 - cleanup must not mask result.
+                        logger.debug("Browser driver cleanup failed")
+                    try:
+                        profile.cleanup()
+                    except Exception:  # noqa: BLE001 - cleanup must not mask result.
+                        logger.debug("Browser profile cleanup failed")
                 profile = None
+                try:
+                    attempt_network.close()
+                except Exception:
+                    logger.debug("2FA proxy lease cleanup failed", exc_info=True)
 
-            if result.get("ok") or result.get("remote_disabled"):
+            if result.get("ok"):
                 break
+            if result.get("remote_disabled"):
+                # The first pass may have disabled the old factor before
+                # enrollment failed. Continue with a fresh session, but only
+                # retry setup so the next pass does not look up a factor that
+                # is already gone.
+                resume_after_remote_disable = True
             if browser_attempt < _TWOFA_CHANGE_BROWSER_RESTART_ATTEMPTS:
                 logger.warning(
                     "[2FA] browser login/change failed; restarting profile (%s/%s): %s",
@@ -247,6 +286,8 @@ def run_twofa_change(
             result["access_token_saved"] = token_persisted
             if not token_persisted:
                 result["warning"] = result.get("warning") or "access token persistence was not updated"
+                if result.get("ok"):
+                    result["retryable"] = False
         else:
             token_persisted = False
         result["account_id"] = account_id
@@ -279,6 +320,7 @@ def run_twofa_change(
         result["persisted"] = persisted
         if not persisted:
             result["warning"] = result.get("warning") or "local 2FA persistence was not updated"
+            result["retryable"] = False
         return result
     except Exception as exc:  # noqa: BLE001 - isolate each account in a batch.
         result = {
@@ -301,7 +343,6 @@ def run_twofa_change(
                 profile.cleanup()
             except Exception:  # noqa: BLE001 - cleanup must not mask the result.
                 logger.debug("Browser profile cleanup failed")
-        network_stack.close()
 
 
 def run_twofa_change_batch(

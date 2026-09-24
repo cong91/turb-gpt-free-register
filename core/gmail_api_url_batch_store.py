@@ -1122,6 +1122,86 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             )
         return True
 
+    def find_latest_assignment_for_job(self, job_id: str) -> Assignment | None:
+        """Return the newest assignment row for one job across every state."""
+        owner = str(job_id or "").strip()
+        if not owner:
+            return None
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            row = connection.execute(
+                "SELECT * FROM gmail_api_url_assignments "
+                "WHERE job_id = ? "
+                "ORDER BY CASE state WHEN 'active' THEN 0 ELSE 1 END, "
+                "updated_at DESC, assignment_id LIMIT 1",
+                (owner,),
+            ).fetchone()
+        return self._assignment(row) if row else None
+
+    def reactivate_assignment(
+        self,
+        batch_id: str,
+        inventory_id: str,
+        job_id: str,
+    ) -> Assignment | None:
+        """Revive one retired alias so its retry job reuses the same mailbox.
+
+        ``discard`` retires a failed alias so a *different* job never claims
+        it again.  A retry in the same job chain is the one caller allowed to
+        undo that retirement: the item returns to ``active`` and a fresh
+        active assignment is bound to the retry job.
+        """
+        batch, item, owner = self._required(batch_id, inventory_id, job_id)
+        from . import db
+
+        with self._runtime_transaction() as connection:
+            row = connection.execute(
+                "SELECT i.*, b.capacity FROM gmail_api_url_batch_items i "
+                "JOIN gmail_api_url_batches b ON b.batch_id = i.batch_id "
+                "WHERE i.batch_id = ? AND i.inventory_id = ?",
+                (batch, item),
+            ).fetchone()
+            if row is None:
+                return None
+            if int(row["completed_count"] or 0) >= int(row["capacity"] or 1):
+                return None
+            alias = str(row["email"] or "").strip()
+            code_url = str(row["code_url"] or "").strip()
+            if not alias or not code_url:
+                return None
+            if str(row["state"] or "").strip().lower() not in {"active", "failed", "exhausted"}:
+                return None
+            if self._alias_is_runtime_blocked(
+                alias, self.runtime_blocked_canonical_roots()
+            ):
+                return None
+            if db.is_gmail_api_url_code_url_failed(code_url, sqlite_path=self.path):
+                return None
+            active = connection.execute(
+                "SELECT 1 FROM gmail_api_url_assignments "
+                "WHERE batch_id = ? AND inventory_id = ? AND state = 'active'",
+                (batch, item),
+            ).fetchone()
+            if active is not None:
+                return None
+            connection.execute(
+                "UPDATE gmail_api_url_batch_items SET state = 'active', "
+                "failure_reason = '' WHERE batch_id = ? AND inventory_id = ?",
+                (batch, item),
+            )
+            assignment_id = uuid.uuid4().hex
+            connection.execute(
+                "INSERT INTO gmail_api_url_assignments "
+                "(assignment_id, batch_id, inventory_id, job_id, state) "
+                "VALUES (?, ?, ?, ?, 'active')",
+                (assignment_id, batch, item, owner),
+            )
+            created = connection.execute(
+                "SELECT * FROM gmail_api_url_assignments WHERE assignment_id = ?",
+                (assignment_id,),
+            ).fetchone()
+        return self._assignment(created)
+
     def ensure_alias_items(
         self,
         code_url: str,
@@ -1365,6 +1445,28 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
             "WHERE code_url = ? AND state != 'exhausted'",
             (url,),
         ).fetchone()[0]
+        slot_rows = connection.execute(
+            "SELECT i.batch_id, i.position, COALESCE(m.aliases_per_source, 12) "
+            "AS source_capacity FROM gmail_api_url_batch_items i "
+            "LEFT JOIN gmail_api_url_batch_meta m ON m.batch_id = i.batch_id "
+            "WHERE i.code_url = ? AND i.state != 'exhausted'",
+            (url,),
+        ).fetchall()
+        slots_by_batch: dict[str, set[int]] = {}
+        for slot_row in slot_rows:
+            batch_id = str(slot_row["batch_id"] or "").strip()
+            position = slot_row["position"]
+            if not batch_id or position is None:
+                continue
+            capacity = max(1, min(12, int(slot_row["source_capacity"] or 12)))
+            slots_by_batch.setdefault(batch_id, set()).add(int(position) // capacity)
+        for batch_id, slots in slots_by_batch.items():
+            connection.execute(
+                "UPDATE gmail_api_url_batch_meta SET desired_sources = "
+                "CASE WHEN desired_sources IS NULL THEN NULL ELSE "
+                "MAX(0, desired_sources - ?) END WHERE batch_id = ?",
+                (len(slots), batch_id),
+            )
         connection.execute(
             "UPDATE gmail_api_url_assignments SET state = 'failed', reason = ?, "
             "updated_at = CURRENT_TIMESTAMP WHERE state IN ('active', 'failed', 'released') "
@@ -1393,6 +1495,47 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 url,
                 reason=message,
             )
+
+    def list_job_ids_for_code_url(self, code_url: str) -> list[str]:
+        """Return job IDs with a persisted assignment tied to one provider URL."""
+        value = str(code_url or "").strip()
+        if not value:
+            return []
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            rows = connection.execute(
+                "SELECT DISTINCT a.job_id FROM gmail_api_url_assignments a "
+                "JOIN gmail_api_url_batch_items i ON i.batch_id = a.batch_id "
+                "AND i.inventory_id = a.inventory_id WHERE i.code_url = ?",
+                (value,),
+            ).fetchall()
+        return [str(row[0]) for row in rows if str(row[0] or "").strip()]
+
+    def source_slots_for_code_url(
+        self,
+        batch_id: str,
+        code_url: str,
+        *,
+        aliases_per_source: int = 12,
+    ) -> set[int]:
+        """Return source slots occupied by one URL in a canonical batch."""
+        batch = str(batch_id or "").strip()
+        value = str(code_url or "").strip()
+        if not batch or not value:
+            return set()
+        capacity = max(1, min(12, int(aliases_per_source or 12)))
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            rows = connection.execute(
+                "SELECT position FROM gmail_api_url_batch_items "
+                "WHERE batch_id = ? AND code_url = ?",
+                (batch, value),
+            ).fetchall()
+        return {
+            int(row["position"]) // capacity
+            for row in rows
+            if row["position"] is not None
+        }
 
     def poll_otp(
         self,
@@ -2024,6 +2167,24 @@ class GmailApiUrlBatchStore(GmailBatchStoreBase):
                 tuple(normalized),
             ).fetchall()
         return [str(row["batch_id"]) for row in rows]
+
+    def list_code_urls_for_batch(self, batch_id: str) -> set[str]:
+        """Return provider URLs that already have items in one batch."""
+        batch = str(batch_id or "").strip()
+        if not batch:
+            return set()
+        with closing(self._connect()) as connection:
+            connection.executescript(self._get_schema_sql())
+            rows = connection.execute(
+                "SELECT DISTINCT code_url FROM gmail_api_url_batch_items "
+                "WHERE batch_id = ?",
+                (batch,),
+            ).fetchall()
+        return {
+            str(row["code_url"] or "").strip()
+            for row in rows
+            if str(row["code_url"] or "").strip()
+        }
 
     def alias_usage_for_code_urls(
         self, code_urls: set[str]

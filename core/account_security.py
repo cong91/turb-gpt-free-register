@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 
 from core.account_export import BrowserPageTransport, fetch_session, setup_2fa_in_page
+from core.browser_twofa_login import _login_existing_account
 from core.codex_login_credentials import CodexLoginCredentials
 from core.email_change import _parse_credential_lines_strict
 
@@ -51,7 +52,16 @@ class TwofaChangeInput:
 
 def parse_twofa_change_inputs(text: str) -> list[TwofaChangeInput]:
     """Parse ``email|password|current_totp_secret`` lines for a batch."""
-    records = _parse_credential_lines_strict(text)
+    try:
+        records = _parse_credential_lines_strict(text)
+    except ValueError as exc:
+        match = re.fullmatch(r"credential line (\d+) is invalid", str(exc).strip())
+        if match:
+            raise ValueError(
+                f"Dòng {match.group(1)} không đúng định dạng. "
+                "Dùng: email|password|2FA hiện tại"
+            ) from exc
+        raise
     if not records:
         raise ValueError("2FA credential input is required")
 
@@ -149,7 +159,6 @@ def _mfa_request_headers(transport: BrowserPageTransport, access_token: str, pat
 
 def _login_and_get_access_token(driver, item: TwofaChangeInput) -> str:
     """Use the shared existing-account browser login and return its fresh token."""
-    from core.browser_twofa_login import _login_existing_account
     from core.openai_auth import AccountUnusableError
 
     last_error: Exception | None = None
@@ -280,16 +289,21 @@ def change_twofa_in_browser(
     proxy: str | None = None,
     access_token: str | None = None,
     allow_oauth_fallback: bool = True,
+    resume_after_remote_disable: bool = False,
 ) -> dict[str, object]:
     """Login, disable the old TOTP, and enroll a new TOTP in one session."""
-    remote_disabled = False
+    # A prior attempt may have disabled the old factor before enrollment
+    # failed. In that state, retry enrollment directly; disabling again would
+    # turn a recoverable setup failure into a guaranteed factor lookup error.
+    remote_disabled = bool(resume_after_remote_disable)
     active_access_token = str(access_token or "").strip()
     try:
         if active_access_token:
             logger.info("[2FA] thử accessToken đã lưu một lần trước khi đăng nhập")
             try:
-                deactivate_2fa_in_page(driver, access_token=active_access_token)
-                remote_disabled = True
+                if not resume_after_remote_disable:
+                    deactivate_2fa_in_page(driver, access_token=active_access_token)
+                    remote_disabled = True
                 new_secret = setup_2fa_in_page(
                     driver,
                     item.email,
@@ -303,7 +317,7 @@ def change_twofa_in_browser(
                     "access_token": active_access_token,
                 }
             except Exception as exc:
-                if remote_disabled:
+                if remote_disabled and not resume_after_remote_disable:
                     raise
                 logger.warning(
                     "[2FA] accessToken đã lưu không dùng được, bỏ qua và chuyển sang đăng nhập: %s: %s",
@@ -329,8 +343,9 @@ def change_twofa_in_browser(
                 str(exc)[:180],
             )
             active_access_token = _oauth_login_and_get_access_token(item, proxy=proxy)
-        deactivate_2fa_in_page(driver, access_token=active_access_token)
-        remote_disabled = True
+        if not resume_after_remote_disable:
+            deactivate_2fa_in_page(driver, access_token=active_access_token)
+            remote_disabled = True
         new_secret = setup_2fa_in_page(
             driver,
             item.email,

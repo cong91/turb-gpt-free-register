@@ -64,6 +64,10 @@ def _is_retryable_network_error(exc: BaseException) -> bool:
     if isinstance(exc, AccountUnusableError):
         return False
     text = str(exc or "").lower()
+    if "403" in text:
+        # 403 是出口 IP 被 Cloudflare 拦截，对同一出口是确定性的：重试同一 IP
+        # 只会加深该出口的封禁评分（连坐后续账号），应立即失败交给上层换 IP。
+        return False
     return any(h in text for h in _RETRYABLE_NETWORK_HINTS)
 
 

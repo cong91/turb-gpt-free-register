@@ -55,6 +55,35 @@ def _append_log(email: str, line: str, *, clear: bool = False) -> None:
         f.write(f"{stamp} [INFO] {line}\n")
 
 
+def _reenqueue_failed_plan_check(account_id: int, email: str) -> None:
+    """查活刷新 AT 成功后，若套餐查询处于失败态则自动重新入队复查。"""
+    try:
+        account = db.get_account(account_id) or {}
+    except Exception:  # noqa: BLE001
+        return
+    if str(account.get("plan_check_status") or "") != "failed":
+        return
+    access_token = str(account.get("access_token") or "").strip()
+    if not access_token:
+        return
+    try:
+        from core.plan_check_service import enqueue_account_plan_check
+
+        queued = enqueue_account_plan_check(
+            account_id=int(account_id),
+            email=email,
+            access_token=access_token,
+            trigger="after_live_check",
+        )
+    except Exception as exc:  # noqa: BLE001 - 查活成功不应被复查入队失败拖垮。
+        _append_log(email, f"[查活] 自动复查套餐入队失败: {type(exc).__name__}: {str(exc)[:160]}")
+        return
+    if queued.get("accepted"):
+        _append_log(email, "[查活] AT 已刷新，套餐查询失败态已自动重新入队复查")
+    elif queued.get("error"):
+        _append_log(email, f"[查活] 自动复查套餐未执行: {queued.get('error')}")
+
+
 def _run_live_check(
     *,
     account_id: int,
@@ -102,32 +131,97 @@ def _run_live_check(
             clear_log=False,
             email_source=email_source,
         )
-        # 认证链早期 403 通常是该出口被 CF 拦截，不代表账号死亡。
-        # auto/proxy 模式下如果用了代理，额外直连兜底一次，便于和套餐查询的 auto 语义保持接近。
-        from config import proxy as proxy_config
-
-        # Preserve the old direct fallback only when rotating proxy is disabled.
-        # A rotating lease must remain the only route for this workflow.
+        # 认证链早期 403 通常是出口 IP 被 Cloudflare 拦截，不代表账号死亡。
         error_text = str(result.get("error") or "")
         if (
-            not bool(getattr(proxy_config, "ROTATING_PROXY_ENABLED", False))
+            rotating_proxy is not None
             and not result.get("ok")
             and result.get("status") == "failed"
             and "403" in error_text
             and selected_proxy
             and str(route.get("network_route") or "") == "proxy"
         ):
-            _append_log(email, "[查活] 代理出口收到 403，尝试直连兜底一次")
-            # BrowserSession 约定：None=从代理池抽取，""=明确直连。
+            # 早期 403 多为当前出口 IP 被 Cloudflare 拦截；查活预检内部的多次
+            # 重试会复用同一 IP，全部撞墙。这里作废当前租约并强制换一个出口
+            # IP 重试一次，避免整次查活浪费在被封 IP 上。
+            _append_log(email, "[查活] 代理出口收到 403，作废租约并更换出口 IP 重试一次")
+            blocked_proxy = rotating_proxy
+            release_rotating_proxy(
+                scope=LIVE_CHECK_PROXY_SCOPE,
+                lane_id=proxy_lane_id,
+                proxy_url=blocked_proxy,
+                retire=True,
+            )
+            rotating_proxy = None
+            try:
+                fresh_proxy = resolve_rotating_proxy(
+                    None,
+                    scope=LIVE_CHECK_PROXY_SCOPE,
+                    lane_id=proxy_lane_id,
+                    force_refresh=True,
+                    exclude_proxy_url=blocked_proxy,
+                )
+            except Exception as exc:  # noqa: BLE001 - 换出口失败保留原失败结果。
+                _append_log(email, f"[查活] 更换出口 IP 失败，保留原失败结果: {type(exc).__name__}: {str(exc)[:160]}")
+                fresh_proxy = None
+            if fresh_proxy:
+                rotating_proxy = fresh_proxy
+                selected_proxy = fresh_proxy
+                result = check_account_liveness(
+                    email,
+                    proxy=fresh_proxy,
+                    clear_log=False,
+                    email_source=email_source,
+                )
+        # 403 兜底直连：代理池整段出口被 CF 拦截时（换 key 也拿到同一 IP），
+        # 与其在被拦链路上反复消耗，直接用本地网络登录一次完成 AT 刷新。
+        # BrowserSession 约定：None=从代理池抽取，""=明确直连。
+        error_text = str(result.get("error") or "")
+        if (
+            not result.get("ok")
+            and result.get("status") == "failed"
+            and "403" in error_text
+            and selected_proxy
+            and str(route.get("network_route") or "") == "proxy"
+        ):
+            _append_log(email, "[查活] 代理出口持续 403，转直连登录兜底一次")
             result = check_account_liveness(
                 email,
                 proxy="",
                 clear_log=False,
                 email_source=email_source,
             )
+        # 浏览器兜底：直连出口也被 CF 拦截时，用 Roxy 指纹浏览器完成登录
+        # （真实浏览器可解 CF 质解，不依赖出口 IP 干净），从页面内读取新 AT。
+        error_text = str(result.get("error") or "")
+        if (
+            not result.get("ok")
+            and result.get("status") == "failed"
+            and "403" in error_text
+            and str(route.get("network_route") or "") == "proxy"
+        ):
+            _append_log(email, "[查活] 直连出口仍 403，转 Roxy 浏览器登录兜底一次")
+            try:
+                from core.live_check_browser import browser_refresh_session
+
+                browser_result = browser_refresh_session(email, email_source=email_source)
+                if browser_result.get("ok"):
+                    result = {
+                        "ok": True,
+                        "status": "live",
+                        "checked_at": local_now().isoformat(timespec="seconds"),
+                        "access_token": browser_result["access_token"],
+                        "session": browser_result.get("session") or {},
+                    }
+            except Exception as exc:  # noqa: BLE001 - 浏览器兜底失败保留原失败结果。
+                _append_log(
+                    email,
+                    f"[查活] 浏览器兜底失败，保留原失败结果: {type(exc).__name__}: {str(exc)[:200]}",
+                )
         db.update_account_liveness(account_id, result)
         if result.get("ok"):
             _append_log(email, "[查活] 完成：账号正常，已刷新最新 AT/accessToken")
+            _reenqueue_failed_plan_check(account_id, email)
         elif result.get("status") == "deactivated":
             _append_log(email, f"[查活] 完成：{result.get('error') or 'OpenAI đã khóa tài khoản'}")
         else:

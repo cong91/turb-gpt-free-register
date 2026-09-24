@@ -24,6 +24,10 @@ AUTO_PLAN_CHECK_AFTER_REGISTER = False
 # 浏览器驱动复用当前注册浏览器；协议驱动在当前 plan worker 中直接执行 OAuth。
 AUTO_CODEX_FOR_FREE_AFTER_REGISTER = False
 
+# 注册后确认 Free Trial 时，自动运行 PAY.153 并记录 checkout session 类型。
+# 仅在套餐查询明确返回 current_plan_type=free 且 plus_trial_eligible=True 时执行。
+AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER = False
+
 # 注册成功并拿到 accessToken 后，在浏览器里随机停留一段时间再关闭连接。
 # 格式：最小秒,最大秒。设为 "0,0" 表示不额外停留。
 POST_REGISTER_DWELL_SECONDS_RANGE = "18,45"
@@ -38,6 +42,7 @@ apply_env_overrides(globals(), {
     'REGISTER_NAME': 'str',
     'AUTO_PLAN_CHECK_AFTER_REGISTER': 'bool',
     'AUTO_CODEX_FOR_FREE_AFTER_REGISTER': 'bool',
+    'AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER': 'bool',
     'POST_REGISTER_DWELL_SECONDS_RANGE': 'str',
     'REGISTRATION_AUTO_RETRY_ATTEMPTS': 'int',
 })

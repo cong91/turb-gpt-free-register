@@ -57,11 +57,59 @@ ChatGPT / OpenAI 账号自动注册与 Codex OAuth 授权工具。当前项目�
 - GPTMail 临时邮箱 API：运行时随机生成邮箱并自动收取验证码
 - TinyHost 临时邮箱 API：从全量在线域名中选择域名，生成随机邮箱并自动收取验证码（`tinyhost`）
 - Paymesh MAIL card：`POST /api/v1/redeem` 领取邮箱，`GET /api/v1/order/lookup` 自动收取验证码（`paymesh`）
+- Automated Email API Gmail：`GET /api/user/email?type=gmail` 领取 Gmail 邮箱，`GET /api/user/mail` 自动收取验证码（`automated_email_api`）。每个服务邮箱在本地展开为最多 12 个 `gmail.com`/`googlemail.com` alias，共享原邮箱取码。
+- OTPGmail.net Gmail：通过 `POST /v1/orders` 租用 Gmail、`GET /v1/orders/{id}` 轮询 OTP（`otpmail`）；每个 order 对应一个 API mailbox，并在本地展开为 12 个 `gmail.com`/`googlemail.com` alias，共享同一个 parent `order_id` 和 mailbox 取码；`service` 代码以 `GET /v1/services` 返回值为准。
+- BambooMMO Gmail：通过 `POST /api/mail/get-mail-apikey` 租用 Gmail（`bamboommo`），`POST /api/mail/get-code-apikey` 轮询 OTP；每个 rental 在本地展开为 12 个 `gmail.com`/`googlemail.com` alias，共享原 rental 取码。首次 OTP 成功后，下一次等待 OTP 会自动调用 rent-again 接口；Server 2 按文档不重复收费。
 - `EMAIL_SOURCE` 支持多个来源组合，例如：
 
 ```python
 EMAIL_SOURCE = "outlook,generic_api,gmail_api_url"
 ```
+
+Automated Email API Gmail 配置（API Key 只放在本地 `.env`）：
+
+```dotenv
+EMAIL_SOURCE=automated_email_api
+EMAIL_API_BASE_URL=https://your-automated-email-api.example
+EMAIL_API_KEY=your_api_key
+EMAIL_API_REQUEST_TIMEOUT=20
+EMAIL_API_POLL_INTERVAL=3
+```
+
+OTPGmail.net 配置（API Key 只放在本地 `.env`，服务代码请先从 `/v1/services` 查询）：
+
+```dotenv
+EMAIL_SOURCE=otpmail
+OTPGMAIL_API_BASE=https://otpgmail.net
+OTPGMAIL_API_KEY=your_api_key
+OTPGMAIL_SERVICE_CODE=dr
+OTPGMAIL_REQUEST_TIMEOUT=15
+OTPGMAIL_POLL_INTERVAL=3
+OTPGMAIL_OTP_MAX_WAIT=120
+```
+
+OTPGmail 每个 `POST /v1/orders`（`quantity=1`）返回一个 mailbox 和一个
+`order_id`。一个 order 在本地固定展开为 12 个 alias/job；12 个 job 都保存
+同一个 parent `order_id` 和 query mailbox，验证码轮询只能查询该 parent order。
+WebUI 的 `count` 表示要购买的 order 数量（因此会创建 `count × 12` 个 job）；
+Sub2API automation 已传入 job 数量时不再重复乘 12。
+
+BambooMMO Gmail 配置（API Key 只放在本地 `.env`）：
+
+```dotenv
+USE_EMAIL_SERVICE=True
+EMAIL_SOURCE=bamboommo
+BAMBOOMMO_API_BASE=https://api.bamboommo.com
+BAMBOOMMO_API_KEY=your_api_key
+BAMBOOMMO_SERVER=2
+BAMBOOMMO_MAIL_TYPE=GM
+BAMBOOMMO_SERVICE=OP
+BAMBOOMMO_REQUEST_TIMEOUT=20
+BAMBOOMMO_POLL_INTERVAL=3
+BAMBOOMMO_OTP_MAX_WAIT=120
+```
+
+`BAMBOOMMO_SERVER` 只能填写 `1` 或 `2`；Server 2 使用 `rentalId` 在首次 OTP 成功后请求下一次 OTP，按文档不重复收费。`GM` 是 Gmail，`OP` 是 BambooMMO 服务列表中的 Open AI。不要把 API Key 写入源码或日志。
 
 - MailNest-迈巢：Outlook 临时邮箱
 
@@ -69,6 +117,8 @@ EMAIL_SOURCE = "outlook,generic_api,gmail_api_url"
 
 - 注册成功后可自动跑 Codex OAuth。
 - 可在 WebUI 配置开启 `AUTO_CODEX_FOR_FREE_AFTER_REGISTER`：注册后先查套餐，只有确认是 Free 且 `plus_trial_eligible` 明确为 `False`（不是 Free Plus）才会直接执行 Codex OAuth；该选项会自动开启注册后套餐查询。它不是手动“补跑 Codex”任务。
+- 可在 WebUI 配置开启 `AUTO_PAY153_FOR_FREE_TRIAL_AFTER_REGISTER`：注册后确认 `current_plan_type=free` 且 `plus_trial_eligible=True` 时，自动执行一次 PAY.153 checkout，并在账号记录中保存 `pay153_checkout_session_kind`（`oaics`、`cs_live`、`cs_test` 或 `unknown`）。这是 checkout session 类型，不是套餐类型或支付方式；失败只写回账号状态，不会删除已注册账号。
+- Account workspace 中的 Free 账号可点击 `Promotion VN`：系统会用 rotating proxy 或 proxy pool 的越南出口，强制启用 PAY.153 promotion 并验证零金额，再复查 Free Trial 资格。套餐查询和这个 promotion probe 都不会回退到直连；没有可用代理时会明确失败并写回状态。原始 checkout session id 只保存在服务端，列表只显示 `oaics`/`cs_live` 等安全分类。
 - 自动 Codex OAuth 在浏览器注册流程中复用当前注册 browser/profile/session；手动“Codex 补跑”是独立授权流程，每次都创建新的 browser profile/session，不恢复注册时 profile，也忽略 Browser Use/Skyvern/Roxy 的固定 profile ID。
 - Codex 授权驱动可选：
   - `CODEX_OAUTH_DRIVER = "protocol"`
@@ -705,10 +755,12 @@ HERO_SMS_API_BASE = "https://hero-sms.com/stubs/handler_api.php"
 HERO_SMS_API_KEY = "你的 HeroSMS API key"
 HERO_SMS_SERVICE = "dr"
 HERO_SMS_COUNTRY = "auto"
+HERO_SMS_MIN_PRICE = "0.01"
 HERO_SMS_MAX_PRICE = "0.1"
 HERO_SMS_COUNTRY_MIN_ATTEMPTS = 4
 HERO_SMS_COUNTRY_HIGH_FAILURE_RATE = 0.75
 HERO_SMS_NUMBER_REJECT_THRESHOLD = 3
+HERO_SMS_COUNTRY_RECOVERY_SECONDS = 3600
 
 # 若 SMS_PROVIDER="h"，H 固定复用：
 #   SMS_SERVICE -> H projectId
@@ -719,7 +771,7 @@ H_ADMIN_AUTH_CODE = "你的H后台授权码"
 
 ViOTP 在 `/session/getv2` 返回完成或过期状态；其公开 API 没有主动 `cancel` / `complete` 接口，因此程序失败换号时只清理本地会话记录并等待平台自动过期。
 
-HeroSMS 在 `HERO_SMS_COUNTRY=auto` 时先调用 `getPrices&service=dr`，过滤库存大于 0 且 `cost <= HERO_SMS_MAX_PRICE` 的全部国家；`HERO_SMS_MAX_PRICE` 是唯一的硬价格上限，当前示例为 `0.1`，不会自动超过该值，也不是一个起始价。候选直接按当前 offer 的实际 `cost` 从低到高排序，有多少个低于 `0.05` 就按实际价格逐个尝试，再继续到 `0.1`，不使用固定价格档位；多 worker 只在完全相同的 cost 中轮换，避免并发分配打乱低价优先顺序。每个 worker lane 都有独立的 country 记忆：本 lane 最近成功的 country 若仍有库存且与当前最低价相同，则优先复用；如果它更贵，则先让更低价候选尝试，低价候选失败后才回到 sticky country；任何 `NO_NUMBERS`/`WRONG_MAX_PRICE` 都会继续扫描当前候选池，直到取号成功或候选耗尽。每个 country 的 Codex 手机验证成功/失败，以及取号时的即时无库存结果都会写入 `turb.sqlite3`，health 会跨不同价格 profile 汇总。单次收不到 OTP 或 verify 错误不会立即高风险封禁，默认累计至少 4 次且失败率达到 75% 才降为低优先级兜底 country；若页面明确报“số điện thoại đã được sử dụng”，会单独累计；达到 `HERO_SMS_NUMBER_REJECT_THRESHOLD`（默认 3）后 country 暂时降为低优先级，优先尝试其他 country，但不会永久删除；当主候选失败或进入恢复探测时，仍可将该 country 作为 fallback 重新 warm，确认库存是否恢复。后续成功会清除该 country 的最近失败标记和该专用计数并恢复本 lane 复用。拿到验证码后使用 `setStatus=6` 完成，失败时使用 `setStatus=8` 取消。价格和库存是动态数据，已成功 country 仍会重新经过当前价格/库存筛选，不能把某个 country ID 视为永久最低价。
+HeroSMS 在 `HERO_SMS_COUNTRY=auto` 时先调用 `getPrices&service=dr`，过滤库存大于 0 且 `HERO_SMS_MIN_PRICE <= cost <= HERO_SMS_MAX_PRICE` 的全部国家；默认最低价为 `0.01`，示例最高价为 `0.1`，最高价仍是硬上限，绝不会自动超过它。候选直接按当前 offer 的实际 `cost` 从低到高排序，不使用固定 `0.05` 起始档位；多 worker 只在完全相同的 cost 中轮换，避免并发分配打乱低价优先顺序。每个 worker lane 都有独立的 country 记忆：本 lane 最近成功的 country 若仍有库存且与当前最低价相同，则优先复用；如果它更贵，则先让更低价候选尝试，低价候选失败后才回到 sticky country；任何 `NO_NUMBERS`/`WRONG_MAX_PRICE` 都会继续扫描当前候选池，直到取号成功或候选耗尽。每个 country 的 Codex 手机验证成功/失败，以及取号时的即时无库存结果都会写入 `turb.sqlite3`，health 会跨不同价格 profile 汇总。单次收不到 OTP 或 verify 错误不会立即高风险封禁，默认累计至少 4 次且失败率达到 75% 才降为低优先级兜底 country；若页面明确报“số điện thoại đã được sử dụng”，会单独累计；达到 `HERO_SMS_NUMBER_REJECT_THRESHOLD`（默认 3）后 country 暂时降为低优先级，优先尝试其他 country，但不会永久删除。被排除的 country 在 `HERO_SMS_COUNTRY_RECOVERY_SECONDS`（默认 3600 秒）后会重新进入主候选池作为 warm probe；warm 成功会清除最近失败标记、重置失败窗口和专用计数，warm 失败则记录新的时间点，等待下一轮冷却后再试，不会永久 fail。拿到验证码后使用 `setStatus=6` 完成，失败时使用 `setStatus=8` 取消。价格和库存是动态数据，已成功 country 仍会重新经过当前价格/库存筛选，不能把某个 country ID 视为永久最低价。
 在 Cloak/Roxy 浏览器流程中，Hero 返回的 E.164 号码还用于自动选择 OpenAI 表单的对应国家/区号，避免号码前缀和 country selector 不一致导致 `whatsapp_channel` 或号码发送失败。
 
 CPA 授权地址来源：
