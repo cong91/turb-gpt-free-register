@@ -49,6 +49,26 @@ EDITABLE_FIELDS = [
         "label": "启用 Codex OAuth", "help": "注册成功后自动跑 Codex 授权；浏览器驱动复用当前注册窗口，协议驱动使用独立 session，落盘 codex-邮箱.json",
     },
     {
+        "key": "ENABLE_2FA", "file": "twofa.py", "type": "bool", "group": "功能开关",
+        "label": "启用 2FA(TOTP)", "help": "注册完成后自动设置动态口令；修改后重启服务",
+    },
+    {
+        "key": "TWOFA_PROXY_MODE", "file": "twofa.py", "type": "str", "group": "功能开关",
+        "label": "2FA代理模式", "help": "saved=优先使用账号代理；pool=每次从 rotating proxy pool 重新分配；修改后重启服务",
+        "choices": [
+            {"value": "saved", "label": "使用账号保存的代理"},
+            {"value": "pool", "label": "每次从代理池重新分配"},
+        ],
+    },
+    {
+        "key": "TWOFA_WORKERS", "file": "twofa.py", "type": "int", "group": "功能开关",
+        "label": "2FA并发数", "help": "后台同时执行的 2FA 任务数，范围 1-16；修改后重启服务",
+    },
+    {
+        "key": "TWOFA_QUEUE_LIMIT", "file": "twofa.py", "type": "int", "group": "功能开关",
+        "label": "2FA队列容量", "help": "允许排队等待的 2FA 任务总数，范围至少覆盖并发数；修改后重启服务",
+    },
+    {
         "key": "REGISTRATION_DRIVER", "file": "roxybrowser.py", "type": "str", "group": "注册方式",
         "label": "注册驱动", "help": f"默认 {DEFAULT_DRIVER}；protocol=纯协议；roxy=RoxyBrowser；cloak=CloakBrowser；browser_use=Browser Use Cloud+Playwright；skyvern=Skyvern Browser Sessions+Playwright；浏览器别名：{_BROWSER_DRIVER_ALIASES}",
     },

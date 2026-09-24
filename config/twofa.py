@@ -17,5 +17,21 @@ ENABLE_2FA = False
 # 仅用于已有账号登录和 2FA re-auth 的邮箱 OTP 等待；普通注册仍使用独立的 OTP_MAX_WAIT。
 TWOFA_OTP_MAX_WAIT = 90
 
+# 2FA 任务的代理策略：saved 使用账号保存的真实代理，pool 每次从 rotating proxy pool 重新分配。
+TWOFA_PROXY_MODE = "saved"
+
+# 后台 2FA 线程池及有界等待队列。修改后需重启进程。
+TWOFA_WORKERS = 2
+TWOFA_QUEUE_LIMIT = 50
+
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'ENABLE_2FA': 'bool', 'TWOFA_OTP_MAX_WAIT': 'int'})
+apply_env_overrides(
+    globals(),
+    {
+        "ENABLE_2FA": "bool",
+        "TWOFA_OTP_MAX_WAIT": "int",
+        "TWOFA_PROXY_MODE": "str",
+        "TWOFA_WORKERS": "int",
+        "TWOFA_QUEUE_LIMIT": "int",
+    },
+)

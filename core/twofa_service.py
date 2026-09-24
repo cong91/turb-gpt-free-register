@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from config import email as _email_cfg
+from config import twofa as _twofa_cfg
 from core import db
 from core.account_export import setup_2fa
 from core.rotating_proxy_runtime import (
@@ -20,9 +21,18 @@ from core.time_utils import local_now
 
 logger = logging.getLogger(__name__)
 
-_WORKERS = 2
+def _bounded_int(name: str, default: int, lower: int, upper: int) -> int:
+    try:
+        value = int(getattr(_twofa_cfg, name, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lower, min(upper, value))
+
+
+_WORKERS = _bounded_int("TWOFA_WORKERS", 2, 1, 16)
+_QUEUE_LIMIT = _bounded_int("TWOFA_QUEUE_LIMIT", 50, _WORKERS, 5000)
 _EXECUTOR = ThreadPoolExecutor(max_workers=_WORKERS, thread_name_prefix="twofa")
-_QUEUE_SLOTS = threading.BoundedSemaphore(50)
+_QUEUE_SLOTS = threading.BoundedSemaphore(_QUEUE_LIMIT)
 _RUNNING: set[int] = set()
 _LOCK = threading.Lock()
 _PROXY_INVENTORY_LOCK = threading.Lock()
@@ -63,7 +73,35 @@ def _normalize_proxy(proxy: str | None) -> str | None:
     return None
 
 
-def is_running(acc_id: int) -> bool:
+def queue_settings() -> dict:
+    return {"workers": _WORKERS, "queue_limit": _QUEUE_LIMIT}
+
+
+def _resolve_twofa_proxy(
+    proxy: str | None,
+    *,
+    proxy_lane_id: int | None = None,
+) -> tuple[str | None, str | None]:
+    mode = str(getattr(_twofa_cfg, "TWOFA_PROXY_MODE", "saved") or "saved").strip().lower()
+    if mode not in {"saved", "pool"}:
+        raise ValueError(f"TWOFA_PROXY_MODE={mode!r} 无效，可选 saved / pool")
+    explicit_proxy = _normalize_proxy(proxy)
+    if mode == "pool":
+        selected_proxy = resolve_rotating_proxy(
+            None,
+            scope=TWOFA_SETUP_PROXY_SCOPE,
+            lane_id=proxy_lane_id,
+        )
+        return _normalize_proxy(selected_proxy), _normalize_proxy(selected_proxy)
+    selected_proxy = resolve_rotating_proxy(
+        explicit_proxy,
+        scope=TWOFA_SETUP_PROXY_SCOPE,
+        lane_id=proxy_lane_id,
+    )
+    rotating_proxy = None if explicit_proxy is not None else _normalize_proxy(selected_proxy)
+    return _normalize_proxy(selected_proxy), rotating_proxy
+
+
     with _LOCK:
         return int(acc_id) in _RUNNING
 
@@ -104,15 +142,10 @@ def _run_twofa(
         fh.addFilter(lambda record: record.threadName == thread_name)
         root_logger.addHandler(fh)
         logger.info("[2FA] 开始后台设置：email=%s trigger=%s", email, trigger)
-        explicit_proxy = _normalize_proxy(proxy)
-        selected_proxy = resolve_rotating_proxy(
-            explicit_proxy,
-            scope=TWOFA_SETUP_PROXY_SCOPE,
-            lane_id=proxy_lane_id,
+        real_proxy, rotating_proxy = _resolve_twofa_proxy(
+            proxy,
+            proxy_lane_id=proxy_lane_id,
         )
-        if explicit_proxy is None:
-            rotating_proxy = _normalize_proxy(selected_proxy)
-        real_proxy = _normalize_proxy(selected_proxy)
         session = BrowserSession(proxy=real_proxy, fingerprint_seed=f"account:{email.lower()}")
         _append_log(email, f"[2FA] 会话创建完成：proxy={session.proxy or 'direct'} device_id={session.device_id}")
         _append_log(email, f"[2FA] 指纹摘要：{session.fingerprint_summary_text()}")
