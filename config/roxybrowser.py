@@ -58,6 +58,14 @@ ROXY_SELENIUM_TIMEOUT: int = 90
 ROXY_SCRIPT_TIMEOUT: int = 90
 ROXY_KEEP_BROWSER_OPEN: bool = False
 
+# Roxy 跨 Profile 本地静态资源缓存。仅允许精确 URL 的 JS/CSS/font/image；
+# 认证、API、挑战和登录资源始终联网。省流量模式开启时自动启用。
+ROXY_LOCAL_ASSET_CACHE_ENABLED: bool = False
+ROXY_LOCAL_ASSET_CACHE_MODE: str = "auto"
+ROXY_LOCAL_ASSET_CACHE_DIR: str = "./cache/roxy-assets"
+ROXY_LOCAL_ASSET_CACHE_MAX_AGE: int = 86400
+ROXY_LOCAL_ASSET_CACHE_MAX_ITEM_BYTES: int = 25 * 1024 * 1024
+
 # Roxy API transient 错误重试。create 的模糊网络错误不重试，避免超时后重复创建孤儿环境；
 # Roxy 明确返回 Creating/Insufficient profile quota 时会保留任务并等待重试。
 ROXY_API_RETRIES: int = 3
@@ -110,4 +118,4 @@ ROXY_PROFILE_CREATE_PAYLOAD: dict = {
 ROXY_CODEX_CALLBACK_TIMEOUT: int = 180
 
 # ---- .env overrides for WebUI editable fields ----
-apply_env_overrides(globals(), {'REGISTRATION_DRIVER': 'str', 'ROXY_API_BASE': 'str', 'ROXY_API_TOKEN': 'str', 'ROXY_PROFILE_ID': 'str', 'ROXY_WORKSPACE_ID': 'str', 'ROXY_PROJECT_ID': 'str', 'ROXY_WORKSPACE_LIST_PATH': 'str', 'ROXY_OPEN_PATH': 'str', 'ROXY_OPEN_HEADLESS': 'bool', 'ROXY_CLOSE_PATH': 'str', 'ROXY_KEEP_BROWSER_OPEN': 'bool', 'ROXY_SCRIPT_TIMEOUT': 'int', 'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool', 'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool', 'ROXY_RANDOM_OS_ON_CREATE': 'bool', 'ROXY_RANDOM_OS_CHOICES': 'str', 'ROXY_RANDOM_PROFILE_NAME_ON_CREATE': 'bool', 'ROXY_PROFILE_NAME_PREFIX': 'str', 'ROXY_CREATE_USE_PROXY_POOL': 'bool', 'ROXY_PROXY_CHECK_CHANNEL': 'str', 'ROXY_DELETE_PATH': 'str', 'ROXY_CODEX_CALLBACK_TIMEOUT': 'int'})
+apply_env_overrides(globals(), {'REGISTRATION_DRIVER': 'str', 'ROXY_API_BASE': 'str', 'ROXY_API_TOKEN': 'str', 'ROXY_PROFILE_ID': 'str', 'ROXY_WORKSPACE_ID': 'str', 'ROXY_PROJECT_ID': 'str', 'ROXY_WORKSPACE_LIST_PATH': 'str', 'ROXY_OPEN_PATH': 'str', 'ROXY_OPEN_HEADLESS': 'bool', 'ROXY_CLOSE_PATH': 'str', 'ROXY_KEEP_BROWSER_OPEN': 'bool', 'ROXY_SCRIPT_TIMEOUT': 'int', 'ROXY_LOCAL_ASSET_CACHE_ENABLED': 'bool', 'ROXY_LOCAL_ASSET_CACHE_MODE': 'str', 'ROXY_LOCAL_ASSET_CACHE_DIR': 'str', 'ROXY_LOCAL_ASSET_CACHE_MAX_AGE': 'int', 'ROXY_LOCAL_ASSET_CACHE_MAX_ITEM_BYTES': 'int', 'ROXY_ONE_PROFILE_PER_ACCOUNT': 'bool', 'ROXY_DELETE_PROFILE_AFTER_RUN': 'bool', 'ROXY_RANDOM_OS_ON_CREATE': 'bool', 'ROXY_RANDOM_OS_CHOICES': 'str', 'ROXY_RANDOM_PROFILE_NAME_ON_CREATE': 'bool', 'ROXY_PROFILE_NAME_PREFIX': 'str', 'ROXY_CREATE_USE_PROXY_POOL': 'bool', 'ROXY_PROXY_CHECK_CHANNEL': 'str', 'ROXY_DELETE_PATH': 'str', 'ROXY_CODEX_CALLBACK_TIMEOUT': 'int'})

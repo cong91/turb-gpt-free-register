@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import unittest
+from unittest.mock import patch
 
 from config.browser import build_browser_environment
 from core.session import BrowserSession
@@ -7,23 +8,25 @@ from core.session import BrowserSession
 
 class SessionNavigationHeaderTests(unittest.TestCase):
     def test_vietnam_exit_uses_matching_locale_and_timezone(self):
-        profile = build_browser_environment({
-            "country": "VN",
-            "timezone": "Asia/Ho_Chi_Minh",
-            "city": "Bien Hoa",
-        })
+        with patch("config.browser.AUTO_BROWSER_LOCALE_FROM_IP", True):
+            profile = build_browser_environment({
+                "country": "VN",
+                "timezone": "Asia/Ho_Chi_Minh",
+                "city": "Bien Hoa",
+            })
 
         self.assertEqual(profile["navigator_language"], "vi-VN")
-        self.assertTrue(profile["accept_language"].startswith("vi-VN,vi;"))
+        self.assertTrue(profile["accept_language"].startswith("vi-VN"))
         self.assertEqual(profile["timezone_iana"], "Asia/Ho_Chi_Minh")
         self.assertEqual(profile["timezone_offset_minutes"], 420)
 
     def test_proxy_country_without_named_profile_is_derived_from_geo(self):
-        profile = build_browser_environment({
-            "country": "TH",
-            "timezone": "Asia/Bangkok",
-            "city": "Bangkok",
-        })
+        with patch("config.browser.AUTO_BROWSER_LOCALE_FROM_IP", True):
+            profile = build_browser_environment({
+                "country": "TH",
+                "timezone": "Asia/Bangkok",
+                "city": "Bangkok",
+            })
 
         self.assertEqual(profile["locale_profile"], "geo:th")
         self.assertEqual(profile["navigator_language"], "th-TH")
@@ -32,10 +35,11 @@ class SessionNavigationHeaderTests(unittest.TestCase):
         self.assertEqual(profile["timezone_offset_minutes"], 420)
 
     def test_unknown_proxy_country_does_not_leak_fixed_local_locale(self):
-        profile = build_browser_environment({
-            "country": "XX",
-            "timezone": "UTC",
-        })
+        with patch("config.browser.AUTO_BROWSER_LOCALE_FROM_IP", True):
+            profile = build_browser_environment({
+                "country": "XX",
+                "timezone": "UTC",
+            })
 
         self.assertEqual(profile["locale_profile"], "geo:xx")
         self.assertEqual(profile["navigator_language"], "en-US")

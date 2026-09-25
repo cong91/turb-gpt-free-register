@@ -125,11 +125,13 @@ def _run_live_check(
             f"proxy_mode={route.get('proxy_mode')} proxy_used={route.get('proxy_used') or '-'} "
             f"fallback_reason={route.get('proxy_fallback_reason') or '-'}"
         )
+        fingerprint_state: dict = {}
         result = check_account_liveness(
             email,
             proxy=selected_proxy,
             clear_log=False,
             email_source=email_source,
+            fingerprint_state=fingerprint_state,
         )
         # 认证链早期 403 通常是出口 IP 被 Cloudflare 拦截，不代表账号死亡。
         error_text = str(result.get("error") or "")
@@ -190,6 +192,7 @@ def _run_live_check(
                 proxy="",
                 clear_log=False,
                 email_source=email_source,
+                fingerprint_state={},
             )
         # 浏览器兜底：直连出口也被 CF 拦截时，用 Roxy 指纹浏览器完成登录
         # （真实浏览器可解 CF 质解，不依赖出口 IP 干净），从页面内读取新 AT。

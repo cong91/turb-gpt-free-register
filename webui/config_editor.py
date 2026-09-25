@@ -1367,15 +1367,31 @@ def update_config(updates: dict) -> dict:
 
     updated, ignored = [], []
     env_updates: dict[str, str] = {}
+    validated: dict[str, object] = {}
 
     for key, value in updates.items():
         field = _FIELD_BY_KEY.get(key)
         if field is None:
             ignored.append(key)
             continue
+        choices = field.get("choices")
+        if choices and value not in {choice["value"] for choice in choices}:
+            raise ValueError("配置选项无效")
+        validated[key] = value
+
+    workers = validated.get("TWOFA_WORKERS")
+    if workers is not None and (not isinstance(workers, int) or not 1 <= workers <= 16):
+        raise ValueError("配置数值无效")
+    queue_limit = validated.get("TWOFA_QUEUE_LIMIT")
+    if queue_limit is not None and (not isinstance(queue_limit, int) or queue_limit < 1):
+        raise ValueError("配置数值无效")
+    if workers is not None and queue_limit is not None and queue_limit < workers:
+        raise ValueError("配置数值无效")
+
+    for key, value in validated.items():
+        field = _FIELD_BY_KEY[key]
         env_updates[key] = _format_env_value(value, field["type"])
         updated.append(key)
-
 
     env_updated = write_env_values(env_updates) if env_updates else []
     if env_updated:

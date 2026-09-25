@@ -761,6 +761,49 @@ def _generic_api_email_line(row: dict) -> str:
     ])
 
 
+def _resolve_generic_api_code_url(email: str) -> str:
+    """Resolve the configured generic API endpoint for an email address."""
+    email = str(email or "").strip()
+    if not email:
+        return ""
+    try:
+        from config import email as email_config
+
+        base = str(getattr(email_config, "EMAIL_API_BASE_URL", "") or "").strip().rstrip("/")
+    except Exception:  # noqa: BLE001
+        base = ""
+    if not base:
+        return ""
+    return f"{base}/messages?mailbox={email}"
+
+
+def resolve_email_api_link(email: str, email_source: str) -> str:
+    """Return a full code URL for generic_api while preserving other sources."""
+    email = str(email or "").strip()
+    email_source = str(email_source or "").strip()
+    if email_source != "generic_api" or not email:
+        return email_source
+    try:
+        pool_row = get_generic_api_email_by_email(email)
+    except Exception:  # noqa: BLE001
+        pool_row = None
+    stored_url = str((pool_row or {}).get("code_url") or "").strip()
+    return stored_url or _resolve_generic_api_code_url(email) or email_source
+
+
+def account_full_export_line(row: dict) -> str:
+    """Build the full account export line with a resolved generic API URL."""
+    email = str(row.get("email") or "").strip()
+    email_api = resolve_email_api_link(email, row.get("email_source") or "")
+    password = _extract_registration_password(row)
+    totp = str(row.get("totp_secret") or "").strip()
+    return "---".join([email, email_api, password, "https://2fa.run/"]) + "----2FA:" + totp
+
+
+def _account_full_export_line(row: dict) -> str:
+    return account_full_export_line(row)
+
+
 def _imap_email_line(row: dict) -> str:
     return "----".join([
         row.get("email") or "",

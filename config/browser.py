@@ -127,6 +127,11 @@ COUNTRY_LOCALE_PROFILE_MAP = {
     "SG": "sg", "GB": "gb", "AU": "gb", "DE": "de", "FR": "fr", "NL": "nl",
 }
 
+_GEO_LOCALE_LANGUAGE = {
+    "TH": "th-TH", "ID": "id-ID", "MY": "ms-MY", "PH": "en-PH", "IN": "en-IN",
+    "KR": "ko-KR", "BR": "pt-BR",
+}
+
 BROWSER_LOCALE_PROFILES = {
     "jp": {"navigator_language": "ja-JP", "navigator_languages": ["ja-JP"], "accept_language": "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7", "timezone_iana": "Asia/Tokyo", "timezone_offset_minutes": 9 * 60, "timezone_name": "Japan Standard Time"},
     "vi": {"navigator_language": "vi-VN", "navigator_languages": ["vi-VN"], "accept_language": "vi-VN", "timezone_iana": "Asia/Ho_Chi_Minh", "timezone_offset_minutes": 7 * 60, "timezone_name": "Indochina Time"},
@@ -172,12 +177,32 @@ def _locale_profile_key_from_geo(geo: dict | None) -> str:
     if not geo or not AUTO_BROWSER_LOCALE_FROM_IP:
         return BROWSER_LOCALE_PROFILE
     country = str(geo.get("country") or geo.get("country_code") or "").upper()
-    return COUNTRY_LOCALE_PROFILE_MAP.get(country, BROWSER_LOCALE_PROFILE)
+    return COUNTRY_LOCALE_PROFILE_MAP.get(country, f"geo:{country.lower()}" if country else BROWSER_LOCALE_PROFILE)
+
+
+def _geo_locale_profile(country: str, timezone: str, key: str) -> dict:
+    language = _GEO_LOCALE_LANGUAGE.get(country, "en-US")
+    language_base = language.split("-", 1)[0]
+    accept_language = f"{language},{language_base};q=0.9,en-US;q=0.8,en;q=0.7"
+    return {
+        "navigator_language": language,
+        "navigator_languages": [language],
+        "accept_language": accept_language,
+        "timezone_iana": timezone or "UTC",
+        "timezone_offset_minutes": 0,
+        "timezone_name": "",
+        "locale_profile": key,
+    }
 
 
 def _build_locale_from_geo(geo: dict | None) -> dict:
     key = _locale_profile_key_from_geo(geo)
-    locale = dict(BROWSER_LOCALE_PROFILES.get(key, BROWSER_LOCALE_PROFILES[BROWSER_LOCALE_PROFILE]))
+    if key.startswith("geo:"):
+        country = key[4:].upper()
+        timezone = str((geo or {}).get("timezone") or "").strip()
+        locale = _geo_locale_profile(country, timezone, key)
+    else:
+        locale = dict(BROWSER_LOCALE_PROFILES.get(key, BROWSER_LOCALE_PROFILES[BROWSER_LOCALE_PROFILE]))
     if geo and AUTO_BROWSER_LOCALE_FROM_IP:
         tz = str(geo.get("timezone") or "").strip()
         if tz:

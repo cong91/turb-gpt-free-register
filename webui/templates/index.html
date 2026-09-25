@@ -7364,6 +7364,9 @@ function renderConfigPlainFieldV2(f) {
     control = `<input type="number" step="0.1" data-key="${attrEsc(f.key)}" value="${attrEsc(fv == null ? '' : fv)}">`;
   } else if (f.type === 'list_str_multiline') {
     control = `<textarea data-key="${attrEsc(f.key)}" placeholder="每行一条，可留空">${attrEsc((fv || []).join('\n'))}</textarea>`;
+  } else if (Array.isArray(f.choices) && f.choices.length) {
+    const options = f.choices.map(choice => `<option value="${attrEsc(choice.value)}"${String(choice.value) === String(fv) ? ' selected' : ''}>${esc(choice.label ?? choice.value)}</option>`).join('');
+    control = `<select data-key="${attrEsc(f.key)}">${options}</select>`;
   } else {
     const shown = isPlaceholderEmpty(fv) ? '' : fv;
     const inputType = f.secret ? 'password' : 'text';

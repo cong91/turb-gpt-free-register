@@ -1,17 +1,14 @@
 # -*- coding: utf-8 -*-
-"""Roxy Chromium 静态资源本地缓存。
+"""Roxy Chromium allowlisted static-asset cache.
 
-通过页面 target 的 CDP WebSocket 同时使用：
-
-* ``Network``：记录成功加载的静态资源正文；
-* ``Fetch``：后续请求命中本地文件时用 ``fulfillRequest`` 直接返回。
-
-只处理精确 URL 的 GET 静态资源。document、API、认证、Cloudflare、Sentinel、
-CES 和 OBI 请求始终走真实网络。
+The cache records successful static GET responses through the page target's CDP
+connection and replays only the exact same URL on later Roxy profiles. Auth,
+API, challenge, and other dynamic resources always continue to the network.
 """
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -22,7 +19,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import requests
 
@@ -31,11 +28,14 @@ from config import roxybrowser as _cfg
 
 logger = logging.getLogger(__name__)
 
-# 多个注册窗口共享同一缓存目录。原子替换只能保证文件不损坏，不能阻止两个
-# 窗口同时把同一 URL 统计为新增，因此检查与写入需要进程级串行化。
 _CACHE_STORE_LOCK = threading.Lock()
-
 _ALLOWED_RESOURCE_TYPES = {"Script", "Stylesheet", "Font", "Image"}
+_RESOURCE_TYPE_ALIASES = {
+    "script": "Script",
+    "stylesheet": "Stylesheet",
+    "font": "Font",
+    "image": "Image",
+}
 _STATIC_EXTENSIONS = {
     ".js", ".mjs", ".css", ".woff", ".woff2", ".ttf", ".otf", ".eot",
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".svg", ".ico",
@@ -51,16 +51,26 @@ _DENIED_PATH_PARTS = (
     "/sentinel/", "/authorize", "/oauth", "/login", "/logout",
     "/email-verification", "/about-you", "/bazaar/", "/obi/",
 )
-_REPLAY_RESPONSE_HEADERS = {
-    "content-type", "cache-control", "etag", "last-modified", "vary",
-    "access-control-allow-origin", "access-control-expose-headers",
-    "cross-origin-resource-policy", "timing-allow-origin",
+_SENSITIVE_QUERY_KEYS = {
+    "access_token", "authorization", "auth", "code", "credential", "id_token",
+    "jwt", "nonce", "oauth_token", "password", "refresh_token", "session",
+    "session_id", "state", "token", "verification_code", "verifier",
+}
+_SAFE_RESPONSE_HEADERS = {
+    "access-control-allow-origin", "access-control-expose-headers", "cache-control",
+    "content-type", "cross-origin-resource-policy", "etag", "last-modified",
+    "timing-allow-origin", "vary",
 }
 
 
 def _mode() -> str:
     value = str(getattr(_cfg, "ROXY_LOCAL_ASSET_CACHE_MODE", "auto") or "auto").strip().lower()
     return value if value in {"record", "replay", "auto"} else "auto"
+
+
+def _normalize_resource_type(resource_type: str) -> str:
+    value = str(resource_type or "").strip()
+    return _RESOURCE_TYPE_ALIASES.get(value.lower(), value)
 
 
 def _cache_key(url: str) -> str:
@@ -77,7 +87,7 @@ def _debugger_http_base(address: str) -> str:
 
 
 def _replace_ws_host(ws_url: str, debugger_address: str) -> str:
-    """Roxy 有时在 json/list 中返回 localhost；按实际 debugger host 修正。"""
+    """Roxy may return localhost in the target list; use the live debugger host."""
     try:
         ws = urlsplit(ws_url)
         debug = urlsplit(_debugger_http_base(debugger_address))
@@ -87,25 +97,58 @@ def _replace_ws_host(ws_url: str, debugger_address: str) -> str:
         host = debug.hostname
         netloc = f"{host}:{port}" if port else host
         return ws._replace(netloc=netloc).geturl()
-    except Exception:
+    except (TypeError, ValueError):
         return ws_url
+
+
+def _has_sensitive_query(url: str) -> bool:
+    try:
+        query = parse_qsl(urlsplit(url).query, keep_blank_values=True)
+    except (TypeError, ValueError):
+        return True
+    for key, value in query:
+        key_text = str(key or "").strip().lower().replace("-", "_")
+        if key_text in _SENSITIVE_QUERY_KEYS:
+            return True
+        if any(part in key_text for part in ("token", "secret", "cookie", "session", "password")):
+            return True
+        if value and any(marker in str(value).lower() for marker in ("bearer ", "eyj")):
+            return True
+    return False
+
+
+def _safe_headers(headers: Any) -> dict[str, str]:
+    if not isinstance(headers, dict):
+        return {}
+    result: dict[str, str] = {}
+    for name, value in headers.items():
+        name_text = str(name or "").strip()
+        if name_text.lower() not in _SAFE_RESPONSE_HEADERS:
+            continue
+        if isinstance(value, (str, int, float)):
+            result[name_text] = str(value)
+    return result
 
 
 class RoxyLocalAssetCache:
     def __init__(self, debugger_address: str | None, *, label: str = "Roxy"):
         self.debugger_address = str(debugger_address or "").strip()
         self.label = label
-        # 省流量模式开启时自动启用跨 Profile 静态资源缓存；显式缓存开关仍
-        # 可在未开启省流量模式时单独启用缓存。
         self.enabled = bool(
             getattr(_cfg, "ROXY_LOCAL_ASSET_CACHE_ENABLED", False)
             or getattr(_browser_cfg, "BROWSER_DATA_SAVER_MODE", False)
         )
         self.mode = _mode()
-        raw_dir = str(getattr(_cfg, "ROXY_LOCAL_ASSET_CACHE_DIR", "./cache/roxy-assets") or "./cache/roxy-assets")
+        raw_dir = str(
+            getattr(_cfg, "ROXY_LOCAL_ASSET_CACHE_DIR", "./cache/roxy-assets")
+            or "./cache/roxy-assets"
+        )
         self.cache_dir = Path(raw_dir).expanduser().resolve()
         self.max_age = max(0, int(getattr(_cfg, "ROXY_LOCAL_ASSET_CACHE_MAX_AGE", 86400) or 0))
-        self.max_item_bytes = max(1024, int(getattr(_cfg, "ROXY_LOCAL_ASSET_CACHE_MAX_ITEM_BYTES", 25 * 1024 * 1024) or 0))
+        self.max_item_bytes = max(
+            1024,
+            int(getattr(_cfg, "ROXY_LOCAL_ASSET_CACHE_MAX_ITEM_BYTES", 25 * 1024 * 1024) or 0),
+        )
         self._thread: threading.Thread | None = None
         self._ws: Any | None = None
         self._stop = threading.Event()
@@ -130,30 +173,31 @@ class RoxyLocalAssetCache:
     def is_cacheable(url: str, resource_type: str = "") -> bool:
         try:
             parsed = urlsplit(str(url or ""))
-        except Exception:
+        except (TypeError, ValueError):
             return False
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             return False
-        host = parsed.hostname.lower()
+        host = parsed.hostname.lower().rstrip(".")
         if not any(host == suffix or host.endswith("." + suffix) for suffix in _ALLOWED_HOST_SUFFIXES):
             return False
         path = parsed.path.lower()
         if any(part in path for part in _DENIED_PATH_PARTS):
             return False
-        rtype = str(resource_type or "")
-        if rtype and rtype not in _ALLOWED_RESOURCE_TYPES:
+        if _has_sensitive_query(str(url)):
+            return False
+        normalized_type = _normalize_resource_type(resource_type)
+        if normalized_type and normalized_type not in _ALLOWED_RESOURCE_TYPES:
             return False
         suffix = Path(path).suffix.lower()
-        return (
-            suffix in _STATIC_EXTENSIONS
-            or "/_next/static/" in path
-            or "/assets/" in path
-        )
+        return suffix in _STATIC_EXTENSIONS or "/_next/static/" in path or "/assets/" in path
 
     def _entry_path(self, url: str) -> Path:
-        return self.cache_dir / _cache_key(url)[:2] / f"{_cache_key(url)}.json"
+        key = _cache_key(url)
+        return self.cache_dir / key[:2] / f"{key}.json"
 
     def _load(self, url: str) -> dict[str, Any] | None:
+        if not self.is_cacheable(url):
+            return None
         path = self._entry_path(url)
         try:
             stat = path.stat()
@@ -162,46 +206,49 @@ class RoxyLocalAssetCache:
             item = json.loads(path.read_text(encoding="utf-8"))
             if item.get("url") != url or not item.get("body_b64"):
                 return None
-            # 兼容旧缓存中按 base64 长度估算而产生的 1~2 字节偏差。
-            item["body_bytes"] = len(base64.b64decode(item["body_b64"]))
+            body = base64.b64decode(item["body_b64"], validate=True)
+            if not body or len(body) > self.max_item_bytes:
+                return None
+            item["body_bytes"] = len(body)
             return item
-        except Exception:
+        except (OSError, ValueError, TypeError, KeyError, binascii.Error, json.JSONDecodeError):
             return None
 
     def _store(self, item: dict[str, Any], body_b64: str) -> None:
         try:
-            raw_size = len(base64.b64decode(body_b64))
-            if raw_size <= 0 or raw_size > self.max_item_bytes:
+            body = base64.b64decode(body_b64, validate=True)
+            if not body or len(body) > self.max_item_bytes:
                 return
             url = str(item.get("url") or "")
-            if not self.is_cacheable(url, str(item.get("resource_type") or "")):
+            resource_type = _normalize_resource_type(str(item.get("resource_type") or ""))
+            if not self.is_cacheable(url, resource_type):
                 return
             payload = {
                 "version": 1,
                 "url": url,
                 "status": int(item.get("status") or 200),
-                "resource_type": item.get("resource_type") or "",
-                "mime_type": item.get("mime_type") or "",
-                "headers": item.get("headers") or {},
+                "resource_type": resource_type,
+                "mime_type": str(item.get("mime_type") or ""),
+                "headers": _safe_headers(item.get("headers")),
                 "body_b64": body_b64,
-                "body_bytes": raw_size,
+                "body_bytes": len(body),
                 "stored_at": int(time.time()),
             }
             with _CACHE_STORE_LOCK:
-                # Chromium 某些版本无法稳定关联 Fetch 与 Network 的请求 ID，命中
-                # 本地缓存的响应也可能再次到达记录路径。已有有效文件不重复覆盖，
-                # 也不再误报成“本轮新增”。过期文件仍会正常刷新。
                 if self._load(url) is not None:
                     return
                 path = self._entry_path(url)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = path.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
-                tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+                tmp.write_text(
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                    encoding="utf-8",
+                )
                 os.replace(tmp, path)
                 self.recorded += 1
-                self.recorded_bytes += raw_size
-                self._recorded_items[url] = raw_size
-        except Exception as exc:
+                self.recorded_bytes += len(body)
+                self._recorded_items[url] = len(body)
+        except (OSError, ValueError, TypeError, binascii.Error) as exc:
             self._remember_error(f"store: {type(exc).__name__}: {exc}")
 
     def _remember_error(self, message: str) -> None:
@@ -214,6 +261,8 @@ class RoxyLocalAssetCache:
         with self._send_lock:
             self._next_id += 1
             command_id = self._next_id
+            if self._ws is None:
+                raise RuntimeError("CDP WebSocket 未连接")
             self._ws.send(json.dumps({"id": command_id, "method": method, "params": params or {}}))
             return command_id
 
@@ -226,11 +275,18 @@ class RoxyLocalAssetCache:
         response = http.get(base + "/json/list", timeout=5)
         response.raise_for_status()
         targets = response.json()
-        pages = [x for x in targets if isinstance(x, dict) and x.get("type") == "page" and x.get("webSocketDebuggerUrl")]
+        pages = [
+            target for target in targets
+            if isinstance(target, dict)
+            and target.get("type") == "page"
+            and target.get("webSocketDebuggerUrl")
+        ]
         if not pages:
             return ""
-        # 优先当前普通页面；about:blank 也可以，后续导航仍使用同一个 target。
-        target = next((x for x in pages if not str(x.get("url") or "").startswith("devtools://")), pages[0])
+        target = next(
+            (target for target in pages if not str(target.get("url") or "").startswith("devtools://")),
+            pages[0],
+        )
         return _replace_ws_host(str(target["webSocketDebuggerUrl"]), self.debugger_address)
 
     def start(self) -> "RoxyLocalAssetCache":
@@ -260,33 +316,37 @@ class RoxyLocalAssetCache:
                 suppress_origin=True,
                 http_no_proxy=["127.0.0.1", "localhost", "::1"],
             )
-            self._send("Network.enable", {
-                "maxTotalBufferSize": 200 * 1024 * 1024,
-                "maxResourceBufferSize": self.max_item_bytes,
-            })
+            self._send(
+                "Network.enable",
+                {
+                    "maxTotalBufferSize": 200 * 1024 * 1024,
+                    "maxResourceBufferSize": self.max_item_bytes,
+                },
+            )
             if self.mode in {"replay", "auto"}:
-                self._send("Fetch.enable", {"patterns": [
-                    {"urlPattern": "*", "resourceType": kind, "requestStage": "Request"}
-                    for kind in sorted(_ALLOWED_RESOURCE_TYPES)
-                ]})
+                self._send(
+                    "Fetch.enable",
+                    {
+                        "patterns": [
+                            {"urlPattern": "*", "resourceType": kind, "requestStage": "Request"}
+                            for kind in sorted(_ALLOWED_RESOURCE_TYPES)
+                        ]
+                    },
+                )
             self._ready.set()
             logger.info("[%s][本地缓存] 已启用 mode=%s dir=%s", self.label, self.mode, self.cache_dir)
-
             while not self._stop.is_set():
                 try:
                     raw = self._ws.recv()
-                except Exception as exc:
-                    # websocket-client 的超时用于周期检查停止信号。
+                except Exception as exc:  # noqa: BLE001
                     if "timed out" in str(exc).lower():
                         continue
                     if self._stop.is_set():
                         break
                     raise
-                if not raw:
-                    continue
-                message = json.loads(raw)
-                self._handle_message(message)
-        except Exception as exc:
+                if raw:
+                    self._handle_message(json.loads(raw))
+        except Exception as exc:  # noqa: BLE001
             self._remember_error(f"run: {type(exc).__name__}: {exc}")
             logger.warning("[%s][本地缓存] 已停用：%s: %s", self.label, type(exc).__name__, exc)
         finally:
@@ -294,7 +354,7 @@ class RoxyLocalAssetCache:
             try:
                 if self._ws is not None:
                     self._ws.close()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
             self._ws = None
 
@@ -305,7 +365,11 @@ class RoxyLocalAssetCache:
             result = message.get("result") or {}
             body = result.get("body")
             if isinstance(body, str):
-                body_b64 = body if result.get("base64Encoded") else base64.b64encode(body.encode("utf-8")).decode("ascii")
+                body_b64 = (
+                    body
+                    if result.get("base64Encoded")
+                    else base64.b64encode(body.encode("utf-8")).decode("ascii")
+                )
                 self._store(item, body_b64)
             return
 
@@ -322,7 +386,7 @@ class RoxyLocalAssetCache:
         request_id = str(params.get("requestId") or "")
         request = params.get("request") or {}
         url = str(request.get("url") or "")
-        resource_type = str(params.get("resourceType") or "")
+        resource_type = _normalize_resource_type(str(params.get("resourceType") or ""))
         try:
             if str(request.get("method") or "GET").upper() != "GET" or not self.is_cacheable(url, resource_type):
                 self._send("Fetch.continueRequest", {"requestId": request_id})
@@ -332,37 +396,33 @@ class RoxyLocalAssetCache:
                 self.cache_misses += 1
                 self._send("Fetch.continueRequest", {"requestId": request_id})
                 return
-            headers = []
-            for name, value in (cached.get("headers") or {}).items():
-                # 不回放旧 cf-ray/date/age/server/x-ms-* 等边缘节点或时效字段。
-                # Content-Encoding/Length 也由 fulfillRequest 根据解码后的 body 重建。
-                if str(name).lower() not in _REPLAY_RESPONSE_HEADERS:
-                    continue
-                if isinstance(value, (str, int, float)):
-                    headers.append({"name": str(name), "value": str(value)})
-            if not any(x["name"].lower() == "content-type" for x in headers) and cached.get("mime_type"):
+            headers = [
+                {"name": name, "value": value}
+                for name, value in _safe_headers(cached.get("headers")).items()
+            ]
+            if not any(header["name"].lower() == "content-type" for header in headers) and cached.get("mime_type"):
                 headers.append({"name": "Content-Type", "value": str(cached["mime_type"])})
             network_id = str(params.get("networkId") or "")
-            self._send("Fetch.fulfillRequest", {
-                "requestId": request_id,
-                "responseCode": int(cached.get("status") or 200),
-                "responseHeaders": headers,
-                "body": str(cached["body_b64"]),
-            })
+            self._send(
+                "Fetch.fulfillRequest",
+                {
+                    "requestId": request_id,
+                    "responseCode": int(cached.get("status") or 200),
+                    "responseHeaders": headers,
+                    "body": str(cached["body_b64"]),
+                },
+            )
             with self._fulfilled_lock:
                 if network_id:
                     self._fulfilled_network_ids.add(network_id)
-                # 部分 Chromium 在 Request 阶段的 Fetch.requestPaused 不提供
-                # networkId；另有版本返回的 ID 与 Network.requestId 不一致。
-                # 无论是否拿到 networkId，都用精确 URL 计数作关联兜底。
                 self._fulfilled_urls[url] += 1
             self.cache_hits += 1
             self.bytes_saved += int(cached.get("body_bytes") or 0)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._remember_error(f"paused: {type(exc).__name__}: {exc}")
             try:
                 self._send("Fetch.continueRequest", {"requestId": request_id})
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
     def _handle_response(self, params: dict[str, Any]) -> None:
@@ -371,7 +431,6 @@ class RoxyLocalAssetCache:
         url = str(response.get("url") or "")
         with self._fulfilled_lock:
             if request_id and request_id in self._fulfilled_network_ids:
-                # ID 已匹配时也要消费 URL 兜底计数，避免残留计数误匹配后续请求。
                 if self._fulfilled_urls.get(url, 0) > 0:
                     self._fulfilled_urls[url] -= 1
                     if self._fulfilled_urls[url] <= 0:
@@ -384,7 +443,7 @@ class RoxyLocalAssetCache:
                 if request_id:
                     self._fulfilled_network_ids.add(request_id)
                 return
-        resource_type = str(params.get("type") or "")
+        resource_type = _normalize_resource_type(str(params.get("type") or ""))
         status = int(response.get("status") or 0)
         if status != 200 or not self.is_cacheable(url, resource_type):
             return
@@ -407,11 +466,10 @@ class RoxyLocalAssetCache:
         try:
             command_id = self._send("Network.getResponseBody", {"requestId": request_id})
             self._pending_bodies[command_id] = item
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             self._remember_error(f"body: {type(exc).__name__}: {exc}")
 
     def was_fulfilled_network_request(self, request_id: str) -> bool:
-        """供流量统计器识别 CDP 本地响应，避免误计为代理下载流量。"""
         if not request_id:
             return False
         with self._fulfilled_lock:
@@ -432,9 +490,7 @@ class RoxyLocalAssetCache:
             "recorded_bytes": self.recorded_bytes,
             "recorded_top": [
                 {"url": url, "bytes": size}
-                for url, size in sorted(
-                    self._recorded_items.items(), key=lambda pair: pair[1], reverse=True
-                )[:30]
+                for url, size in sorted(self._recorded_items.items(), key=lambda pair: pair[1], reverse=True)[:30]
             ],
             "hits": self.cache_hits,
             "misses": self.cache_misses,
@@ -449,7 +505,7 @@ class RoxyLocalAssetCache:
         try:
             if self._ws is not None:
                 self._ws.settimeout(0.1)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
         if self._thread is not None:
             self._thread.join(timeout=3)
@@ -458,18 +514,13 @@ class RoxyLocalAssetCache:
         if self.enabled:
             logger.info(
                 "[%s][本地缓存] 结束 recorded=%s hits=%s misses=%s saved=%sB errors=%s",
-                self.label, result["recorded"], result["hits"], result["misses"],
-                result["bytes_saved"], len(result["errors"]),
+                self.label,
+                result["recorded"],
+                result["hits"],
+                result["misses"],
+                result["bytes_saved"],
+                len(result["errors"]),
             )
-            if result.get("recorded_top"):
-                logger.info(
-                    "[%s][本地缓存] 本轮新增资源 Top：%s",
-                    self.label,
-                    [
-                        f"{item['bytes']}B {item['url']}"
-                        for item in result["recorded_top"][:10]
-                    ],
-                )
         return result
 
 

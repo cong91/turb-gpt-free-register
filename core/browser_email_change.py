@@ -16,6 +16,8 @@ from core.rotating_proxy_runtime import (
 )
 
 logger = logging.getLogger(__name__)
+_EMAIL_CHANGE_RESTART_ATTEMPTS = 2
+_EMAIL_CHANGE_RESTART_ATTEMPTS = 2
 
 
 def _redacted_error(exc: Exception, item: EmailChangeInput) -> str:
@@ -31,73 +33,53 @@ def run_email_change(
     *,
     proxy_lane_id: int | None = None,
 ) -> dict[str, object]:
-    """Run one email change in an isolated configured browser session."""
-    profile = None
-    rotating_proxy: str | None = None
-    try:
-        active_proxy = resolve_rotating_proxy(
-            None,
-            scope=EMAIL_CHANGE_PROXY_SCOPE,
-            lane_id=proxy_lane_id,
-        )
-        rotating_proxy = active_proxy
-        profile = (
-            open_browser_profile(proxy=active_proxy)
-            if active_proxy is not None
-            else open_browser_profile()
-        )
-        result = change_email_in_browser(profile.driver, item)
-        result["browser_provider"] = profile.provider
-        if not bool(result.get("ok")):
-            result.setdefault("persisted", False)
-            return result
-        persistence_warning = ""
+    """Run one email change with bounded fresh-profile recovery."""
+    last_result: dict[str, object] = {"ok": False}
+    for attempt in range(_EMAIL_CHANGE_RESTART_ATTEMPTS):
+        profile = None
+        rotating_proxy: str | None = None
         try:
-            persisted = db.update_account_email(item.old_email, item.new_email)
-        except Exception as exc:  # noqa: BLE001 - persistence adapters have mixed error types.
-            persisted = False
-            persistence_warning = _redacted_error(exc, item)
-        result["persisted"] = persisted
-        if persisted:
+            active_proxy = resolve_rotating_proxy(None, scope=EMAIL_CHANGE_PROXY_SCOPE, lane_id=proxy_lane_id)
+            rotating_proxy = active_proxy
+            profile = open_browser_profile(proxy=active_proxy) if active_proxy is not None else open_browser_profile()
+            result = change_email_in_browser(profile.driver, item)
+            result["browser_provider"] = profile.provider
+            last_result = result
+            if not bool(result.get("ok")):
+                result.setdefault("persisted", False)
+                if not result.get("retryable", True) or attempt + 1 >= _EMAIL_CHANGE_RESTART_ATTEMPTS:
+                    return result
+                continue
             try:
+                persisted = db.update_account_email(item.old_email, item.new_email)
+            except Exception as exc:
+                persisted = False
+                result["warning"] = _redacted_error(exc, item)
+            result["persisted"] = persisted
+            if persisted:
                 updated = db.get_account_by_email(item.new_email)
                 if updated and updated.get("id") is not None:
                     result["account_id"] = int(updated["id"])
-            except Exception as exc:  # noqa: BLE001 - export identity lookup must not mask remote success.
-                persistence_warning = _redacted_error(exc, item)
-        try:
             source_email = item.gmail_source_email or item.new_email
             if db.get_gmail_api_url_email_by_email(source_email):
                 db.release_gmail_api_url_email(source_email, "used", "account email changed")
-        except Exception as exc:  # noqa: BLE001 - pool adapters have mixed error types.
-            persistence_warning = persistence_warning or _redacted_error(exc, item)
-        if not persisted:
-            detail = persistence_warning or "source account was not found in local persistence"
-            result["warning"] = f"account changed remotely but local persistence was not updated: {detail}"
-        return result
-    except Exception as exc:  # noqa: BLE001 - isolate every browser job into a result.
-        return {
-            "ok": False,
-            "old_email": item.old_email,
-            "new_email": item.new_email,
-            "error": _redacted_error(exc, item),
-        }
-    finally:
-        if rotating_proxy is not None:
-            release_rotating_proxy(
-                scope=EMAIL_CHANGE_PROXY_SCOPE,
-                lane_id=proxy_lane_id,
-                proxy_url=rotating_proxy,
-            )
-        if profile is not None:
-            try:
-                profile.close()
-            except Exception:  # noqa: BLE001 - driver shutdown is best-effort cleanup.
-                logger.debug("Browser driver cleanup failed")
-            try:
-                profile.cleanup()
-            except Exception:  # noqa: BLE001 - profile cleanup must not mask job result.
-                logger.debug("Browser profile cleanup failed")
+            if not persisted:
+                result["warning"] = result.get("warning") or "source account was not found in local persistence"
+                result["retryable"] = False
+            return result
+        except Exception as exc:
+            last_result = {"ok": False, "old_email": item.old_email, "new_email": item.new_email, "error": _redacted_error(exc, item), "retryable": True}
+            if attempt + 1 >= _EMAIL_CHANGE_RESTART_ATTEMPTS:
+                return last_result
+        finally:
+            if rotating_proxy is not None:
+                release_rotating_proxy(scope=EMAIL_CHANGE_PROXY_SCOPE, lane_id=proxy_lane_id, proxy_url=rotating_proxy)
+            if profile is not None:
+                try: profile.close()
+                except Exception: logger.debug("Browser driver cleanup failed")
+                try: profile.cleanup()
+                except Exception: logger.debug("Browser profile cleanup failed")
+    return last_result
 
 
 def run_email_change_batch(
