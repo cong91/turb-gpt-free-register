@@ -13,7 +13,9 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
+
+from config import browser as _browser_cfg
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,43 @@ def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def _safe_url_for_log(url: Any, *, max_length: int = 600) -> str:
+    """保留 URL 结构并隐藏查询值、userinfo 与 data/blob 内容。"""
+    text = str(url or "")
+    if not text:
+        return "-"
+    if text.lower().startswith(("data:", "blob:")):
+        return text.split(":", 1)[0].lower() + ":<redacted>"
+    try:
+        parsed = urlsplit(text)
+        query_keys = []
+        for part in str(parsed.query or "").split("&"):
+            if not part:
+                continue
+            query_keys.append(f"{part.split('=', 1)[0]}=<redacted>")
+        netloc = parsed.netloc.rsplit("@", 1)[-1]
+        safe = urlunsplit((parsed.scheme, netloc, parsed.path, "&".join(query_keys), ""))
+    except (TypeError, ValueError):
+        safe = text.split("?", 1)[0]
+    safe = safe.replace("\r", "").replace("\n", "")
+    return safe[:max_length] + ("…" if len(safe) > max_length else "")
+
+
+def _normalize_resource_type(value: Any) -> str:
+    aliases = {
+        "img": "image",
+        "images": "image",
+        "video": "media",
+        "audio": "media",
+        "videos": "media",
+        "fonts": "font",
+        "css": "stylesheet",
+        "xmlhttprequest": "xhr",
+    }
+    raw = str(value or "other").strip().lower()
+    return aliases.get(raw, raw or "other")
+
+
 class _TrafficAccumulator:
     """只保存计数，不保存 URL、Header 或请求体。"""
 
@@ -83,6 +122,111 @@ class _TrafficAccumulator:
         self.unknown_size_request_count = 0
         self.websocket_count = 0
         self._reported = False
+        self._local_asset_cache: Any | None = None
+        self._detail_log_enabled = False
+        self._detail_log_max_entries = 2000
+        self._request_details: list[dict[str, Any]] = []
+        self._request_detail_index: dict[str, int] = {}
+        self._request_detail_sequence = 0
+        self._configure_detail_logging()
+
+    def _configure_detail_logging(self) -> None:
+        self._detail_log_enabled = bool(getattr(_browser_cfg, "BROWSER_TRAFFIC_DETAIL_LOG", False))
+        try:
+            configured_max = int(getattr(_browser_cfg, "BROWSER_TRAFFIC_DETAIL_MAX_ENTRIES", 2000) or 2000)
+        except (TypeError, ValueError):
+            configured_max = 2000
+        self._detail_log_max_entries = max(1, min(configured_max, 10000))
+
+    @staticmethod
+    def _cache_status(*, cache_status: Any = None, from_cache: Any = None) -> str:
+        raw = str(cache_status or "").strip().lower()
+        if raw in {"hit", "miss", "unknown", "service_worker"}:
+            return raw
+        return "hit" if from_cache is True else "unknown"
+
+    def _record_request_detail(
+        self,
+        *,
+        request_id: Any = None,
+        resource_type: Any = "other",
+        method: Any = "GET",
+        url: Any = "",
+        status: Any = None,
+        upload_bytes: Any = 0,
+        download_bytes: Any = 0,
+        response_body_bytes: Any = 0,
+        response_header_bytes: Any = 0,
+        failed: bool = False,
+        unfinished: bool = False,
+        cache_status: Any = None,
+        from_cache: Any = None,
+        mime_type: Any = "",
+        detail_key: Any = None,
+    ) -> None:
+        if not self._detail_log_enabled:
+            return
+        try:
+            status_value = int(float(status)) if status is not None and str(status) else None
+        except (TypeError, ValueError, OverflowError):
+            status_value = None
+        cache_value = self._cache_status(cache_status=cache_status, from_cache=from_cache)
+        with self._lock:
+            self._request_detail_sequence += 1
+            key = str(detail_key or f"anonymous:{self._request_detail_sequence}")
+            detail = {
+                "request_id": str(request_id) if request_id is not None else "-",
+                "type": _normalize_resource_type(resource_type),
+                "method": str(method or "GET").upper(),
+                "status": status_value,
+                "upload_bytes": _non_negative_int(upload_bytes),
+                "download_bytes": _non_negative_int(download_bytes),
+                "response_body_bytes": _non_negative_int(response_body_bytes),
+                "response_header_bytes": _non_negative_int(response_header_bytes),
+                "failed": bool(failed),
+                "unfinished": bool(unfinished),
+                "from_cache": cache_value == "hit",
+                "cache_status": cache_value,
+                "mime_type": str(mime_type or "").replace("\r", "").replace("\n", "")[:160],
+                "url": _safe_url_for_log(url),
+            }
+            existing_index = self._request_detail_index.get(key)
+            if existing_index is None:
+                if len(self._request_details) >= self._detail_log_max_entries:
+                    return
+                self._request_detail_index[key] = len(self._request_details)
+                self._request_details.append(detail)
+            else:
+                self._request_details[existing_index] = detail
+
+    def _log_request_details(self) -> None:
+        if not self._detail_log_enabled:
+            return
+        with self._lock:
+            details = list(self._request_details)
+        for index, item in enumerate(details, 1):
+            logger.info(
+                "[%s] [资源明细] #%s %s %s status=%s upload=%sB download=%sB "
+                "body=%sB headers=%sB failed=%s unfinished=%s cache=%s mime=%s url=%s",
+                self.label,
+                index,
+                item["type"],
+                item["method"],
+                item["status"] if item["status"] is not None else "-",
+                item["upload_bytes"],
+                item["download_bytes"],
+                item["response_body_bytes"],
+                item["response_header_bytes"],
+                int(item["failed"]),
+                int(item["unfinished"]),
+                item["cache_status"],
+                item["mime_type"],
+                item["url"],
+            )
+
+    def attach_local_asset_cache(self, cache: Any | None) -> None:
+        """让统计器排除本地 Roxy 静态资源响应。"""
+        self._local_asset_cache = cache
 
     def _add_http(self, upload: int = 0, download: int = 0) -> None:
         with self._lock:
@@ -123,6 +267,9 @@ class _TrafficAccumulator:
                 "unfinished_request_count": int(self.unfinished_request_count),
                 "unknown_size_request_count": int(self.unknown_size_request_count),
                 "websocket_count": int(self.websocket_count),
+                "detail_log_enabled": bool(self._detail_log_enabled),
+                "detail_log_max_entries": int(self._detail_log_max_entries),
+                "detail_recorded_count": int(len(self._request_details)),
                 "note": note,
             }
             return result
@@ -218,6 +365,81 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
             body = None
         return header_bytes + _payload_size(body) if body else header_bytes
 
+    def _request_metadata(self, request: Any, *, include_response: bool) -> dict[str, Any]:
+        try:
+            resource_type = getattr(request, "resource_type", "other")
+        except Exception:  # noqa: BLE001
+            resource_type = "other"
+        try:
+            method = getattr(request, "method", "GET")
+        except Exception:  # noqa: BLE001
+            method = "GET"
+        try:
+            url = getattr(request, "url", "")
+        except Exception:  # noqa: BLE001
+            url = ""
+        response = None
+        if include_response:
+            try:
+                response = request.response()
+            except Exception:  # noqa: BLE001
+                response = None
+        status = getattr(response, "status", None) if response is not None else None
+        mime_type = ""
+        cache_status = "unknown"
+        if response is not None:
+            try:
+                headers = getattr(response, "headers", {}) or {}
+                mime_type = headers.get("content-type", "") if isinstance(headers, dict) else ""
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if bool(getattr(response, "from_service_worker", False)):
+                    cache_status = "service_worker"
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "resource_type": _normalize_resource_type(resource_type),
+            "method": str(method or "GET").upper(),
+            "url": str(url or ""),
+            "status": status,
+            "mime_type": mime_type,
+            "cache_status": cache_status,
+        }
+
+    def _record_playwright_detail(
+        self,
+        request: Any,
+        *,
+        request_id: Any,
+        upload_bytes: Any = 0,
+        download_bytes: Any = 0,
+        response_body_bytes: Any = 0,
+        response_header_bytes: Any = 0,
+        failed: bool = False,
+        unfinished: bool = False,
+        include_response: bool = True,
+    ) -> None:
+        if not self._detail_log_enabled:
+            return
+        metadata = self._request_metadata(request, include_response=include_response)
+        self._record_request_detail(
+            request_id=request_id,
+            resource_type=metadata["resource_type"],
+            method=metadata["method"],
+            url=metadata["url"],
+            status=metadata["status"],
+            upload_bytes=upload_bytes,
+            download_bytes=download_bytes,
+            response_body_bytes=response_body_bytes,
+            response_header_bytes=response_header_bytes,
+            failed=failed,
+            unfinished=unfinished,
+            cache_status=metadata["cache_status"],
+            mime_type=metadata["mime_type"],
+            detail_key=f"playwright:{request_id}",
+        )
+
     def _mark_request(self, request: Any, *, failed: bool) -> None:
         key = id(request)
         with self._lock:
@@ -228,18 +450,36 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 self.request_count += 1
             self._requests[key] = request
 
-        try:
-            sizes = request.sizes()
-        except Exception:  # noqa: BLE001
-            # requestfailed 没有 response，sizes() 通常不可用。
+        if failed:
             upload = self._request_fallback_upload(request)
             with self._lock:
                 self.http_upload_bytes += upload
                 self.unknown_size_request_count += 1
-                if failed:
-                    self.failed_request_count += 1
-                else:
-                    self.completed_request_count += 1
+                self.failed_request_count += 1
+            self._record_playwright_detail(
+                request,
+                request_id=key,
+                upload_bytes=upload,
+                failed=True,
+                include_response=False,
+            )
+            return
+
+        try:
+            sizes = request.sizes()
+        except Exception:  # noqa: BLE001
+            # 极少数完成事件也可能拿不到 sizes()；此时只估算上传，且不再读取 response。
+            upload = self._request_fallback_upload(request)
+            with self._lock:
+                self.http_upload_bytes += upload
+                self.unknown_size_request_count += 1
+                self.completed_request_count += 1
+            self._record_playwright_detail(
+                request,
+                request_id=key,
+                upload_bytes=upload,
+                include_response=False,
+            )
             return
 
         values = {
@@ -262,6 +502,53 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 self.failed_request_count += 1
             else:
                 self.completed_request_count += 1
+        self._record_playwright_detail(
+            request,
+            request_id=key,
+            upload_bytes=upload,
+            download_bytes=download,
+            response_body_bytes=values["responseBodySize"] or 0,
+            response_header_bytes=values["responseHeadersSize"] or 0,
+            include_response=True,
+        )
+
+    def _record_unfinished_request_details(self) -> None:
+        if not self._detail_log_enabled:
+            return
+        for key, request in list(self._requests.items()):
+            with self._lock:
+                if key in self._accounted_requests:
+                    continue
+            try:
+                sizes = request.sizes()
+            except Exception:  # noqa: BLE001
+                self._record_playwright_detail(
+                    request,
+                    request_id=key,
+                    upload_bytes=self._request_fallback_upload(request),
+                    unfinished=True,
+                    include_response=False,
+                )
+                continue
+            values = {
+                name: _optional_size(_size_field(sizes, name))
+                for name in (
+                    "requestBodySize",
+                    "requestHeadersSize",
+                    "responseBodySize",
+                    "responseHeadersSize",
+                )
+            }
+            self._record_playwright_detail(
+                request,
+                request_id=key,
+                upload_bytes=(values["requestBodySize"] or 0) + (values["requestHeadersSize"] or 0),
+                download_bytes=(values["responseBodySize"] or 0) + (values["responseHeadersSize"] or 0),
+                response_body_bytes=values["responseBodySize"] or 0,
+                response_header_bytes=values["responseHeadersSize"] or 0,
+                unfinished=True,
+                include_response=True,
+            )
 
     def _on_request_finished(self, request: Any) -> None:
         self._mark_request(request, failed=False)
@@ -310,8 +597,10 @@ class PlaywrightTrafficTracker(_TrafficAccumulator):
                 0, len(self._requests) - len(self._accounted_requests)
             )
         self._remove_listeners()
+        self._record_unfinished_request_details()
         snapshot = self._finish_snapshot()
         self._log_snapshot(snapshot)
+        self._log_request_details()
         return snapshot
 
 
@@ -368,6 +657,39 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
         start_line = f"HTTP/1.1 {status or 0} {status_text}\r\n"
         return cls._header_size(response.get("headers") or {}, start_line=start_line)
 
+    def _record_cdp_detail(
+        self,
+        record: dict[str, Any],
+        *,
+        body_size: Any = 0,
+        failed: bool = False,
+        unfinished: bool = False,
+    ) -> None:
+        if not self._detail_log_enabled:
+            return
+        request = record.get("request") or {}
+        response = record.get("response") or {}
+        cache_status = "hit" if record.get("served_from_cache") else ("miss" if response else "unknown")
+        body = 0 if cache_status == "hit" else max(
+            _non_negative_int(body_size), _non_negative_int(record.get("received_body_bytes"))
+        )
+        header = 0 if cache_status == "hit" else self._response_header_size(response)
+        self._record_request_detail(
+            request_id=record.get("request_id"),
+            resource_type=record.get("resource_type") or "other",
+            method=request.get("method") if isinstance(request, dict) else "GET",
+            url=request.get("url") if isinstance(request, dict) else "",
+            status=response.get("status") if isinstance(response, dict) else None,
+            upload_bytes=0 if cache_status == "hit" else record.get("upload_size", 0),
+            download_bytes=0 if cache_status == "hit" else body + header,
+            response_body_bytes=body,
+            response_header_bytes=header,
+            failed=failed,
+            unfinished=unfinished,
+            cache_status=cache_status,
+            mime_type=response.get("mimeType") if isinstance(response, dict) else "",
+            detail_key=record.get("detail_key"),
+        )
     def _finish_cdp_request(self, record: dict[str, Any], *, body_size: Any = 0, failed: bool = False) -> None:
         if record.get("finished"):
             return
@@ -384,6 +706,17 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                 self.failed_request_count += 1
             else:
                 self.completed_request_count += 1
+        self._record_cdp_detail(record, body_size=body_size, failed=failed)
+
+
+    def _is_local_asset(self, request_id: str) -> bool:
+        cache = self._local_asset_cache
+        if cache is None:
+            return False
+        try:
+            return bool(cache.was_fulfilled_network_request(request_id))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _handle_cdp_event(self, method: str, params: dict[str, Any]) -> None:
         self._network_event_count += 1
@@ -404,10 +737,12 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                 "request": request,
                 "response": None,
                 "finished": False,
-                "served_from_cache": False,
+                "served_from_cache": self._is_local_asset(request_id),
                 "upload_size": self._request_upload_size(request),
                 "upload_added": False,
                 "received_body_bytes": 0,
+                "resource_type": _normalize_resource_type(params.get("type") or "other"),
+                "detail_key": f"selenium:{request_id}",
             }
             self._requests[request_id] = record
             with self._lock:
@@ -421,6 +756,8 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                 response = params.get("response") or {}
                 record["response"] = response
                 if response.get("fromDiskCache") or response.get("fromMemoryCache"):
+                    record["served_from_cache"] = True
+                if self._is_local_asset(request_id):
                     record["served_from_cache"] = True
             return
 
@@ -443,12 +780,16 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
             request_id = str(params.get("requestId") or "")
             record = self._requests.get(request_id)
             if record is not None:
+                if self._is_local_asset(request_id):
+                    record["served_from_cache"] = True
                 self._finish_cdp_request(record, body_size=params.get("encodedDataLength", 0))
             return
 
         if method == "Network.dataReceived":
             request_id = str(params.get("requestId") or "")
             record = self._requests.get(request_id)
+            if record is not None and self._is_local_asset(request_id):
+                record["served_from_cache"] = True
             if record is not None and not record.get("served_from_cache"):
                 record["received_body_bytes"] = (
                     _non_negative_int(record.get("received_body_bytes"))
@@ -570,6 +911,27 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
             with self._lock:
                 self.request_count += 1
                 self.completed_request_count += 1
+                detail_enabled = self._detail_log_enabled
+            if detail_enabled:
+                self._record_request_detail(
+                    request_id=f"timing-{len(self._fallback_seen)}",
+                    resource_type="document" if item in (data.get("navigation") or []) else "other",
+                    method="GET",
+                    url=item.get("name") or document,
+                    status=None,
+                    download_bytes=transfer,
+                    response_body_bytes=_non_negative_int(item.get("encodedBodySize")),
+                    cache_status="unknown",
+                    detail_key=f"timing:{key}",
+                )
+
+    def _record_unfinished_cdp_details(self, records: list[dict[str, Any]]) -> None:
+        for record in records:
+            self._record_cdp_detail(
+                record,
+                body_size=record.get("received_body_bytes", 0),
+                unfinished=True,
+            )
 
     def checkpoint(self) -> None:
         if not self._stopped:
@@ -598,6 +960,8 @@ class SeleniumTrafficTracker(_TrafficAccumulator):
                     self.unknown_size_request_count += 1
                 unfinished = len(unfinished_records)
                 self.unfinished_request_count = unfinished
+        self._record_unfinished_cdp_details(unfinished_records)
         snapshot = self._finish_snapshot()
         self._log_snapshot(snapshot)
+        self._log_request_details()
         return snapshot

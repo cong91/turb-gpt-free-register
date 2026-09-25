@@ -7,20 +7,46 @@ from core import cloakbrowser_driver
 
 class BrowserLocaleTests(unittest.TestCase):
     def test_vietnamese_locale_profile_is_supported(self):
-        profile = browser._build_locale_from_geo({"country": "VN", "timezone": "Asia/Ho_Chi_Minh"})
+        with patch.object(browser, "AUTO_BROWSER_LOCALE_FROM_IP", True):
+            profile = browser._build_locale_from_geo({"country": "VN", "timezone": "Asia/Ho_Chi_Minh"})
 
         self.assertEqual(profile["locale_profile"], "vi")
         self.assertEqual(profile["navigator_language"], "vi-VN")
         self.assertEqual(profile["timezone_iana"], "Asia/Ho_Chi_Minh")
 
-    def test_configured_vietnamese_profile_does_not_raise(self):
+    def test_proxy_country_without_named_profile_is_derived_from_geo(self):
+        with patch.object(browser, "AUTO_BROWSER_LOCALE_FROM_IP", True):
+            profile = browser.build_browser_environment({
+                "country": "TH",
+                "timezone": "Asia/Bangkok",
+                "city": "Bangkok",
+            })
+
+        self.assertEqual(profile["locale_profile"], "geo:th")
+        self.assertEqual(profile["navigator_language"], "th-TH")
+        self.assertTrue(profile["accept_language"].startswith("th-TH,th;"))
+        self.assertEqual(profile["timezone_iana"], "Asia/Bangkok")
+        self.assertEqual(profile["timezone_offset_minutes"], 420)
+
+    def test_unknown_proxy_country_does_not_leak_fixed_local_locale(self):
+        with patch.object(browser, "AUTO_BROWSER_LOCALE_FROM_IP", True):
+            profile = browser.build_browser_environment({
+                "country": "XX",
+                "timezone": "UTC",
+            })
+
+        self.assertEqual(profile["locale_profile"], "geo:xx")
+        self.assertEqual(profile["navigator_language"], "en-US")
+        self.assertEqual(profile["timezone_iana"], "UTC")
+
         profile = browser.build_browser_environment()
 
         self.assertTrue(profile["navigator_language"])
         self.assertIn(profile["navigator_language"], profile["navigator_languages"])
 
     def test_exit_ip_does_not_change_fixed_locale(self):
-        profile = browser._build_locale_from_geo({"country": "ID", "timezone": "Asia/Jakarta"})
+        with patch.object(browser, "AUTO_BROWSER_LOCALE_FROM_IP", False):
+            profile = browser._build_locale_from_geo({"country": "ID", "timezone": "Asia/Jakarta"})
 
         self.assertEqual(profile["locale_profile"], browser.BROWSER_LOCALE_PROFILE)
         self.assertEqual(profile["navigator_language"], "vi-VN")

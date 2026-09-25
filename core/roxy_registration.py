@@ -26,6 +26,7 @@ from core.browser_selenium_adapter import (
     center_browser_window as _center_browser_window,
 )
 from core.browser_traffic import SeleniumTrafficTracker
+from core.roxy_asset_cache import RoxyLocalAssetCache
 from core.email_provider import (
     acquire_email_after_input,
     resolve_email_source,
@@ -151,6 +152,8 @@ def run_roxy_registration(
     account_id: int | None = None
     network_identity: dict | None = None
     traffic_tracker: SeleniumTrafficTracker | None = None
+    asset_cache: RoxyLocalAssetCache | None = None
+    asset_cache_snapshot: dict | None = None
     network_traffic: dict | None = None
 
     def _traffic_checkpoint() -> None:
@@ -177,6 +180,14 @@ def run_roxy_registration(
 
             network_identity = network_identity_for_tunnel(tunnel, opened.profile_id)
         driver = _build_driver(opened)
+        try:
+            asset_cache = RoxyLocalAssetCache(opened.debugger_address, label="Roxy").start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[Roxy注册] 初始化本地静态资源缓存失败，继续联网加载：%s: %s",
+                type(exc).__name__,
+                str(exc)[:180],
+            )
         from core.registration_network_identity import (
             NetworkIdentityError,
             probe_browser_geo,
@@ -186,6 +197,7 @@ def run_roxy_registration(
         browser_geo = probe_browser_geo(driver) or {}
         try:
             traffic_tracker = SeleniumTrafficTracker(driver, label="Roxy")
+            traffic_tracker.attach_local_asset_cache(asset_cache)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "[Roxy注册] 初始化浏览器流量统计失败，继续注册：%s: %s",
@@ -433,6 +445,15 @@ def run_roxy_registration(
         # 统计注册浏览器关闭前的完整会话；注册后停留期间的网络请求也计入。
         post_register_dwell(email, label="Roxy注册")
         _traffic_checkpoint()
+        if asset_cache is not None:
+            try:
+                asset_cache_snapshot = asset_cache.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[Roxy注册] 保存本地静态资源缓存统计失败，继续保存账号：%s: %s",
+                    type(exc).__name__,
+                    str(exc)[:180],
+                )
         if traffic_tracker is not None:
             try:
                 network_traffic = traffic_tracker.stop()
@@ -442,6 +463,10 @@ def run_roxy_registration(
                     type(exc).__name__,
                     str(exc)[:180],
                 )
+        if asset_cache_snapshot is not None:
+            if not isinstance(network_traffic, dict):
+                network_traffic = {}
+            network_traffic["local_asset_cache"] = asset_cache_snapshot
         account_id = save_account_data(
             email=email,
             access_token=access_token,
@@ -480,11 +505,20 @@ def run_roxy_registration(
             "error": None if codex_ok else f"Codex 未完成: {codex_result.get('message')}",
         }
     except Exception as exc:
+        if asset_cache is not None and asset_cache_snapshot is None:
+            try:
+                asset_cache_snapshot = asset_cache.stop()
+            except Exception:  # noqa: BLE001, S110
+                pass
         if traffic_tracker is not None:
             try:
                 network_traffic = traffic_tracker.stop()
             except Exception:  # noqa: BLE001, S110
                 pass
+        if asset_cache_snapshot is not None:
+            if not isinstance(network_traffic, dict):
+                network_traffic = {}
+            network_traffic["local_asset_cache"] = asset_cache_snapshot
         logger.error("[Roxy注册] 失败：%s: %s", type(exc).__name__, exc)
         logger.debug("[Roxy注册] 失败详情", exc_info=True)
         release_registration_email_on_failure(
@@ -502,6 +536,11 @@ def run_roxy_registration(
             "error": f"{type(exc).__name__}: {str(exc)[:800]}",
         }
     finally:
+        if asset_cache is not None:
+            try:
+                asset_cache.stop()
+            except Exception:  # noqa: BLE001, S110
+                pass
         if traffic_tracker is not None:
             try:
                 traffic_tracker.stop()

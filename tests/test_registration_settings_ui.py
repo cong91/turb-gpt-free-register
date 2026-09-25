@@ -8,6 +8,31 @@ CONFIG_EDITOR = PROJECT_ROOT / "webui" / "config_editor.py"
 
 
 class RegistrationSettingsUiTests(unittest.TestCase):
+    def test_config_choices_use_pending_select_save_collector(self):
+        source = INDEX_TEMPLATE.read_text(encoding="utf-8")
+        renderer_start = source.index("function renderConfigPlainFieldV2")
+        renderer_end = source.index("function renderMixedConfigSectionV2", renderer_start)
+        renderer = source[renderer_start:renderer_end]
+        reader_start = source.index("function readConfigElementValue")
+        reader_end = source.index("function gmailApiUrlAvailableCount", reader_start)
+        reader = source[reader_start:reader_end]
+        collector_start = source.index("function trackConfigFieldChange")
+        collector_end = source.index("$('#tab-config').addEventListener('input'", collector_start)
+        collector = source[collector_start:collector_end]
+        save_start = source.index("async function saveConfigUpdates")
+        save_end = source.index("$('#tab-config').addEventListener('click'", save_start)
+        saver = source[save_start:save_end]
+
+        self.assertIn("Array.isArray(f.choices) && f.choices.length", renderer)
+        self.assertIn("<select data-key=", renderer)
+        self.assertIn("choice.value", renderer)
+        self.assertIn("choice.label", renderer)
+        self.assertIn("CONFIG_PENDING_UPDATES[f.key]", renderer)
+        self.assertIn("CONFIG_PENDING_UPDATES[f.key] = readConfigElementValue(el, f)", collector)
+        self.assertIn("updates[f.key] = readConfigElementValue(el, f)", saver)
+        self.assertIn("JSON.stringify({updates})", saver)
+        self.assertIn("f.key === 'CODEX_OAUTH_DRIVER'", source)
+
     def test_registration_settings_render_free_codex_toggle(self):
         source = INDEX_TEMPLATE.read_text(encoding="utf-8")
         start = source.index("function renderRegistrationSettingsSection")

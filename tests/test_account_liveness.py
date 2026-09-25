@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import ClassVar
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import core.account_liveness as liveness
 import core.live_check_service as live_service
@@ -29,6 +29,9 @@ class _DummyBrowserSession:
         self.blocked_reason = ""
         self.created.append(self)
         self.kwargs = kwargs
+
+    def close(self):
+        self.session.close()
 
     def fingerprint_summary(self):
         return {
@@ -78,13 +81,16 @@ class AccountLivenessTests(unittest.TestCase):
 
         self.assertEqual(session.proxy, "")
         self.assertEqual(authorize_url, "https://auth.example/authorize")
-        self.assertEqual(session.kwargs["fingerprint_seed"], "account:user@example.com")
+        self.assertTrue(
+            session.kwargs["fingerprint_seed"].startswith("live-check:user@example.com:")
+        )
 
     def test_preflight_fails_fast_on_csrf_403_without_same_proxy_retry(self):
         # 403 是出口被 CF 拦截，同一出口重试只会加深封禁评分，必须立即上抛。
+        error = RuntimeError("HTTP Error 403")
         with (
             patch.object(liveness, "BrowserSession", _DummyBrowserSession),
-            patch.object(liveness, "get_csrf_token", side_effect=RuntimeError("HTTP Error 403")),
+            patch.object(liveness, "get_csrf_token", side_effect=error),
             patch.object(liveness, "signin_openai", return_value="authorize"),
             patch.object(liveness.time, "sleep"),
             self.assertRaises(RuntimeError),
@@ -97,6 +103,59 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertTrue(_DummyBrowserSession.created[0].session.closed)
 
     def test_preflight_retries_with_new_session_on_transient_network_error(self):
+        errors = [RuntimeError("proxy connection reset"), "csrf"]
+        with (
+            patch.object(liveness, "BrowserSession", _DummyBrowserSession),
+            patch.object(liveness, "get_csrf_token", side_effect=errors),
+            patch.object(liveness, "signin_openai", return_value="authorize"),
+            patch.object(liveness.time, "sleep"),
+        ):
+            session, _ = liveness._network_preflight_with_retry(
+                "user@example.com", None, max_attempts=2
+            )
+
+        self.assertIs(_DummyBrowserSession.created[-1], session)
+        self.assertEqual(len(_DummyBrowserSession.created), 2)
+        self.assertTrue(_DummyBrowserSession.created[0].session.closed)
+        self.assertEqual(
+            _DummyBrowserSession.created[0].kwargs["fingerprint_seed"],
+            _DummyBrowserSession.created[1].kwargs["fingerprint_seed"],
+        )
+
+    def test_fingerprint_identity_is_pinned_when_session_is_recreated_in_one_attempt(self):
+        state = {}
+        first = MagicMock()
+        first.browser_profile = {
+            "navigator_language": "ja-JP",
+            "timezone_iana": "Asia/Tokyo",
+            "screen_width": 1512,
+        }
+        second = MagicMock()
+        second.browser_profile = dict(first.browser_profile)
+        with patch.object(liveness, "BrowserSession", side_effect=[first, second]) as factory:
+            self.assertIs(
+                liveness._new_fingerprint_pinned_session(
+                    "user@example.com", "socks5://proxy:1080", state,
+                ),
+                first,
+            )
+            self.assertIs(
+                liveness._new_fingerprint_pinned_session(
+                    "user@example.com", "", state,
+                ),
+                second,
+            )
+
+        first_kwargs = factory.call_args_list[0].kwargs
+        second_kwargs = factory.call_args_list[1].kwargs
+        self.assertTrue(first_kwargs["detect_exit_geo"])
+        self.assertIsNone(first_kwargs["browser_profile"])
+        self.assertFalse(second_kwargs["detect_exit_geo"])
+        self.assertEqual(second_kwargs["browser_profile"]["navigator_language"], "ja-JP")
+        self.assertEqual(second_kwargs["browser_profile"]["timezone_iana"], "Asia/Tokyo")
+        self.assertEqual(first_kwargs["fingerprint_seed"], second_kwargs["fingerprint_seed"])
+        self.assertTrue(str(first_kwargs["fingerprint_seed"]).startswith("live-check:user@example.com:"))
+
         errors = [RuntimeError("proxy connection reset"), "csrf-ok"]
         with (
             patch.object(liveness, "BrowserSession", _DummyBrowserSession),
@@ -211,6 +270,10 @@ class AccountLivenessTests(unittest.TestCase):
         self.assertEqual(check.call_args_list[0].kwargs["email_source"], "remail")
         self.assertEqual(check.call_args_list[1].kwargs["proxy"], "")
         self.assertEqual(check.call_args_list[1].kwargs["email_source"], "remail")
+        self.assertIsNot(
+            check.call_args_list[0].kwargs["fingerprint_state"],
+            check.call_args_list[1].kwargs["fingerprint_state"],
+        )
         self.assertTrue(slot.released)
 
 

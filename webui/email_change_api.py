@@ -26,6 +26,7 @@ _PASSWORD_APPLY_STATUSES = frozenset({"queued", "running", "success", "failed"})
 _progress_lock = threading.RLock()
 _twofa_progress: dict[str, dict] = {}
 _password_progress: dict[str, dict] = {}
+_email_progress: dict[str, dict] = {}
 logger = logging.getLogger(__name__)
 
 

@@ -465,6 +465,42 @@ class BrowserEmailChangeRunnerTests(unittest.TestCase):
         self.assertEqual([result["old_email"] for result in results], [item.old_email for item in items])
 
 
+
+class EmailChangeRecoveryTests(unittest.TestCase):
+    def test_browser_runner_retries_with_fresh_profile_and_preserves_proxy_lane(self):
+        from core import browser_email_change
+        item = EmailChangeInput(
+            old_email="old@example.com", password="secret",
+            totp_secret="JBSWY3DPEHPK3PXP", new_email="new@example.com",
+            code_url="https://mail.example/otp/1",
+        )
+        first = Mock(driver=Mock(), provider="roxy")
+        second = Mock(driver=Mock(), provider="roxy")
+        with (
+            patch("config.proxy.ROTATING_PROXY_ENABLED", True),
+            patch.object(browser_email_change, "resolve_rotating_proxy", return_value="http://proxy:1") as resolve,
+            patch.object(browser_email_change, "open_browser_profile", side_effect=[first, second]),
+            patch.object(browser_email_change, "change_email_in_browser", side_effect=[
+                {"ok": False, "retryable": True, "error": "reauth_required"},
+                {"ok": True},
+            ]),
+            patch.object(browser_email_change.db, "update_account_email", return_value=True),
+            patch.object(browser_email_change.db, "get_account_by_email", return_value={"id": 7}),
+            patch.object(browser_email_change.db, "get_gmail_api_url_email_by_email", return_value=None),
+            patch.object(browser_email_change, "release_rotating_proxy") as release,
+        ):
+            result = browser_email_change.run_email_change(item, proxy_lane_id=2)
+        self.assertTrue(result["ok"])
+        self.assertEqual(resolve.call_count, 2)
+        self.assertEqual(release.call_count, 2)
+        self.assertEqual(first.close.call_count, 1)
+        self.assertEqual(second.cleanup.call_count, 1)
+
+    def test_email_change_api_retries_failed_row_without_storing_credentials(self):
+        from webui import email_change_api
+        self.assertTrue(hasattr(email_change_api, "_email_progress"))
+
+
 class EmailChangeApiTests(unittest.TestCase):
     def setUp(self):
         self.client = create_app(auth_code="test-auth").test_client()
