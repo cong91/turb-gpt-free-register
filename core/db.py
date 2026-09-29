@@ -1994,6 +1994,10 @@ def update_account_2fa(
             })
             if registration_password is not None:
                 row["registration_password"] = str(registration_password or "")
+            if row["twofa_status"] == "active":
+                # 2FA 生效即视为账号回到使用中；status="failed" 的回写不得复活 archived 行。
+                row["archived"] = False
+                row["archived_at"] = None
 
         return _mutate_account_row(
             acc_id=acc_id,
@@ -2030,6 +2034,7 @@ def update_account_password(
 
     Chỉ đụng registration_password + extra_json; 2FA/codex fields giữ nguyên.
     Mặc định gắn password_changed_at (ISO local) nếu caller không truyền.
+    Ghi thành công thì tự bỏ archived để tài khoản hiện lại trong danh sách.
     """
     target_id = int(acc_id)
     updates = {"password_changed_at": _now()}
@@ -2051,6 +2056,8 @@ def update_account_password(
                 "registration_password": str(password),
                 "extra_json": json.dumps(extra, ensure_ascii=False),
             })
+            row["archived"] = False
+            row["archived_at"] = None
             return True
 
         return _mutate_account_row(acc_id=target_id, mutator=mutate)
@@ -3153,7 +3160,7 @@ def save_personal_info_change_batch(
     normalized_mode = str(mode or "").strip().lower()
     if not normalized_id:
         raise ValueError("personal information batch_id is required")
-    if normalized_mode not in {"email", "twofa"}:
+    if normalized_mode not in {"email", "twofa", "password"}:
         raise ValueError("personal information mode is invalid")
 
     safe_results: list[dict] = []
@@ -3246,7 +3253,11 @@ def get_personal_info_change_export_rows(batch_id: str | None = None) -> list[di
 
 
 def update_account_email(old_email: str, new_email: str) -> bool:
-    """Atomically replace an account email and refresh its persisted export line."""
+    """Atomically replace an account email and refresh its persisted export line.
+
+    A successful rename also clears the archived flag so the renamed row stays
+    visible under the new email instead of disappearing from default views.
+    """
     old_key = str(old_email or "").strip().casefold()
     new_value = str(new_email or "").strip()
     new_key = new_value.casefold()
@@ -3265,6 +3276,9 @@ def update_account_email(old_email: str, new_email: str) -> bool:
         row["email"] = new_value
         row["original_email_line"] = new_value
         row["updated_at"] = _now()
+        if row.get("archived"):
+            row["archived"] = False
+            row["archived_at"] = None
         row["copy_line"] = _account_line(row)
         _save_accounts(rows)
         return True

@@ -133,6 +133,24 @@
   border-bottom: 1px solid #e2e8f0;
 }
 
+.personal-info-results-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.personal-info-plan {
+  font-weight: 650;
+}
+
+.personal-info-plan-trial {
+  color: #0f766e;
+  font-size: 12px;
+  font-weight: 650;
+}
+
 .personal-info-form-head h2,
 .personal-info-results-head h2 {
   margin: 5px 0 0;

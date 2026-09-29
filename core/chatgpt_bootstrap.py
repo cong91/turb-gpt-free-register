@@ -179,10 +179,17 @@ def anonymous_bootstrap(session: BrowserSession, *, strict: bool = False) -> Non
     logger.info("[Bootstrap] 匿名态 ChatGPT 预热完成")
 
 
-def authenticated_bootstrap(session: BrowserSession, access_token: str | None = None, *, strict: bool = False) -> None:
-    """登录态 ChatGPT bootstrap，access_token 存在时补 Authorization。"""
+def authenticated_bootstrap(
+    session: BrowserSession,
+    access_token: str | None = None,
+    *,
+    strict: bool = False,
+    include_plan_check: bool = True,
+) -> dict:
+    """登录态 ChatGPT bootstrap，返回本轮已读取的套餐诊断结果。"""
     referer = "https://chatgpt.com/"
     tz = session.js_timezone_offset_min()
+    diagnostic_plan = None
 
     def headers():
         h = session.get_chatgpt_headers(referer=referer)
@@ -211,6 +218,21 @@ def authenticated_bootstrap(session: BrowserSession, access_token: str | None = 
         )
         if path in diagnostic_paths:
             logger.info("[资格诊断] endpoint=%s %s", path, _diagnostic_response_summary(resp))
+        if path.startswith("/accounts/check/") and include_plan_check and resp is not None:
+            try:
+                from core.chatgpt_plan import parse_accounts_check
+
+                diagnostic_plan = parse_accounts_check(resp.json(), token=access_token or "")
+                diagnostic_plan.update(
+                    {
+                        "proxy_mode": "browser",
+                        "network_route": "browser",
+                        "proxy_used": None,
+                        "proxy_fallback_reason": None,
+                    }
+                )
+            except Exception as exc:  # noqa: BLE001 - diagnostics are best effort.
+                logger.debug("[Bootstrap] account plan diagnostic parse failed: %s", exc)
     prep = _chat_requirements_prepare(session, _API_BASE, referer, strict=strict)
     for url in [
         f"{_API_BASE}/system_hints?mode=basic",
@@ -237,3 +259,4 @@ def authenticated_bootstrap(session: BrowserSession, access_token: str | None = 
     if callable(log_cookies):
         log_cookies("authenticated_bootstrap_complete")
     logger.info("[Bootstrap] 登录态 ChatGPT 预热完成")
+    return {"plan": diagnostic_plan} if diagnostic_plan else {}

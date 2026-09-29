@@ -99,15 +99,38 @@ def required_account_proxy(
     rotating_scope: str,
     lane_id: int | None = None,
     lease_owner_id: str | None = None,
-) -> Iterator[tuple[str, str]]:
-    """Yield a non-direct route, preferring rotating proxy then proxy pool."""
+) -> Iterator[tuple[str | None, str]]:
+    """Yield a non-direct route, then fall back to the active system VPN."""
     # This contract is intentionally stricter than browser account workflows:
     # a caller-supplied registration/Nord proxy is never trusted for package
     # checks or PAY.153.  Only an allocated rotating lease or pool entry may be
     # used, so the explicit argument is retained solely for API compatibility.
 
-    # Package checks have a stricter contract than browser recovery flows:
-    # only a rotating lease or a configured proxy-pool entry is acceptable.
+    from core.nordvpn_wireguard import (
+        is_per_profile_proxy_enabled,
+        proxy_for_registration,
+    )
+
+    if is_per_profile_proxy_enabled():
+        with ExitStack() as stack:
+            try:
+                proxy_context = (
+                    proxy_for_registration(owner_id=lease_owner_id)
+                    if lease_owner_id is not None
+                    else proxy_for_registration()
+                )
+                active_proxy = stack.enter_context(proxy_context)
+            except Exception as exc:  # noqa: BLE001 - try the remaining routes.
+                logger.warning(
+                    "[Account network] NordVPN WireGuard unavailable for plan check: %s: %s",
+                    type(exc).__name__,
+                    str(exc)[:180],
+                )
+            else:
+                if active_proxy:
+                    yield active_proxy, "nordvpn_wireguard"
+                    return
+
     active_proxy = resolve_rotating_proxy(None, scope=rotating_scope, lane_id=lane_id)
     if active_proxy:
         try:
@@ -120,16 +143,31 @@ def required_account_proxy(
                 proxy_url=active_proxy,
             )
 
-    from config.proxy import pick_proxy
+    from config import proxy as proxy_cfg
 
-    pool_proxy = pick_proxy(
+    configured_proxy = str(getattr(proxy_cfg, "PLAN_CHECK_PROXY", "") or "").strip()
+    if configured_proxy:
+        yield configured_proxy, "plan_proxy"
+        return
+
+    pool_proxy = proxy_cfg.pick_proxy(
         probe_url="https://chatgpt.com/auth/login",
         probe_timeout=4.0,
     )
     if pool_proxy:
         yield pool_proxy, "proxy_pool"
         return
-    raise RuntimeError("套餐查询必须使用 proxy xoay hoặc proxy pool; hiện chưa lấy được proxy")
+
+    from core.nordvpn_cli import is_connected
+
+    if is_connected():
+        logger.info("[Account network] no proxy lease available; using active NordVPN system route")
+        yield None, "nordvpn_system"
+        return
+
+    raise RuntimeError(
+        "套餐查询未获取到 proxy xoay/proxy pool，且 NordVPN 系统隧道未连接"
+    )
 
 
 @contextmanager

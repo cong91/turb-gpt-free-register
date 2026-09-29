@@ -59,7 +59,7 @@ def parse_twofa_change_inputs(text: str) -> list[TwofaChangeInput]:
         if match:
             raise ValueError(
                 f"Dòng {match.group(1)} không đúng định dạng. "
-                "Dùng: email|password|2FA hiện tại"
+                "Dùng: email|password|2FA hoặc email----password----2FA"
             ) from exc
         raise
     if not records:
@@ -290,6 +290,7 @@ def change_twofa_in_browser(
     access_token: str | None = None,
     allow_oauth_fallback: bool = True,
     resume_after_remote_disable: bool = False,
+    keep_session: bool = False,
 ) -> dict[str, object]:
     """Login, disable the old TOTP, and enroll a new TOTP in one session."""
     # A prior attempt may have disabled the old factor before enrollment
@@ -369,12 +370,13 @@ def change_twofa_in_browser(
             result["access_token"] = active_access_token
         return result
     finally:
-        logout = getattr(driver, "get", None)
-        if callable(logout):
-            try:
-                logout("https://chatgpt.com/auth/logout")
-            except Exception:  # noqa: BLE001 - logout is best-effort cleanup.
-                logger.debug("ChatGPT logout cleanup failed")
+        if not keep_session:
+            logout = getattr(driver, "get", None)
+            if callable(logout):
+                try:
+                    logout("https://chatgpt.com/auth/logout")
+                except Exception:  # noqa: BLE001 - logout is best-effort cleanup.
+                    logger.debug("ChatGPT logout cleanup failed")
 
 
 def redact_twofa_result(result: dict[str, object]) -> dict[str, object]:

@@ -203,9 +203,10 @@ def _run_plan_check(
             lease_owner_id=lease_owner_id,
         ) as (active_proxy, network_mode):
             logger.info("[Plan] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
+            plan_proxy = "" if network_mode == "nordvpn_system" else active_proxy
             _wait_for_rate_slot()
             plan_kwargs = {
-                "proxy": active_proxy,
+                "proxy": plan_proxy,
                 "timezone_offset_min": timezone_offset_min,
             }
             result = check_account_plan(access_token, **plan_kwargs)
@@ -228,7 +229,7 @@ def _run_plan_check(
                 _wait_for_rate_slot()
                 recheck_result = check_account_plan(
                     access_token,
-                    proxy=active_proxy,
+                    proxy=plan_proxy,
                     timezone_offset_min=timezone_offset_min,
                     max_attempts=1,
                 )
@@ -259,7 +260,7 @@ def _run_plan_check(
                     _wait_for_rate_slot()
                     promotion_recheck = check_account_plan(
                         access_token,
-                        proxy=active_proxy,
+                        proxy=plan_proxy,
                         timezone_offset_min=timezone_offset_min,
                         max_attempts=1,
                     )
@@ -349,6 +350,76 @@ def _run_plan_check(
         return result
     finally:
         _QUEUE_SLOTS.release()
+
+
+def run_sync_plan_check(
+    *,
+    account_id: int,
+    email: str,
+    access_token: str,
+    trigger: str,
+    browser_transport,
+    timezone_offset_min: str = "-",
+) -> dict:
+    """Run the plan check synchronously inside a live authenticated browser.
+
+    Called while the browser session that just changed 2FA/password is still
+    open: the request goes through the browser's same-origin transport, so no
+    proxy lease is acquired and the background queue is not involved.  A
+    failure here must never undo the credential change that already succeeded.
+    """
+    account_id = int(account_id)
+    email = str(email or "").strip()
+    access_token = str(access_token or "").strip()
+    if not access_token:
+        return {"ok": False, "accepted": False, "error": "access token is missing"}
+    if browser_transport is None:
+        return {"ok": False, "accepted": False, "error": "browser transport is missing"}
+
+    if not db.claim_account_plan_check(acc_id=account_id, trigger=str(trigger or "manual")):
+        logger.info("[Plan] 账号已有套餐查询在排队/执行，跳过同浏览器同步查询: %s", email)
+        return {"ok": False, "accepted": False, "busy": True, "error": "该账号正在查询套餐"}
+    try:
+        if not db.mark_account_plan_check_running(account_id):
+            return {"ok": False, "accepted": False, "error": "账号已删除或套餐查询状态已被重置"}
+
+        _wait_for_rate_slot()
+        result = check_account_plan(
+            access_token,
+            proxy="",
+            browser_transport=browser_transport,
+            timezone_offset_min=str(timezone_offset_min or "-"),
+        )
+        db.update_account_plan_check(acc_id=account_id, result=result)
+        if result.get("ok"):
+            logger.info(
+                "[Plan] 同浏览器查询成功: %s, plan=%s, plus_trial=%s, trigger=%s",
+                email,
+                result.get("current_plan_type") or "unknown",
+                bool(result.get("plus_trial_eligible")),
+                trigger,
+            )
+        else:
+            logger.warning(
+                "[Plan] 同浏览器查询失败: %s, trigger=%s, error=%s",
+                email,
+                trigger,
+                result.get("error") or "未知错误",
+            )
+        return {"accepted": True, **result}
+    except Exception as exc:  # plan lookup must not undo the credential change.
+        result = {
+            "ok": False,
+            "accepted": False,
+            "checked_at": local_now().isoformat(timespec="seconds"),
+            "error": f"{type(exc).__name__}: {str(exc)[:180]}",
+        }
+        try:
+            db.update_account_plan_check(acc_id=account_id, result=result)
+        except Exception:
+            logger.exception("[Plan] 写入同浏览器查询异常状态失败: account_id=%s", account_id)
+        logger.exception("[Plan] 同浏览器查询异常: %s", email)
+        return result
 
 
 def enqueue_account_plan_check(

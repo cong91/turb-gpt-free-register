@@ -76,6 +76,78 @@ class AccountTwofaPersistenceTests(unittest.TestCase):
         self.assertEqual(row["twofa_error"], "TimeoutException: script timeout")
         self.assertIsNone(row["totp_secret"])
 
+    def test_update_account_2fa_active_unarchives_archived_account(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            accounts_path = root / "accounts.json"
+            accounts_path.write_text("[]\n", encoding="utf-8")
+            patches = (
+                patch.object(db, "_ACCOUNTS_JSON", accounts_path),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_VIEWER_HTML", root / "viewer.html"),
+            )
+            for item in patches:
+                item.start()
+                self.addCleanup(item.stop)
+
+            account_id = db.insert_account(
+                email="user@example.com",
+                access_token="access-token",
+                registration_password="openai-password",
+                twofa_status="pending",
+            )
+            self.assertTrue(db.archive_account(account_id, True))
+            self.assertTrue(
+                db.update_account_2fa(
+                    account_id,
+                    status="active",
+                    totp_secret="JBSWY3DPEHPK3PXP",
+                )
+            )
+            row = db.get_account(account_id)
+
+        self.assertFalse(row["archived"])
+        self.assertIsNone(row["archived_at"])
+        self.assertEqual(row["twofa_status"], "active")
+        self.assertEqual(row["totp_secret"], "JBSWY3DPEHPK3PXP")
+
+    def test_update_account_2fa_failure_keeps_archived_account(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            accounts_path = root / "accounts.json"
+            accounts_path.write_text("[]\n", encoding="utf-8")
+            patches = (
+                patch.object(db, "_ACCOUNTS_JSON", accounts_path),
+                patch.object(db, "_LEGACY_ACCOUNTS_JSON", root / "legacy.json"),
+                patch.object(db, "_ACCOUNTS_TXT", root / "accounts.txt"),
+                patch.object(db, "_TOKENS_TXT", root / "tokens.txt"),
+                patch.object(db, "_VIEWER_HTML", root / "viewer.html"),
+            )
+            for item in patches:
+                item.start()
+                self.addCleanup(item.stop)
+
+            account_id = db.insert_account(
+                email="user@example.com",
+                access_token="access-token",
+                twofa_status="pending",
+            )
+            self.assertTrue(db.archive_account(account_id, True))
+            self.assertTrue(
+                db.update_account_2fa(
+                    account_id,
+                    status="failed",
+                    error="TimeoutException: script timeout",
+                )
+            )
+            row = db.get_account(account_id)
+
+        self.assertTrue(row["archived"])
+        self.assertTrue(row["archived_at"])
+        self.assertEqual(row["twofa_status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

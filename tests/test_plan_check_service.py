@@ -254,5 +254,158 @@ class PlanCheckWorkerLifecycleTests(unittest.TestCase):
         return True
 
 
+class RunSyncPlanCheckTests(unittest.TestCase):
+    def test_sync_plan_check_uses_browser_transport_and_persists_result(self):
+        from unittest.mock import patch as mock_patch
+
+        with (
+            mock_patch.object(plan_check_service.db, "claim_account_plan_check", return_value=True) as claim,
+            mock_patch.object(plan_check_service.db, "mark_account_plan_check_running", return_value=True),
+            mock_patch.object(plan_check_service.db, "update_account_plan_check") as update,
+            mock_patch.object(plan_check_service, "_wait_for_rate_slot"),
+            mock_patch.object(
+                plan_check_service,
+                "check_account_plan",
+                return_value={"ok": True, "current_plan_type": "free", "plus_trial_eligible": False},
+            ) as check_plan,
+        ):
+            result = plan_check_service.run_sync_plan_check(
+                account_id=5,
+                email="user@example.com",
+                access_token="token",
+                trigger="twofa_change",
+                browser_transport=object(),
+            )
+
+        self.assertTrue(result["accepted"])
+        self.assertTrue(result["ok"])
+        claim.assert_called_once_with(acc_id=5, trigger="twofa_change")
+        check_plan.assert_called_once()
+        kwargs = check_plan.call_args.kwargs
+        self.assertEqual(kwargs["proxy"], "")
+        self.assertIsNotNone(kwargs["browser_transport"])
+        update.assert_called_once()
+
+    def test_sync_plan_check_busy_claim_skips_check(self):
+        from unittest.mock import patch as mock_patch
+
+        with (
+            mock_patch.object(plan_check_service.db, "claim_account_plan_check", return_value=False),
+            mock_patch.object(
+                plan_check_service,
+                "check_account_plan",
+                side_effect=AssertionError("must not run when claim is busy"),
+            ),
+        ):
+            result = plan_check_service.run_sync_plan_check(
+                account_id=5,
+                email="user@example.com",
+                access_token="token",
+                trigger="twofa_change",
+                browser_transport=object(),
+            )
+
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["busy"])
+
+    def test_sync_plan_check_requires_transport_and_token(self):
+        result = plan_check_service.run_sync_plan_check(
+            account_id=5,
+            email="user@example.com",
+            access_token="",
+            trigger="twofa_change",
+            browser_transport=object(),
+        )
+        self.assertFalse(result["accepted"])
+        self.assertIn("access token", result["error"])
+
+        result = plan_check_service.run_sync_plan_check(
+            account_id=5,
+            email="user@example.com",
+            access_token="token",
+            trigger="twofa_change",
+            browser_transport=None,
+        )
+        self.assertFalse(result["accepted"])
+        self.assertIn("browser transport", result["error"])
+
+
+class RequiredAccountProxyRouteTests(unittest.TestCase):
+    def test_falls_back_to_active_nordvpn_system_route(self):
+        from core import account_network
+
+        with (
+            patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=False),
+            patch("core.account_network.resolve_rotating_proxy", return_value=None),
+            patch("config.proxy.PLAN_CHECK_PROXY", ""),
+            patch("config.proxy.pick_proxy", return_value=""),
+            patch("core.nordvpn_cli.is_connected", return_value=True),
+            account_network.required_account_proxy(
+                None,
+                rotating_scope="plan_check",
+            ) as (route, mode),
+        ):
+            self.assertIsNone(route)
+            self.assertEqual(mode, "nordvpn_system")
+
+    def test_uses_configured_plan_proxy_before_pool(self):
+        from core import account_network
+
+        with (
+            patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=False),
+            patch("core.account_network.resolve_rotating_proxy", return_value=None),
+            patch("config.proxy.PLAN_CHECK_PROXY", "http://plan-proxy.example:8080"),
+            patch("config.proxy.pick_proxy", side_effect=AssertionError("pool must not run")),
+            account_network.required_account_proxy(
+                None,
+                rotating_scope="plan_check",
+            ) as (route, mode),
+        ):
+            self.assertEqual(route, "http://plan-proxy.example:8080")
+            self.assertEqual(mode, "plan_proxy")
+
+    def test_raises_when_no_route_and_nordvpn_disconnected(self):
+        from core import account_network
+
+        with (
+            patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=False),
+            patch("core.account_network.resolve_rotating_proxy", return_value=None),
+            patch("config.proxy.PLAN_CHECK_PROXY", ""),
+            patch("config.proxy.pick_proxy", return_value=""),
+            patch("core.nordvpn_cli.is_connected", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "NordVPN"),
+            account_network.required_account_proxy(
+                None,
+                rotating_scope="plan_check",
+            ),
+        ):
+            pass
+
+    def test_prefers_wireguard_lease_when_per_profile_proxy_enabled(self):
+        from core import account_network
+
+        @contextmanager
+        def wireguard_context(*_args, **_kwargs):
+            yield "socks5://127.0.0.1:25000"
+
+        with (
+            patch("core.nordvpn_wireguard.is_per_profile_proxy_enabled", return_value=True),
+            patch(
+                "core.nordvpn_wireguard.proxy_for_registration",
+                side_effect=wireguard_context,
+            ),
+            patch(
+                "core.account_network.resolve_rotating_proxy",
+                side_effect=AssertionError("rotating proxy must not run"),
+            ),
+            account_network.required_account_proxy(
+                None,
+                rotating_scope="plan_check",
+            ) as (route, mode),
+        ):
+            self.assertEqual(route, "socks5://127.0.0.1:25000")
+            self.assertEqual(mode, "nordvpn_wireguard")
+
+
 if __name__ == "__main__":
     unittest.main()

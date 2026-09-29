@@ -865,7 +865,12 @@ def setup_2fa(
     if access_token:
         try:
             logger.info("[2FA] 使用现有 accessToken 预热登录态...")
-            authenticated_bootstrap(session, access_token, strict=False)
+            authenticated_bootstrap(
+                session,
+                access_token,
+                strict=False,
+                include_plan_check=False,
+            )
             human_delay("navigate")
             logger.info("[2FA] accessToken 预热完成")
         except Exception as exc:  # noqa: BLE001

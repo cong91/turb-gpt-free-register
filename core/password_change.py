@@ -133,18 +133,38 @@ class PasswordChangeInput:
 
 
 def parse_password_change_inputs(text: str) -> list[PasswordChangeInput]:
-    """Parse ``email[----current_password[----totp_secret]]`` lines for a batch."""
+    """Parse ``email[delimiter current_password[delimiter totp_secret]]`` lines."""
     items: list[PasswordChangeInput] = []
     seen_emails: set[str] = set()
     for line_number, raw_line in enumerate(str(text or "").splitlines(), 1):
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = [part.strip() for part in line.split("----")]
+        delimiter_candidates = [
+            (position, delimiter)
+            for delimiter in ("|", "----")
+            if (position := line.find(delimiter)) >= 0
+        ]
+        if delimiter_candidates:
+            _, delimiter = min(delimiter_candidates)
+        else:
+            delimiter = ""
+        if delimiter == "----":
+            parts = [part.strip() for part in line.split(delimiter)]
+        elif delimiter == "|":
+            first = line.find(delimiter)
+            last = line.rfind(delimiter)
+            parts = [line[:first].strip()]
+            if last > first:
+                parts.extend((line[first + len(delimiter):last].strip(), line[last + len(delimiter):].strip()))
+            else:
+                parts.append(line[first + len(delimiter):].strip())
+        else:
+            parts = [line]
         if len(parts) > 3:
             raise ValueError(
                 f"Dòng {line_number} có quá nhiều trường. "
-                "Dùng: email----mật_khẩu_hiện_tại----2FA(tùy chọn)"
+                "Dùng: email|mật_khẩu_hiện_tại|2FA hoặc email----mật_khẩu_hiện_tại----2FA"
             )
         email = parts[0]
         if not _EMAIL_RE.fullmatch(email):
@@ -527,6 +547,7 @@ def change_password_in_browser(
     *,
     access_token: str | None = None,
     allow_oauth_fallback: bool = True,
+    keep_session: bool = False,
 ) -> dict[str, object]:
     """Run the reauth password change in one browser; errors come back redacted.
 
@@ -602,9 +623,10 @@ def change_password_in_browser(
             result["access_token"] = active_access_token
         return result
     finally:
-        logout = getattr(driver, "get", None)
-        if callable(logout):
-            try:
-                logout("https://chatgpt.com/auth/logout")
-            except Exception:  # noqa: BLE001 - logout is best-effort cleanup.
-                logger.debug("ChatGPT logout cleanup failed")
+        if not keep_session:
+            logout = getattr(driver, "get", None)
+            if callable(logout):
+                try:
+                    logout("https://chatgpt.com/auth/logout")
+                except Exception:  # noqa: BLE001 - logout is best-effort cleanup.
+                    logger.debug("ChatGPT logout cleanup failed")

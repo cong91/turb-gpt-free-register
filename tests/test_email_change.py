@@ -38,6 +38,24 @@ class EmailChangeInputTests(unittest.TestCase):
             ],
         )
 
+    def test_pairs_dash_delimited_credentials_with_gmail_api_url(self):
+        result = parse_email_change_inputs(
+            "backend_export.3a@icloud.com----B5H6!!a$ul5Wgv----ATY3FIMESST7OQTCQI7OLYNT7X62UEFH\n",
+            "new@example.com----https://mail.example/otp/1\n",
+        )
+
+        self.assertEqual(result[0].old_email, "backend_export.3a@icloud.com")
+        self.assertEqual(result[0].password, "B5H6!!a$ul5Wgv")
+        self.assertEqual(result[0].totp_secret, "ATY3FIMESST7OQTCQI7OLYNT7X62UEFH")
+
+    def test_preserves_other_delimiter_inside_dash_delimited_password(self):
+        result = parse_email_change_inputs(
+            "old@example.com----pa|ss----JBSWY3DPEHPK3PXP\n",
+            "new@example.com----https://mail.example/otp/1\n",
+        )
+
+        self.assertEqual(result[0].password, "pa|ss")
+
     @patch("core.gmail_api_url_client.requests.get")
     @patch("core.gmail_api_url_client._batch_store")
     def test_email_change_602_quarantines_raw_source_before_retry(
@@ -332,6 +350,48 @@ class AccountEmailPersistenceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             db.update_account_email("old@example.com", "new@example.com")
 
+    def test_update_account_email_unarchives_archived_account(self):
+        db.insert_account(email="old@example.com", access_token="access-token")
+        account_id = db.get_account_by_email("old@example.com")["id"]
+        self.assertTrue(db.archive_account(account_id, True))
+        self.assertTrue(db.get_account(account_id)["archived"])
+
+        self.assertTrue(db.update_account_email("old@example.com", "new@example.com"))
+
+        self.assertIsNone(db.get_account_by_email("old@example.com"))
+        account = db.get_account_by_email("new@example.com")
+        self.assertFalse(account["archived"])
+        self.assertIsNone(account["archived_at"])
+        self.assertEqual(account["email"], "new@example.com")
+
+    def test_personal_info_change_batch_accepts_password_mode(self):
+        app_state_path = Path(self.temp_dir.name) / "app-state.sqlite3"
+        with patch.object(app_state_db, "APP_STATE_DB_PATH", app_state_path):
+            account_id = db.insert_account(
+                email="changed@example.com",
+                access_token="access-token",
+                registration_password="password",
+            )
+            batch = db.save_personal_info_change_batch(
+                "pw-batch-1",
+                "password",
+                [
+                    {
+                        "ok": True,
+                        "account_id": account_id,
+                        "email": "changed@example.com",
+                        "change_status": "success",
+                    },
+                ],
+            )
+            rows = db.get_personal_info_change_export_rows("pw-batch-1")
+            latest = db.get_personal_info_change_batch()
+
+        self.assertEqual(batch["mode"], "password")
+        self.assertEqual(batch["exportable_count"], 1)
+        self.assertEqual([row["email"] for row in rows], ["changed@example.com"])
+        self.assertEqual(latest["batch_id"], "pw-batch-1")
+
     def test_personal_info_change_batch_resolves_export_rows_from_persistence(self):
         app_state_path = Path(self.temp_dir.name) / "app-state.sqlite3"
         with patch.object(app_state_db, "APP_STATE_DB_PATH", app_state_path):
@@ -520,7 +580,7 @@ class EmailChangeApiTests(unittest.TestCase):
         response = self.client.post(
             "/api/accounts/change-email",
             json={
-                "credentials": "old@example.com|secret|JBSWY3DPEHPK3PXP",
+                "credentials": "old@example.com----secret----JBSWY3DPEHPK3PXP",
                 "gmail_api": "new@example.com----https://mail.example/otp/1",
                 "workers": 2,
             },
@@ -532,6 +592,8 @@ class EmailChangeApiTests(unittest.TestCase):
         items = run_batch.call_args.args[0]
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].new_email, "new@example.com")
+        self.assertEqual(items[0].password, "secret")
+        self.assertEqual(items[0].totp_secret, "JBSWY3DPEHPK3PXP")
         self.assertEqual(run_batch.call_args.kwargs["workers"], 2)
         payload = response.get_json()
         self.assertRegex(payload["change_batch_id"], r"^[0-9a-f]{32}$")

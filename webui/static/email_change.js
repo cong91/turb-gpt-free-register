@@ -17,9 +17,12 @@
   const pending = document.getElementById('personalPending');
   const succeeded = document.getElementById('personalSucceeded');
   const failed = document.getElementById('personalFailed');
+  const retryAllButton = document.getElementById('personalRetryFailed');
   let activeMode = 'email';
   let twofaProgressBatchId = '';
   let passwordProgressBatchId = '';
+  let twofaRetryActive = false;
+  let passwordRetryActive = false;
   let exportBatchId = '';
   let exportableCount = 0;
   let progressTimer = null;
@@ -71,12 +74,23 @@
     return { label: 'Lỗi', className: 'is-failed' };
   };
 
+  const planCell = (result) => {
+    const planCheck = result && result.plan_check;
+    if (!planCheck || !planCheck.accepted) return '<span class="personal-info-no-action">-</span>';
+    if (!planCheck.ok) return '<span class="personal-info-result-status is-failed">Kiểm tra lỗi</span>';
+    const plan = String(planCheck.current_plan_type || 'unknown');
+    const label = plan.charAt(0).toUpperCase() + plan.slice(1);
+    const trial = planCheck.plus_trial_eligible ? ' <span class="personal-info-plan-trial">+Plus trial</span>' : '';
+    return `<span class="personal-info-plan">${escapeHtml(label)}${trial}</span>`;
+  };
+
   const renderResults = (payload, mode) => {
     const resultList = Array.isArray(payload.results) ? payload.results : [];
     const successfulResults = resultList.filter((result) => (result.status || result.change_status) === 'success');
     const batchDone = mode === 'twofa' || mode === 'password'
       ? ['completed', 'failed'].includes(payload.status)
       : true;
+    const retryActive = mode === 'twofa' ? twofaRetryActive : mode === 'password' ? passwordRetryActive : false;
     exportBatchId = mode === 'password' ? '' : (batchDone ? String(payload.change_batch_id || '') : '');
     exportableCount = mode === 'password' || !batchDone
       ? 0
@@ -94,7 +108,7 @@
       const account = mode === 'email'
         ? `${result.old_email || result.email || '-'} -> ${result.new_email || '-'}`
         : (result.email || '-');
-      const planQueued = mode === 'twofa' && result.plan_check && result.plan_check.accepted;
+      const planQueued = mode === 'twofa' && result.plan_check && result.plan_check.accepted && !result.plan_check.ok;
       const detail = result.detail || result.error || result.warning || (state.className === 'is-success'
         ? (mode === 'password' ? 'Đã đổi mật khẩu.' : planQueued ? 'Đã cập nhật dữ liệu tài khoản. Đang kiểm tra loại gói.' : 'Đã cập nhật dữ liệu tài khoản.')
         : state.className === 'is-pending' ? 'Đang chờ luồng xử lý.'
@@ -106,16 +120,26 @@
       const retryButton = mode === 'twofa'
         ? `<button type="button" class="personal-info-retry" data-twofa-retry-index="${index}">Thử lại</button>`
         : `<button type="button" class="personal-info-retry" data-password-retry-index="${rowIndex}">Thử lại</button>`;
-      const retryAction = batchDone && result.retryable !== false
+      // Khi một retry đang chạy (batch tạm về running), các row lỗi khác
+      // vẫn phải giữ nút thử lại để có thể chạy song song.
+      const retryAllowed = batchDone || retryActive;
+      const retryAction = retryAllowed && result.retryable !== false
         && (mode === 'twofa' || mode === 'password')
         && ['is-failed', 'is-partial'].includes(state.className)
         ? retryButton
         : '<span class="personal-info-no-action">-</span>';
-      return `<tr><td>${escapeHtml(account)}</td><td>${action}</td><td><span class="personal-info-result-status ${state.className}">${state.label}</span></td><td>${escapeHtml(detail)}</td><td>${retryAction}</td></tr>`;
+      return `<tr><td>${escapeHtml(account)}</td><td>${action}</td><td><span class="personal-info-result-status ${state.className}">${state.label}</span></td><td>${planCell(result)}</td><td>${escapeHtml(detail)}</td><td>${retryAction}</td></tr>`;
     }).join('');
     resultEmpty.hidden = resultList.length > 0;
     resultPanel.hidden = false;
     exportButton.disabled = !exportBatchId || exportableCount === 0;
+    if (retryAllButton) {
+      const showRetryAll = (mode === 'twofa' || mode === 'password')
+        && batchDone
+        && Number(payload.failed || 0) > 0;
+      retryAllButton.hidden = !showRetryAll;
+      retryAllButton.disabled = !showRetryAll;
+    }
   };
 
   const showRequestError = (message) => {
@@ -130,8 +154,14 @@
     exportBatchId = '';
     twofaProgressBatchId = '';
     passwordProgressBatchId = '';
+    twofaRetryActive = false;
+    passwordRetryActive = false;
     exportableCount = 0;
     exportButton.disabled = true;
+    if (retryAllButton) {
+      retryAllButton.hidden = true;
+      retryAllButton.disabled = true;
+    }
     setStatus(message, true);
   };
 
@@ -164,6 +194,7 @@
           return;
         }
         stopProgressPolling();
+        twofaRetryActive = false;
         if (payload.batch_error) {
           setStatus(`Batch đổi 2FA gặp lỗi: ${payload.batch_error}`, true);
           return;
@@ -200,11 +231,41 @@
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || 'Không thể thử lại đổi 2FA');
+      twofaRetryActive = true;
       renderResults(payload, 'twofa');
-      await pollTwofaProgress(batchId);
+      // Một vòng poll là đủ; retry song song chỉ cập nhật row trong cùng batch.
+      if (!progressTimer) await pollTwofaProgress(batchId);
     } catch (error) {
       button.disabled = false;
       setStatus(error instanceof Error ? error.message : 'Không thể thử lại đổi 2FA', true);
+    }
+  };
+
+  const retryAllTwofaFailed = async (batchId) => {
+    retryAllButton.disabled = true;
+    setStatus('Đang thử lại toàn bộ tài khoản lỗi (đổi 2FA)...');
+    try {
+      const credentials = document.getElementById('twofaCredentials').value.trim();
+      if (!credentials) throw new Error('Hãy nhập lại danh sách tài khoản cần đổi 2FA để thử lại');
+      const response = await fetch('/api/accounts/change-twofa-retry-failed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          batch_id: batchId,
+          credentials,
+          workers: Number(document.getElementById('twofaWorkers').value || 1),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || 'Không thể thử lại các tài khoản lỗi');
+      twofaRetryActive = true;
+      renderResults(payload, 'twofa');
+      if (!progressTimer) await pollTwofaProgress(batchId);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Không thể thử lại các tài khoản lỗi', true);
+    } finally {
+      retryAllButton.disabled = false;
     }
   };
 
@@ -230,6 +291,7 @@
           return;
         }
         stopProgressPolling();
+        passwordRetryActive = false;
         if (payload.batch_error) {
           setStatus(`Batch đổi mật khẩu gặp lỗi: ${payload.batch_error}`, true);
           return;
@@ -263,11 +325,38 @@
       });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(payload.error || 'Không thể thử lại đổi mật khẩu');
+      passwordRetryActive = true;
       renderResults(payload, 'password');
-      await pollPasswordProgress(batchId);
+      // Một vòng poll là đủ; retry song song chỉ cập nhật row trong cùng batch.
+      if (!progressTimer) await pollPasswordProgress(batchId);
     } catch (error) {
       button.disabled = false;
       setStatus(error instanceof Error ? error.message : 'Không thể thử lại đổi mật khẩu', true);
+    }
+  };
+
+  const retryAllPasswordFailed = async (batchId) => {
+    retryAllButton.disabled = true;
+    setStatus('Đang thử lại toàn bộ tài khoản lỗi (đổi mật khẩu)...');
+    try {
+      const response = await fetch('/api/accounts/change-password-retry-failed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({
+          batch_id: batchId,
+          workers: Number(document.getElementById('passwordWorkers').value || 1),
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(payload.error || 'Không thể thử lại các tài khoản lỗi');
+      passwordRetryActive = true;
+      renderResults(payload, 'password');
+      if (!progressTimer) await pollPasswordProgress(batchId);
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Không thể thử lại các tài khoản lỗi', true);
+    } finally {
+      retryAllButton.disabled = false;
     }
   };
 
@@ -286,8 +375,14 @@
     exportBatchId = '';
     twofaProgressBatchId = '';
     passwordProgressBatchId = '';
+    twofaRetryActive = false;
+    passwordRetryActive = false;
     exportableCount = 0;
     exportButton.disabled = true;
+    if (retryAllButton) {
+      retryAllButton.hidden = true;
+      retryAllButton.disabled = true;
+    }
     resultPanel.hidden = true;
     setStatus(isTwofa ? 'Đang đổi 2FA theo từng tài khoản...' : isPassword ? 'Đang đổi mật khẩu theo từng tài khoản...' : 'Đang xử lý đổi email...');
     try {
@@ -377,6 +472,18 @@
       exportButton.disabled = !exportBatchId || exportableCount === 0;
     }
   });
+
+  if (retryAllButton) {
+    retryAllButton.addEventListener('click', () => {
+      if (activeMode === 'twofa' && twofaProgressBatchId) {
+        retryAllTwofaFailed(twofaProgressBatchId);
+        return;
+      }
+      if (activeMode === 'password' && passwordProgressBatchId) {
+        retryAllPasswordFailed(passwordProgressBatchId);
+      }
+    });
+  }
 
   resultBody.addEventListener('click', (event) => {
     const twofaButton = event.target.closest('[data-twofa-retry-index]');

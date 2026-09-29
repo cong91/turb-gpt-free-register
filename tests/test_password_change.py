@@ -99,6 +99,20 @@ class PasswordChangeInputTests(unittest.TestCase):
         self.assertEqual(items[2].current_password, "current-three")
         self.assertEqual(items[2].totp_secret, "TOTPBASE32")
 
+    def test_parse_accepts_pipe_delimited_credentials_too(self):
+        items = parse_password_change_inputs(
+            "backend_export.3a@icloud.com|B5H6!!a$ul5Wgv|ATY3FIMESST7OQTCQI7OLYNT7X62UEFH"
+        )
+
+        self.assertEqual(items[0].email, "backend_export.3a@icloud.com")
+        self.assertEqual(items[0].current_password, "B5H6!!a$ul5Wgv")
+        self.assertEqual(items[0].totp_secret, "ATY3FIMESST7OQTCQI7OLYNT7X62UEFH")
+
+    def test_parse_preserves_pipe_inside_dash_delimited_password(self):
+        items = parse_password_change_inputs("user@example.com----pa|ss----TOTPBASE32")
+
+        self.assertEqual(items[0].current_password, "pa|ss")
+
     def test_parse_rejects_invalid_email(self):
         with self.assertRaises(ValueError):
             parse_password_change_inputs("not-an-email")
@@ -269,6 +283,22 @@ class PasswordChangeDbTests(unittest.TestCase):
         self.assertFalse(db.update_account_password(account_id, password="   "))
         row = db.get_account(account_id)
         self.assertEqual(row["registration_password"], "old-pw")
+
+    def test_update_account_password_unarchives_archived_account(self):
+        account_id = db.insert_account(
+            email="user@example.com",
+            access_token="browser-token",
+            registration_password="old-pw",
+        )
+        self.assertTrue(db.archive_account(account_id, True))
+        self.assertTrue(db.get_account(account_id)["archived"])
+
+        self.assertTrue(db.update_account_password(account_id, password="new-pw"))
+
+        row = db.get_account(account_id)
+        self.assertFalse(row["archived"])
+        self.assertIsNone(row["archived_at"])
+        self.assertEqual(row["registration_password"], "new-pw")
 
 
 class PasswordChangeBrowserTests(unittest.TestCase):

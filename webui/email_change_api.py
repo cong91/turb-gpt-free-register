@@ -38,6 +38,26 @@ def _result_succeeded(result: dict) -> bool:
     )
 
 
+def _plan_check_note(plan_check: object) -> str:
+    """Human-readable plan suffix appended to a successful change row detail."""
+    if not isinstance(plan_check, dict) or not plan_check.get("accepted"):
+        return ""
+    if plan_check.get("ok"):
+        plan = str(plan_check.get("current_plan_type") or "unknown").strip()
+        trial = " (có Plus trial)" if bool(plan_check.get("plus_trial_eligible")) else ""
+        return f" Gói: {plan}{trial}."
+    error = str(plan_check.get("error") or "").strip()
+    return f" Kiểm tra gói thất bại: {error[:120]}." if error else " Kiểm tra gói thất bại."
+
+
+def _force_fail_rows_locked(rows: list, row_indexes: list[int], detail: str) -> None:
+    """Mark still-running retry rows as failed after their worker crashed."""
+    for row_index in row_indexes:
+        if 0 <= row_index < len(rows) and rows[row_index].get("status") in {"queued", "running"}:
+            rows[row_index]["status"] = "failed"
+            rows[row_index]["detail"] = detail
+
+
 def _public_result(result: dict) -> dict:
     safe = redact_twofa_result(result)
     if _result_succeeded(safe):
@@ -127,11 +147,10 @@ def _apply_twofa_progress(batch_id: str, index: int, update: dict) -> None:
                 row["detail"] = str(result_detail).strip()[:500]
             elif row["status"] == "success":
                 plan_check = safe.get("plan_check")
-                row["detail"] = (
-                    "Đã cập nhật dữ liệu tài khoản. Đang kiểm tra loại gói."
-                    if isinstance(plan_check, dict) and plan_check.get("accepted")
-                    else "Đã cập nhật dữ liệu tài khoản."
-                )
+                if isinstance(plan_check, dict) and plan_check.get("accepted"):
+                    row["detail"] = f"Đã cập nhật dữ liệu tài khoản.{_plan_check_note(plan_check)}"
+                else:
+                    row["detail"] = "Đã cập nhật dữ liệu tài khoản. Đang kiểm tra loại gói."
 
 
 def _twofa_progress_snapshot(batch_id: str) -> dict | None:
@@ -212,9 +231,14 @@ def _persist_twofa_progress_batch(batch_id: str, public_results: list[dict]) -> 
             current["succeeded"] = succeeded
 
 
-def _public_results_for_batch(batch_id: str) -> list[dict] | None:
+def _public_results_for_batch(
+    progress: dict[str, dict],
+    batch_id: str,
+    *,
+    missing_error: str,
+) -> list[dict] | None:
     with _progress_lock:
-        current = _twofa_progress.get(batch_id)
+        current = progress.get(batch_id)
         if not current:
             return None
         rows = current.get("results") or []
@@ -225,19 +249,19 @@ def _public_results_for_batch(batch_id: str) -> list[dict] | None:
             dict(value) if isinstance(value, dict) else {
                 "email": row.get("email"),
                 "change_status": "failed",
-                "error": row.get("detail") or "2FA change did not return a result",
+                "error": row.get("detail") or missing_error,
             }
             for value, row in zip(stored, rows)
         ]
 
 
-def _batch_is_terminal(batch_id: str) -> bool:
+def _batch_is_terminal(progress: dict[str, dict], batch_id: str, terminal: frozenset[str]) -> bool:
     with _progress_lock:
-        current = _twofa_progress.get(batch_id)
+        current = progress.get(batch_id)
         if not current:
             return False
         rows = current.get("results") or []
-        return bool(rows) and all(row.get("status") in _PROGRESS_TERMINAL_STATUSES for row in rows)
+        return bool(rows) and all(row.get("status") in terminal for row in rows)
 
 
 def _run_twofa_retry(batch_id: str, index: int, item) -> None:
@@ -265,7 +289,11 @@ def _run_twofa_retry(batch_id: str, index: int, item) -> None:
             index,
             {"status": status, "email": item.email, "result": result},
         )
-        public_results = _public_results_for_batch(batch_id) if _batch_is_terminal(batch_id) else None
+        public_results = (
+            _public_results_for_batch(_twofa_progress, batch_id, missing_error="2FA change did not return a result")
+            if _batch_is_terminal(_twofa_progress, batch_id, _PROGRESS_TERMINAL_STATUSES)
+            else None
+        )
         if public_results is not None:
             _persist_twofa_progress_batch(batch_id, public_results)
     except Exception:
@@ -279,12 +307,14 @@ def _run_twofa_retry(batch_id: str, index: int, item) -> None:
         _apply_twofa_progress(batch_id, index, {"status": "failed", "result": failure})
         with _progress_lock:
             current = _twofa_progress.get(batch_id)
-            if current:
+            rows = (current or {}).get("results") or []
+            if rows and all(row.get("status") in _PROGRESS_TERMINAL_STATUSES for row in rows):
                 current["status"] = "completed"
                 current["batch_error"] = "Thử lại 2FA thất bại"
-        public_results = _public_results_for_batch(batch_id)
-        if public_results is not None:
-            _persist_twofa_progress_batch(batch_id, public_results)
+        if _batch_is_terminal(_twofa_progress, batch_id, _PROGRESS_TERMINAL_STATUSES):
+            public_results = _public_results_for_batch(_twofa_progress, batch_id, missing_error="2FA change did not return a result")
+            if public_results is not None:
+                _persist_twofa_progress_batch(batch_id, public_results)
 
 
 def _start_twofa_retry(batch_id: str, index: int, item) -> None:
@@ -292,6 +322,59 @@ def _start_twofa_retry(batch_id: str, index: int, item) -> None:
         target=_run_twofa_retry,
         args=(batch_id, index, item),
         name=f"twofa-change-retry-{batch_id[:8]}-{index}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _run_twofa_retry_failed_batch(batch_id: str, row_indexes: list[int], items: list, workers: int) -> None:
+    """Re-run every failed row of a batch under the configured worker count."""
+    row_by_position = {position: row_index for position, row_index in enumerate(row_indexes)}
+    try:
+        results = run_twofa_change_batch(
+            items,
+            workers=workers,
+            progress_callback=lambda position, update: _apply_twofa_progress(
+                batch_id,
+                row_by_position.get(position),
+                update,
+            ),
+        )
+    except Exception:
+        logger.exception("2FA retry-failed batch crashed: batch=%s", batch_id)
+        results = []
+    for position, result in enumerate(results):
+        status = "success" if _result_succeeded(result) else (
+            "partial_failure" if result.get("remote_disabled") else "failed"
+        )
+        _apply_twofa_progress(
+            batch_id,
+            row_by_position.get(position),
+            {"status": status, "email": result.get("email"), "result": result},
+        )
+    with _progress_lock:
+        batch = _twofa_progress.get(batch_id)
+        if batch:
+            _force_fail_rows_locked(
+                batch.get("results") or [],
+                row_indexes,
+                "Thử lại 2FA thất bại, hãy thử lại thủ công",
+            )
+    if _batch_is_terminal(_twofa_progress, batch_id, _PROGRESS_TERMINAL_STATUSES):
+        public_results = _public_results_for_batch(
+            _twofa_progress,
+            batch_id,
+            missing_error="2FA change did not return a result",
+        )
+        if public_results is not None:
+            _persist_twofa_progress_batch(batch_id, public_results)
+
+
+def _start_twofa_retry_failed(batch_id: str, row_indexes: list[int], items: list, workers: int) -> None:
+    thread = threading.Thread(
+        target=_run_twofa_retry_failed_batch,
+        args=(batch_id, row_indexes, items, workers),
+        name=f"twofa-change-retry-failed-{batch_id[:8]}",
         daemon=True,
     )
     thread.start()
@@ -387,6 +470,7 @@ def _create_password_progress(batch_id: str, items: list) -> bool:
             # Chỉ giữ email: credential không được lưu lại trong progress dict,
             # retry dựng lại input từ email (mật khẩu cũ/tOTP lấy từ DB).
             "emails": [item.email for item in items],
+            "public_results": [None] * len(items),
             "results": [
                 {
                     "index": index,
@@ -426,7 +510,10 @@ def _apply_password_progress(batch_id: str, index: int, update: dict) -> None:
         result = update.get("result")
         if isinstance(result, dict):
             safe = _public_password_result(result)
-            for key in ("account_id", "email", "mode", "change_status", "error", "warning", "retryable"):
+            public_results = batch.get("public_results")
+            if isinstance(public_results, list) and index < len(public_results):
+                public_results[index] = dict(safe)
+            for key in ("account_id", "email", "mode", "change_status", "error", "warning", "plan_check", "retryable"):
                 if key in safe and safe[key] not in (None, ""):
                     row[key] = safe[key]
             row["status"] = str(safe.get("change_status") or status)
@@ -434,7 +521,8 @@ def _apply_password_progress(batch_id: str, index: int, update: dict) -> None:
             if result_detail:
                 row["detail"] = str(result_detail).strip()[:500]
             elif row["status"] == "success":
-                row["detail"] = "Đã đổi mật khẩu và lưu vào dữ liệu tài khoản."
+                plan_note = _plan_check_note(safe.get("plan_check"))
+                row["detail"] = f"Đã đổi mật khẩu và lưu vào dữ liệu tài khoản.{plan_note}"
 
 
 def _password_progress_snapshot(batch_id: str) -> dict | None:
@@ -474,6 +562,29 @@ def _settle_password_batch(batch_id: str) -> None:
             current["status"] = "completed"
 
 
+def _persist_password_progress_batch(batch_id: str, public_results: list[dict]) -> None:
+    succeeded = sum(1 for result in public_results if result.get("change_status") == "success")
+    try:
+        batch = db.save_personal_info_change_batch(batch_id, "password", public_results)
+    except Exception as exc:
+        logger.exception("保存密码修改批次失败: batch=%s", batch_id)
+        with _progress_lock:
+            current = _password_progress.get(batch_id)
+            if current:
+                current["status"] = "failed"
+                current["batch_error"] = f"无法保存本次变更记录: {type(exc).__name__}"
+                current["change_batch_id"] = None
+                current["exportable_count"] = 0
+        return
+    with _progress_lock:
+        current = _password_progress.get(batch_id)
+        if current:
+            current["status"] = "completed"
+            current["change_batch_id"] = batch["batch_id"]
+            current["exportable_count"] = batch["exportable_count"]
+            current["succeeded"] = succeeded
+
+
 def _finish_password_progress(batch_id: str, results: list[dict]) -> None:
     for index, result in enumerate(results):
         safe = _public_password_result(result)
@@ -487,6 +598,10 @@ def _finish_password_progress(batch_id: str, results: list[dict]) -> None:
             },
         )
     _settle_password_batch(batch_id)
+    _persist_password_progress_batch(
+        batch_id,
+        [_public_password_result(result) for result in results],
+    )
 
 
 def _run_password_retry(batch_id: str, index: int, item) -> None:
@@ -525,13 +640,25 @@ def _run_password_retry(batch_id: str, index: int, item) -> None:
             "error": "Thử lại đổi mật khẩu thất bại, hãy thử lại thủ công",
         }
         _apply_password_progress(batch_id, index, {"status": "failed", "result": failure})
-        with _progress_lock:
-            current = _password_progress.get(batch_id)
-            if current:
-                current["status"] = "completed"
-                current["batch_error"] = "Thử lại đổi mật khẩu thất bại"
+        _settle_password_batch(batch_id)
+        if _batch_is_terminal(_password_progress, batch_id, _PASSWORD_TERMINAL_STATUSES):
+            current = None
+            with _progress_lock:
+                current = _password_progress.get(batch_id)
+                if current:
+                    current["batch_error"] = "Thử lại đổi mật khẩu thất bại"
+            public_results = _public_results_for_batch(_password_progress, batch_id, missing_error="Password change did not return a result")
+            if public_results is not None:
+                _persist_password_progress_batch(batch_id, public_results)
         return
     _settle_password_batch(batch_id)
+    public_results = (
+        _public_results_for_batch(_password_progress, batch_id, missing_error="Password change did not return a result")
+        if _batch_is_terminal(_password_progress, batch_id, _PASSWORD_TERMINAL_STATUSES)
+        else None
+    )
+    if public_results is not None:
+        _persist_password_progress_batch(batch_id, public_results)
 
 
 def _start_password_retry(batch_id: str, index: int, item) -> None:
@@ -539,6 +666,62 @@ def _start_password_retry(batch_id: str, index: int, item) -> None:
         target=_run_password_retry,
         args=(batch_id, index, item),
         name=f"password-change-retry-{batch_id[:8]}-{index}",
+        daemon=True,
+    )
+    thread.start()
+
+
+def _run_password_retry_failed_batch(batch_id: str, row_indexes: list[int], items: list, workers: int) -> None:
+    """Re-run every failed password row under the configured worker count."""
+    row_by_position = {position: row_index for position, row_index in enumerate(row_indexes)}
+    try:
+        results = run_password_change_batch(
+            items,
+            workers=workers,
+            progress_callback=lambda position, update: _apply_password_progress(
+                batch_id,
+                row_by_position.get(position),
+                update,
+            ),
+        )
+    except Exception:
+        logger.exception("Password retry-failed batch crashed: batch=%s", batch_id)
+        results = []
+    for position, result in enumerate(results):
+        safe = _public_password_result(result)
+        _apply_password_progress(
+            batch_id,
+            row_by_position.get(position),
+            {
+                "status": str(safe.get("change_status") or "failed"),
+                "email": result.get("email"),
+                "result": result,
+            },
+        )
+    with _progress_lock:
+        batch = _password_progress.get(batch_id)
+        if batch:
+            _force_fail_rows_locked(
+                batch.get("results") or [],
+                row_indexes,
+                "Thử lại đổi mật khẩu thất bại, hãy thử lại thủ công",
+            )
+    _settle_password_batch(batch_id)
+    if _batch_is_terminal(_password_progress, batch_id, _PASSWORD_TERMINAL_STATUSES):
+        public_results = _public_results_for_batch(
+            _password_progress,
+            batch_id,
+            missing_error="Password change did not return a result",
+        )
+        if public_results is not None:
+            _persist_password_progress_batch(batch_id, public_results)
+
+
+def _start_password_retry_failed(batch_id: str, row_indexes: list[int], items: list, workers: int) -> None:
+    thread = threading.Thread(
+        target=_run_password_retry_failed_batch,
+        args=(batch_id, row_indexes, items, workers),
+        name=f"password-change-retry-failed-{batch_id[:8]}",
         daemon=True,
     )
     thread.start()
@@ -736,8 +919,8 @@ def register_email_change_routes(app) -> None:
             if index < 0 or index >= len(rows) or index >= len(retry_items):
                 return jsonify({"ok": False, "error": "index không hợp lệ"}), 400
             row = rows[index]
-            if batch.get("status") not in {"completed", "failed"}:
-                return jsonify({"ok": False, "error": "Batch vẫn đang xử lý, hãy chờ hoàn tất trước khi thử lại"}), 409
+            if row.get("status") in {"queued", "running"}:
+                return jsonify({"ok": False, "error": "Tài khoản này đang xử lý, hãy chờ hoàn tất trước khi thử lại"}), 409
             if row.get("status") not in {"failed", "partial_failure"}:
                 return jsonify({"ok": False, "error": "Tài khoản này chưa ở trạng thái lỗi để thử lại"}), 409
             if row.get("retryable") is False:
@@ -759,6 +942,72 @@ def register_email_change_routes(app) -> None:
                     row = (batch.get("results") or [])[index]
                     row["status"] = "failed"
                     row["detail"] = "无法启动手动重试"
+                    batch["status"] = "completed"
+                    batch["batch_error"] = f"无法启动手动重试: {type(exc).__name__}"
+            return jsonify({"ok": False, "error": "无法启动手动重试"}), 500
+        return jsonify(_twofa_progress_snapshot(batch_id)), 202
+
+    @app.post("/api/accounts/change-twofa-retry-failed")
+    def api_accounts_change_twofa_retry_failed():
+        if not _same_origin_mutation():
+            return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
+        if request.content_length and request.content_length > _MAX_JSON_BYTES:
+            return jsonify({"ok": False, "error": "请求体过大"}), 413
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求数据必须是对象"}), 400
+        batch_id = str(data.get("batch_id") or "").strip()
+        credentials = str(data.get("credentials") or "").strip()
+        try:
+            workers = max(1, min(4, int(data.get("workers", 1) or 1)))
+        except (TypeError, ValueError):
+            workers = 1
+        if not batch_id:
+            return jsonify({"ok": False, "error": "batch_id là bắt buộc"}), 400
+        if not credentials:
+            return jsonify({"ok": False, "error": "credentials là bắt buộc để thử lại"}), 400
+        try:
+            retry_items = parse_twofa_change_inputs(credentials)
+            if len(retry_items) > _MAX_ITEMS:
+                raise ValueError(f"maximum {_MAX_ITEMS} accounts per request")
+        except (TypeError, ValueError) as exc:
+            return jsonify({"ok": False, "error": str(exc)}), 400
+        with _progress_lock:
+            batch = _twofa_progress.get(batch_id)
+            rows = batch.get("results") if batch else None
+            emails = batch.get("emails") if batch else None
+            if batch is None or not isinstance(rows, list) or not isinstance(emails, list):
+                return jsonify({"ok": False, "error": "Không tìm thấy tiến độ đổi 2FA"}), 404
+            if len(retry_items) != len(rows) or len(emails) != len(rows):
+                return jsonify({"ok": False, "error": "Danh sách credential không khớp batch 2FA"}), 409
+            failed: list[tuple[int, object]] = []
+            for index, row in enumerate(rows):
+                if row.get("status") not in {"failed", "partial_failure"}:
+                    continue
+                if row.get("retryable") is False:
+                    continue
+                if str(emails[index]).casefold() != retry_items[index].email.casefold():
+                    return jsonify({
+                        "ok": False,
+                        "error": f"Credential không khớp tài khoản cần thử lại: {emails[index]}",
+                    }), 409
+                failed.append((index, retry_items[index]))
+            if not failed:
+                return jsonify({"ok": False, "error": "Không có tài khoản lỗi đủ điều kiện thử lại"}), 409
+            row_indexes = [index for index, _item in failed]
+            items = [item for _index, item in failed]
+            for index in row_indexes:
+                rows[index]["status"] = "running"
+                rows[index]["detail"] = "Đang đăng nhập và thử lại đổi 2FA"
+            batch["status"] = "running"
+            batch["batch_error"] = None
+        try:
+            _start_twofa_retry_failed(batch_id, row_indexes, items, workers)
+        except Exception as exc:
+            logger.exception("启动 2FA 重试失败批次: batch=%s", batch_id)
+            with _progress_lock:
+                batch = _twofa_progress.get(batch_id)
+                if batch:
                     batch["status"] = "completed"
                     batch["batch_error"] = f"无法启动手动重试: {type(exc).__name__}"
             return jsonify({"ok": False, "error": "无法启动手动重试"}), 500
@@ -848,8 +1097,8 @@ def register_email_change_routes(app) -> None:
             if index < 0 or index >= len(rows):
                 return jsonify({"ok": False, "error": "index không hợp lệ"}), 400
             row = rows[index]
-            if batch.get("status") not in {"completed", "failed"}:
-                return jsonify({"ok": False, "error": "Batch vẫn đang xử lý, hãy chờ hoàn tất trước khi thử lại"}), 409
+            if row.get("status") in {"queued", "running"}:
+                return jsonify({"ok": False, "error": "Tài khoản này đang xử lý, hãy chờ hoàn tất trước khi thử lại"}), 409
             if row.get("status") not in {"failed"}:
                 return jsonify({"ok": False, "error": "Tài khoản này chưa ở trạng thái lỗi để thử lại"}), 409
             if row.get("retryable") is False:
@@ -871,6 +1120,60 @@ def register_email_change_routes(app) -> None:
                     row = (batch.get("results") or [])[index]
                     row["status"] = "failed"
                     row["detail"] = "无法启动手动重试"
+                    batch["status"] = "completed"
+                    batch["batch_error"] = f"无法启动手动重试: {type(exc).__name__}"
+            return jsonify({"ok": False, "error": "无法启动手动重试"}), 500
+        return jsonify(_password_progress_snapshot(batch_id)), 202
+
+    @app.post("/api/accounts/change-password-retry-failed")
+    def api_accounts_change_password_retry_failed():
+        if not _same_origin_mutation():
+            return jsonify({"ok": False, "error": "请求来源不受信任"}), 403
+        if request.content_length and request.content_length > _MAX_JSON_BYTES:
+            return jsonify({"ok": False, "error": "请求体过大"}), 413
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"ok": False, "error": "请求数据必须是对象"}), 400
+        batch_id = str(data.get("batch_id") or "").strip()
+        try:
+            workers = max(1, min(4, int(data.get("workers", 1) or 1)))
+        except (TypeError, ValueError):
+            workers = 1
+        if not batch_id:
+            return jsonify({"ok": False, "error": "batch_id là bắt buộc"}), 400
+        with _progress_lock:
+            batch = _password_progress.get(batch_id)
+            rows = batch.get("results") if batch else None
+            emails = batch.get("emails") if batch else None
+            if batch is None or not isinstance(rows, list) or not isinstance(emails, list):
+                return jsonify({"ok": False, "error": "Không tìm thấy tiến độ đổi mật khẩu"}), 404
+            if len(emails) != len(rows):
+                return jsonify({"ok": False, "error": "Batch đổi mật khẩu không nhất quán"}), 409
+            failed: list[tuple[int, object]] = []
+            for index, row in enumerate(rows):
+                if row.get("status") not in {"failed"}:
+                    continue
+                if row.get("retryable") is False:
+                    continue
+                # Credential không được giữ lại trong progress dict: dựng lại input
+                # từ email, run_password_change sẽ resolve mật khẩu cũ/tOTP từ DB.
+                failed.append((index, parse_password_change_inputs(str(emails[index]))[0]))
+            if not failed:
+                return jsonify({"ok": False, "error": "Không có tài khoản lỗi đủ điều kiện thử lại"}), 409
+            row_indexes = [index for index, _item in failed]
+            items = [item for _index, item in failed]
+            for index in row_indexes:
+                rows[index]["status"] = "running"
+                rows[index]["detail"] = "Đang đăng nhập và thử lại đổi mật khẩu"
+            batch["status"] = "running"
+            batch["batch_error"] = None
+        try:
+            _start_password_retry_failed(batch_id, row_indexes, items, workers)
+        except Exception as exc:
+            logger.exception("启动密码重试失败批次: batch=%s", batch_id)
+            with _progress_lock:
+                batch = _password_progress.get(batch_id)
+                if batch:
                     batch["status"] = "completed"
                     batch["batch_error"] = f"无法启动手动重试: {type(exc).__name__}"
             return jsonify({"ok": False, "error": "无法启动手动重试"}), 500

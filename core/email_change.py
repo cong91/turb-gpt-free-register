@@ -77,13 +77,21 @@ def _parse_credential_lines_strict(text: str) -> list[tuple[str, str, str]]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        first = line.find("|")
-        last = line.rfind("|")
+        delimiter_candidates = [
+            (position, delimiter)
+            for delimiter in ("|", "----")
+            if (position := line.find(delimiter)) >= 0
+        ]
+        if not delimiter_candidates:
+            raise ValueError(f"credential line {line_number} is invalid")
+        _, delimiter = min(delimiter_candidates)
+        first = line.find(delimiter)
+        last = line.rfind(delimiter)
         if first <= 0 or last <= first:
             raise ValueError(f"credential line {line_number} is invalid")
         email = line[:first].strip()
-        password = line[first + 1:last].strip()
-        totp_secret = line[last + 1:].strip()
+        password = line[first + len(delimiter):last].strip()
+        totp_secret = line[last + len(delimiter):].strip()
         if not _valid_email(email) or not password or not totp_secret:
             raise ValueError(f"credential line {line_number} is invalid")
         records.append((email, password, totp_secret))

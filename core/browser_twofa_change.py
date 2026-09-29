@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 
 from core import db
+from core.account_export import BrowserPageTransport
 from core.account_network import preferred_account_proxy
 from core.account_security import (
     TwofaChangeInput,
@@ -96,39 +97,47 @@ def _record_local_failure(
     return result
 
 
-def _queue_new_account_plan_check(
+def _run_plan_check_with_live_browser(
     account_id: int,
     item: TwofaChangeInput,
     access_token: str,
+    profile,
     result: dict[str, object],
 ) -> None:
-    """Queue plan detection after a new account has a usable session token."""
+    """Check the plan inside the browser that just finished the 2FA change.
+
+    The profile is still open here: the same-origin transport reuses the
+    logged-in session, so no proxy lease and no background worker are needed.
+    A failure only lands in result["plan_check"]; it never undoes the 2FA
+    change that already succeeded.
+    """
     if not access_token:
         result["plan_check"] = {"accepted": False, "error": "access token is missing"}
         return
     try:
-        from core.plan_check_service import enqueue_account_plan_check
+        from core.plan_check_service import run_sync_plan_check
 
-        queued = enqueue_account_plan_check(
+        plan_result = run_sync_plan_check(
             account_id=account_id,
             email=item.email,
             access_token=access_token,
             trigger="twofa_change",
-            proxy=None,
-            timezone_offset_min="-",
+            browser_transport=BrowserPageTransport(profile.driver),
         )
-        result["plan_check"] = {
-            "accepted": bool(queued.get("accepted")),
-            "status": str(queued.get("status") or "").strip() or None,
-            "error": str(queued.get("error") or "").strip() or None,
-        }
-        if not queued.get("accepted"):
-            result["warning"] = result.get("warning") or str(
-                queued.get("error") or "account plan check was not queued"
-            )
-    except Exception as exc:  # noqa: BLE001 - plan lookup must not undo a saved MFA change.
-        result["plan_check"] = {"accepted": False, "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
-        result["warning"] = result.get("warning") or "account plan check could not be queued"
+    except Exception as exc:  # noqa: BLE001 - plan lookup must not undo the 2FA change.
+        plan_result = {"accepted": False, "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
+    result["plan_check"] = {
+        "accepted": bool(plan_result.get("accepted")),
+        "ok": bool(plan_result.get("ok")),
+        "status": "success" if plan_result.get("ok") else "failed",
+        "current_plan_type": plan_result.get("current_plan_type"),
+        "plus_trial_eligible": plan_result.get("plus_trial_eligible"),
+        "error": str(plan_result.get("error") or "").strip() or None,
+    }
+    if not plan_result.get("ok"):
+        result["warning"] = result.get("warning") or str(
+            plan_result.get("error") or "account plan check failed"
+        )
 
 
 def _should_resume_after_remote_disable(account: dict) -> bool:
@@ -185,6 +194,7 @@ def run_twofa_change(
     remote_disabled_seen = resume_after_remote_disable
 
     profile = None
+    attempt_network: ExitStack | None = None
     try:
         _notify_progress(
             progress_callback,
@@ -218,6 +228,9 @@ def run_twofa_change(
                     "proxy": active_proxy,
                     "access_token": last_access_token or stored_access_token,
                     "allow_oauth_fallback": True,
+                    # Keep the authenticated session alive so the plan check can
+                    # reuse this browser after the TOTP change completes.
+                    "keep_session": True,
                 }
                 if resume_after_remote_disable:
                     change_kwargs["resume_after_remote_disable"] = True
@@ -234,20 +247,25 @@ def run_twofa_change(
                     "error": last_error,
                 }
             finally:
-                if profile is not None:
+                if not bool(result.get("ok")):
+                    # Failed attempts tear down immediately; a successful attempt
+                    # keeps the browser and proxy lease open for the plan check.
+                    if profile is not None:
+                        try:
+                            profile.close()
+                        except Exception:  # noqa: BLE001 - cleanup must not mask result.
+                            logger.debug("Browser driver cleanup failed")
+                        try:
+                            profile.cleanup()
+                        except Exception:  # noqa: BLE001 - cleanup must not mask result.
+                            logger.debug("Browser profile cleanup failed")
+                    profile = None
                     try:
-                        profile.close()
-                    except Exception:  # noqa: BLE001 - cleanup must not mask result.
-                        logger.debug("Browser driver cleanup failed")
-                    try:
-                        profile.cleanup()
-                    except Exception:  # noqa: BLE001 - cleanup must not mask result.
-                        logger.debug("Browser profile cleanup failed")
-                profile = None
-                try:
-                    attempt_network.close()
-                except Exception:
-                    logger.debug("2FA proxy lease cleanup failed", exc_info=True)
+                        if attempt_network is not None:
+                            attempt_network.close()
+                    except Exception:
+                        logger.debug("2FA proxy lease cleanup failed", exc_info=True)
+                    attempt_network = None
 
             if result.get("ok"):
                 break
@@ -292,8 +310,6 @@ def run_twofa_change(
             token_persisted = False
         result["account_id"] = account_id
         result["browser_provider"] = browser_provider
-        if is_new_account and token_persisted:
-            _queue_new_account_plan_check(account_id, item, access_token, result)
         if not bool(result.get("ok")):
             if result.get("remote_disabled"):
                 return _record_remote_disable_failure(account_id, item, result)
@@ -321,6 +337,18 @@ def run_twofa_change(
         if not persisted:
             result["warning"] = result.get("warning") or "local 2FA persistence was not updated"
             result["retryable"] = False
+
+        # The browser is still open (keep_session=True). Check the plan in the
+        # same authenticated session before closing it, so no proxy lease or
+        # background worker is needed.
+        if token_persisted and profile is not None and profile.driver is not None:
+            _run_plan_check_with_live_browser(
+                account_id,
+                item,
+                access_token,
+                profile,
+                result,
+            )
         return result
     except Exception as exc:  # noqa: BLE001 - isolate each account in a batch.
         result = {
@@ -343,6 +371,11 @@ def run_twofa_change(
                 profile.cleanup()
             except Exception:  # noqa: BLE001 - cleanup must not mask the result.
                 logger.debug("Browser profile cleanup failed")
+        if attempt_network is not None:
+            try:
+                attempt_network.close()
+            except Exception:
+                logger.debug("2FA proxy lease cleanup failed", exc_info=True)
 
 
 def run_twofa_change_batch(

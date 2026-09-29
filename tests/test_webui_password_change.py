@@ -16,6 +16,14 @@ def _block_batch_runner(*_args, **_kwargs):
 class PasswordChangeApiTests(unittest.TestCase):
     def setUp(self):
         self.client = create_app(auth_code="test-auth").test_client()
+        # Batch worker chạy ngay trong test (immediate thread) -> persist lịch sử
+        # đổi pass phải được mock để không ghi vào turb.sqlite3 thật.
+        save_patcher = patch(
+            "webui.email_change_api.db.save_personal_info_change_batch",
+            return_value={"batch_id": "b" * 32, "exportable_count": 1},
+        )
+        self.save_batch = save_patcher.start()
+        self.addCleanup(save_patcher.stop)
 
     def tearDown(self):
         with email_change_api._progress_lock:
@@ -48,7 +56,10 @@ class PasswordChangeApiTests(unittest.TestCase):
 
         response = self.client.post(
             "/api/accounts/change-password",
-            json={"credentials": "user@example.com", "workers": 2},
+            json={
+                "credentials": "user@example.com----current-password----TOTPBASE32",
+                "workers": 2,
+            },
             headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
         )
 
@@ -67,9 +78,38 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertNotIn("NEWSECRET-MUST-STAY-SERVER-SIDE", json.dumps(payload))
         self.assertNotIn("token-must-stay-server-side", json.dumps(payload))
         run_batch.assert_called_once()
+        parsed_item = run_batch.call_args.args[0][0]
+        self.assertEqual(parsed_item.current_password, "current-password")
+        self.assertEqual(parsed_item.totp_secret, "TOTPBASE32")
         self.assertEqual(run_batch.call_args.kwargs["workers"], 2)
         with email_change_api._progress_lock:
             self.assertNotIn("items", email_change_api._password_progress[payload["batch_id"]])
+
+    @patch("webui.email_change_api.threading.Thread")
+    @patch("webui.email_change_api.run_password_change_batch")
+    def test_change_password_batch_persists_history_with_password_mode(self, run_batch, thread):
+        self._run_thread_target_immediately(thread)
+        run_batch.return_value = [{
+            "ok": True,
+            "persisted": True,
+            "email": "user@example.com",
+            "account_id": 7,
+        }]
+
+        response = self.client.post(
+            "/api/accounts/change-password",
+            json={"credentials": "user@example.com"},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+
+        self.assertEqual(response.status_code, 202, response.get_json())
+        self.assertEqual(response.get_json()["results"][0]["status"], "success")
+        self.save_batch.assert_called_once()
+        batch_id, mode, results = self.save_batch.call_args.args
+        self.assertRegex(batch_id, r"^[0-9a-f]{32}$")
+        self.assertEqual(mode, "password")
+        self.assertEqual(results[0]["change_status"], "success")
+        self.assertEqual(results[0]["account_id"], 7)
 
     @patch("webui.email_change_api.run_password_change_batch", side_effect=_block_batch_runner)
     @patch("webui.email_change_api.threading.Thread")
@@ -206,6 +246,12 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertEqual(retried_item.email, "user@example.com")
         self.assertEqual(retried_item.current_password, "")
         self.assertIsNone(retried_item.totp_secret)
+        # Lần thử lại thành công phải ghi lại lịch sử batch mới nhất.
+        self.assertEqual(self.save_batch.call_count, 2)
+        retry_batch_id, retry_mode, retry_results = self.save_batch.call_args.args
+        self.assertEqual(retry_batch_id, initial_payload["batch_id"])
+        self.assertEqual(retry_mode, "password")
+        self.assertEqual(retry_results[0]["change_status"], "success")
 
     @patch("webui.email_change_api.threading.Thread")
     @patch("webui.email_change_api.run_password_change_batch")

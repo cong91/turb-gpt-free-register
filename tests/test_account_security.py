@@ -53,6 +53,15 @@ class TwofaChangeInputTests(unittest.TestCase):
             ],
         )
 
+    def test_parses_credential_lines_with_dash_delimiter(self):
+        result = parse_twofa_change_inputs(
+            "backend_export.3a@icloud.com----B5H6!!a$ul5Wgv----ATY3FIMESST7OQTCQI7OLYNT7X62UEFH\n"
+        )
+
+        self.assertEqual(result[0].email, "backend_export.3a@icloud.com")
+        self.assertEqual(result[0].password, "B5H6!!a$ul5Wgv")
+        self.assertEqual(result[0].current_totp_secret, "ATY3FIMESST7OQTCQI7OLYNT7X62UEFH")
+
     def test_rejects_duplicate_emails_and_empty_input(self):
         with self.assertRaisesRegex(ValueError, "required"):
             parse_twofa_change_inputs("")
@@ -943,7 +952,7 @@ class TwofaApiTests(unittest.TestCase):
 
         response = self.client.post(
             "/api/accounts/change-twofa",
-            json={"credentials": "user@example.com|password|OLDSECRET", "workers": 2},
+            json={"credentials": "user@example.com----password----OLDSECRET", "workers": 2},
             headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
         )
 
@@ -958,6 +967,9 @@ class TwofaApiTests(unittest.TestCase):
         self.assertNotIn("new_totp_secret", json.dumps(payload))
         self.assertNotIn("token-must-stay-server-side", json.dumps(payload))
         run_batch.assert_called_once()
+        parsed_item = run_batch.call_args.args[0][0]
+        self.assertEqual(parsed_item.password, "password")
+        self.assertEqual(parsed_item.current_totp_secret, "OLDSECRET")
         save_batch.assert_called_once()
         self.assertEqual(save_batch.call_args.args[1], "twofa")
 

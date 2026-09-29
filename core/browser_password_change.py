@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 
 from core import db
+from core.account_export import BrowserPageTransport
 from core.account_network import preferred_account_proxy
 from core.browser_profile import open_browser_profile
 from core.password_change import (
@@ -38,6 +39,49 @@ def _notify_progress(
         callback(index, dict(update))
     except Exception:
         logger.debug("Password change progress callback failed", exc_info=True)
+
+
+def _run_plan_check_with_live_browser(
+    account_id: int,
+    item: PasswordChangeInput,
+    access_token: str,
+    profile,
+    result: dict[str, object],
+) -> None:
+    """Check the plan inside the browser that just finished the password change.
+
+    The profile is still open here: the same-origin transport reuses the
+    logged-in session, so no proxy lease and no background worker are needed.
+    A failure only lands in result["plan_check"]; it never undoes the password
+    change that already succeeded.
+    """
+    if not access_token:
+        result["plan_check"] = {"accepted": False, "error": "access token is missing"}
+        return
+    try:
+        from core.plan_check_service import run_sync_plan_check
+
+        plan_result = run_sync_plan_check(
+            account_id=account_id,
+            email=item.email,
+            access_token=access_token,
+            trigger="password_change",
+            browser_transport=BrowserPageTransport(profile.driver),
+        )
+    except Exception as exc:  # noqa: BLE001 - plan lookup must not undo the password change.
+        plan_result = {"accepted": False, "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
+    result["plan_check"] = {
+        "accepted": bool(plan_result.get("accepted")),
+        "ok": bool(plan_result.get("ok")),
+        "status": "success" if plan_result.get("ok") else "failed",
+        "current_plan_type": plan_result.get("current_plan_type"),
+        "plus_trial_eligible": plan_result.get("plus_trial_eligible"),
+        "error": str(plan_result.get("error") or "").strip() or None,
+    }
+    if not plan_result.get("ok"):
+        result["warning"] = result.get("warning") or str(
+            plan_result.get("error") or "account plan check failed"
+        )
 
 
 def run_password_change(
@@ -88,6 +132,7 @@ def run_password_change(
     stored_access_token = str((account or {}).get("access_token") or "").strip()
 
     profile = None
+    attempt_network: ExitStack | None = None
     try:
         _notify_progress(
             progress_callback,
@@ -120,6 +165,9 @@ def run_password_change(
                     item,
                     access_token=last_access_token or stored_access_token,
                     allow_oauth_fallback=True,
+                    # Keep the authenticated session alive so the plan check can
+                    # reuse this browser after the password change completes.
+                    keep_session=True,
                 )
                 last_error = str(result.get("error") or "")
                 last_access_token = str(result.get("access_token") or "").strip() or last_access_token
@@ -132,20 +180,25 @@ def run_password_change(
                     "error": last_error,
                 }
             finally:
-                if profile is not None:
+                if not bool(result.get("ok")):
+                    # Failed attempts tear down immediately; a successful attempt
+                    # keeps the browser and proxy lease open for the plan check.
+                    if profile is not None:
+                        try:
+                            profile.close()
+                        except Exception:  # noqa: BLE001 - cleanup must not mask result.
+                            logger.debug("Browser driver cleanup failed")
+                        try:
+                            profile.cleanup()
+                        except Exception:  # noqa: BLE001 - cleanup must not mask result.
+                            logger.debug("Browser profile cleanup failed")
+                    profile = None
                     try:
-                        profile.close()
-                    except Exception:  # noqa: BLE001 - cleanup must not mask result.
-                        logger.debug("Browser driver cleanup failed")
-                    try:
-                        profile.cleanup()
-                    except Exception:  # noqa: BLE001 - cleanup must not mask result.
-                        logger.debug("Browser profile cleanup failed")
-                profile = None
-                try:
-                    attempt_network.close()
-                except Exception:
-                    logger.debug("Password change proxy lease cleanup failed", exc_info=True)
+                        if attempt_network is not None:
+                            attempt_network.close()
+                    except Exception:
+                        logger.debug("Password change proxy lease cleanup failed", exc_info=True)
+                    attempt_network = None
 
             if result.get("ok"):
                 break
@@ -204,6 +257,18 @@ def run_password_change(
                 result["retryable"] = False
         result["persisted"] = persisted
         result.pop("new_password", None)
+
+        # The browser is still open (keep_session=True). Check the plan in the
+        # same authenticated session before closing it, so no proxy lease or
+        # background worker is needed.
+        if access_token and profile is not None and profile.driver is not None:
+            _run_plan_check_with_live_browser(
+                account_id,
+                item,
+                access_token,
+                profile,
+                result,
+            )
         return result
     except Exception as exc:  # noqa: BLE001 - isolate each account in a batch.
         return {
@@ -223,6 +288,11 @@ def run_password_change(
                 profile.cleanup()
             except Exception:  # noqa: BLE001 - cleanup must not mask the result.
                 logger.debug("Browser profile cleanup failed")
+        if attempt_network is not None:
+            try:
+                attempt_network.close()
+            except Exception:
+                logger.debug("Password change proxy lease cleanup failed", exc_info=True)
 
 
 def run_password_change_batch(
