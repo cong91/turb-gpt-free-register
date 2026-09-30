@@ -601,11 +601,55 @@ def _account_filter_sql(
                 "COALESCE(json_extract(payload, '$.plus_trial_eligible'), 0) IN (1, '1', 'true')",
             ])
             params.append("free")
+        elif plan in {"promo", "promotion", "plan_promo", "eligible_promo"} or plan.startswith("promo:"):
+            # 当前套餐必须是 free，并且任意套餐存在至少一个可用优惠活动；
+            # 不限定 Plus。eligible_promo_campaigns 是以套餐名为 key 的对象。
+            promo_expr = "json_extract(payload, '$.eligible_promo_campaigns')"
+            where.append(f"{plan_expr} = ?")
+            where.append("json_type(payload, '$.eligible_promo_campaigns') = 'object'")
+            where.append(f"EXISTS (SELECT 1 FROM json_each({promo_expr}))")
+            params.append("free")
+            promo_parts = plan.split(":") if plan.startswith("promo:") else []
+            promo_type = promo_parts[1].strip()[:64] if len(promo_parts) > 1 else ""
+            promo_discount = promo_parts[2].strip()[:16] if len(promo_parts) > 2 else ""
+            conditions: list[str] = []
+            condition_params: list[Any] = []
+            if promo_type and promo_type not in {"*", "all", "any"}:
+                canonical = promo_type.lower().replace("-", "").replace("_", "").replace(" ", "")
+                if canonical.startswith("chatgpt"):
+                    canonical = canonical[7:]
+                if canonical.endswith("plan"):
+                    canonical = canonical[:-4]
+                normalized_key = "lower(replace(replace(replace(j.key, '-', ''), '_', ''), ' ', ''))"
+                normalized_name = (
+                    "lower(replace(replace(replace(COALESCE(CAST(json_extract(j.value, '$.metadata.plan_name') AS TEXT), ''), "
+                    "'-', ''), '_', ''), ' ', ''))"
+                )
+                conditions.append(
+                    f"({normalized_key} = ? OR {normalized_name} IN (?, ?, ?))"
+                )
+                condition_params.extend([canonical, canonical, f"{canonical}plan", f"chatgpt{canonical}plan"])
+            if promo_discount:
+                try:
+                    discount_value = float(promo_discount.rstrip("%"))
+                except ValueError:
+                    discount_value = None
+                if discount_value is not None:
+                    conditions.append("CAST(json_extract(j.value, '$.metadata.discount.percentage') AS REAL) = ?")
+                    condition_params.append(discount_value)
+            if conditions:
+                where.append(
+                    f"EXISTS (SELECT 1 FROM json_each({promo_expr}) AS j WHERE "
+                    + " AND ".join(conditions) + ")"
+                )
+                params.extend(condition_params)
         elif plan in {"free_no_trial", "free_without_trial", "free_not_trial"}:
-            where.extend([
-                f"{plan_expr} = ?",
-                "lower(COALESCE(CAST(json_extract(payload, '$.plus_trial_eligible') AS TEXT), '')) IN ('0', 'false', 'no', 'off')",
-            ])
+            # 只匹配已成功查询且没有任何套餐优惠的 free 账号；字段缺失代表
+            # 尚未得到完整优惠结果，不应归入“不可试用套餐”。
+            promo_expr = "json_extract(payload, '$.eligible_promo_campaigns')"
+            where.append(f"{plan_expr} = ?")
+            where.append("json_type(payload, '$.eligible_promo_campaigns') = 'object'")
+            where.append(f"NOT EXISTS (SELECT 1 FROM json_each({promo_expr}))")
             params.append("free")
         elif plan == "plus":
             # 与 _account_matches_plan_filter 保持一致：free(可试用)不算已开通 Plus。
@@ -1551,6 +1595,53 @@ def _account_matches_plan_filter(row: dict, plan_filter: str | None = None) -> b
         return not plan or plan in {"unknown", "unresolved", "none", "null"}
     if f in {"free_plus", "free_plus_trial", "plus_trial_eligible"}:
         return plan == "free" and bool(row.get("plus_trial_eligible"))
+    if f in {"promo", "promotion", "plan_promo", "eligible_promo"} or f.startswith("promo:"):
+        # 与 _account_filter_sql 的 promo 分支保持一致：free + 至少一个可用优惠。
+        if plan != "free":
+            return False
+        campaigns = row.get("eligible_promo_campaigns")
+        if not isinstance(campaigns, dict) or not campaigns:
+            return False
+        parts = f.split(":") if f.startswith("promo:") else []
+        promo_type = parts[1].strip()[:64] if len(parts) > 1 else ""
+        promo_discount = parts[2].strip()[:16] if len(parts) > 2 else ""
+
+        def _promo_canonical(value: object) -> str:
+            text = str(value or "").strip().lower()
+            for ch in ("-", "_", " "):
+                text = text.replace(ch, "")
+            if text.startswith("chatgpt"):
+                text = text[7:]
+            if text.endswith("plan"):
+                text = text[:-4]
+            return text
+
+        matched: list[object] = list(campaigns.values())
+        if promo_type and promo_type not in {"*", "all", "any"}:
+            canonical = _promo_canonical(promo_type)
+            accepted = {canonical, f"{canonical}plan", f"chatgpt{canonical}plan"}
+            matched = [
+                entry for key, entry in campaigns.items()
+                if _promo_canonical(key) == canonical
+                or _promo_canonical(
+                    (entry or {}).get("metadata", {}).get("plan_name")
+                    if isinstance(entry, dict) else ""
+                ) in accepted
+            ]
+        if promo_discount:
+            try:
+                discount_value = float(promo_discount.rstrip("%"))
+            except ValueError:
+                discount_value = None
+            if discount_value is not None:
+                matched = [
+                    entry for entry in matched
+                    if isinstance(entry, dict)
+                    and isinstance((entry.get("metadata") or {}).get("discount"), dict)
+                    and isinstance(entry["metadata"]["discount"].get("percentage"), (int, float))
+                    and float(entry["metadata"]["discount"]["percentage"]) == discount_value
+                ]
+        return bool(matched)
     if f == "plus":
         # “free(可Plus试用)”只是可试用，不算已开通 Plus。
         return "plus" in plan and "free" not in plan
