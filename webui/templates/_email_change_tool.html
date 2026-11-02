@@ -31,6 +31,14 @@
     </div>
 
     <form id="emailChangeForm" class="personal-info-form">
+      <div class="personal-info-codex-option">
+        <label class="personal-info-codex-toggle" for="loginCodexAfterChange">
+          <input id="loginCodexAfterChange" type="checkbox" name="login_codex_after_change" aria-describedby="loginCodexAfterChangeHelp loginCodexAfterChangeAvailability"{% if not codex_live_session_supported %} disabled{% endif %}>
+          <span>Sau khi đổi thành công, đăng nhập Codex ngay trong cùng phiên trình duyệt</span>
+        </label>
+        <p id="loginCodexAfterChangeHelp" class="personal-info-codex-help">Chỉ chạy cho tài khoản đổi thành công. Có thể cần thêm email OTP, xác minh SMS/thuê số và proxy; các bước này có thể tốn lượt OTP, phí dịch vụ hoặc hạn mức proxy.</p>
+        <p id="loginCodexAfterChangeAvailability" class="personal-info-codex-help"{% if codex_live_session_supported %} hidden{% endif %}>Tùy chọn này chỉ khả dụng khi phiên trình duyệt được giữ đến khi Codex hoàn tất.</p>
+      </div>
       <section class="personal-info-workspace" data-personal-panel="email" role="tabpanel">
         <div class="personal-info-form-head">
           <div>
@@ -106,6 +114,18 @@
         </div>
       </section>
 
+      <section id="personalInfoCodexResults" class="personal-info-results personal-info-codex-results" hidden>
+        <div class="personal-info-results-head">
+          <div><p class="personal-info-kicker">CODEX OAUTH</p><h2>Kết quả đăng nhập Codex</h2></div>
+        </div>
+        <p id="personalCodexStatus" class="personal-info-status" role="status" aria-live="polite"></p>
+        <div class="personal-info-result-table-wrap" role="region" aria-label="Kết quả Codex theo tài khoản" tabindex="0">
+          <table class="personal-info-result-table personal-info-codex-table">
+            <thead><tr><th>Tài khoản</th><th>Trạng thái Codex</th><th>Chi tiết</th></tr></thead>
+            <tbody id="personalCodexResultBody"></tbody>
+          </table>
+        </div>
+      </section>
       <section id="personalInfoResults" class="personal-info-results" hidden>
         <div class="personal-info-results-head">
           <div>

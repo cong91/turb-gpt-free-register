@@ -98,8 +98,7 @@ class BrowserCredentialLoginTests(unittest.TestCase):
     def test_open_and_submit_email_does_not_capture_screenshot_in_normal_flow(self):
         driver = Mock()
         with patch.object(credential_login, "human_delay"), patch.object(
-            credential_login, "_maybe_accept"
-        ), patch.object(credential_login, "classify_login_state", return_value="unknown"), patch.object(
+            credential_login, "classify_login_state", return_value="unknown"), patch.object(
             credential_login, "_type_email_address"
         ), patch.object(credential_login, "_submit_email_step"):
             state = credential_login._open_and_submit_email(

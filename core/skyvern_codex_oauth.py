@@ -16,6 +16,7 @@ def run_skyvern_codex_oauth(
     existing_page=None,
     existing_session_info=None,
     fresh_browser_profile: bool = False,
+    clear_existing_state: bool = True,
 ) -> dict:
     return run_browser_use_codex_oauth(
         email=email,
@@ -29,4 +30,5 @@ def run_skyvern_codex_oauth(
         existing_page=existing_page,
         existing_session_info=existing_session_info,
         fresh_browser_profile=fresh_browser_profile,
+        clear_existing_state=clear_existing_state,
     )

@@ -6,10 +6,10 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 
-from core import db
+from core import db, password_change_recovery
 from core.account_export import BrowserPageTransport
 from core.account_network import preferred_account_proxy
-from core.browser_profile import open_browser_profile
+from core.browser_profile import configured_browser_profile_provider, open_browser_profile
 from core.password_change import (
     PasswordChangeInput,
     _redacted_error,
@@ -90,6 +90,7 @@ def run_password_change(
     proxy_lane_id: int | None = None,
     progress_callback: Callable[[int, dict[str, object]], None] | None = None,
     progress_index: int | None = None,
+    login_codex_after_change: bool = False,
 ) -> dict[str, object]:
     """Change one account's ChatGPT password and persist the new value locally."""
     _notify_progress(
@@ -130,6 +131,17 @@ def run_password_change(
             return {"ok": False, "persisted": False, "email": item.email, "error": "account id missing"}
         account_id = int(account_id_value)
     stored_access_token = str((account or {}).get("access_token") or "").strip()
+    try:
+        password_change_recovery.stage(account_id, item.new_password)
+    except Exception:
+        return {
+            "ok": False,
+            "persisted": False,
+            "email": item.email,
+            "account_id": account_id,
+            "retryable": False,
+            "error": "Không thể lưu ứng viên mật khẩu; hãy đối soát dữ liệu khôi phục cục bộ",
+        }
 
     profile = None
     attempt_network: ExitStack | None = None
@@ -146,6 +158,7 @@ def run_password_change(
         for browser_attempt in range(1, _PASSWORD_CHANGE_BROWSER_RESTART_ATTEMPTS + 1):
             profile = None
             attempt_network = ExitStack()
+            mutation_started = False
             try:
                 active_proxy, network_mode = attempt_network.enter_context(preferred_account_proxy(
                     None,
@@ -154,12 +167,17 @@ def run_password_change(
                     lease_owner_id=f"password-change:{account_id}",
                 ))
                 logger.info("[PassChange] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
+                if active_proxy is not None and configured_browser_profile_provider() == "skyvern":
+                    raise RuntimeError(
+                        "Skyvern không hỗ trợ route proxy hiện tại; chưa bắt đầu đổi mật khẩu. Hãy chọn route direct rõ ràng hoặc provider hỗ trợ proxy."
+                    )
                 profile = (
                     open_browser_profile(proxy=active_proxy)
                     if active_proxy is not None
                     else open_browser_profile()
                 )
                 browser_provider = str(getattr(profile, "provider", "") or "")
+                mutation_started = True
                 result = change_password_in_browser(
                     profile.driver,
                     item,
@@ -178,6 +196,7 @@ def run_password_change(
                     "email": item.email,
                     "mode": item.mode,
                     "error": last_error,
+                    **({"retryable": False, "remote_state_uncertain": True} if mutation_started else {}),
                 }
             finally:
                 if not bool(result.get("ok")):
@@ -200,7 +219,7 @@ def run_password_change(
                         logger.debug("Password change proxy lease cleanup failed", exc_info=True)
                     attempt_network = None
 
-            if result.get("ok"):
+            if result.get("ok") or result.get("retryable") is False:
                 break
             if browser_attempt < _PASSWORD_CHANGE_BROWSER_RESTART_ATTEMPTS:
                 logger.warning(
@@ -225,7 +244,7 @@ def run_password_change(
                 )
             except Exception as exc:  # noqa: BLE001 - keep the change result visible.
                 token_persisted = False
-                result["warning"] = _redacted_error(exc, item)
+                result["warning"] = _redacted_error(str(exc).replace(access_token, "[redacted]"), item)
             result["access_token_saved"] = token_persisted
             if not token_persisted:
                 result["warning"] = result.get("warning") or "access token persistence was not updated"
@@ -236,8 +255,19 @@ def run_password_change(
         result["account_id"] = account_id
         result["browser_provider"] = browser_provider
         if not bool(result.get("ok")):
+            if login_codex_after_change:
+                from core.personal_info_codex import skipped_personal_info_codex
+
+                result["codex"] = skipped_personal_info_codex(
+                    item.email,
+                    "Bỏ qua: thao tác đổi mật khẩu chưa thành công; trạng thái đổi mật khẩu được giữ nguyên.",
+                )
             result["persisted"] = False
             result.pop("new_password", None)
+            if result.get("remote_state_uncertain"):
+                result["warning"] = "Cần đối soát mật khẩu bằng công cụ khôi phục cục bộ"
+            else:
+                password_change_recovery.discard(account_id)
             return result
 
         # already_set means OpenAI rejected the reset (a password already
@@ -248,6 +278,7 @@ def run_password_change(
                 persisted = db.update_account_password(
                     account_id,
                     password=item.new_password,
+                    extra_updates={"registration_password": item.new_password},
                 )
             except Exception as exc:  # noqa: BLE001 - remote result must remain visible.
                 persisted = False
@@ -257,6 +288,13 @@ def run_password_change(
                 result["retryable"] = False
         result["persisted"] = persisted
         result.pop("new_password", None)
+        if persisted or result.get("already_set"):
+            try:
+                password_change_recovery.discard(account_id)
+            except Exception:
+                result["warning"] = "Cần dọn bản ghi khôi phục mật khẩu cục bộ"
+        else:
+            result["warning"] = "Cần đối soát mật khẩu bằng công cụ khôi phục cục bộ"
 
         # The browser is still open (keep_session=True). Check the plan in the
         # same authenticated session before closing it, so no proxy lease or
@@ -269,6 +307,41 @@ def run_password_change(
                 profile,
                 result,
             )
+        if login_codex_after_change and persisted and not result.get("already_set") and profile is not None:
+            _notify_progress(
+                progress_callback,
+                progress_index,
+                {"status": "running", "email": item.email, "codex": {"status": "running", "ok": False}},
+            )
+            try:
+                from core.personal_info_codex import run_personal_info_codex_and_record
+
+                result["codex"] = run_personal_info_codex_and_record(
+                    email=item.email,
+                    profile=profile,
+                    active_proxy=active_proxy,
+                    password=item.new_password,
+                    totp_secret=item.totp_secret or "",
+                )
+            except Exception:
+                result["retryable"] = False
+                result["codex"] = {
+                    "status": "failed",
+                    "ok": False,
+                    "reason": "Đăng nhập Codex thất bại; thao tác đổi mật khẩu vẫn thành công.",
+                }
+                try:
+                    from core.personal_info_codex import record_personal_info_codex
+
+                    record_personal_info_codex(item.email, result["codex"])
+                except Exception:
+                    result["codex"]["status_persisted"] = False
+        elif login_codex_after_change:
+            result["codex"] = {
+                "status": "skipped",
+                "ok": False,
+                "reason": "Bỏ qua: mật khẩu mới chưa được áp dụng và lưu thành công",
+            }
         return result
     except Exception as exc:  # noqa: BLE001 - isolate each account in a batch.
         return {
@@ -300,6 +373,7 @@ def run_password_change_batch(
     *,
     workers: int = 1,
     progress_callback: Callable[[int, dict[str, object]], None] | None = None,
+    login_codex_after_change: bool = False,
 ) -> list[dict[str, object]]:
     """Run isolated configured browser sessions concurrently in input order."""
     max_workers = max(1, min(4, int(workers or 1), len(items) or 1))
@@ -320,6 +394,7 @@ def run_password_change_batch(
                 proxy_lane_id=index % max_workers,
                 progress_callback=progress_callback,
                 progress_index=index,
+                login_codex_after_change=login_codex_after_change,
             ): index
             for index, item in enumerate(items)
         }

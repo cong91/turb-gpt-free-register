@@ -3,10 +3,14 @@ from unittest.mock import patch
 
 from config import twofa as twofa_config
 from core.browser_twofa_login import (
+    _complete_workspace_chooser,
+    _fetch_session_after_workspace,
     _finish_existing_account_totp,
     _login_existing_account,
     _login_password,
+    _on_workspace_chooser,
     _password_submit_state,
+    _select_personal_workspace,
     _submit_existing_account_totp,
 )
 from core.openai_auth import AccountUnusableError
@@ -583,6 +587,137 @@ class BrowserTwofaLoginTests(unittest.TestCase):
             wait_for_otp.call_args.kwargs["max_wait"],
             int(getattr(twofa_config, "TWOFA_OTP_MAX_WAIT", 90) or 90),
         )
+        fetch_session.assert_called_once_with(driver, timeout=120)
+
+
+class BrowserTwofaWorkspaceChooserTests(unittest.TestCase):
+    """Multi-workspace accounts stop at /workspace; the personal entry must win."""
+
+    def test_only_the_workspace_route_counts_as_chooser(self):
+        for url in (
+            "https://auth.openai.com/workspace",
+            "https://auth.openai.com/workspace/",
+            "https://auth.openai.com/workspace?next=1",
+        ):
+            with self.subTest(url=url):
+                driver = type("Driver", (), {"current_url": url})()
+                self.assertTrue(_on_workspace_chooser(driver))
+
+    def test_other_routes_are_not_the_chooser(self):
+        for url in (
+            "https://auth.openai.com/workspaces",
+            "https://chatgpt.com/",
+            "https://auth.openai.com/mfa-challenge/abc",
+            "https://auth.openai.com/log-in/password",
+        ):
+            with self.subTest(url=url):
+                driver = type("Driver", (), {"current_url": url})()
+                self.assertFalse(_on_workspace_chooser(driver))
+
+    @patch("core.browser_twofa_login._human_click")
+    def test_selects_personal_workspace_over_team_entry(self, human_click):
+        class Element:
+            def __init__(self, value):
+                self._value = value
+
+            def get_attribute(self, name):
+                return self._value if name == "value" else None
+
+        team = Element("11111111-1111-1111-1111-111111111111")
+        personal = Element("22222222-2222-2222-2222-222222222222")
+
+        class Driver:
+            def execute_script(self, _script, *_args):
+                return {"ok": True, "value": "22222222-2222-2222-2222-222222222222", "text": "個人アカウント"}
+
+            def find_elements(self, _by, _selector):
+                return [team, personal]
+
+        self.assertTrue(_select_personal_workspace(Driver()))
+        human_click.assert_called_once()
+        self.assertIs(human_click.call_args.args[1], personal)
+
+    def test_returns_false_when_no_workspace_entry_is_offered(self):
+        class Driver:
+            current_url = "https://auth.openai.com/workspace"
+
+            def execute_script(self, _script, *_args):
+                return {"ok": False, "reason": "no_workspace_entries"}
+
+        self.assertFalse(_select_personal_workspace(Driver()))
+
+    def test_falls_back_to_script_click_when_element_lookup_fails(self):
+        calls = []
+
+        class Driver:
+            def execute_script(self, script, *args):
+                calls.append(args)
+                if len(calls) == 1:
+                    return {"ok": True, "value": "w-1", "text": "personal"}
+                return True
+
+            def find_elements(self, _by, _selector):
+                raise RuntimeError("adapter without element lookup")
+
+        self.assertTrue(_select_personal_workspace(Driver()))
+        self.assertEqual(calls[1], ("w-1",))
+
+    @patch("core.browser_twofa_login._select_personal_workspace", return_value=True)
+    def test_chooser_completion_stops_once_the_page_has_left(self, select):
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/workspace"})()
+
+        states = iter([True, True, False])
+
+        with patch("core.browser_twofa_login._on_workspace_chooser", side_effect=lambda _d: next(states)):
+            self.assertTrue(_complete_workspace_chooser(driver, timeout=5))
+        select.assert_called_once_with(driver)
+
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login._complete_workspace_chooser", return_value=True)
+    def test_session_read_answers_the_chooser_first(self, complete, fetch_session):
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/workspace"})()
+
+        result = _fetch_session_after_workspace(driver, timeout=30)
+
+        self.assertEqual(result["accessToken"], "token")
+        complete.assert_called_once_with(driver)
+        fetch_session.assert_called_once_with(driver, timeout=30)
+
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login._complete_workspace_chooser")
+    def test_session_read_skips_the_chooser_on_ordinary_pages(self, complete, fetch_session):
+        driver = type("Driver", (), {"current_url": "https://chatgpt.com/"})()
+        calls = []
+
+        with patch("core.browser_twofa_login._on_workspace_chooser", side_effect=lambda _d: calls.append(1) or False):
+            result = _fetch_session_after_workspace(driver, timeout=30)
+
+        self.assertEqual(result["accessToken"], "token")
+        complete.assert_not_called()
+        fetch_session.assert_called_once_with(driver, timeout=30)
+
+    @patch("core.browser_twofa_login._fetch_chatgpt_session", return_value={"accessToken": "token"})
+    @patch("core.browser_twofa_login._complete_workspace_chooser", return_value=True)
+    @patch("core.browser_twofa_login._submit_existing_account_totp", return_value="accepted")
+    def test_totp_accepted_state_selects_workspace_before_reading_session(
+        self,
+        _submit_totp,
+        complete,
+        fetch_session,
+    ):
+        # Regression: batch ddef14d0 (windysylney@gmail.com) — TOTP accepted, the
+        # page was the workspace chooser, so the session read returned no token.
+        driver = type("Driver", (), {"current_url": "https://auth.openai.com/workspace"})()
+
+        result = _finish_existing_account_totp(
+            driver,
+            "user@example.com",
+            120,
+            "JBSWY3DPEHPK3PXP",
+        )
+
+        self.assertEqual(result["accessToken"], "token")
+        complete.assert_called_once_with(driver)
         fetch_session.assert_called_once_with(driver, timeout=120)
 
 

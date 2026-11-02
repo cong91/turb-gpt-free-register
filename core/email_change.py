@@ -5,6 +5,7 @@ import ipaddress
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as dataclass_field
 from urllib.parse import urlsplit
@@ -200,12 +201,22 @@ def poll_new_email_otp(
     *,
     after_ts: float,
     before_code: str | None,
+    max_wait: float | None = None,
+    poll_interval: float | None = None,
 ) -> str:
     """Poll the configured Gmail API URL for the post-change verification code."""
     return poll_verification_code(
         item.gmail_account(),
-        max_wait=int(getattr(email_config, "OTP_MAX_WAIT", 60) or 60),
-        poll_interval=int(getattr(email_config, "OTP_POLL_INTERVAL", 3) or 3),
+        max_wait=(
+            max_wait
+            if max_wait is not None
+            else int(getattr(email_config, "OTP_MAX_WAIT", 60) or 60)
+        ),
+        poll_interval=(
+            poll_interval
+            if poll_interval is not None
+            else int(getattr(email_config, "OTP_POLL_INTERVAL", 3) or 3)
+        ),
         after_ts=after_ts,
         before_code=before_code,
     )
@@ -288,12 +299,11 @@ def _login_chatgpt_with_credentials(driver, credentials: CodexLoginCredentials) 
         _clear_otp_inputs,
         _click_continue,
         _human_type_text,
-        _maybe_accept,
-        _submit_email_step,
-        _type_email_address,
         _type_otp,
         _visible,
     )
+    from core.browser_email_entry import _submit_email_step, _type_email_address
+    from core.browser_page_actions import _maybe_accept
 
     driver.get("https://chatgpt.com/auth/login")
     _maybe_accept(driver)
@@ -453,8 +463,18 @@ def _open_settings_account(driver) -> None:
     raise RuntimeError("ChatGPT change-email action was not found")
 
 
-def change_email_in_browser(driver, item: EmailChangeInput) -> dict[str, object]:
-    """Log in, submit a new email, verify it, and clear the session."""
+class EmailChangeConfirmationError(RuntimeError):
+    """Email verification may have changed the remote account; do not retry."""
+
+
+def change_email_in_browser(
+    driver,
+    item: EmailChangeInput,
+    *,
+    keep_session: bool = False,
+    otp_confirmation_callback: Callable[[str], None] | None = None,
+) -> dict[str, object]:
+    """Log in, submit a new email, verify it, and optionally retain the session."""
     try:
         _login_chatgpt_with_credentials(driver, item.credentials())
         _open_settings_account(driver)
@@ -462,14 +482,32 @@ def change_email_in_browser(driver, item: EmailChangeInput) -> dict[str, object]
         submitted_at = time.time()
         _submit_email_change_request(driver, item.new_email)
         code = poll_new_email_otp(item, after_ts=submitted_at, before_code=before_code)
-        _submit_email_verification_code(driver, code)
-        _wait_for_email_change_success(driver, item.new_email)
-        acknowledge_verification_code(item.gmail_account(), code)
+        code_submitted = False
+        try:
+            code_submitted = True
+            _submit_email_verification_code(driver, code)
+            _wait_for_email_change_success(driver, item.new_email)
+        except Exception as exc:
+            if not code_submitted:
+                raise
+            raise EmailChangeConfirmationError(
+                "Email change may have been accepted remotely; verify account state before retrying"
+            ) from exc
+        if otp_confirmation_callback is not None:
+            try:
+                otp_confirmation_callback(code)
+            except Exception:  # noqa: BLE001 - the primary mutation already succeeded.
+                logger.warning("Email change succeeded but OTP confirmation handoff failed")
+        try:
+            acknowledge_verification_code(item.gmail_account(), code)
+        except Exception:
+            logger.warning("Email change succeeded but OTP source acknowledgement failed")
         return {"ok": True, "old_email": item.old_email, "new_email": item.new_email}
     finally:
-        logout = getattr(driver, "get", None)
-        if callable(logout):
-            try:
-                logout("https://chatgpt.com/auth/logout")
-            except Exception:  # noqa: BLE001 - logout is best-effort cleanup.
-                logger.debug("ChatGPT logout cleanup failed")
+        if not keep_session:
+            logout = getattr(driver, "get", None)
+            if callable(logout):
+                try:
+                    logout("https://chatgpt.com/auth/logout")
+                except Exception:  # noqa: BLE001 - logout is best-effort cleanup.
+                    logger.debug("ChatGPT logout cleanup failed")

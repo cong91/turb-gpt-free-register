@@ -397,8 +397,7 @@ def _request_sub2_authorize_url() -> dict:
         raise RuntimeError(f"[Codex][sub2] sub2 未返回有效 auth_url: {payload}")
     if not state:
         raise RuntimeError("[Codex][sub2] 授权地址缺少 state")
-    logger.info("[Codex][sub2] 已获取授权地址，state=%s...", state[:12])
-    logger.info("[Codex][sub2] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][sub2] 已获取授权地址")
     if not session_id:
         logger.warning("[Codex][sub2] 授权地址响应缺少 session_id，后续 exchange-code 可能失败")
     return {"auth_url": auth_url, "state": state, "session_id": session_id, "origin": _sub2_codex_base(), "raw": payload}
@@ -699,8 +698,7 @@ def _request_cpa_authorize_url() -> dict:
         raise RuntimeError(f"[Codex][CPA] CPA 未返回有效 auth_url: {payload}")
     if not state:
         raise RuntimeError("[Codex][CPA] CPA 授权地址缺少 state")
-    logger.info(f"[Codex][CPA] 已获取授权地址，state={state[:12]}...")
-    logger.info(f"[Codex][CPA] 完整授权地址: {auth_url}")
+    logger.info("[Codex][CPA] 已获取授权地址")
     return {
         "auth_url": auth_url,
         "state": state,
@@ -910,12 +908,15 @@ def _bootstrap_authorize(
     auth_url = _ensure_oai_context_url(auth_url, session)
     headers = session.get_auth_navigate_headers(referer="https://chatgpt.com/")
     logger.info("[Codex] 跟随 Codex authorize URL 建立会话...")
-    logger.info(f"[Codex] 完整授权地址: {auth_url}")
+    logger.info("[Codex] 已获取授权地址")
     resp = _with_net_retry(
         "bootstrap authorize",
         lambda: session.get(auth_url, headers=headers, allow_redirects=True),
     )
-    logger.debug(f"[Codex] authorize 落点: {getattr(resp, 'url', '')}, status={getattr(resp, 'status_code', '')}")
+    logger.debug(
+        "[Codex] authorize redirect completed: status=%s",
+        getattr(resp, "status_code", ""),
+    )
 
 
 # ============================================================
@@ -939,7 +940,7 @@ def _submit_email(session: BrowserSession, email: str) -> None:
         raise RuntimeError(
             f"[Codex] 提交邮箱失败 status={resp.status_code}: {(resp.text or '')[:300]}"
         )
-    logger.info(f"[Codex] 已提交邮箱 {email}，等待邮箱 OTP")
+    logger.info("[Codex] Đã gửi email xác thực, chờ OTP")
 
 
 # ============================================================
@@ -971,8 +972,12 @@ def _submit_email_otp(session: BrowserSession, code: str) -> None:
                 account_unusable_error_message(body_error_code),
                 error_code=body_error_code,
             )
+        logger.warning(
+            "[Codex] 邮箱 OTP 请求失败 status=%s",
+            resp.status_code,
+        )
         raise RuntimeError(
-            f"[Codex] 邮箱 OTP 验证失败 status={resp.status_code}: {(resp.text or '')[:300]}"
+            f"[Codex] 邮箱 OTP 验证失败 status={resp.status_code}"
         )
     logger.info("[Codex] 邮箱 OTP 验证通过")
 
@@ -1190,12 +1195,17 @@ def _follow_until_callback(session: BrowserSession, url: str, state: str) -> str
         headers = session.get_auth_navigate_headers(referer="https://auth.openai.com/")
         resp = session.get(url, headers=headers, allow_redirects=False)
         loc = resp.headers.get("location") or resp.headers.get("Location")
-        logger.debug(f"[Codex] callback 跟随 hop {hop}: status={getattr(resp,'status_code','')}, location={loc}")
+        logger.debug(
+            "[Codex] callback redirect hop=%s status=%s",
+            hop,
+            getattr(resp, "status_code", ""),
+        )
         if loc is None:
             raise RuntimeError(
-                f"[Codex] 跟随中断，未命中 callback: url={url}, "
-                f"status={getattr(resp,'status_code','')}, body={(resp.text or '')[:200]}"
+                f"[Codex] 跟随重定向时未命中 callback: "
+                f"status={getattr(resp, 'status_code', '')}"
             )
+
         if _is_redirect_uri(loc):
             return loc
         url = loc if loc.startswith("http") else ("https://auth.openai.com" + loc)
@@ -1232,11 +1242,8 @@ def exchange_codex_token(session: BrowserSession, code: str, code_verifier: str)
         )
     token_resp = resp.json()
     if not token_resp.get("access_token"):
-        raise RuntimeError(f"[Codex] token 响应缺少 access_token: {token_resp}")
-    logger.info(
-        f"[Codex] 换 token 成功，expires_in={token_resp.get('expires_in')}, "
-        f"access_token={token_resp['access_token'][:16]}..."
-    )
+        raise RuntimeError("[Codex] token response missing access_token")
+    logger.info("[Codex] 换 token 成功，expires_in=%s", token_resp.get("expires_in"))
     return token_resp
 
 
@@ -1283,6 +1290,81 @@ def build_codex_storage(token_resp: dict, id_claims: dict) -> dict:
         "email": id_claims.get("email", ""),
         "type": "codex",
         "expired": expired_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+
+def _sub2api_account_credentials(storage: dict) -> dict:
+    """
+    把 CLIProxyAPI CodexTokenStorage 映射成 sub2api DataAccount.credentials。
+    字段集对齐 sub2api 导出格式（backend/internal/handler/admin/account_data.go 的
+    DataAccount.credentials / enrichCredentialsFromIDToken 填充键）。
+    """
+    def _pick(*keys: str) -> str:
+        for key in keys:
+            value = storage.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    access_token = _pick("access_token")
+    refresh_token = _pick("refresh_token")
+    if not access_token and not refresh_token:
+        raise ValueError("凭证缺少 access_token / refresh_token，无法转成 Sub2API 导入格式")
+
+    credentials: dict = {
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "id_token": _pick("id_token"),
+        "email": _pick("email"),
+    }
+    account_id = _pick("account_id")
+    if account_id:
+        credentials["chatgpt_account_id"] = account_id
+    expires_at = _pick("expired", "expires_at")
+    if expires_at:
+        credentials["expires_at"] = expires_at
+    plan_type = _pick("plan_type")
+    if plan_type:
+        credentials["plan_type"] = plan_type
+    return credentials
+
+
+def to_sub2api_data_account(storage: dict) -> dict:
+    """
+    把本地 CLIProxyAPI CodexTokenStorage 转成 sub2api DataAccount 结构
+    （backend/internal/handler/admin/account_data.go 的 DataAccount JSON 形态）。
+    这是 sub2api “导入数据” 弹窗（ImportDataModal → ImportData）接受的唯一格式，
+    整体 payload 必须是 {type, version, exported_at, proxies, accounts}。
+    """
+    credentials = _sub2api_account_credentials(storage)
+    email = str(credentials.get("email") or "").strip()
+    email_key = email.replace("@", "_").replace(".", "_")
+    extra: dict = {"email_key": email_key}
+    last_refresh = storage.get("last_refresh")
+    if isinstance(last_refresh, str) and last_refresh.strip():
+        extra["last_refresh"] = last_refresh.strip()
+    return {
+        "name": email or "codex-import",
+        "platform": "openai",
+        "type": "oauth",
+        "concurrency": 10,
+        "priority": 1,
+        "credentials": credentials,
+        "extra": extra,
+    }
+
+
+def to_sub2api_data_payload(storages: list[dict], exported_at: str) -> dict:
+    """
+    组装 sub2api DataPayload（type/version/exported_at + proxies + accounts）。
+    exported_at 用 ISO8601（sub2api ExportData 用 time.RFC3339 UTC）。
+    """
+    return {
+        "type": "sub2api-data",
+        "version": 1,
+        "exported_at": exported_at,
+        "proxies": [],
+        "accounts": [to_sub2api_data_account(storage) for storage in storages],
     }
 
 
@@ -1448,6 +1530,7 @@ def run_codex_oauth(
     existing_page=None,
     existing_session_info=None,
     fresh_browser_profile: bool = False,
+    clear_existing_state: bool = True,
     _cpa_reauth_round: int = 1,
 ) -> dict:
     """Run Codex OAuth, optionally reusing a caller-owned browser session."""
@@ -1488,6 +1571,7 @@ def run_codex_oauth(
             existing_page=existing_page,
             existing_session_info=existing_session_info,
             fresh_browser_profile=fresh_browser_profile,
+            clear_existing_state=clear_existing_state,
             _cpa_reauth_round=_cpa_reauth_round,
         )
 
@@ -1525,6 +1609,7 @@ def run_codex_oauth(
             existing_page=existing_page,
             existing_session_info=existing_session_info,
             fresh_browser_profile=fresh_browser_profile,
+            clear_existing_state=clear_existing_state,
             _cpa_reauth_round=_cpa_reauth_round,
         )
     finally:
@@ -1551,6 +1636,7 @@ def _run_codex_oauth_impl(
     existing_page=None,
     existing_session_info=None,
     fresh_browser_profile: bool = False,
+    clear_existing_state: bool = True,
     _cpa_reauth_round: int = 1,
 ) -> dict:
     """
@@ -1595,7 +1681,6 @@ def _run_codex_oauth_impl(
             existing_session_info,
         )
     )
-    has_reusable_browser_context = has_roxy_context or has_cloud_context
     if fresh_browser_profile and (has_roxy_context or has_cloud_context):
         return _codex_result(
             status="failed",
@@ -1621,176 +1706,25 @@ def _run_codex_oauth_impl(
             message="复用 BrowserUse/Skyvern session 必须同时提供 existing_browser 和 existing_session_info",
         )
 
-    # Codex OAuth 支持多种驱动：
-    # protocol：原纯协议；roxy/cloak/browser_use：用真实浏览器跑页面并捕获 localhost callback。
-    try:
-        from config import codex as _codex_cfg
-        from config import roxybrowser as _roxy_cfg
-        selected_oauth_driver = str(
-            oauth_driver or getattr(_codex_cfg, "CODEX_OAUTH_DRIVER", "protocol") or "protocol"
-        ).strip().lower()
-        if selected_oauth_driver == "same_as_registration":
-            selected_oauth_driver = str(
-                getattr(_roxy_cfg, "REGISTRATION_DRIVER", "protocol") or "protocol"
-            ).strip().lower()
-        reusing_roxy_context = has_roxy_context
-        reusing_cloud_context = has_cloud_context
-        if (reusing_roxy_context or reusing_cloud_context) and selected_oauth_driver in (
-            "protocol", "api", "http",
-        ):
-            return _codex_result(
-                status="failed",
-                email=email,
-                message="protocol Codex OAuth 没有可复用的 browser profile；请在拥有当前 browser 的 worker 内执行",
-            )
-        if reusing_roxy_context and selected_oauth_driver not in (
-            "roxy", "roxybrowser", "fingerprint", "browser",
-            "cloak", "cloakbrowser",
-        ):
-            return _codex_result(
-                status="failed",
-                email=email,
-                message="当前 Roxy/Cloak browser context 与 CODEX_OAUTH_DRIVER 不匹配",
-            )
-        if reusing_cloud_context and selected_oauth_driver not in (
-            "browser_use", "browseruse", "browser-use", "bu", "skyvern", "sv",
-        ):
-            return _codex_result(
-                status="failed",
-                email=email,
-                message="当前 BrowserUse/Skyvern session 与 CODEX_OAUTH_DRIVER 不匹配",
-            )
-        if credentials:
-            credential_email = str(getattr(credentials, "email", "") or "").strip().lower()
-            if credential_email != str(email or "").strip().lower():
-                return _codex_result(status="failed", email=email, message="Codex credential email mismatch")
-            if selected_oauth_driver not in (
-                "roxy", "roxybrowser", "fingerprint", "browser",
-                "cloak", "cloakbrowser",
-                "browser_use", "browseruse", "browser-use", "bu",
-                "skyvern", "sv",
-            ):
-                return _codex_result(
-                    status="failed",
-                    email=email,
-                    message="Codex credential login 只支持 Roxy/Cloak/BrowserUse/Skyvern browser driver",
-                )
-        if selected_oauth_driver in ("roxy", "roxybrowser", "fingerprint", "browser"):
-            from core.roxy_codex_oauth import run_roxy_codex_oauth
-            roxy_kwargs = {
-                "otp_provider": otp_provider,
-                "proxy": proxy,
-                "force": True,
-                "credentials": credentials,
-                "existing_driver": existing_driver,
-                "existing_opened": existing_opened,
-                "reuse_existing_profile": reusing_roxy_context,
-            }
-            if fresh_browser_profile:
-                roxy_kwargs["fresh_profile"] = True
-            return run_roxy_codex_oauth(
-                email,
-                **roxy_kwargs,
-            )
-        if selected_oauth_driver in ("browser_use", "browseruse", "browser-use", "bu"):
-            from core.browser_use_codex_oauth import run_browser_use_codex_oauth
-            browser_kwargs = {
-                "otp_provider": otp_provider,
-                "proxy": proxy,
-                "force": True,
-                "credentials": credentials,
-                "existing_browser": existing_browser,
-                "existing_context": existing_context,
-                "existing_page": existing_page,
-                "existing_session_info": existing_session_info,
-            }
-            if fresh_browser_profile:
-                browser_kwargs["fresh_browser_profile"] = True
-            return run_browser_use_codex_oauth(
-                email,
-                **browser_kwargs,
-            )
-        if selected_oauth_driver in ("skyvern", "sv"):
-            from core.skyvern_codex_oauth import run_skyvern_codex_oauth
-            skyvern_kwargs = {
-                "otp_provider": otp_provider,
-                "proxy": proxy,
-                "force": True,
-                "credentials": credentials,
-                "existing_browser": existing_browser,
-                "existing_context": existing_context,
-                "existing_page": existing_page,
-                "existing_session_info": existing_session_info,
-            }
-            if fresh_browser_profile:
-                skyvern_kwargs["fresh_browser_profile"] = True
-            return run_skyvern_codex_oauth(
-                email,
-                **skyvern_kwargs,
-            )
-        if selected_oauth_driver in ("cloak", "cloakbrowser"):
-            from config import cloakbrowser as _cloak_cfg
-            from core.cloakbrowser_driver import build_cloak_driver
-            from core.roxy_codex_oauth import run_roxy_codex_oauth
-            if reusing_roxy_context:
-                return run_roxy_codex_oauth(
-                    email,
-                    otp_provider=otp_provider,
-                    proxy=proxy,
-                    force=True,
-                    existing_driver=existing_driver,
-                    existing_opened=existing_opened,
-                    reuse_existing_profile=True,
-                    clear_existing_state=True,
-                    credentials=credentials,
-                )
-            driver, opened = build_cloak_driver(proxy=proxy)
-            try:
-                return run_roxy_codex_oauth(
-                    email,
-                    otp_provider=otp_provider,
-                    proxy=proxy,
-                    force=True,
-                    existing_driver=driver,
-                    existing_opened=opened,
-                    reuse_existing_profile=True,
-                    clear_existing_state=True,
-                    credentials=credentials,
-                )
-            finally:
-                if not bool(getattr(_cloak_cfg, "CLOAK_KEEP_BROWSER_OPEN", False)):
-                    try:
-                        driver.quit()
-                    except Exception:  # noqa: BLE001, S110
-                        pass
-        if selected_oauth_driver not in ("protocol", "api", "http"):
-            raise RuntimeError(f"[Codex] 不支持的 CODEX_OAUTH_DRIVER={selected_oauth_driver!r}，可选 protocol / roxy / cloak / browser_use / skyvern")
-    except ImportError as exc:
-        if has_reusable_browser_context:
-            return _codex_result(
-                status="failed",
-                email=email,
-                message=(
-                    "复用 browser context 所需的 Codex OAuth driver 不可用："
-                    f"{type(exc).__name__}"
-                ),
-            )
-        if fresh_browser_profile:
-            return _codex_result(
-                status="failed",
-                email=email,
-                message=(
-                    "Codex retry 的 fresh browser profile driver 不可用："
-                    f"{type(exc).__name__}"
-                ),
-            )
-        if credentials:
-            return _codex_result(
-                status="failed",
-                email=email,
-                message=f"Codex credential driver unavailable: {type(exc).__name__}",
-            )
-        # 没装 selenium / 未提供 roxy 配置时继续走协议模式，保持旧行为。
+    from core.codex_browser_dispatch import dispatch_browser_oauth
+
+    browser_result = dispatch_browser_oauth(
+        email=email,
+        otp_provider=otp_provider,
+        proxy=proxy,
+        credentials=credentials,
+        oauth_driver=oauth_driver,
+        existing_driver=existing_driver,
+        existing_opened=existing_opened,
+        existing_browser=existing_browser,
+        existing_context=existing_context,
+        existing_page=existing_page,
+        existing_session_info=existing_session_info,
+        fresh_browser_profile=fresh_browser_profile,
+        clear_existing_state=clear_existing_state,
+    )
+    if browser_result is not None:
+        return browser_result
 
     if otp_provider is None:
         from core.email_provider import wait_for_otp as otp_provider
@@ -1857,7 +1791,7 @@ def _run_codex_oauth_impl(
                 otp_after_ts = time.time()
                 _submit_email(session, email)
                 human_delay("api")
-        logger.info(f"[Codex] 邮箱 OTP 收到：{email_otp}")
+        logger.info("[Codex] 邮箱 OTP 已收到")
         human_delay("otp_input")
         _submit_email_otp(session, email_otp)
         human_delay("api")
@@ -1869,78 +1803,26 @@ def _run_codex_oauth_impl(
         # 6. 选 workspace → 拿 callback code
         callback_url = _select_workspace_and_get_callback(session, state)
         code = _extract_code(callback_url, state)
-        logger.info(f"[Codex] 已拿到 authorization code：{code[:24]}...")
+        logger.info("[Codex] 已获取 authorization code")
 
-        # 7A. CPA 模式：把 callback URL 交给 CPA，由 CPA 持有 verifier 并完成换 token / 写 auth。
-        #     本地不再用 code 换 token；仅保存 CPA 返回的授权文件或回调回执。
-        if auth_source == "cpa":
-            submit_payload = _submit_cpa_callback(callback_url)
-            path = _save_cpa_local_record(
-                email=email,
-                callback_url=callback_url,
-                auth_url=auth_url or "",
-                state=state,
-                submit_payload=submit_payload,
-            )
-            msg = submit_payload.get("message") or submit_payload.get("status_message") or "CPA callback submitted"
-            logger.info(f"[Codex][CPA] 成功：{email}，{msg}，本地记录={path or 'disabled'}")
-            return _codex_result(
-                status="success",
-                ok=True,
-                email=email,
-                file_path=str(path) if path else None,
-                callback_url=callback_url,
-                message=str(msg),
-            )
+        from core.codex_callback_finalizer import finish_codex_callback
 
-        # 7A-sub2. sub2 模式：把 callback URL 上传给 sub2。
-        if auth_source == "sub2":
-            submit_payload = _submit_sub2_callback(
-                callback_url,
-                session_id=(sub2_auth or {}).get("session_id", ""),
-                redirect_uri=(parse_qs(urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
-            )
-            path = _save_sub2_local_record(
-                email=email,
-                callback_url=callback_url,
-                auth_url=auth_url or "",
-                state=state,
-                submit_payload=submit_payload,
-            )
-            msg = submit_payload.get("message") or submit_payload.get("status_message") or "sub2 callback uploaded"
-            logger.info(f"[Codex][sub2] 成功：{email}，{msg}，本地记录={path or 'disabled'}")
-            return _codex_result(
-                status="success",
-                ok=True,
-                email=email,
-                file_path=str(path) if path else None,
-                callback_url=callback_url,
-                message=str(msg),
-            )
-
-        # 7B. local 模式：保留旧实现，用本地 verifier 换 token 并保存 CPA 兼容授权文件。
-        if not code_verifier:
-            raise RuntimeError("[Codex] local 模式缺少 code_verifier")
-        token_resp = exchange_codex_token(session, code, code_verifier)
-
-        # 8. 解析 id_token + 落盘
-        id_claims = _parse_id_token(token_resp.get("id_token", ""))
-        effective_email = id_claims.get("email") or email
-        storage = build_codex_storage(token_resp, id_claims)
-        path = save_codex_credential(storage, effective_email, id_claims.get("plan_type", ""))
-
-        logger.info(
-            f"[Codex] 成功：{effective_email}，plan={id_claims.get('plan_type') or 'unknown'}, "
-            f"account_id={id_claims.get('account_id') or 'unknown'}, 已保存到 {path}"
-        )
-        return _codex_result(
-            status="success",
-            ok=True,
-            email=effective_email,
-            file_path=str(path),
+        callback_result = finish_codex_callback(
+            email=email,
+            auth_source=auth_source,
+            auth_url=auth_url or "",
             callback_url=callback_url,
-            message=f"plan={id_claims.get('plan_type') or 'unknown'}",
+            state=state,
+            code=code,
+            code_verifier=code_verifier or "",
+            sub2_auth=locals().get("sub2_auth"),
+            proxy=proxy,
+            preserve_session=bool(existing_driver or existing_opened or existing_browser or existing_context or existing_page or existing_session_info) and not clear_existing_state,
+            allow_callback_receipt=bool(existing_driver or existing_opened or existing_browser or existing_context or existing_page or existing_session_info) and not clear_existing_state,
         )
+        if callback_result.get("status") == "success":
+            callback_result["message"] = f"{callback_result.get('message') or ''}".strip()
+        return callback_result
     except AccountUnusableError as exc:
         message = account_unusable_message(exc.error_code)
         logger.warning(f"[Codex] {message}（{exc.error_code or 'account_deactivated'}）：{email}")

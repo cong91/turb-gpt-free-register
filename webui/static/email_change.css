@@ -1,4 +1,10 @@
+#tab-email-change {
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr);
+}
+
 .personal-info-shell {
+  min-width: 0;
   width: min(1180px, 100%);
   margin: 0 auto;
   padding: 28px 0 42px;
@@ -110,6 +116,54 @@
 
 .personal-info-form {
   margin-top: 16px;
+}
+
+.personal-info-codex-option {
+  display: grid;
+  gap: 6px;
+  margin: 0 0 16px;
+  padding: 14px 16px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.personal-info-codex-toggle {
+  display: flex;
+  min-height: 44px;
+  align-items: center;
+  gap: 10px;
+  color: #1e293b;
+  font-size: 13px;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.personal-info-codex-toggle input {
+  width: 20px;
+  height: 20px;
+  flex: 0 0 20px;
+  accent-color: #2563eb;
+}
+
+.personal-info-codex-toggle input:focus-visible {
+  outline: 3px solid #bfdbfe;
+  outline-offset: 2px;
+}
+
+.personal-info-codex-help {
+  margin: 0 0 0 30px;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.personal-info-codex-results {
+  margin-top: 16px;
+}
+
+.personal-info-codex-table {
+  min-width: 520px;
 }
 
 .personal-info-workspace,
@@ -542,6 +596,8 @@
   .personal-info-input-grid,
   .personal-info-twofa-layout { padding: 15px; }
   .personal-info-actionbar { align-items: stretch; flex-wrap: wrap; padding: 14px 15px; }
+  .personal-info-codex-option { padding: 12px; }
+  .personal-info-codex-help { margin-left: 0; }
   .personal-info-primary { width: 100%; margin-left: 0; }
   .personal-info-summary {
     grid-template-columns: repeat(2, minmax(0, 1fr));

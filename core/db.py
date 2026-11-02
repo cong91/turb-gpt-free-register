@@ -3274,6 +3274,16 @@ def save_personal_info_change_batch(
             "error": str(raw.get("error") or "").strip()[:500],
             "warning": str(raw.get("warning") or "").strip()[:500],
         }
+        codex = raw.get("codex")
+        if isinstance(codex, dict):
+            codex_status = str(codex.get("status") or "").strip().lower()
+            if codex_status in {"success", "receipt", "failed", "skipped"}:
+                entry["codex"] = {
+                    "status": codex_status,
+                    "ok": bool(codex.get("ok")) and codex_status in {"success", "receipt"},
+                    "credential_saved": bool(codex.get("credential_saved")),
+                    "reason": str(codex.get("reason") or "").strip()[:300],
+                }
         safe_results.append(entry)
 
     batch = {

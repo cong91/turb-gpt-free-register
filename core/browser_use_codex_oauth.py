@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from contextlib import nullcontext
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit
 
 from config import browser_use as _cfg
 from config import roxybrowser as _roxy_cfg
 from core import codex_oauth as _codex_proto
 from core import sms_provider
+from core.browser_credential_login import acknowledge_email_otp, request_email_otp
 from core.browser_use_client import BrowserUseClient
 from core.browser_use_registration import (
     _clear_otp_inputs,
@@ -131,7 +133,7 @@ def _extract_callback_url_from_page(page) -> str:
         ) or []
         for url in urls:
             if _is_callback_url(str(url)):
-                logger.info("[Codex][BrowserUse] 已从页面性能记录提取 callback URL：%s", str(url)[:160])
+                logger.info("[Codex][BrowserUse] 已从页面性能记录提取 callback URL")
                 return str(url)
     except Exception as exc:  # noqa: BLE001
         logger.debug("[Codex][BrowserUse] 提取 callback URL 失败：%s", exc)
@@ -188,7 +190,7 @@ def _wait_for_fresh_email_otp(otp_provider, email: str, after_ts: float, used_co
                 return code
         time.sleep(1 if _fast_mode() else 2)
     if last_code:
-        raise RuntimeError(f"等待邮箱 OTP 超时，最后只拿到已使用验证码：{last_code}")
+        raise RuntimeError("Timed out waiting for a fresh email verification code")
     raise RuntimeError("等待邮箱 OTP 超时")
 
 
@@ -229,7 +231,7 @@ def _wait_auth_page_ready(page, timeout: int = 8) -> None:
     logger.warning("[Codex][BrowserUse] 登录页等待渲染超时，最后 URL=%s", last_url or "-")
 
 
-def _visible_locator_any_frame(page, selectors: list[str], timeout_ms: int = 1000):
+def _visible_locator_any_frame(page, selectors: list[str], timeout_ms: int = 1000, *, sensitive: bool = False):
     for frame in _all_frames(page):
         for selector in selectors:
             try:
@@ -239,15 +241,19 @@ def _visible_locator_any_frame(page, selectors: list[str], timeout_ms: int = 100
                 if loc.is_visible(timeout=timeout_ms):
                     return loc
             except Exception as exc:  # noqa: BLE001
-                logger.debug("BrowserUse locator visibility probe failed: %s: %s", type(exc).__name__, exc)
+                if not sensitive:
+                    logger.debug("BrowserUse locator visibility probe failed: %s: %s", type(exc).__name__, exc)
                 continue
     return None
 
 
-def _click_first_any_frame(page, selectors: list[str], timeout_ms: int = 5000) -> bool:
+def _click_first_any_frame(page, selectors: list[str], timeout_ms: int = 5000, *, sensitive: bool = False) -> bool:
     end = time.time() + timeout_ms / 1000
     while time.time() < end:
-        loc = _visible_locator_any_frame(page, selectors, timeout_ms=700)
+        if sensitive:
+            loc = _visible_locator_any_frame(page, selectors, timeout_ms=700, sensitive=True)
+        else:
+            loc = _visible_locator_any_frame(page, selectors, timeout_ms=700)
         if loc is not None:
             try:
                 loc.scroll_into_view_if_needed(timeout=2000)
@@ -263,11 +269,14 @@ def _click_first_any_frame(page, selectors: list[str], timeout_ms: int = 5000) -
     return False
 
 
-def _fill_first_any_frame(page, selectors: list[str], value: str, timeout_ms: int = 10000) -> bool:
+def _fill_first_any_frame(page, selectors: list[str], value: str, timeout_ms: int = 10000, *, sensitive: bool = False) -> bool:
     end = time.time() + timeout_ms / 1000
     last_err = None
     while time.time() < end:
-        loc = _visible_locator_any_frame(page, selectors, timeout_ms=700)
+        if sensitive:
+            loc = _visible_locator_any_frame(page, selectors, timeout_ms=700, sensitive=True)
+        else:
+            loc = _visible_locator_any_frame(page, selectors, timeout_ms=700)
         if loc is not None:
             try:
                 loc.scroll_into_view_if_needed(timeout=2000)
@@ -293,7 +302,7 @@ def _fill_first_any_frame(page, selectors: list[str], value: str, timeout_ms: in
                 except Exception as exc2:  # noqa: BLE001
                     last_err = exc2
         time.sleep(0.25)
-    if last_err:
+    if last_err and not sensitive:
         logger.debug("[Codex][BrowserUse] fill any-frame failed: %s", last_err)
     return False
 
@@ -348,7 +357,16 @@ def _body_snippet(page, limit: int = 600) -> str:
 
 
 def _current_state_for_log(page) -> str:
-    return f"url={_page_url(page) or '-'} body={_body_snippet(page, 500) or '-'}"
+    url = _page_url(page) or "-"
+    if _is_callback_url(url):
+        url = "<oauth-callback>"
+    else:
+        parsed = urlsplit(url)
+        url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}" if parsed.scheme else "-"
+    body = _body_snippet(page, 500) or "-"
+    body = re.sub(r"\b\d{6,8}\b", "[redacted-code]", body)
+    body = re.sub(r"\+?\d[\d\s().-]{6,}\d", "[redacted-phone]", body)
+    return f"url={url} body={body}"
 
 
 def _looks_next_step_after_login(page) -> bool:
@@ -372,7 +390,10 @@ def _looks_next_step_after_login(page) -> bool:
 
 def _classify_credential_login_state(page) -> str:
     """识别 Browser Use/Skyvern 的密码、TOTP、授权或账号停用页面。"""
-    info = _quick_auth_state(page)
+    try:
+        info = _quick_auth_state(page)
+    except Exception:  # noqa: BLE001 - page errors may contain sensitive values.
+        raise RuntimeError("Codex credential login state unavailable") from None
     url = str(info.get("url") or _page_url(page) or "").lower()
     body = _body_snippet(page, 1600)
     if not body:
@@ -387,6 +408,9 @@ def _classify_credential_login_state(page) -> str:
     ):
         return "accepted"
 
+    if any(marker in url or marker in body for marker in ("account-chooser", "choose an account", "select an account", "continue as", "use another account")):
+        return "account_chooser"
+
     email_markers = (
         "email-verification",
         "email_otp",
@@ -396,7 +420,8 @@ def _classify_credential_login_state(page) -> str:
         "電子メールに送信",
     )
     if any(marker in url or marker in body for marker in email_markers):
-        return "email_otp"
+        rejected = any(marker in body for marker in ("incorrect", "invalid", "expired", "try again", "错误", "无效", "过期"))
+        return "email_otp_invalid" if rejected else "email_otp"
 
     totp_markers = (
         "/mfa",
@@ -424,7 +449,7 @@ def _classify_credential_login_state(page) -> str:
 
     for frame in _all_frames(page):
         try:
-            if _visible_locator_any_frame(frame, ["input[type='password']"], timeout_ms=500) is not None:
+            if _visible_locator_any_frame(frame, ["input[type='password']"], timeout_ms=500, sensitive=True) is not None:
                 return "password"
             if _visible_locator_any_frame(
                 frame,
@@ -435,10 +460,11 @@ def _classify_credential_login_state(page) -> str:
                     "input[type='tel']",
                 ],
                 timeout_ms=500,
+                sensitive=True,
             ) is not None:
                 return "totp"
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("BrowserUse credential state frame probe failed: %s: %s", type(exc).__name__, exc)
+        except Exception:  # noqa: BLE001
+            logger.debug("BrowserUse credential state frame probe failed")
             continue
     if any(marker in body for marker in ("allow access", "authorize codex", "continue to codex", "consent")):
         return "accepted"
@@ -470,6 +496,8 @@ def _credential_login_error(state: str) -> Exception:
         return AccountUnusableError(account_unusable_error_message(error_code), error_code=error_code)
     if state == "email_otp":
         return RuntimeError("Codex credential login unexpectedly requires email OTP")
+    if state == "email_otp_invalid":
+        return RuntimeError("Codex credential login email OTP was rejected")
     if state == "password_invalid":
         return RuntimeError("Codex credential login password was rejected")
     if state == "totp_invalid":
@@ -481,8 +509,54 @@ def _credential_login_error(state: str) -> Exception:
     return RuntimeError(f"Codex credential login did not reach the OAuth flow: state={state}")
 
 
-def _login_with_credentials(page, credentials: CodexLoginCredentials, auth_url: str) -> None:
-    """Authenticate Browser Use/Skyvern with password and authenticator TOTP."""
+def _submit_credential_email_otp(page, code: str) -> None:
+    try:
+        for frame in _all_frames(page):
+            _clear_otp_inputs(frame)
+            locator = _visible_locator_any_frame(
+                frame,
+                ["input[name='code']", "input[autocomplete='one-time-code']", "input[name='otp']"],
+                timeout_ms=500,
+                sensitive=True,
+            )
+            if locator is not None:
+                locator.fill(code, timeout=5000)
+                break
+            boxes = frame.locator("input[maxlength='1'], input[data-index], input[aria-label*='digit' i]")
+            if boxes.count() >= len(code):
+                for index, digit in enumerate(code):
+                    boxes.nth(index).fill(digit, timeout=5000)
+                break
+            locator = _visible_locator_any_frame(
+                frame,
+                ["input[aria-label*='code' i]", "input[placeholder*='code' i]", "input[inputmode='numeric']", "input[type='tel']"],
+                timeout_ms=500,
+                sensitive=True,
+            )
+            if locator is not None:
+                locator.fill(code, timeout=5000)
+                break
+        else:
+            raise RuntimeError("Codex credential email OTP input not found")
+        _bu_delay("otp_input")
+        if not _click_first_any_frame(
+            page,
+            [
+                "button[type='submit']", "input[type='submit']", "button:has-text('Continue')",
+                "button:has-text('Verify')", "button:has-text('Submit')", "button:has-text('继续')",
+                "button:has-text('验证')", "form button",
+            ],
+            timeout_ms=5000,
+            sensitive=True,
+        ):
+            page.keyboard.press("Enter")
+    except Exception:  # noqa: BLE001 - browser exceptions may contain input values.
+        raise RuntimeError("Codex credential email OTP submission failed") from None
+
+
+def _login_with_credentials(page, credentials: CodexLoginCredentials, auth_url: str, otp_provider=None) -> None:
+    """Authenticate Browser Use/Skyvern with an optional email OTP provider."""
+    otp_after_ts = time.time()
     page.goto(
         auth_url,
         wait_until="domcontentloaded",
@@ -495,90 +569,106 @@ def _login_with_credentials(page, credentials: CodexLoginCredentials, auth_url: 
     _wait_auth_page_ready(page, timeout=2)
     _bu_delay("navigate")
     _maybe_accept_cookies(page)
-    _fill_email_for_codex(page, credentials.email)
-    state = _wait_for_credential_login_state(page)
-    if state == "accepted":
-        return
-    if state != "password":
-        raise _credential_login_error(state)
-
-    if not _fill_first_any_frame(
-        page,
-        [
-            "input[type='password']",
-            "input[name*='password' i]",
-            "input[autocomplete='current-password']",
-        ],
-        credentials.password,
-        timeout_ms=10000,
-    ):
-        raise RuntimeError("Codex credential login password input not found")
-    if not _click_first_any_frame(
-        page,
-        [
-            "button[type='submit']",
-            "input[type='submit']",
-            "button:has-text('Continue')",
-            "button:has-text('Log in')",
-            "button:has-text('Sign in')",
-            "button:has-text('继续')",
-            "button:has-text('登录')",
-            "form button",
-        ],
-        timeout_ms=5000,
-    ):
+    state = _classify_credential_login_state(page)
+    if state in {"email_otp", "email_otp_invalid"}:
+        otp_after_ts = None
+    if state == "unknown":
         try:
-            page.keyboard.press("Enter")
-        except Exception:  # noqa: BLE001, S110
-            pass
-    _bu_delay("form")
-    state = _wait_for_credential_login_state(page, ignored_states={"password"})
-    if state == "accepted":
-        return
-    if state != "totp":
-        raise _credential_login_error(state)
+            _fill_email_for_codex(page, credentials.email)
+        except Exception:  # noqa: BLE001 - page diagnostics may contain sensitive values.
+            raise RuntimeError("Codex credential login email submission failed") from None
+        state = _wait_for_credential_login_state(page)
 
-    previous_code = None
-    for attempt in range(2):
-        code = generate_totp_code(credentials.totp_secret, previous_code=previous_code)
-        previous_code = code
-        if not _fill_first_any_frame(
-            page,
-            [
-                "input[autocomplete='one-time-code']",
-                "input[name='code']",
-                "input[name='otp']",
-                "input[inputmode='numeric']",
-                "input[type='tel']",
-            ],
-            code,
-            timeout_ms=8000,
-        ):
-            raise RuntimeError("Codex credential login authenticator input not found")
-        if not _click_first_any_frame(
-            page,
-            [
-                "button[type='submit']",
-                "input[type='submit']",
-                "button:has-text('Continue')",
-                "button:has-text('Verify')",
-                "button:has-text('Submit')",
-                "button:has-text('继续')",
-                "button:has-text('验证')",
-                "form button",
-            ],
-            timeout_ms=5000,
-        ):
-            try:
-                page.keyboard.press("Enter")
-            except Exception:  # noqa: BLE001, S110
-                pass
-        _bu_delay("otp_input")
-        state = _wait_for_credential_login_state(page, ignored_states={"totp"})
+    password_submitted = False
+    email_attempts = 0
+    previous_email_code = None
+    totp_attempts = 0
+    previous_totp_code = None
+    while True:
         if state == "accepted":
             return
-        if state != "totp_invalid" or attempt >= 1:
+        if state in {"email_otp", "email_otp_invalid"}:
+            if otp_provider is None:
+                raise _credential_login_error("email_otp")
+            if email_attempts >= 2:
+                raise _credential_login_error("email_otp_invalid")
+            code = request_email_otp(otp_provider, credentials.email, otp_after_ts)
+            if code == previous_email_code:
+                raise RuntimeError("Codex credential email OTP provider returned a previously rejected code")
+            retrying_rejection = state == "email_otp_invalid"
+            previous_email_code = code
+            email_attempts += 1
+            _submit_credential_email_otp(page, code)
+            ignored = {"email_otp", "email_otp_invalid"} if retrying_rejection else {"email_otp"}
+            state = _wait_for_credential_login_state(page, ignored_states=ignored)
+            if state in {"accepted", "totp"} or (state == "password" and not password_submitted):
+                acknowledge_email_otp(otp_provider, code)
+                continue
+            if state == "email_otp_invalid" and email_attempts < 2:
+                continue
             raise _credential_login_error(state)
+        if state == "password" and not password_submitted:
+            password_submitted = True
+            if not _fill_first_any_frame(
+                page,
+                ["input[type='password']", "input[name*='password' i]", "input[autocomplete='current-password']"],
+                credentials.password,
+                timeout_ms=10000,
+                sensitive=True,
+            ):
+                raise RuntimeError("Codex credential login password input not found")
+            if not _click_first_any_frame(
+                page,
+                [
+                    "button[type='submit']", "input[type='submit']", "button:has-text('Continue')",
+                    "button:has-text('Log in')", "button:has-text('Sign in')", "button:has-text('继续')",
+                    "button:has-text('登录')", "form button",
+                ],
+                timeout_ms=5000,
+                sensitive=True,
+            ):
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            _bu_delay("form")
+            state = _wait_for_credential_login_state(page, ignored_states={"password"})
+            continue
+        if state == "totp" or (state == "totp_invalid" and 0 < totp_attempts < 2):
+            if totp_attempts >= 2:
+                raise _credential_login_error(state)
+            code = generate_totp_code(credentials.totp_secret, previous_code=previous_totp_code)
+            previous_totp_code = code
+            totp_attempts += 1
+            if not _fill_first_any_frame(
+                page,
+                [
+                    "input[autocomplete='one-time-code']", "input[name='code']", "input[name='otp']",
+                    "input[inputmode='numeric']", "input[type='tel']",
+                ],
+                code,
+                timeout_ms=8000,
+                sensitive=True,
+            ):
+                raise RuntimeError("Codex credential login authenticator input not found")
+            if not _click_first_any_frame(
+                page,
+                [
+                    "button[type='submit']", "input[type='submit']", "button:has-text('Continue')",
+                    "button:has-text('Verify')", "button:has-text('Submit')", "button:has-text('继续')",
+                    "button:has-text('验证')", "form button",
+                ],
+                timeout_ms=5000,
+                sensitive=True,
+            ):
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            _bu_delay("otp_input")
+            state = _wait_for_credential_login_state(page, ignored_states={"totp"})
+            continue
+        raise _credential_login_error(state)
 
 
 
@@ -860,7 +950,7 @@ def _maybe_click_passwordless_after_email(page, email: str, timeout: int = 18) -
                 return
             url = _page_url(page)
             if url != last_url:
-                logger.info("[Codex][BrowserUse] 提交邮箱后检测密码/OTP 跳转：url=%s", url or "-")
+                logger.info("[Codex][BrowserUse] 提交邮箱后检测密码/OTP 跳转")
                 last_url = url
             lower = str(url or "").lower()
             if ("/password" in lower or "auth.openai.com" in lower) and _click_passwordless_signup_if_present(page):
@@ -1025,7 +1115,7 @@ def _fill_login_password_if_present(page, email: str, timeout: int = 18) -> str 
 def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_tracker: dict | None = None) -> None:
     otp_after_ts = time.time()
     logger.info("[Codex][BrowserUse] 打开授权地址")
-    logger.info("[Codex][BrowserUse] 完整授权地址: %s", auth_url)
+    logger.info("[Codex][BrowserUse] 已获取授权地址")
     _t_goto = _StepTimer("打开授权页")
     page.goto(auth_url, wait_until="domcontentloaded", timeout=_timeout_ms(getattr(_cfg, "BROWSER_USE_NAVIGATION_TIMEOUT", 90)))
     try:
@@ -1117,7 +1207,7 @@ def _fill_email_and_otp(page, email: str, otp_provider, auth_url: str, dead_trac
             _restart_email_otp_flow("等待验证码超时，避免点击 resend 导致 500")
             continue
         used_codes.add(str(code))
-        logger.info("[Codex][BrowserUse] 邮箱 OTP 收到：%s", code)
+        logger.info("[Codex][BrowserUse] 邮箱 OTP 已收到")
         _t_otp_submit = _StepTimer("提交邮箱 OTP")
         _clear_otp_inputs(page)
         _type_otp(page, code)
@@ -1604,11 +1694,11 @@ def _do_phone_verification_if_present(page) -> None:
             )
             logger.info("[Codex][BrowserUse] 已取号：%s activation=%s", phone, activation_id)
             _t_phone_send = _StepTimer(f"填写并提交手机号 attempt={attempt}")
-            phone_e164 = _fill_phone(page, phone)
+            _fill_phone(page, phone)
             _bu_delay("form")
             send_state = _wait_after_phone_send(page, timeout=12 if _fast_mode() else 18)
             _t_phone_send.done(f"state={send_state}")
-            logger.info("[Codex][BrowserUse] 手机号提交后状态：%s phone=%s", send_state, phone_e164)
+            logger.info("[Codex][BrowserUse] 手机号提交后状态：%s", send_state)
             if send_state == "callback":
                 return
             if send_state != "code_page":
@@ -1617,7 +1707,7 @@ def _do_phone_verification_if_present(page) -> None:
             _t_sms = _StepTimer(f"等待手机短信 attempt={attempt}")
             sms_code = sms_provider.wait_for_sms_code(activation_id, http)
             _t_sms.done()
-            logger.info("[Codex][BrowserUse] 手机 OTP 收到：%s", sms_code)
+            logger.info("[Codex][BrowserUse] 手机 OTP 已收到")
             _clear_otp_inputs(page)
             _type_otp(page, sms_code)
             _bu_delay("otp_input")
@@ -1656,7 +1746,9 @@ def _do_phone_verification_if_present(page) -> None:
     raise RuntimeError(f"手机验证失败，已重试 {max_retries} 次：{last_error}")
 
 
-def _finish_consent_workspace(context, page) -> str:
+def _finish_consent_workspace(context, page, before_submit=None) -> str:
+    if before_submit is not None:
+        before_submit()
     end = time.time() + int(getattr(_roxy_cfg, "ROXY_CODEX_CALLBACK_TIMEOUT", 180) or 180)
     while time.time() < end:
         callback = _extract_callback_url_from_context(context, page)
@@ -1696,13 +1788,14 @@ def _run_browser_use_codex_oauth_once(
     existing_page=None,
     existing_session_info=None,
     fresh_browser_profile: bool = False,
+    clear_existing_state: bool = True,
 ) -> dict:
     from core import codex_oauth as proto
     if not force and not proto._cfg.ENABLE_CODEX_AUTO:
         return proto._codex_result(status="skipped", message="ENABLE_CODEX_AUTO=False")
     if not email:
         return proto._codex_result(status="skipped", message="email 为空")
-    if otp_provider is None:
+    if otp_provider is None and credentials is None:
         from core.email_provider import wait_for_otp as otp_provider
 
     provider = str(cloud_provider or "browser_use").strip().lower()
@@ -1792,65 +1885,40 @@ def _run_browser_use_codex_oauth_once(
 
             if credentials is None:
                 _fill_email_and_otp(page, email, otp_provider, auth_url, dead_tracker=dead_tracker)
-            else:
+            elif otp_provider is None:
                 _login_with_credentials(page, credentials, auth_url)
+            else:
+                _login_with_credentials(page, credentials, auth_url, otp_provider=otp_provider)
             _do_phone_verification_if_present(page)
             logger.info("[Codex][BrowserUse] 手机验证处理完成/无需处理，等待授权确认和 callback")
             _t_callback = _StepTimer("等待 consent/workspace/callback")
-            callback_url = _finish_consent_workspace(context, page)
+            if reusing_existing_session and not clear_existing_state:
+                from core.personal_info_codex import verify_cloud_identity
+                callback_url = _finish_consent_workspace(
+                    context, page, before_submit=lambda: verify_cloud_identity(context, email),
+                )
+            else:
+                callback_url = _finish_consent_workspace(context, page)
             _t_callback.done()
             code = proto._extract_code(callback_url, state)
-            logger.info("[Codex][BrowserUse] 已捕获 callback code：%s...", code[:24])
+            logger.info("[Codex][BrowserUse] 已捕获 callback code")
 
-            if auth_source == "cpa":
-                submit_payload = proto._submit_cpa_callback(callback_url)
-                file_path = proto._save_cpa_local_record(
-                    email=email,
-                    callback_url=callback_url,
-                    auth_url=auth_url,
-                    state=state,
-                    submit_payload=submit_payload,
-                )
-                msg = submit_payload.get("message") or submit_payload.get("status_message") or "CPA callback submitted"
-                _t_all.done("success")
-                return proto._codex_result(
-                    status="success",
-                    ok=True,
-                    email=email,
-                    file_path=str(file_path) if file_path else None,
-                    callback_url=callback_url,
-                    message=str(msg),
-                )
+            from core.cloud_codex_callback import finish_cloud_codex_callback
 
-            if auth_source == "sub2":
-                submit_payload = proto._submit_sub2_callback(
-                    callback_url,
-                    session_id=(sub2_auth or {}).get("session_id", ""),
-                    redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
-                )
-                file_path = proto._save_sub2_local_record(
-                    email=email,
-                    callback_url=callback_url,
-                    auth_url=auth_url,
-                    state=state,
-                    submit_payload=submit_payload,
-                )
-                msg = submit_payload.get("message") or submit_payload.get("status_message") or "sub2 callback uploaded"
-                _t_all.done("success")
-                return proto._codex_result(
-                    status="success",
-                    ok=True,
-                    email=email,
-                    file_path=str(file_path) if file_path else None,
-                    callback_url=callback_url,
-                    message=str(msg),
-                )
-
-            token_payload = proto._exchange_codex_token(code, code_verifier)
-            storage = proto._build_codex_storage(token_payload)
-            path = proto._save_codex_credential(email, storage)
+            result = finish_cloud_codex_callback(
+                email=email,
+                auth_source=auth_source,
+                auth_url=auth_url,
+                callback_url=callback_url,
+                state=state,
+                code=code,
+                code_verifier=code_verifier,
+                sub2_auth=locals().get("sub2_auth"),
+                proxy=proxy,
+                preserve_session=not clear_existing_state,
+            )
             _t_all.done("success")
-            return proto._codex_result(status="success", ok=True, email=email, file_path=str(path), callback_url=callback_url)
+            return result
     except AccountUnusableError as exc:
         message = account_unusable_message(exc.error_code)
         logger.warning("[Codex][BrowserUse] %s：%s，%s", message, email, exc.error_code)
@@ -1935,6 +2003,7 @@ def _run_browser_use_codex_oauth_impl(
     existing_page=None,
     existing_session_info=None,
     fresh_browser_profile: bool = False,
+    clear_existing_state: bool = True,
 ) -> dict:
     """Browser Use Codex OAuth 入口；CPA callback 409 timeout 时重新开启一轮授权。"""
     from core import codex_oauth as proto
@@ -1961,6 +2030,7 @@ def _run_browser_use_codex_oauth_impl(
             existing_page=existing_page,
             existing_session_info=existing_session_info,
             fresh_browser_profile=fresh_browser_profile,
+            clear_existing_state=clear_existing_state,
         )
         last_result = result
         if result.get("ok"):
@@ -1987,6 +2057,7 @@ def run_browser_use_codex_oauth(
     existing_page=None,
     existing_session_info=None,
     fresh_browser_profile: bool = False,
+    clear_existing_state: bool = True,
 ) -> dict:
     """Browser Use Codex OAuth 入口。
 
@@ -2008,6 +2079,7 @@ def run_browser_use_codex_oauth(
             existing_page=existing_page,
             existing_session_info=existing_session_info,
             fresh_browser_profile=fresh_browser_profile,
+            clear_existing_state=clear_existing_state,
         )
     return _run_browser_use_codex_oauth_impl(
         email=email,
@@ -2021,4 +2093,5 @@ def run_browser_use_codex_oauth(
         existing_page=existing_page,
         existing_session_info=existing_session_info,
         fresh_browser_profile=fresh_browser_profile,
+        clear_existing_state=clear_existing_state,
     )

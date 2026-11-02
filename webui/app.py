@@ -405,7 +405,18 @@ def create_app(auth_code: str | None = None) -> Flask:
     # ----------------------------------------------------------
     @app.get("/")
     def index():
-        return render_template("index.html")
+        from config import roxybrowser as driver_config
+        from core.browser_registry import resolve_browser_profile_provider
+
+        try:
+            resolve_browser_profile_provider(getattr(driver_config, "REGISTRATION_DRIVER", ""))
+            codex_live_session_supported = True
+        except RuntimeError:
+            codex_live_session_supported = False
+        return render_template(
+            "index.html",
+            codex_live_session_supported=codex_live_session_supported,
+        )
 
     # ----------------------------------------------------------
     # 统计概览
@@ -2655,6 +2666,93 @@ def create_app(auth_code: str | None = None) -> Flask:
                 "X-Codex-Exported-Count": str(len(bundle)),
                 "X-Codex-Skipped-Count": str(len(errors) + duplicate_count),
                 "X-Codex-Account-Line-Skipped-Count": str(len(account_line_errors)),
+            },
+        )
+
+    @app.post("/api/codex/download-bulk-sub2api")
+    def api_codex_download_bulk_sub2api():
+        """
+        把选中的本地 Codex 凭证转成 sub2api DataPayload（“导入数据”弹窗格式）并打包 ZIP。
+        Body: {"filenames": ["codex-xxx.json", ...]}
+        ZIP 内：sub2api-data.json（{type,version,exported_at,proxies,accounts}，
+        直接导入 Sub2API 的 导入数据 弹窗）+ manifest.json。
+        """
+        import io
+        import json as _json
+        import zipfile
+        from datetime import datetime as _dt
+
+        from core.codex_oauth import to_sub2api_data_account
+
+        data = request.get_json(silent=True) or {}
+        filenames = data.get("filenames") or []
+        if not isinstance(filenames, list) or not filenames:
+            return jsonify({"ok": False, "error": "filenames 必须是非空数组"}), 400
+        if len(filenames) > 1000:
+            return jsonify({"ok": False, "error": "单次最多 1000 个"}), 400
+
+        converted = []
+        added = []
+        errors = []
+        duplicate_count = 0
+        seen_filenames = set()
+        for fname in filenames:
+            if not isinstance(fname, str):
+                errors.append({"filename": str(fname), "error": "非字符串"})
+                continue
+            if fname in seen_filenames:
+                duplicate_count += 1
+                continue
+            seen_filenames.add(fname)
+            try:
+                content, real_fname = db.read_codex_credential(fname)
+                parsed = _json.loads(content)
+                if not isinstance(parsed, dict):
+                    raise TypeError("Codex 凭证内容不是对象")
+                converted.append(to_sub2api_data_account(parsed))
+                added.append({"filename": real_fname})
+                db.mark_codex_exported(real_fname)
+            except Exception as exc:  # noqa: BLE001
+                errors.append({"filename": fname, "error": f"{type(exc).__name__}: {exc}"})
+
+        if not converted:
+            return jsonify({"ok": False, "error": "没有可转换的 Codex 凭证", "errors": errors}), 404
+        now = _dt.now(tz=timezone.utc)
+        payload = {
+            "type": "sub2api-data",
+            "version": 1,
+            "exported_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "proxies": [],
+            "accounts": converted,
+        }
+        manifest = {
+            "exported_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "source": "sub2api",
+            "count": len(converted),
+            "files": added,
+            "errors": errors,
+        }
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(
+                "sub2api-data.json",
+                _json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+            zf.writestr("manifest.json", _json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        dl_name = f"codex-sub2api-bulk-{now.strftime('%Y%m%d-%H%M%S')}.zip"
+        zip_bytes = buf.getvalue()
+        return Response(
+            zip_bytes,
+            mimetype="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{dl_name}"',
+                "Content-Length": str(len(zip_bytes)),
+                "Cache-Control": "no-store, max-age=0",
+                "Pragma": "no-cache",
+                "X-Content-Type-Options": "nosniff",
+                "X-Download-Options": "noopen",
+                "X-Codex-Exported-Count": str(len(converted)),
+                "X-Codex-Skipped-Count": str(len(errors) + duplicate_count),
             },
         )
 

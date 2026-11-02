@@ -472,6 +472,19 @@ class TwofaRunnerTests(unittest.TestCase):
             self.stack.enter_context(patch.object(db, name, root / filename))
         self.stack.enter_context(patch.object(db, "_render_static_viewer"))
 
+        @contextmanager
+        def direct_proxy(*_args, **_kwargs):
+            yield None, "direct"
+
+        self.stack.enter_context(patch(
+            "core.browser_twofa_change.preferred_account_proxy",
+            side_effect=direct_proxy,
+        ))
+        self.stack.enter_context(patch(
+            "core.plan_check_service.run_sync_plan_check",
+            return_value={"accepted": False, "ok": False},
+        ))
+
     def tearDown(self):
         self.stack.close()
         self.temp_dir.cleanup()
@@ -488,9 +501,14 @@ class TwofaRunnerTests(unittest.TestCase):
                 "access_token": "fresh-token",
             }),
             patch(
-                "core.plan_check_service.enqueue_account_plan_check",
-                return_value={"accepted": True, "status": "queued"},
-            ) as enqueue_plan,
+                "core.plan_check_service.run_sync_plan_check",
+                return_value={
+                    "accepted": True,
+                    "ok": True,
+                    "current_plan_type": "free",
+                    "plus_trial_eligible": False,
+                },
+            ) as plan_check,
         ):
             result = run_twofa_change(item)
 
@@ -501,15 +519,8 @@ class TwofaRunnerTests(unittest.TestCase):
         self.assertEqual(stored["registration_password"], item.password)
         self.assertEqual(stored["totp_secret"], "NEWSECRET")
         self.assertEqual(stored["twofa_status"], "active")
-        enqueue_plan.assert_called_once_with(
-            account_id=result["account_id"],
-            email=item.email,
-            access_token="fresh-token",
-            trigger="twofa_change",
-            proxy=None,
-            timezone_offset_min="-",
-        )
-        self.assertEqual(result["plan_check"]["status"], "queued")
+        plan_check.assert_called_once()
+        self.assertEqual(result["plan_check"]["status"], "success")
 
     def test_success_updates_existing_account_without_creating_duplicate(self):
         account_id = db.insert_account(
@@ -658,6 +669,7 @@ class TwofaRunnerTests(unittest.TestCase):
             proxy=None,
             access_token="stored-token",
             allow_oauth_fallback=True,
+            keep_session=True,
         )
         profile.close.assert_called_once_with()
         profile.cleanup.assert_called_once_with()
@@ -935,9 +947,9 @@ class TwofaApiTests(unittest.TestCase):
 
         thread_mock.side_effect = start_thread
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.db.save_personal_info_change_batch")
-    @patch("webui.email_change_api.run_twofa_change_batch")
+    @patch("webui.twofa_change_api.threading.Thread")
+    @patch("webui.twofa_change_api.db.save_personal_info_change_batch")
+    @patch("webui.twofa_change_api.run_twofa_change_batch")
     def test_change_twofa_route_returns_statuses_and_persists_export_batch(self, run_batch, save_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -973,7 +985,7 @@ class TwofaApiTests(unittest.TestCase):
         save_batch.assert_called_once()
         self.assertEqual(save_batch.call_args.args[1], "twofa")
 
-    @patch("webui.email_change_api.threading.Thread")
+    @patch("webui.twofa_change_api.threading.Thread")
     def test_change_twofa_route_returns_batch_for_progress_polling(self, thread):
         response = self.client.post(
             "/api/accounts/change-twofa",
@@ -1001,9 +1013,9 @@ class TwofaApiTests(unittest.TestCase):
         self.assertEqual(status_payload["results"][0]["email"], "user@example.com")
         self.assertEqual(status_payload["results"][0]["status"], "queued")
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.db.save_personal_info_change_batch", return_value={"batch_id": "d" * 32, "exportable_count": 0})
-    @patch("webui.email_change_api.run_twofa_change_batch")
+    @patch("webui.twofa_change_api.threading.Thread")
+    @patch("webui.twofa_change_api.db.save_personal_info_change_batch", return_value={"batch_id": "d" * 32, "exportable_count": 0})
+    @patch("webui.twofa_change_api.run_twofa_change_batch")
     def test_change_twofa_route_fails_when_access_token_was_not_saved(self, run_batch, _save_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -1027,9 +1039,9 @@ class TwofaApiTests(unittest.TestCase):
         self.assertEqual(payload["succeeded"], 0)
         self.assertEqual(payload["failed"], 1)
 
-    @patch("webui.email_change_api.db.save_personal_info_change_batch")
-    @patch("webui.email_change_api.run_twofa_change_batch")
-    @patch("webui.email_change_api.threading.Thread")
+    @patch("webui.twofa_change_api.db.save_personal_info_change_batch")
+    @patch("webui.twofa_change_api.run_twofa_change_batch")
+    @patch("webui.twofa_change_api.threading.Thread")
     def test_change_twofa_manual_retry_accepts_credentials_without_server_retention(
         self,
         thread,
@@ -1090,11 +1102,11 @@ class TwofaApiTests(unittest.TestCase):
         self.assertEqual(retried_item.email, "user@example.com")
         self.assertEqual(retried_item.password, "password")
         self.assertEqual(retried_item.current_totp_secret, "OLDSECRET")
-        from webui import email_change_api
+        from webui import twofa_change_api
 
-        self.assertNotIn("items", email_change_api._twofa_progress[initial_payload["batch_id"]])
+        self.assertNotIn("items", twofa_change_api._twofa_progress[initial_payload["batch_id"]])
 
-    @patch("webui.email_change_api.threading.Thread", side_effect=RuntimeError("thread unavailable"))
+    @patch("webui.twofa_change_api.threading.Thread", side_effect=RuntimeError("thread unavailable"))
     def test_change_twofa_start_failure_marks_each_row_retryable(self, _thread):
         response = self.client.post(
             "/api/accounts/change-twofa",
@@ -1113,9 +1125,9 @@ class TwofaApiTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["status"], "failed")
         self.assertIn("逐条重试", payload["results"][0]["detail"])
 
-    @patch("webui.email_change_api.db.save_personal_info_change_batch", return_value={"batch_id": "g" * 32, "exportable_count": 0})
-    @patch("webui.email_change_api.run_twofa_change_batch")
-    @patch("webui.email_change_api.threading.Thread")
+    @patch("webui.twofa_change_api.db.save_personal_info_change_batch", return_value={"batch_id": "g" * 32, "exportable_count": 0})
+    @patch("webui.twofa_change_api.run_twofa_change_batch")
+    @patch("webui.twofa_change_api.threading.Thread")
     def test_manual_retry_rejects_remote_success_without_local_persistence(self, thread, run_batch, _save_batch):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -1147,7 +1159,7 @@ class TwofaApiTests(unittest.TestCase):
         self.assertIn("đối soát", retry.get_json()["error"])
         run_batch.assert_called_once()
 
-    @patch("webui.email_change_api.threading.Thread")
+    @patch("webui.twofa_change_api.threading.Thread")
     def test_change_twofa_manual_retry_requires_failed_row(self, thread):
         response = self.client.post(
             "/api/accounts/change-twofa",

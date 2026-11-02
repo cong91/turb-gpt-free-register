@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from urllib.parse import urlsplit
 
 from config import twofa as _twofa_cfg
 from core.browser_challenge import (
@@ -38,6 +39,23 @@ from core.registration_flow import (
 )
 
 logger = logging.getLogger(__name__)
+
+_WORKSPACE_CHOOSER_PATH = "/workspace"
+_WORKSPACE_CHOOSER_TIMEOUT = 30
+# The chooser entry for the personal workspace is labelled in the account's own
+# language.  The account's existing MFA state belongs to that workspace, so the
+# team entries must not be picked when a personal one exists.
+_PERSONAL_WORKSPACE_MARKERS = (
+    "個人アカウント",
+    "个人账户",
+    "个人帐户",
+    "个人账号",
+    "個人帳戶",
+    "個人帳號",
+    "personal account",
+    "personal workspace",
+    "personal",
+)
 
 
 def _clear_stale_browser_auth_state(driver) -> None:
@@ -273,7 +291,7 @@ def _finish_existing_account_totp(
     """Submit the supplied factor and fetch the authenticated browser session."""
     state = _submit_existing_account_totp(driver, totp_secret)
     if state in {"logged_in", "accepted", "unknown"}:
-        session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+        session_info = _fetch_session_after_workspace(driver, timeout=timeout)
         if not session_info.get("accessToken"):
             if state == "unknown":
                 raise RuntimeError("已有账号登录 authenticator TOTP 后未建立 session")
@@ -294,6 +312,118 @@ def _on_about_you_page(driver) -> bool:
         marker in url
         for marker in ("about-you", "profile", "signup/profile", "create-account/about")
     )
+
+
+def _on_workspace_chooser(driver) -> bool:
+    """Whether the auth flow currently sits on the workspace chooser."""
+    try:
+        url = str(getattr(driver, "current_url", "") or "").lower()
+    except Exception:  # noqa: BLE001 - page probe must not mask the login result.
+        url = ""
+    path = urlsplit(url).path.rstrip("/")
+    return path == _WORKSPACE_CHOOSER_PATH
+
+
+def _select_personal_workspace(driver) -> bool:
+    """Pick the personal workspace entry so the session can be issued.
+
+    Multi-workspace accounts stop at ``/workspace`` after a successful password
+    and TOTP login.  The chooser lists one button per workspace; the MFA factor
+    being changed belongs to the personal workspace, so team entries are only
+    used when no personal entry exists.  Returns whether a workspace was picked.
+    """
+    try:
+        result = driver.execute_script(
+            r"""
+            const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length)
+              && getComputedStyle(el).visibility !== 'hidden' && getComputedStyle(el).display !== 'none';
+            const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+            const markers = arguments[0] || [];
+            const buttons = [...document.querySelectorAll('button[name="workspace_id"], form[action$="/workspace"] button')]
+              .filter(visible);
+            if (!buttons.length) return {ok: false, reason: 'no_workspace_entries'};
+            const label = el => norm([
+              el.textContent,
+              el.getAttribute('aria-label'),
+              el.querySelector('[title]')?.getAttribute('title'),
+            ].join(' '));
+            let target = buttons.find(el => markers.some(marker => label(el).includes(marker)));
+            if (!target) {
+              if (buttons.length !== 1) return {ok: false, reason: 'no_personal_entry', count: buttons.length};
+              target = buttons[0];
+            }
+            target.scrollIntoView({block: 'center'});
+            return {ok: true, value: target.getAttribute('value') || '', text: norm(target.textContent).slice(0, 80)};
+            """,
+            list(_PERSONAL_WORKSPACE_MARKERS),
+        ) or {}
+    except Exception as exc:  # noqa: BLE001 - the caller retries the whole login.
+        logger.warning("[Browser 2FA] 工作区选择页探测失败: %s: %s", type(exc).__name__, exc)
+        return False
+    if not result.get("ok"):
+        logger.warning(
+            "[Browser 2FA] 工作区选择页未找到个人工作区: %s",
+            {k: v for k, v in result.items() if k != "ok"},
+        )
+        return False
+    try:
+        from selenium.webdriver.common.by import By
+
+        for element in driver.find_elements(By.CSS_SELECTOR, "button[name='workspace_id']"):
+            value = str(element.get_attribute("value") or "")
+            if value and value == str(result.get("value") or ""):
+                _human_click(driver, element, label="workspace_select")
+                logger.info("[Browser 2FA] 已选择个人工作区: %s", result.get("text"))
+                return True
+    except Exception as exc:  # noqa: BLE001 - fall back to the JS click below.
+        logger.debug("[Browser 2FA] 工作区按钮人工化点击失败，回退脚本点击: %s", exc)
+    try:
+        clicked = driver.execute_script(
+            """
+            const visible = el => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+            const value = String(arguments[0] || '');
+            const target = [...document.querySelectorAll('button[name="workspace_id"]')]
+              .filter(visible)
+              .find(el => (el.getAttribute('value') || '') === value);
+            if (!target) return false;
+            target.click();
+            return true;
+            """,
+            result.get("value"),
+        )
+    except Exception as exc:  # noqa: BLE001 - the caller retries the whole login.
+        logger.warning("[Browser 2FA] 工作区按钮脚本点击失败: %s: %s", type(exc).__name__, exc)
+        return False
+    if clicked:
+        logger.info("[Browser 2FA] 已选择个人工作区: %s", result.get("text"))
+    return bool(clicked)
+
+
+def _complete_workspace_chooser(driver, timeout: int = _WORKSPACE_CHOOSER_TIMEOUT) -> bool:
+    """Leave the workspace chooser by selecting the personal workspace."""
+    end = time.monotonic() + max(1.0, float(timeout))
+    attempted = False
+    while time.monotonic() < end:
+        if not _on_workspace_chooser(driver):
+            return attempted
+        if not attempted:
+            attempted = _select_personal_workspace(driver)
+        time.sleep(0.5)
+    logger.warning("[Browser 2FA] 工作区选择页等待超时，仍未离开: url=%s", getattr(driver, "current_url", ""))
+    return attempted
+
+
+def _fetch_session_after_workspace(driver, *, timeout: int) -> dict:
+    """Read the ChatGPT session, resolving the workspace chooser first.
+
+    Multi-workspace accounts stop at ``/workspace`` right after the password and
+    authenticator login; until a workspace is selected ``/api/auth/session``
+    returns no accessToken, so the session read must not run before the chooser
+    is answered.
+    """
+    if _on_workspace_chooser(driver):
+        _complete_workspace_chooser(driver)
+    return _fetch_chatgpt_session(driver, timeout=timeout)
 
 
 def _login_existing_account(
@@ -350,7 +480,7 @@ def _login_existing_account(
         _wait_for_browser_challenge(driver, timeout=min(45, max(1, int(timeout))))
     if _has_access_token(driver):
         logger.info("[Browser 2FA] profile vẫn còn session đăng nhập, bỏ qua email login OTP")
-        session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+        session_info = _fetch_session_after_workspace(driver, timeout=timeout)
         if not session_info.get("accessToken"):
             raise RuntimeError("已有账号登录成功但未拿到 accessToken")
         return session_info
@@ -381,7 +511,7 @@ def _login_existing_account(
     if next_state in ("login_password", "password"):
         password_state = _login_password(driver, password)
         if password_state == "logged_in":
-            session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+            session_info = _fetch_session_after_workspace(driver, timeout=timeout)
             if not session_info.get("accessToken"):
                 raise RuntimeError("已有账号登录成功但未拿到 accessToken")
             return session_info
@@ -396,6 +526,13 @@ def _login_existing_account(
                 timeout,
                 current_totp_secret,
             )
+        if password_state == "next" and _on_workspace_chooser(driver):
+            # Multi-workspace accounts can land on the chooser straight after
+            # the password step; answer it before reading the session.
+            session_info = _fetch_session_after_workspace(driver, timeout=timeout)
+            if not session_info.get("accessToken"):
+                raise RuntimeError("已有账号登录成功但未拿到 accessToken")
+            return session_info
         if password_state == "next" and profile and _on_about_you_page(driver):
             # Account đã qua about-you ở lần đăng ký nhưng OpenAI chưa finalize
             # profile phía server: login lại sẽ bị đẩy về about-you — điền nốt
@@ -407,7 +544,7 @@ def _login_existing_account(
                 profile[0],
             )
             if _complete_profile_page(driver, profile[0], profile[1], timeout=60):
-                session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+                session_info = _fetch_session_after_workspace(driver, timeout=timeout)
                 if not session_info.get("accessToken"):
                     raise RuntimeError("已有账号登录成功但未拿到 accessToken")
                 return session_info
@@ -417,7 +554,7 @@ def _login_existing_account(
                 f"：state={password_state} url={getattr(driver, 'current_url', '')}"
             )
     if next_state == "logged_in":
-        session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+        session_info = _fetch_session_after_workspace(driver, timeout=timeout)
         if not session_info.get("accessToken"):
             raise RuntimeError("已有账号登录成功但未拿到 accessToken")
         return session_info
@@ -473,7 +610,7 @@ def _login_existing_account(
         current_otp = None
         logger.warning("[Browser 2FA] 已有账号登录 OTP 失败，准备重新获取：%s/3", attempt + 1)
 
-    session_info = _fetch_chatgpt_session(driver, timeout=timeout)
+    session_info = _fetch_session_after_workspace(driver, timeout=timeout)
     if not session_info.get("accessToken"):
         raise RuntimeError("已有账号登录成功但未拿到 accessToken")
     return session_info

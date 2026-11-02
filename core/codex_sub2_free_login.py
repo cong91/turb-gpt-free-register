@@ -27,7 +27,7 @@ def select_target_ids(
     authenticated_emails: set[str] | None = None,
     retrying_emails: set[str] | None = None,
 ) -> dict:
-    """Return runnable account IDs plus explicit skip counts."""
+    """Return runnable account IDs and separate credential and receipt skips."""
     authenticated_emails = {
         str(email or "").strip().lower()
         for email in (authenticated_emails or set())
@@ -40,6 +40,7 @@ def select_target_ids(
     }
     account_ids: list[int] = []
     skipped_authenticated = 0
+    skipped_receipt = 0
     skipped_deactivated = 0
     skipped_retrying = 0
     for row in rows:
@@ -49,6 +50,9 @@ def select_target_ids(
             skipped_authenticated += 1
             continue
         status = str(row.get("codex_status") or "").strip().lower()
+        if status == "receipt":
+            skipped_receipt += 1
+            continue
         if status == "deactivated":
             skipped_deactivated += 1
             continue
@@ -64,6 +68,7 @@ def select_target_ids(
         "account_ids": account_ids,
         "count": len(account_ids),
         "skipped_authenticated": skipped_authenticated,
+        "skipped_receipt": skipped_receipt,
         "skipped_deactivated": skipped_deactivated,
         "skipped_retrying": skipped_retrying,
     }

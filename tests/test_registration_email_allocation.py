@@ -2,8 +2,8 @@ import unittest
 from unittest.mock import patch
 
 from config import email as email_config
+from core import browser_email_entry, email_provider, registration_flow
 from core import browser_use_registration as browser_use
-from core import email_provider, registration_flow
 
 
 class DelayedEmailAllocationTests(unittest.TestCase):
@@ -40,9 +40,9 @@ class DelayedEmailAllocationTests(unittest.TestCase):
         with patch.object(
             registration_flow, "_wait_for_browser_challenge"
         ), patch.object(
-            registration_flow, "_wait_for_email_input", side_effect=find_input
+            browser_email_entry, "_wait_for_email_input", side_effect=find_input
         ), patch.object(
-            registration_flow,
+            browser_email_entry,
             "_human_type_text",
             side_effect=lambda *args, **kwargs: events.append("type_email"),
         ), patch.object(

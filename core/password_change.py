@@ -562,6 +562,7 @@ def change_password_in_browser(
     if not new_password:
         raise ValueError("Cần gọi resolve_password_change_input để sinh mật khẩu mới")
     active_access_token = str(access_token or "").strip()
+    submitted_new_password = False
     try:
         # Baseline BEFORE the reauth so a stale mailbox OTP can never be picked.
         try:
@@ -596,6 +597,7 @@ def change_password_in_browser(
 
         _resolve_password_change_challenge(driver, item, otp_baseline)
         _wait_for_new_password_page(driver)
+        submitted_new_password = True
         already_set = _fill_new_password_page(driver, new_password)
 
         session = _fetch_chatgpt_session(driver, timeout=60)
@@ -619,6 +621,9 @@ def change_password_in_browser(
             "mode": mode,
             "error": _redacted_error(f"{type(exc).__name__}: {exc}", item),
         }
+        if submitted_new_password:
+            result["retryable"] = False
+            result["remote_state_uncertain"] = True
         if active_access_token:
             result["access_token"] = active_access_token
         return result

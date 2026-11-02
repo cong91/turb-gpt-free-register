@@ -11,6 +11,7 @@ from config import roxybrowser as _roxy_cfg
 from core import codex_oauth as _codex_proto
 from core import sms_provider
 from core.browser_auth_actions import _click_passwordless_signup_if_present
+from core.browser_email_entry import _submit_email_step, _type_email_address
 from core.browser_page_actions import (
     _clear_otp_inputs,
     _click_any,
@@ -38,7 +39,6 @@ from core.openai_auth import (
     account_unusable_message,
     detect_account_unusable_response_body,
 )
-from core.registration_flow import _submit_email_step, _type_email_address
 from core.roxy_phone_country import select_phone_country, select_vietnam_country
 from core.roxybrowser_client import RoxyBrowserClient
 
@@ -261,11 +261,9 @@ def _wait_for_otp_input(driver, timeout: int = 30) -> None:
         time.sleep(0.8)
     state = _email_otp_page_state(driver)
     logger.warning(
-        "[Codex][Browser] 等待 OTP 输入框超时，页面 url=%s inputs=%s buttons=%s 文本前300字=%s",
-        str(state.get("url") or ""),
+        "[Codex][Browser] OTP input timeout: inputs=%s buttons=%s",
         len(state.get("inputs") or []),
-        [(b.get("text") or "")[:24] for b in (state.get("buttons") or [])][:8],
-        str(state.get("text") or "")[:300],
+        len(state.get("buttons") or []),
     )
     raise RuntimeError("等待 OTP 输入框超时，页面未出现验证码输入框")
 
@@ -546,10 +544,9 @@ def _wait_for_fresh_email_otp(otp_provider, email: str, after_ts: float, used_co
         last_code = code or last_code
         remaining = int(end - time.time())
         if remaining <= 0:
-            raise RuntimeError(f"等待新的邮箱验证码超时，取码接口仍返回已失败验证码：{last_code or '-'}")
+            raise RuntimeError("Timed out waiting for a fresh email verification code")
         logger.warning(
-            "[Codex][Browser] 取码接口仍返回已提交过的旧 OTP=%s，继续等待最新验证码（剩余 %ss）",
-            last_code or "-",
+            "[Codex][Browser] 邮箱取码接口仍返回已使用验证码，继续等待最新验证码（剩余 %ss）",
             remaining,
         )
         time.sleep(min(5, max(1, remaining)))
@@ -647,16 +644,17 @@ def _phone_page_state(driver) -> dict:
         return driver.execute_script(r"""
         const visible = el => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
         const radios = [...document.querySelectorAll('input[type=radio]')].filter(visible).map(el => ({
-          name: el.name || '', value: el.value || '', checked: !!el.checked, id: el.id || ''
+          name: el.name || '', checked: !!el.checked, id: el.id || '',
+          channel: /whatsapp/i.test(el.value || '') ? 'whatsapp' : (/^(sms|text|text_message|text-message)$/i.test(el.value || '') ? 'sms' : 'other')
         }));
         const inputs = [...document.querySelectorAll('input,select,textarea')].filter(visible).map(el => ({
           tag: el.tagName, type: el.getAttribute('type') || '', name: el.getAttribute('name') || '',
           id: el.id || '', autocomplete: el.getAttribute('autocomplete') || '', placeholder: el.getAttribute('placeholder') || '',
-          ariaInvalid: el.getAttribute('aria-invalid') || '', value: el.value || ''
+          ariaInvalid: el.getAttribute('aria-invalid') || ''
         }));
         const forms = [...document.querySelectorAll('form')].map(f => ({action: f.getAttribute('action') || ''}));
         const bodyText = (document.body?.innerText || '').slice(0, 1200);
-        return {url: location.href, radios, inputs, forms, bodyText};
+        return {url: location.href.split('?')[0], radios, inputs, forms, bodyText};
         """) or {}
     except Exception as exc:  # noqa: BLE001
         return {"error": f"{type(exc).__name__}: {exc}", "url": getattr(driver, 'current_url', '')}
@@ -669,7 +667,7 @@ def _select_sms_channel_or_raise(driver) -> None:
     has_whatsapp = any('whatsapp' in str(r.get('value','')).lower().replace(' ', '') for r in radios)
     has_sms = any(str(r.get('value','')).lower() in ('sms', 'text', 'text_message', 'text-message') for r in radios)
     if has_whatsapp and not has_sms:
-        raise RuntimeError(f"whatsapp_channel: 页面仅提供 WhatsApp 通道 state={state}")
+        raise RuntimeError("WhatsApp-only phone verification is unsupported")
     # 选择 SMS/text radio。无 radio 时可能默认 SMS。
     selected = driver.execute_script(r"""
     const radios = [...document.querySelectorAll('input[type=radio]')];
@@ -821,9 +819,9 @@ def _ensure_add_phone_input(driver, *, reason: str = ""):
             return _find_any(driver, _PHONE_INPUT_SELECTORS, timeout=8)
         except Exception as back_exc:  # noqa: BLE001
             raise RuntimeError(
-                f"无法回到手机号输入页以重新换号: direct={type(first_exc).__name__}: {first_exc}; "
-                f"back={type(back_exc).__name__}: {back_exc}; state={_phone_page_state(driver)}"
-            )
+                f"Unable to return to phone input page: "
+                f"direct={type(first_exc).__name__}; back={type(back_exc).__name__}"
+            ) from back_exc
 
 
 def _set_phone_value(driver, phone: str, *, timeout: int = 10) -> dict:
@@ -836,7 +834,7 @@ def _set_phone_value(driver, phone: str, *, timeout: int = 10) -> dict:
     - 触发 input/change 并 blur，让 React/React-Aria 完成校验。
     """
     if not _has_strict_add_phone_form(driver):
-        raise RuntimeError(f"当前不是 add-phone 手机号输入页，不能填写手机号: state={_phone_page_state(driver)}")
+        raise RuntimeError("Current page is not a phone number form")
     result = driver.execute_script(r"""
     const rawPhone = String(arguments[0] || '').trim();
     const e164 = rawPhone.startsWith('+') ? rawPhone : ('+' + rawPhone.replace(/\D+/g, ''));
@@ -1008,7 +1006,7 @@ def _verify_add_phone_value_before_submit(driver, expected_e164: str) -> dict:
     return {ok, visibleValue, hiddenValue, expected, visibleDigits, hiddenDigits, expectedDigits, expectedNationalDigits, selectedDialCode, url: location.href};
     """, expected_e164)
     if not result or not result.get("ok"):
-        raise RuntimeError(f"手机号提交前校验失败 result={result} state={_phone_page_state(driver)}")
+        raise RuntimeError("Phone verification code was rejected")
     return result
 
 
@@ -1220,16 +1218,16 @@ def _wait_after_phone_otp_submit(driver, timeout: int = 20) -> str:
 def _classify_phone_page_failure(state: dict) -> str:
     if _is_phone_code_state(state):
         return ''
-    # WhatsApp 用 DOM radio value 判断；页面 body 通常同时渲染 SMS 和 WhatsApp
-    # 文案，不能因为 body 中出现 WhatsApp 就把已选 SMS 判成失败。
+    # WhatsApp and SMS radio values are normalized at the page boundary; page body
+    # text can mention both channels regardless of which one is selected.
     radios = state.get('radios') or []
     normalized_values = {
-        str(r.get('value') or '').lower().replace(' ', '')
+        str(r.get('channel') or '').lower()
         for r in radios
     }
     has_sms = bool(normalized_values.intersection({'sms', 'text', 'text_message', 'text-message'}))
     if any(
-        'whatsapp' in str(r.get('value') or '').lower().replace(' ', '')
+        'whatsapp' in str(r.get('channel') or '').lower()
         and r.get('checked')
         for r in radios
     ):
@@ -1316,17 +1314,23 @@ def _do_phone_verification_if_present(driver) -> None:
                         "[Codex][Browser] 已按号码选择手机国家：%s",
                         country_info.get("country") or country_info.get("dialCode") or "-",
                     )
-                logger.info("[Codex][Browser] 手机验证尝试 %s/%s，provider=%s，号码=+%s", attempt, max_retries, provider, phone)
+                logger.info(
+                    "[Codex][Browser] 手机验证尝试 %s/%s，provider=%s",
+                    attempt,
+                    max_retries,
+                    provider,
+                )
                 phone_fill = _set_phone_value(driver, f"+{phone}", timeout=10)
                 logger.info(
-                    "[Codex][Browser] 已重新设置手机号：e164=%s visible=%s hidden=%s dialCode=%s country=%s",
-                    phone_fill.get("e164"), phone_fill.get("actualVisible"), phone_fill.get("hiddenValue") or "-",
-                    phone_fill.get("dialCode") or "-", (str(phone_fill.get("selectedText") or "-") + (" [changed]" if phone_fill.get("selectedChanged") else "")),
+                    "[Codex][Browser] 已重新设置手机号，country=%s changed=%s",
+                    phone_fill.get("dialCode") or "-",
+                    bool(phone_fill.get("selectedChanged")),
                 )
                 _blur_active_input_and_wait(driver, label="手机号输入完成")
-                phone_verify = _verify_add_phone_value_before_submit(driver, str(phone_fill.get("e164") or f"+{phone}"))
-                logger.info("[Codex][Browser] 手机号提交前校验通过：visible=%s hidden=%s", phone_verify.get("visibleValue"), phone_verify.get("hiddenValue") or "-")
+                _verify_add_phone_value_before_submit(driver, str(phone_fill.get("e164") or f"+{phone}"))
+                logger.info("[Codex][Browser] 手机号提交前校验通过")
                 logger.info("[Codex][Browser] 检查并选择 SMS 短信通道")
+
                 _select_sms_channel_or_raise(driver)
                 _blur_active_input_and_wait(driver, label="短信通道确认完成")
                 submit_info = _click_add_phone_continue_button(driver, timeout=10)
@@ -1338,10 +1342,7 @@ def _do_phone_verification_if_present(driver) -> None:
                 logger.info("[Codex][Browser] 已进入手机验证码页")
 
                 sms_provider.set_status(activation_id, 1, http=http)
-                logger.info(
-                    "[Codex][Browser] 短信已发送，开始轮询验证码 activation_id=%s wait=%ss interval=%ss",
-                    activation_id, sms_provider._cfg.SMS_CODE_WAIT, sms_provider._cfg.SMS_POLL_INTERVAL
-                )
+                logger.info("[Codex][Browser] 短信已发送，开始轮询验证码")
                 sms_code = sms_provider.wait_for_sms_code(activation_id, http)
                 logger.info("[Codex][Browser] 手机 OTP 已收到")
                 _type_otp(driver, sms_code)
@@ -1409,8 +1410,10 @@ def _do_phone_verification_if_present(driver) -> None:
             pass
 
 
-def _finish_consent_workspace(driver) -> str:
+def _finish_consent_workspace(driver, before_submit=None) -> str:
     """点击 Codex consent/workspace 页面里的继续/允许按钮，直到 callback。"""
+    if before_submit is not None:
+        before_submit()
     end = time.time() + int(_roxy_cfg.ROXY_CODEX_CALLBACK_TIMEOUT)
     while time.time() < end:
         callback = _extract_callback_url_from_any_window(driver)
@@ -1547,74 +1550,39 @@ def _run_roxy_codex_oauth_once(
         if credentials is not None:
             from core.browser_credential_login import login_with_credentials
 
-            login_with_credentials(driver, credentials, auth_url)
+            if otp_provider is None:
+                login_with_credentials(driver, credentials, auth_url)
+            else:
+                login_with_credentials(driver, credentials, auth_url, otp_provider=otp_provider)
         else:
             _fill_email_and_otp(driver, email, otp_provider, auth_url)
         human_delay("api")
         logger.info("[Codex][Browser] 检查是否需要手机号验证")
         _do_phone_verification_if_present(driver)
         logger.info("[Codex][Browser] 手机验证处理完成/无需处理，等待授权确认和 callback")
-        callback_url = _finish_consent_workspace(driver)
+        if reuse_existing_profile and not clear_existing_state:
+            from core.personal_info_codex import verify_live_identity
+            callback_url = _finish_consent_workspace(
+                driver, before_submit=lambda: verify_live_identity(driver, email),
+            )
+        else:
+            callback_url = _finish_consent_workspace(driver)
         code = proto._extract_code(callback_url, state)
         logger.info("[Codex][Browser] 已捕获 callback code")
 
-        if auth_source == "cpa":
-            submit_payload = proto._submit_cpa_callback(callback_url)
-            path = proto._save_cpa_local_record(
-                email=email,
-                callback_url=callback_url,
-                auth_url=auth_url,
-                state=state,
-                submit_payload=submit_payload,
-            )
-            msg = submit_payload.get("message") or submit_payload.get("status_message") or "CPA callback submitted"
-            return proto._codex_result(
-                status="success",
-                ok=True,
-                email=email,
-                file_path=str(path) if path else None,
-                callback_url=callback_url,
-                message=f"{_codex_driver_name()}: {msg}",
-            )
+        from core.codex_callback_finalizer import finish_codex_callback
 
-        if auth_source == "sub2":
-            submit_payload = proto._submit_sub2_callback(
-                callback_url,
-                session_id=(sub2_auth or {}).get("session_id", ""),
-                redirect_uri=(proto.parse_qs(proto.urlparse(auth_url or "").query).get("redirect_uri") or [""])[0],
-            )
-            path = proto._save_sub2_local_record(
-                email=email,
-                callback_url=callback_url,
-                auth_url=auth_url,
-                state=state,
-                submit_payload=submit_payload,
-            )
-            msg = submit_payload.get("message") or submit_payload.get("status_message") or "sub2 callback uploaded"
-            return proto._codex_result(
-                status="success",
-                ok=True,
-                email=email,
-                file_path=str(path) if path else None,
-                callback_url=callback_url,
-                message=f"{_codex_driver_name()}: {msg}",
-            )
-
-        if not code_verifier:
-            raise RuntimeError("[Codex][Browser] local 模式缺少 code_verifier")
-        session = proto.BrowserSession(proxy=proxy, fingerprint_seed=f"account:{email.lower()}")
-        token_resp = proto.exchange_codex_token(session, code, code_verifier)
-        id_claims = proto._parse_id_token(token_resp.get("id_token", ""))
-        effective_email = id_claims.get("email") or email
-        storage = proto.build_codex_storage(token_resp, id_claims)
-        path = proto.save_codex_credential(storage, effective_email, id_claims.get("plan_type", ""))
-        return proto._codex_result(
-            status="success",
-            ok=True,
-            email=effective_email,
-            file_path=str(path),
+        return finish_codex_callback(
+            email=email,
+            auth_source=auth_source,
+            auth_url=auth_url,
             callback_url=callback_url,
-            message=f"{_codex_driver_name()} plan={id_claims.get('plan_type') or 'unknown'}",
+            state=state,
+            code=code,
+            code_verifier=code_verifier or "",
+            sub2_auth=locals().get("sub2_auth"),
+            proxy=proxy,
+            preserve_session=reuse_existing_profile and not clear_existing_state,
         )
     except AccountUnusableError as exc:
         message = account_unusable_message(exc.error_code)

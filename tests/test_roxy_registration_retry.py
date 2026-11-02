@@ -197,25 +197,25 @@ class RoxyRegistrationRetryTests(unittest.TestCase):
         driver = Mock(current_url="https://chatgpt.com/auth/login")
         email_input = object()
         with (
-            patch("core.registration_flow._find_any", side_effect=[RuntimeError("email input is not mounted"), email_input]) as find_input,
-            patch("core.registration_flow._email_entry_state", return_value={
+            patch("core.browser_email_entry._find_any", side_effect=[RuntimeError("email input is not mounted"), email_input]) as find_input,
+            patch("core.browser_email_entry._email_entry_state", return_value={
                 "url": "https://chatgpt.com/auth/login",
                 "title": "Chờ một chút...",
                 "inputs": [],
                 "actions": [],
             }),
             patch(
-                "core.registration_flow._browser_challenge_state",
+                "core.browser_email_entry._browser_challenge_state",
                 return_value={"is_challenge": True, "reason": "chờ một chút"},
             ),
             patch(
-                "core.registration_flow._wait_for_browser_challenge",
+                "core.browser_email_entry._wait_for_browser_challenge",
                 return_value={"is_challenge": False},
             ) as wait_for_challenge,
-            patch("core.registration_flow._click_email_entry_option", return_value=False),
-            patch("core.registration_flow.time.sleep"),
+            patch("core.browser_email_entry._click_email_entry_option", return_value=False),
+            patch("core.browser_email_entry.time.sleep"),
         ):
-            from core.registration_flow import _wait_for_email_input
+            from core.browser_email_entry import _wait_for_email_input
 
             result = _wait_for_email_input(driver, timeout=1)
 

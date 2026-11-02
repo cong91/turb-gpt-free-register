@@ -11,6 +11,10 @@
   const resultPanel = document.getElementById('personalInfoResults');
   const resultBody = document.getElementById('personalResultBody');
   const resultEmpty = document.getElementById('personalResultEmpty');
+  const codexPanel = document.getElementById('personalInfoCodexResults');
+  const codexResultBody = document.getElementById('personalCodexResultBody');
+  const codexStatus = document.getElementById('personalCodexStatus');
+  const codexAvailability = document.getElementById('loginCodexAfterChangeAvailability');
   const status = document.getElementById('status');
   const submitted = document.getElementById('personalSubmitted');
   const running = document.getElementById('personalRunning');
@@ -18,6 +22,8 @@
   const succeeded = document.getElementById('personalSucceeded');
   const failed = document.getElementById('personalFailed');
   const retryAllButton = document.getElementById('personalRetryFailed');
+  const loginCodexAfterChange = document.getElementById('loginCodexAfterChange');
+  const codexAvailable = Boolean(loginCodexAfterChange && !loginCodexAfterChange.disabled);
   let activeMode = 'email';
   let twofaProgressBatchId = '';
   let passwordProgressBatchId = '';
@@ -26,6 +32,7 @@
   let exportBatchId = '';
   let exportableCount = 0;
   let progressTimer = null;
+  let submittedCodexOption = false;
 
   const escapeHtml = (value) => String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -86,6 +93,7 @@
 
   const renderResults = (payload, mode) => {
     const resultList = Array.isArray(payload.results) ? payload.results : [];
+    if (codexResultBody) codexResultBody.innerHTML = '';
     const successfulResults = resultList.filter((result) => (result.status || result.change_status) === 'success');
     const batchDone = mode === 'twofa' || mode === 'password'
       ? ['completed', 'failed'].includes(payload.status)
@@ -103,6 +111,39 @@
     if (pending) pending.textContent = String(payload.pending ?? resultList.filter((result) => result.status === 'queued').length);
     succeeded.textContent = String(payload.succeeded ?? successfulResults.length);
     failed.textContent = String(payload.failed ?? resultList.filter((result) => ['failed', 'partial_failure'].includes(result.status || result.change_status)).length);
+    if (codexPanel && codexResultBody && submittedCodexOption) {
+      const codexRows = resultList.map((result) => {
+        const changeState = result.status || result.change_status;
+        const codex = result.codex || {
+          status: ['failed', 'partial_failure'].includes(changeState) ? 'skipped' : 'waiting_change',
+          ok: false,
+        };
+        const reasonText = String(codex.reason || '').toLowerCase();
+        const skippedBeforeChange = changeState === 'failed' || changeState === 'partial_failure';
+        const skippedForRoute = codex.status === 'skipped' && !skippedBeforeChange;
+        const mapping = codex.status === 'running' ? ['Đang đăng nhập Codex', 'is-running']
+          : codex.status === 'success' ? ['Codex thành công', 'is-success']
+            : codex.status === 'receipt' ? ['Codex hoàn tất (callback)', 'is-success']
+              : codex.status === 'skipped' && skippedBeforeChange ? ['Bỏ qua: đổi thông tin chưa thành công', 'is-pending']
+                : codex.status === 'skipped' ? ['Bỏ qua: phiên không hỗ trợ route Codex', 'is-pending']
+                  : codex.status === 'failed' ? ['Codex thất bại', 'is-failed']
+                    : ['Đang chờ đổi thông tin', 'is-pending'];
+        const reason = codex.reason || mapping[0];
+        const account = mode === 'email' ? (result.new_email || result.email || result.old_email) : result.email;
+        return `<tr><td>${escapeHtml(account || '-')}</td><td><span class="personal-info-result-status ${mapping[1]}">${mapping[0]}</span></td><td>${escapeHtml(reason)}</td></tr>`;
+      });
+      codexResultBody.innerHTML = codexRows.join('');
+      codexPanel.hidden = false;
+      if (codexStatus) {
+        const successes = resultList.filter((result) => ['success', 'receipt'].includes(result.codex?.status)).length;
+        const errors = resultList.filter((result) => result.codex?.status === 'failed').length;
+        const active = resultList.filter((result) => result.codex?.status === 'running').length;
+        codexStatus.textContent = `Codex: ${successes} hoàn tất, ${active} đang chạy, ${errors} lỗi.`;
+        codexStatus.classList.toggle('is-error', errors > 0);
+      }
+    } else if (codexPanel) {
+      codexPanel.hidden = true;
+    }
     resultBody.innerHTML = resultList.map((result, index) => {
       const state = resultStatus(result);
       const account = mode === 'email'
@@ -146,6 +187,8 @@
     resultPanel.hidden = false;
     resultBody.innerHTML = '';
     resultEmpty.hidden = false;
+    if (codexResultBody) codexResultBody.innerHTML = '';
+    if (codexPanel) codexPanel.hidden = true;
     submitted.textContent = '0';
     if (running) running.textContent = '0';
     if (pending) pending.textContent = '0';
@@ -386,15 +429,19 @@
     resultPanel.hidden = true;
     setStatus(isTwofa ? 'Đang đổi 2FA theo từng tài khoản...' : isPassword ? 'Đang đổi mật khẩu theo từng tài khoản...' : 'Đang xử lý đổi email...');
     try {
+      const codexOption = Boolean(codexAvailable && loginCodexAfterChange.checked);
+      submittedCodexOption = codexOption;
+      if (loginCodexAfterChange) loginCodexAfterChange.disabled = true;
       const body = isTwofa
-        ? { credentials, workers: Number(document.getElementById('twofaWorkers').value || 1) }
+        ? { credentials, workers: Number(document.getElementById('twofaWorkers').value || 1), login_codex_after_change: codexOption }
         : isPassword
-          ? { credentials, workers: Number(document.getElementById('passwordWorkers').value || 1) }
+          ? { credentials, workers: Number(document.getElementById('passwordWorkers').value || 1), login_codex_after_change: codexOption }
           : {
             credentials,
             gmail_api: document.getElementById('gmailApi').value,
             quota: Number(document.getElementById('quota').value || 1),
             workers: Number(document.getElementById('workers').value || 1),
+            login_codex_after_change: codexOption,
           };
       const response = await fetch(isTwofa
         ? '/api/accounts/change-twofa'
@@ -433,6 +480,7 @@
       showRequestError(error instanceof Error ? error.message : 'Không thể gửi yêu cầu');
     } finally {
       activeSubmit.disabled = false;
+      if (loginCodexAfterChange) loginCodexAfterChange.disabled = !codexAvailable;
     }
   };
 

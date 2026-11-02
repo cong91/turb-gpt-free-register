@@ -4,7 +4,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from webui import email_change_api
+from webui import password_change_api
 from webui.app import create_app
 
 
@@ -19,15 +19,15 @@ class PasswordChangeApiTests(unittest.TestCase):
         # Batch worker chạy ngay trong test (immediate thread) -> persist lịch sử
         # đổi pass phải được mock để không ghi vào turb.sqlite3 thật.
         save_patcher = patch(
-            "webui.email_change_api.db.save_personal_info_change_batch",
+            "webui.password_change_api.db.save_personal_info_change_batch",
             return_value={"batch_id": "b" * 32, "exportable_count": 1},
         )
         self.save_batch = save_patcher.start()
         self.addCleanup(save_patcher.stop)
 
     def tearDown(self):
-        with email_change_api._progress_lock:
-            email_change_api._password_progress.clear()
+        with password_change_api._progress_lock:
+            password_change_api._password_progress.clear()
 
     @staticmethod
     def _run_thread_target_immediately(thread_mock):
@@ -40,8 +40,8 @@ class PasswordChangeApiTests(unittest.TestCase):
 
         thread_mock.side_effect = start_thread
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.run_password_change_batch")
+    @patch("webui.password_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch")
     def test_change_password_route_returns_statuses_without_secrets(self, run_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -82,11 +82,61 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertEqual(parsed_item.current_password, "current-password")
         self.assertEqual(parsed_item.totp_secret, "TOTPBASE32")
         self.assertEqual(run_batch.call_args.kwargs["workers"], 2)
-        with email_change_api._progress_lock:
-            self.assertNotIn("items", email_change_api._password_progress[payload["batch_id"]])
+        with password_change_api._progress_lock:
+            self.assertNotIn("items", password_change_api._password_progress[payload["batch_id"]])
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.run_password_change_batch")
+    @patch("webui.password_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch")
+    def test_codex_option_is_snapshotted_through_row_and_retry_all(self, run_batch, thread):
+        self._run_thread_target_immediately(thread)
+        run_batch.side_effect = [
+            [{"ok": False, "persisted": False, "email": "user@example.com", "error": "login"}],
+            [{"ok": False, "persisted": False, "email": "user@example.com", "error": "login again"}],
+            [{"ok": False, "persisted": False, "email": "user@example.com", "error": "login once more"}],
+        ]
+        initial = self.client.post(
+            "/api/accounts/change-password",
+            json={"credentials": "user@example.com", "login_codex_after_change": True},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+        self.assertEqual(initial.status_code, 202, initial.get_json())
+        batch_id = initial.get_json()["batch_id"]
+        self.assertTrue(run_batch.call_args_list[0].kwargs["login_codex_after_change"])
+
+        with password_change_api._progress_lock:
+            password_change_api._password_progress[batch_id]["login_codex_after_change"] = True
+        row_retry = self.client.post(
+            "/api/accounts/change-password-retry",
+            json={"batch_id": batch_id, "index": 0},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+        self.assertEqual(row_retry.status_code, 202, row_retry.get_json())
+        self.assertTrue(run_batch.call_args_list[1].kwargs["login_codex_after_change"])
+
+        retry_all = self.client.post(
+            "/api/accounts/change-password-retry-failed",
+            json={"batch_id": batch_id, "workers": 2},
+            headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+        )
+        self.assertEqual(retry_all.status_code, 202, retry_all.get_json())
+        self.assertTrue(run_batch.call_args_list[2].kwargs["login_codex_after_change"])
+
+    def test_change_password_rejects_non_boolean_codex_option(self):
+        with (
+            patch("webui.password_change_api.threading.Thread") as thread,
+            patch("webui.password_change_api.run_password_change_batch") as run_batch,
+        ):
+            response = self.client.post(
+                "/api/accounts/change-password",
+                json={"credentials": "user@example.com", "login_codex_after_change": "false"},
+                headers={"Origin": "http://localhost", "X-Auth-Code": "test-auth"},
+            )
+        self.assertEqual(response.status_code, 400, response.get_json())
+        thread.assert_not_called()
+        run_batch.assert_not_called()
+
+    @patch("webui.password_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch")
     def test_change_password_batch_persists_history_with_password_mode(self, run_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -111,8 +161,8 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertEqual(results[0]["change_status"], "success")
         self.assertEqual(results[0]["account_id"], 7)
 
-    @patch("webui.email_change_api.run_password_change_batch", side_effect=_block_batch_runner)
-    @patch("webui.email_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch", side_effect=_block_batch_runner)
+    @patch("webui.password_change_api.threading.Thread")
     def test_change_password_route_returns_batch_for_progress_polling(self, thread, _run_batch):
         response = self.client.post(
             "/api/accounts/change-password",
@@ -145,8 +195,8 @@ class PasswordChangeApiTests(unittest.TestCase):
         )
         self.assertEqual(missing.status_code, 404, missing.get_json())
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.run_password_change_batch")
+    @patch("webui.password_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch")
     def test_change_password_route_reports_already_set_as_success_with_warning(self, run_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -171,8 +221,8 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["status"], "success")
         self.assertEqual(payload["results"][0]["warning"], "Mật khẩu đã tồn tại từ trước")
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.run_password_change_batch")
+    @patch("webui.password_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch")
     def test_change_password_route_fails_when_local_persistence_missing(self, run_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -197,8 +247,8 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertEqual(payload["failed"], 1)
         self.assertEqual(payload["results"][0]["status"], "failed")
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.run_password_change_batch")
+    @patch("webui.password_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch")
     def test_change_password_manual_retry_reruns_failed_row(self, run_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.side_effect = [
@@ -253,8 +303,8 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertEqual(retry_mode, "password")
         self.assertEqual(retry_results[0]["change_status"], "success")
 
-    @patch("webui.email_change_api.threading.Thread")
-    @patch("webui.email_change_api.run_password_change_batch")
+    @patch("webui.password_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch")
     def test_change_password_manual_retry_rejects_row_marked_not_retryable(self, run_batch, thread):
         self._run_thread_target_immediately(thread)
         run_batch.return_value = [{
@@ -282,8 +332,8 @@ class PasswordChangeApiTests(unittest.TestCase):
         self.assertIn("đối soát", retry.get_json()["error"])
         run_batch.assert_called_once()
 
-    @patch("webui.email_change_api.run_password_change_batch", side_effect=_block_batch_runner)
-    @patch("webui.email_change_api.threading.Thread")
+    @patch("webui.password_change_api.run_password_change_batch", side_effect=_block_batch_runner)
+    @patch("webui.password_change_api.threading.Thread")
     def test_change_password_manual_retry_requires_completed_batch(self, _thread, _run_batch):
         response = self.client.post(
             "/api/accounts/change-password",
@@ -357,7 +407,7 @@ class PasswordChangeApiTests(unittest.TestCase):
         )
         self.assertEqual(too_many.status_code, 400, too_many.get_json())
 
-    @patch("webui.email_change_api.threading.Thread", side_effect=RuntimeError("thread unavailable"))
+    @patch("webui.password_change_api.threading.Thread", side_effect=RuntimeError("thread unavailable"))
     def test_change_password_start_failure_marks_rows_failed(self, _thread):
         response = self.client.post(
             "/api/accounts/change-password",
@@ -377,9 +427,9 @@ class PasswordChangeApiTests(unittest.TestCase):
 
     def test_change_password_route_rejects_batch_when_progress_is_full(self):
         # Chỉ batch đang chạy mới chặn: trim luôn dọn batch đã hoàn tất.
-        with email_change_api._progress_lock:
-            for i in range(email_change_api._MAX_PROGRESS_BATCHES):
-                email_change_api._password_progress[f"old-{i}"] = {
+        with password_change_api._progress_lock:
+            for i in range(password_change_api._MAX_PROGRESS_BATCHES):
+                password_change_api._password_progress[f"old-{i}"] = {
                     "batch_id": f"old-{i}",
                     "status": "running",
                     "created_at": str(i),

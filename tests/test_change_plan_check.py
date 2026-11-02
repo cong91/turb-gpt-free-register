@@ -185,6 +185,15 @@ class TwofaChangeLivePlanCheckTests(unittest.TestCase):
 
 
 class PasswordChangeLivePlanCheckTests(unittest.TestCase):
+    def setUp(self):
+        for target in (
+            "core.browser_password_change.password_change_recovery.stage",
+            "core.browser_password_change.password_change_recovery.discard",
+        ):
+            patcher = patch(target)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _patches(self, profile, change_result):
         return (
             patch(
@@ -259,6 +268,104 @@ class PasswordChangeLivePlanCheckTests(unittest.TestCase):
         self.assertEqual(plan_kwargs["trigger"], "password_change")
         self.assertIsNotNone(plan_kwargs["browser_transport"])
         self.assertEqual(events, ["plan_check", "close", "cleanup"])
+
+    def test_failed_password_change_keeps_existing_codex_status(self):
+        profile = Mock(provider="roxy")
+        profile.driver = Mock()
+        item = _password_item()
+        patches = self._patches(profile, {"ok": False, "email": item.email, "error": "change failed"})
+        with (
+            patches[0], patches[1], patches[2], patches[3],
+            patch("core.browser_password_change._PASSWORD_CHANGE_BROWSER_RESTART_ATTEMPTS", 1),
+            patch("core.db.update_account_codex_status") as update,
+        ):
+            result = run_password_change(item, login_codex_after_change=True)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["codex"]["status"], "skipped")
+        update.assert_not_called()
+
+    def test_password_codex_progress_stays_running_until_follow_up_returns(self):
+        profile = Mock(provider="roxy")
+        profile.driver = Mock()
+        updates = []
+        patches = self._patches(profile, {
+            "ok": True, "email": "user@example.com", "access_token": "new-token",
+        })
+        with (
+            patches[0], patches[1], patches[2], patches[3],
+            patch("core.browser_password_change.db.update_account_access_token", return_value=True),
+            patch("core.browser_password_change.db.update_account_password", return_value=True),
+            patch("core.plan_check_service.run_sync_plan_check", return_value={"accepted": True, "ok": True}),
+            patch("core.personal_info_codex.run_personal_info_codex_and_record", return_value={"status": "success", "ok": True}),
+        ):
+            run_password_change(
+                _password_item(), login_codex_after_change=True,
+                progress_callback=lambda _index, update: updates.append(update), progress_index=0,
+            )
+        codex_update = next(update for update in updates if update.get("codex"))
+        self.assertEqual(codex_update["status"], "running")
+        self.assertEqual(codex_update["codex"]["status"], "running")
+
+    def test_codex_exception_preserves_password_success_and_non_retryable_result(self):
+        profile = Mock(provider="roxy")
+        profile.driver = Mock()
+        item = _password_item()
+        patches = self._patches(profile, {"ok": True, "email": item.email})
+        with (
+            patches[0], patches[1], patches[2], patches[3] as change,
+            patch("core.browser_password_change.db.update_account_password", return_value=True),
+            patch("core.personal_info_codex.run_personal_info_codex_and_record", side_effect=RuntimeError("NEWPW-123")),
+            patch("core.personal_info_codex.record_personal_info_codex") as record,
+            patch("core.browser_password_change.password_change_recovery.discard") as discard,
+        ):
+            result = run_password_change(item, login_codex_after_change=True)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["persisted"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(result["codex"]["status"], "failed")
+        self.assertNotIn(item.new_password, str(result))
+        change.assert_called_once()
+        discard.assert_called_once_with(7)
+        record.assert_called_once_with(item.email, result["codex"])
+        profile.close.assert_called_once()
+
+    def test_failed_persistence_keeps_recovery_and_skips_codex(self):
+        profile = Mock(provider="roxy")
+        profile.driver = Mock()
+        item = _password_item()
+        patches = self._patches(profile, {"ok": True, "email": item.email})
+        with (
+            patches[0], patches[1], patches[2], patches[3],
+            patch("core.browser_password_change.db.update_account_password", side_effect=RuntimeError("NEWPW-123")),
+            patch("core.personal_info_codex.run_personal_info_codex_and_record") as codex,
+            patch("core.browser_password_change.password_change_recovery.discard") as discard,
+        ):
+            result = run_password_change(item, login_codex_after_change=True)
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["persisted"])
+        self.assertFalse(result["retryable"])
+        self.assertEqual(result["codex"]["status"], "skipped")
+        self.assertNotIn(item.new_password, str(result))
+        discard.assert_not_called()
+        codex.assert_not_called()
+
+    def test_token_persistence_exception_redacts_access_token(self):
+        profile = Mock(provider="roxy")
+        profile.driver = Mock()
+        patches = self._patches(profile, {
+            "ok": True, "email": "user@example.com", "access_token": "TOKENVALUE",
+        })
+        with (
+            patches[0], patches[1], patches[2], patches[3],
+            patch("core.browser_password_change.db.update_account_access_token", side_effect=RuntimeError("cannot save TOKENVALUE")),
+            patch("core.browser_password_change.db.update_account_password", return_value=True),
+            patch("core.plan_check_service.run_sync_plan_check", return_value={"accepted": True, "ok": True}),
+        ):
+            result = run_password_change(_password_item())
+        self.assertNotIn("TOKENVALUE", str(result))
 
     def test_failure_skips_plan_check_and_closes_browser_immediately(self):
         profile = Mock(provider="roxy")

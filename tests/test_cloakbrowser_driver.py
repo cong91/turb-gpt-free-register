@@ -96,7 +96,7 @@ class BrowserElementTests(unittest.TestCase):
 
         self.assertIn('native = getattr(el, "locator", None) or getattr(el, "handle", None)', source)
         self.assertIn('if getattr(el, "locator", None) is not None or getattr(el, "handle", None) is not None:', source)
-        email_entry_source = (Path(__file__).parents[1] / "core" / "registration_flow.py").read_text(
+        email_entry_source = (Path(__file__).parents[1] / "core" / "browser_email_entry.py").read_text(
             encoding="utf-8"
         )
         self.assertIn('el = _find_any(driver, _EMAIL_INPUT_SELECTORS, timeout=2)', email_entry_source)
@@ -270,9 +270,9 @@ class CloakAdapterContractTests(unittest.TestCase):
         self.assertEqual(2, len(page.calls))
 
 class BrowserSeleniumDriverTests(unittest.TestCase):
-    @patch("core.registration_flow._find_any")
+    @patch("core.browser_email_entry._find_any")
     def test_browser_registration_returns_native_email_element_for_cloak(self, find_any):
-        from core.registration_flow import _wait_for_email_input
+        from core.browser_email_entry import _wait_for_email_input
 
         driver = type("BrowserSeleniumDriver", (), {})()
         expected_element = object()

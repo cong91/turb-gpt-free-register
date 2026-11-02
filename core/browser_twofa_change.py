@@ -7,14 +7,13 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import ExitStack
 
-from core import db
-from core.account_export import BrowserPageTransport
+from core import db, twofa_change_post_auth
 from core.account_network import preferred_account_proxy
 from core.account_security import (
     TwofaChangeInput,
     change_twofa_in_browser,
 )
-from core.browser_profile import open_browser_profile
+from core.browser_profile import configured_browser_profile_provider, open_browser_profile
 from core.rotating_proxy_runtime import (
     TWOFA_CHANGE_PROXY_SCOPE,
     prepare_rotating_proxy_lanes,
@@ -41,9 +40,9 @@ def _notify_progress(
         logger.debug("2FA progress callback failed", exc_info=True)
 
 
-def _redacted_error(message: object, item: TwofaChangeInput) -> str:
+def _redacted_error(message: object, item: TwofaChangeInput, *extra_secrets: str) -> str:
     output = str(message or "")[:400]
-    for secret in (item.password, item.current_totp_secret):
+    for secret in (item.password, item.current_totp_secret, *extra_secrets):
         if secret:
             output = output.replace(secret, "[redacted]")
     return re.sub(r"\b\d{6,8}\b", "[redacted-code]", output)
@@ -56,7 +55,7 @@ def _record_remote_disable_failure(
 ) -> dict[str, object]:
     """Clear the local factor after a remote disable cannot be completed."""
     result["persisted"] = False
-    error = _redacted_error(result.get("error"), item)
+    error = _redacted_error(result.get("error"), item, str(result.get("new_totp_secret") or ""))
     try:
         persisted = db.update_account_2fa(
             account_id,
@@ -81,7 +80,7 @@ def _record_local_failure(
 ) -> dict[str, object]:
     """Keep a newly captured account visible without retaining an unusable secret."""
     result["persisted"] = False
-    error = _redacted_error(result.get("error"), item)
+    error = _redacted_error(result.get("error"), item, str(result.get("new_totp_secret") or ""))
     try:
         persisted = db.update_account_2fa(
             account_id,
@@ -95,49 +94,6 @@ def _record_local_failure(
     if not persisted:
         result["warning"] = "local 2FA failure state was not updated"
     return result
-
-
-def _run_plan_check_with_live_browser(
-    account_id: int,
-    item: TwofaChangeInput,
-    access_token: str,
-    profile,
-    result: dict[str, object],
-) -> None:
-    """Check the plan inside the browser that just finished the 2FA change.
-
-    The profile is still open here: the same-origin transport reuses the
-    logged-in session, so no proxy lease and no background worker are needed.
-    A failure only lands in result["plan_check"]; it never undoes the 2FA
-    change that already succeeded.
-    """
-    if not access_token:
-        result["plan_check"] = {"accepted": False, "error": "access token is missing"}
-        return
-    try:
-        from core.plan_check_service import run_sync_plan_check
-
-        plan_result = run_sync_plan_check(
-            account_id=account_id,
-            email=item.email,
-            access_token=access_token,
-            trigger="twofa_change",
-            browser_transport=BrowserPageTransport(profile.driver),
-        )
-    except Exception as exc:  # noqa: BLE001 - plan lookup must not undo the 2FA change.
-        plan_result = {"accepted": False, "error": f"{type(exc).__name__}: {str(exc)[:180]}"}
-    result["plan_check"] = {
-        "accepted": bool(plan_result.get("accepted")),
-        "ok": bool(plan_result.get("ok")),
-        "status": "success" if plan_result.get("ok") else "failed",
-        "current_plan_type": plan_result.get("current_plan_type"),
-        "plus_trial_eligible": plan_result.get("plus_trial_eligible"),
-        "error": str(plan_result.get("error") or "").strip() or None,
-    }
-    if not plan_result.get("ok"):
-        result["warning"] = result.get("warning") or str(
-            plan_result.get("error") or "account plan check failed"
-        )
 
 
 def _should_resume_after_remote_disable(account: dict) -> bool:
@@ -156,6 +112,7 @@ def run_twofa_change(
     proxy_lane_id: int | None = None,
     progress_callback: Callable[[int, dict[str, object]], None] | None = None,
     progress_index: int | None = None,
+    login_codex_after_change: bool = False,
 ) -> dict[str, object]:
     """Replace one account's TOTP and upsert its local persistence row."""
     _notify_progress(
@@ -215,12 +172,20 @@ def run_twofa_change(
                     lane_id=proxy_lane_id,
                     lease_owner_id=f"twofa-change:{account_id}",
                 ))
+                if active_proxy is not None and configured_browser_profile_provider() == "skyvern":
+                    raise RuntimeError(
+                        "Skyvern không hỗ trợ route proxy hiện tại; chưa bắt đầu đổi 2FA. Hãy chọn route direct rõ ràng hoặc provider hỗ trợ proxy."
+                    )
                 logger.info("[2FA] network=%s lane=%s", network_mode, proxy_lane_id or "thread")
                 profile = (
                     open_browser_profile(proxy=active_proxy)
                     if active_proxy is not None
                     else open_browser_profile()
                 )
+                if str(getattr(profile, "provider", "") or "").strip().lower() == "skyvern" and active_proxy is not None:
+                    raise RuntimeError(
+                        "Skyvern không hỗ trợ route proxy hiện tại; không thể bắt đầu đổi 2FA khi chưa có phiên direct được chọn rõ ràng"
+                    )
                 browser_provider = str(getattr(profile, "provider", "") or "")
                 # Try one stored token, then one credential login in this same
                 # profile. The security layer owns that fallback boundary.
@@ -300,7 +265,9 @@ def run_twofa_change(
                 )
             except Exception as exc:  # noqa: BLE001 - keep the MFA result visible.
                 token_persisted = False
-                result["warning"] = _redacted_error(exc, item)
+                result["warning"] = _redacted_error(
+                    exc, item, access_token, str(result.get("new_totp_secret") or "")
+                )
             result["access_token_saved"] = token_persisted
             if not token_persisted:
                 result["warning"] = result.get("warning") or "access token persistence was not updated"
@@ -312,11 +279,15 @@ def run_twofa_change(
         result["browser_provider"] = browser_provider
         if not bool(result.get("ok")):
             if result.get("remote_disabled"):
-                return _record_remote_disable_failure(account_id, item, result)
-            if is_new_account:
-                return _record_local_failure(account_id, item, result)
-            result["persisted"] = False
+                result = _record_remote_disable_failure(account_id, item, result)
+            elif is_new_account:
+                result = _record_local_failure(account_id, item, result)
+            else:
+                result["persisted"] = False
+            if login_codex_after_change:
+                twofa_change_post_auth.record_skipped_change(item.email, result)
             return result
+
 
         new_secret = str(result.get("new_totp_secret") or "").strip()
         if not new_secret:
@@ -332,23 +303,30 @@ def run_twofa_change(
             )
         except Exception as exc:  # noqa: BLE001 - remote result must remain visible.
             persisted = False
-            result["warning"] = _redacted_error(exc, item)
+            result["warning"] = _redacted_error(exc, item, new_secret)
         result["persisted"] = persisted
         if not persisted:
             result["warning"] = result.get("warning") or "local 2FA persistence was not updated"
             result["retryable"] = False
 
-        # The browser is still open (keep_session=True). Check the plan in the
-        # same authenticated session before closing it, so no proxy lease or
-        # background worker is needed.
-        if token_persisted and profile is not None and profile.driver is not None:
-            _run_plan_check_with_live_browser(
-                account_id,
-                item,
-                access_token,
-                profile,
-                result,
+        try:
+            twofa_change_post_auth.run_twofa_post_auth(
+                account_id=account_id,
+                item=item,
+                access_token=access_token if token_persisted else "",
+                profile=profile,
+                active_proxy=active_proxy,
+                new_totp_secret=new_secret,
+                persisted=bool(result.get("persisted")),
+                login_codex_after_change=login_codex_after_change,
+                progress_callback=progress_callback,
+                progress_index=progress_index,
+                result=result,
             )
+        except Exception:
+            logger.error("2FA post-auth follow-up failed")
+            if login_codex_after_change:
+                twofa_change_post_auth.record_failed_codex(item.email, result)
         return result
     except Exception as exc:  # noqa: BLE001 - isolate each account in a batch.
         result = {
@@ -365,11 +343,11 @@ def run_twofa_change(
         if profile is not None:
             try:
                 profile.close()
-            except Exception:  # noqa: BLE001 - cleanup must not mask the result.
+            except Exception:
                 logger.debug("Browser driver cleanup failed")
             try:
                 profile.cleanup()
-            except Exception:  # noqa: BLE001 - cleanup must not mask the result.
+            except Exception:
                 logger.debug("Browser profile cleanup failed")
         if attempt_network is not None:
             try:
@@ -383,6 +361,7 @@ def run_twofa_change_batch(
     *,
     workers: int = 1,
     progress_callback: Callable[[int, dict[str, object]], None] | None = None,
+    login_codex_after_change: bool = False,
 ) -> list[dict[str, object]]:
     """Run isolated configured browser sessions concurrently in input order."""
     max_workers = max(1, min(4, int(workers or 1), len(items) or 1))
@@ -396,16 +375,16 @@ def run_twofa_change_batch(
         prepare_rotating_proxy_lanes(max_workers, scope=TWOFA_CHANGE_PROXY_SCOPE)
     results: list[dict[str, object] | None] = [None] * len(items)
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="twofa-change") as executor:
-        futures = {
-            executor.submit(
-                run_twofa_change,
-                item,
-                proxy_lane_id=index % max_workers,
-                progress_callback=progress_callback,
-                progress_index=index,
-            ): index
-            for index, item in enumerate(items)
-        }
+        futures = {}
+        for index, item in enumerate(items):
+            kwargs = {
+                "proxy_lane_id": index % max_workers,
+                "progress_callback": progress_callback,
+                "progress_index": index,
+            }
+            if login_codex_after_change:
+                kwargs["login_codex_after_change"] = True
+            futures[executor.submit(run_twofa_change, item, **kwargs)] = index
         for future in as_completed(futures):
             index = futures[future]
             try:

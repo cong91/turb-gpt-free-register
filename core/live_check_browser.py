@@ -7,6 +7,7 @@
 import logging
 import time
 
+from core.browser_email_entry import _submit_email_step, _type_email_address
 from core.browser_page_actions import (
     _clear_otp_inputs,
     _click_continue,
@@ -21,11 +22,7 @@ from core.browser_page_actions import (
 from core.browser_selenium_adapter import build_selenium_driver as _build_driver
 from core.email_provider import wait_for_otp
 from core.humanize import delay as human_delay
-from core.registration_flow import (
-    _fetch_chatgpt_session,
-    _submit_email_step,
-    _type_email_address,
-)
+from core.registration_flow import _fetch_chatgpt_session
 from core.roxy_codex_oauth import (
     _fill_login_password_if_present,
     _fill_mfa_challenge_if_present,

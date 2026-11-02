@@ -6,8 +6,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from core import db
-from core.browser_profile import open_browser_profile
-from core.email_change import EmailChangeInput, change_email_in_browser
+from core.browser_profile import configured_browser_profile_provider, open_browser_profile
+from core.email_change import EmailChangeConfirmationError, EmailChangeInput, change_email_in_browser
 from core.rotating_proxy_runtime import (
     EMAIL_CHANGE_PROXY_SCOPE,
     prepare_rotating_proxy_lanes,
@@ -16,7 +16,6 @@ from core.rotating_proxy_runtime import (
 )
 
 logger = logging.getLogger(__name__)
-_EMAIL_CHANGE_RESTART_ATTEMPTS = 2
 _EMAIL_CHANGE_RESTART_ATTEMPTS = 2
 
 
@@ -32,6 +31,7 @@ def run_email_change(
     item: EmailChangeInput,
     *,
     proxy_lane_id: int | None = None,
+    login_codex_after_change: bool = False,
 ) -> dict[str, object]:
     """Run one email change with bounded fresh-profile recovery."""
     last_result: dict[str, object] = {"ok": False}
@@ -41,12 +41,28 @@ def run_email_change(
         try:
             active_proxy = resolve_rotating_proxy(None, scope=EMAIL_CHANGE_PROXY_SCOPE, lane_id=proxy_lane_id)
             rotating_proxy = active_proxy
+            if active_proxy is not None and configured_browser_profile_provider() == "skyvern":
+                return {
+                    "ok": False,
+                    "persisted": False,
+                    "old_email": item.old_email,
+                    "new_email": item.new_email,
+                    "retryable": False,
+                    "error": "Skyvern không hỗ trợ route proxy hiện tại; chưa bắt đầu đổi email. Hãy chọn route direct rõ ràng hoặc provider hỗ trợ proxy.",
+                }
             profile = open_browser_profile(proxy=active_proxy) if active_proxy is not None else open_browser_profile()
-            result = change_email_in_browser(profile.driver, item)
+            result = change_email_in_browser(profile.driver, item, keep_session=login_codex_after_change)
             result["browser_provider"] = profile.provider
             last_result = result
             if not bool(result.get("ok")):
                 result.setdefault("persisted", False)
+                if login_codex_after_change:
+                    from core.personal_info_codex import skipped_personal_info_codex
+
+                    result["codex"] = skipped_personal_info_codex(
+                        item.new_email,
+                        "Bỏ qua: thao tác đổi email chưa thành công; trạng thái đổi email được giữ nguyên.",
+                    )
                 if not result.get("retryable", True) or attempt + 1 >= _EMAIL_CHANGE_RESTART_ATTEMPTS:
                     return result
                 continue
@@ -57,28 +73,91 @@ def run_email_change(
                 result["warning"] = _redacted_error(exc, item)
             result["persisted"] = persisted
             if persisted:
-                updated = db.get_account_by_email(item.new_email)
-                if updated and updated.get("id") is not None:
-                    result["account_id"] = int(updated["id"])
+                try:
+                    updated = db.get_account_by_email(item.new_email)
+                    if updated and updated.get("id") is not None:
+                        result["account_id"] = int(updated["id"])
+                except Exception as exc:
+                    result["warning"] = _redacted_error(exc, item)
             source_email = item.gmail_source_email or item.new_email
-            if db.get_gmail_api_url_email_by_email(source_email):
-                db.release_gmail_api_url_email(source_email, "used", "account email changed")
+            try:
+                if db.get_gmail_api_url_email_by_email(source_email):
+                    db.release_gmail_api_url_email(source_email, "used", "account email changed")
+            except Exception as exc:
+                result["warning"] = result.get("warning") or _redacted_error(exc, item)
             if not persisted:
                 result["warning"] = result.get("warning") or "source account was not found in local persistence"
                 result["retryable"] = False
+                if login_codex_after_change:
+                    try:
+                        from core.personal_info_codex import skipped_personal_info_codex
+
+                        result["codex"] = skipped_personal_info_codex(
+                            item.new_email,
+                            "Bỏ qua: đổi email chưa được lưu vào tài khoản cục bộ; trạng thái đổi email được giữ nguyên.",
+                        )
+                    except Exception:
+                        result["codex"] = {
+                            "status": "skipped",
+                            "ok": False,
+                            "reason": "Bỏ qua: đổi email chưa được lưu vào tài khoản cục bộ.",
+                            "status_persisted": False,
+                        }
+            elif login_codex_after_change:
+                try:
+                    from core.personal_info_codex import run_personal_info_codex_and_record
+
+                    result["codex"] = run_personal_info_codex_and_record(
+                        email=item.new_email,
+                        profile=profile,
+                        active_proxy=active_proxy,
+                        password=item.password,
+                        totp_secret=item.totp_secret,
+                    )
+                except Exception:
+                    result["retryable"] = False
+                    result["codex"] = {
+                        "status": "failed",
+                        "ok": False,
+                        "reason": "Đăng nhập Codex thất bại; thao tác đổi email vẫn thành công.",
+                    }
+                    try:
+                        from core.personal_info_codex import record_personal_info_codex
+
+                        record_personal_info_codex(item.new_email, result["codex"])
+                    except Exception:
+                        result["codex"]["status_persisted"] = False
             return result
+        except EmailChangeConfirmationError as exc:
+            return {
+                "ok": False,
+                "old_email": item.old_email,
+                "new_email": item.new_email,
+                "persisted": False,
+                "retryable": False,
+                "remote_state_uncertain": True,
+                "error": _redacted_error(exc, item),
+            }
         except Exception as exc:
             last_result = {"ok": False, "old_email": item.old_email, "new_email": item.new_email, "error": _redacted_error(exc, item), "retryable": True}
             if attempt + 1 >= _EMAIL_CHANGE_RESTART_ATTEMPTS:
                 return last_result
         finally:
-            if rotating_proxy is not None:
-                release_rotating_proxy(scope=EMAIL_CHANGE_PROXY_SCOPE, lane_id=proxy_lane_id, proxy_url=rotating_proxy)
             if profile is not None:
-                try: profile.close()
-                except Exception: logger.debug("Browser driver cleanup failed")
-                try: profile.cleanup()
-                except Exception: logger.debug("Browser profile cleanup failed")
+                try:
+                    profile.close()
+                except Exception:
+                    logger.debug("Browser driver cleanup failed")
+                try:
+                    profile.cleanup()
+                except Exception:
+                    logger.debug("Browser profile cleanup failed")
+            if rotating_proxy is not None:
+                release_rotating_proxy(
+                    scope=EMAIL_CHANGE_PROXY_SCOPE,
+                    lane_id=proxy_lane_id,
+                    proxy_url=rotating_proxy,
+                )
     return last_result
 
 
@@ -86,6 +165,7 @@ def run_email_change_batch(
     items: list[EmailChangeInput],
     *,
     workers: int = 1,
+    login_codex_after_change: bool = False,
 ) -> list[dict[str, object]]:
     """Run different Gmail APIs concurrently while serializing each shared OTP URL."""
     grouped: dict[str, list[tuple[int, EmailChangeInput]]] = {}
@@ -102,8 +182,12 @@ def run_email_change_batch(
         return [
             (
                 index,
-                run_email_change(item, proxy_lane_id=proxy_lane_id)
+                run_email_change(item, proxy_lane_id=proxy_lane_id, login_codex_after_change=login_codex_after_change)
+                if rotating_enabled and login_codex_after_change
+                else run_email_change(item, proxy_lane_id=proxy_lane_id)
                 if rotating_enabled
+                else run_email_change(item, login_codex_after_change=login_codex_after_change)
+                if login_codex_after_change
                 else run_email_change(item),
             )
             for index, item in group

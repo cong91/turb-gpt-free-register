@@ -15,6 +15,7 @@ class BrowserProfileSession:
     timeout: int
     keep_open: bool
     _cleanup: Callable[[], None]
+    existing_opened: Any | None = None
     session_info: Any | None = None
 
     def close(self) -> None:
@@ -32,6 +33,13 @@ def _configured_provider() -> str:
     from core.browser_registry import resolve_registration_driver
 
     return resolve_registration_driver(driver_config)
+
+
+def configured_browser_profile_provider() -> str:
+    """Return the canonical provider used for personal-information sessions."""
+    from core.browser_registry import resolve_browser_profile_provider
+
+    return resolve_browser_profile_provider(_configured_provider())
 
 
 def open_browser_profile(proxy: str | None = None) -> BrowserProfileSession:

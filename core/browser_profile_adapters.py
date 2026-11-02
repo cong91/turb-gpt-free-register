@@ -49,6 +49,7 @@ def _open_roxy(proxy: str | None = None) -> BrowserProfileSession:
         timeout=timeout,
         keep_open=keep_open,
         _cleanup=(lambda: None) if keep_open else lambda: client.cleanup_profile(opened),
+        existing_opened=opened,
     )
 
 
@@ -57,7 +58,7 @@ def _open_cloak(proxy: str | None = None) -> BrowserProfileSession:
     from core.browser_selenium_adapter import center_browser_window
     from core.cloakbrowser_driver import build_cloak_driver
 
-    driver, _opened = build_cloak_driver(proxy=proxy)
+    driver, opened = build_cloak_driver(proxy=proxy)
     center_browser_window(driver)
     timeout = max(1, int(getattr(driver_config, "CLOAK_SELENIUM_TIMEOUT", 90) or 90))
     driver.set_page_load_timeout(timeout)
@@ -70,6 +71,7 @@ def _open_cloak(proxy: str | None = None) -> BrowserProfileSession:
         timeout=timeout,
         keep_open=bool(getattr(driver_config, "CLOAK_KEEP_BROWSER_OPEN", False)),
         _cleanup=lambda: None,
+        existing_opened=opened,
     )
 
 

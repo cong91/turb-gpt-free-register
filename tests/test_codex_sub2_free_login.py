@@ -48,6 +48,19 @@ class CodexSub2FreeLoginTests(unittest.TestCase):
         self.assertEqual(result["account_ids"], [])
         self.assertEqual(result["skipped_authenticated"], 2)
 
+    def test_selector_skips_callback_receipts_without_claiming_credentials(self):
+        result = codex_sub2_free_login.select_target_ids([
+            {**self._eligible(7), "codex_status": "receipt"},
+            {**self._eligible(8), "codex_status": "failed"},
+        ])
+
+        self.assertEqual(result["account_ids"], [8])
+        self.assertEqual(result["skipped_authenticated"], 0)
+        self.assertEqual(result["skipped_receipt"], 1)
+        self.assertFalse(codex_sub2_free_login.is_codex_authenticated(
+            {**self._eligible(7), "codex_status": "receipt"}, set(),
+        ))
+
     def test_selector_skips_only_retrying_accounts_with_a_live_worker(self):
         rows = [
             {**self._eligible(7), "codex_status": "retrying"},
@@ -93,6 +106,44 @@ class CodexSub2FreeLoginTests(unittest.TestCase):
         list_statuses.assert_called_once_with(limit=5001, archived=False)
         list_codex_accounts.assert_called_once_with(archived="all")
         active_retrying.assert_called_once_with()
+
+    @patch("webui.codex_sub2_api.db.list_account_plan_check_statuses")
+    @patch("webui.codex_sub2_api.db.list_codex_accounts", return_value=[])
+    @patch("webui.codex_sub2_api.codex_retry_service.active_retrying_emails", return_value=set())
+    @patch("webui.codex_sub2_api._codex_cfg.CODEX_AUTH_URL_SOURCE", "sub2")
+    def test_targets_api_skips_receipt_without_counting_it_as_credential(self, _active, _codex, list_statuses):
+        list_statuses.return_value = {
+            "items": [{**self._eligible(7), "codex_status": "receipt"}, self._eligible(8)],
+            "total": 2,
+        }
+        response = self.client.get("/api/codex/sub2-free-no-trial-targets", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["account_ids"], [8])
+        self.assertEqual(response.get_json()["skipped_receipt"], 1)
+        self.assertEqual(response.get_json()["skipped_authenticated"], 0)
+
+    @patch("webui.codex_sub2_api.db.list_account_plan_check_statuses")
+    @patch("webui.codex_sub2_api.db.list_codex_accounts", return_value=[
+        {"email": "user7@example.com", "type": "codex_sub2_callback"},
+        {"email": "user8@example.com", "type": "codex_cpa_callback"},
+        {"email": "user9@example.com", "type": "codex"},
+    ])
+    @patch("webui.codex_sub2_api.codex_retry_service.active_retrying_emails", return_value=set())
+    @patch("webui.codex_sub2_api._codex_cfg.CODEX_AUTH_URL_SOURCE", "sub2")
+    def test_targets_api_distinguishes_callback_records_from_credentials(self, _active, _codex, list_statuses):
+        list_statuses.return_value = {
+            "items": [
+                {**self._eligible(7), "codex_status": "receipt"},
+                {**self._eligible(8), "codex_status": "receipt"},
+                self._eligible(9), self._eligible(10),
+            ],
+            "total": 4,
+        }
+        response = self.client.get("/api/codex/sub2-free-no-trial-targets", headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["account_ids"], [10])
+        self.assertEqual(response.get_json()["skipped_receipt"], 2)
+        self.assertEqual(response.get_json()["skipped_authenticated"], 1)
 
     @patch("webui.codex_sub2_api.db.list_account_plan_check_statuses")
     @patch("webui.codex_sub2_api.db.list_codex_accounts", return_value=[])

@@ -43,6 +43,9 @@ def register_codex_sub2_routes(app) -> None:
             str(row.get("email") or "").strip().lower()
             for row in codex_rows
             if str(row.get("email") or "").strip()
+            and str(row.get("type") or "").strip().lower() not in {
+                "codex_cpa_callback", "codex_sub2_callback",
+            }
         }
         retrying_emails = codex_retry_service.active_retrying_emails()
         result = codex_sub2_free_login.select_target_ids(
